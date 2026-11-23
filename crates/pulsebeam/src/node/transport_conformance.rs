@@ -761,6 +761,7 @@ fn qualification_rejects_missing_payload_sequential_peers_and_unretired_graphs()
         "connection without payload qualified"
     );
     let mut message = TopicMessage {
+        captured_at: None,
         room: ROOM.into(),
         topic: TOPIC.into(),
         mode: TopicMode::Latest,

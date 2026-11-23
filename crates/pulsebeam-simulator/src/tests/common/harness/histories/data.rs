@@ -287,6 +287,7 @@ impl DataLane {
                     publication_id,
                     sequence,
                     data,
+                    ..
                 } => {
                     ensure!(
                         participant_id == self.participant_id
@@ -318,6 +319,20 @@ impl DataLane {
                         self.last = Some(sequence);
                     }
                     self.received.insert(data);
+                }
+                DataEvent::Discontinuity {
+                    participant_id,
+                    publication_id,
+                    ..
+                } => {
+                    ensure!(
+                        self.delivery != Delivery::Ordered
+                            && participant_id == self.participant_id
+                            && Some(&publication_id) == track.as_ref(),
+                        "invalid data discontinuity"
+                    );
+                    self.last = None;
+                    self.sequences.clear();
                 }
                 DataEvent::Gap {
                     participant_id,

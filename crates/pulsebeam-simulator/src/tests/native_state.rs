@@ -469,6 +469,7 @@ fn message(source: &wire::Track, sequence: u64, payload: u8) -> pulsebeam_proto:
     pulsebeam_proto::topic::TopicFrame {
         body: Some(pulsebeam_proto::topic::topic_frame::Body::Message(
             pulsebeam_proto::topic::TopicMessage {
+                captured_at: None,
                 publication_id: source.publication_id.clone(),
                 sequence,
                 payload: vec![payload],

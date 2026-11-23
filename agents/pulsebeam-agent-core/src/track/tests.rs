@@ -22,6 +22,7 @@ fn message(
     bytes: &[u8],
 ) -> TopicNotification {
     TopicNotification::Message(TopicMessage {
+        captured_at: None,
         room: "room".into(),
         topic: "events".into(),
         mode: delivery,
@@ -1059,11 +1060,11 @@ fn hidden_video_demand_does_not_allocate_and_withdrawal_retains_logical_interest
 }
 
 #[test]
-fn receive_owners_filter_participants_rebind_and_keep_independent_bytes() {
+fn unreliable_receive_owners_filter_participants_rebind_and_keep_independent_bytes() {
     let mut resources = TrackResources::default();
     let all = TrackOwner(1);
     let alice = TrackOwner(2);
-    let spec = data(TopicMode::Ordered);
+    let spec = data(TopicMode::Lossy);
     resources
         .receive(
             all,
@@ -1088,12 +1089,24 @@ fn receive_owners_filter_participants_rebind_and_keep_independent_bytes() {
         .unwrap();
     resources.retain_producer(&spec).unwrap();
     assert_eq!(resources.registrations().subscribers.len(), 1);
-    resources.notify(&message(TopicMode::Ordered, "bob", "old", 1, &[255, 0]));
+    resources.notify(&message(TopicMode::Lossy, "bob", "old", 1, &[255, 0]));
     assert_eq!(resources.read(alice).unwrap(), None);
     resources.read(all).unwrap();
     for track in ["old", "republished"] {
-        let original = message(TopicMode::Ordered, "alice", track, 1, &[255, 0]);
+        let original = message(TopicMode::Lossy, "alice", track, 1, &[255, 0]);
         resources.notify(&original);
+        if track == "republished" {
+            for owner in [all, alice] {
+                assert_eq!(
+                    resources.read(owner).unwrap(),
+                    Some(DataEvent::Discontinuity {
+                        participant_id: "alice".into(),
+                        previous_publication_id: "old".into(),
+                        publication_id: "republished".into(),
+                    })
+                );
+            }
+        }
         let mut first = resources.read(all).unwrap().unwrap();
         if let DataEvent::Message { data, .. } = &mut first {
             data[0] = 1;
@@ -1101,6 +1114,7 @@ fn receive_owners_filter_participants_rebind_and_keep_independent_bytes() {
         assert_eq!(
             resources.read(alice).unwrap(),
             Some(DataEvent::Message {
+                captured_at: None,
                 participant_id: "alice".into(),
                 publication_id: track.into(),
                 sequence: 1,
@@ -1153,6 +1167,7 @@ fn exact_receive_references_share_until_the_last_owner_and_rooms_stay_distinct()
     assert_eq!(
         resources.read(second).unwrap(),
         Some(DataEvent::Message {
+            captured_at: None,
             participant_id: "alice".into(),
             publication_id: "a-track".into(),
             sequence: 0,
@@ -1196,7 +1211,43 @@ fn latest_coalesces_per_track_and_lossy_drops_oldest() {
 }
 
 #[test]
-fn ordered_overflow_reports_loss_inline_instead_of_implying_continuity() {
+fn reliable_overflow_terminates_only_the_slow_subscription() {
+    let mut resources = TrackResources::default();
+    let slow = TrackOwner(1);
+    let fast = TrackOwner(2);
+    for owner in [slow, fast] {
+        resources
+            .receive(
+                owner,
+                &data(TopicMode::Ordered),
+                TrackSelector {
+                    room: "room".into(),
+                    participant_id: "alice".into(),
+                    track_id: "events".into(),
+                },
+            )
+            .unwrap();
+    }
+    for sequence in 0..=DATA_RECEIVE_CAPACITY as u64 {
+        resources.notify(&message(
+            TopicMode::Ordered,
+            "alice",
+            "track",
+            sequence,
+            &[],
+        ));
+        assert!(
+            matches!(resources.read(fast), Ok(Some(DataEvent::Message { sequence: observed, .. })) if observed == sequence)
+        );
+    }
+    assert!(
+        matches!(resources.read(slow), Err(TrackResourceError::ReceiveFailed(error)) if error.code == crate::ffi::ErrorCode::ContinuityLost)
+    );
+    assert_eq!(resources.registrations().subscribers.len(), 1);
+}
+
+#[test]
+fn reliable_subscription_does_not_restart_at_a_replacement_publication() {
     let mut resources = TrackResources::default();
     let owner = TrackOwner(1);
     resources
@@ -1210,34 +1261,22 @@ fn ordered_overflow_reports_loss_inline_instead_of_implying_continuity() {
             },
         )
         .unwrap();
-    for sequence in 0..300 {
-        resources.notify(&message(
-            TopicMode::Ordered,
-            "alice",
-            "track",
-            sequence,
-            &[],
-        ));
-    }
-    assert_eq!(
-        resources.read(owner).unwrap(),
-        Some(DataEvent::Gap {
-            participant_id: "alice".into(),
-            publication_id: "track".into(),
-            from: 0,
-            to: 45,
-        })
-    );
-    for sequence in 45..300 {
+    resources.notify(&message(TopicMode::Ordered, "alice", "original", 42, &[]));
+    assert!(matches!(
+        resources.read(owner),
+        Ok(Some(DataEvent::Message { sequence: 42, .. }))
+    ));
+    resources.notify(&message(TopicMode::Ordered, "alice", "replacement", 0, &[]));
+    for _ in 0..2 {
         assert!(
-            matches!(resources.read(owner).unwrap(), Some(DataEvent::Message { sequence: observed, .. }) if observed == sequence)
+            matches!(resources.read(owner), Err(TrackResourceError::ReceiveFailed(error)) if error.code == crate::ffi::ErrorCode::ContinuityLost)
         );
     }
-    assert_eq!(resources.read(owner).unwrap(), None);
+    assert!(resources.registrations().subscribers.is_empty());
 }
 
 #[test]
-fn unrepresentable_overflow_and_channel_failure_end_only_affected_owners() {
+fn channel_failure_ends_only_matching_owners() {
     for mode in [TopicMode::Latest, TopicMode::Ordered] {
         let mut resources = TrackResources::default();
         let all = TrackOwner(1);
@@ -1276,13 +1315,7 @@ fn unrepresentable_overflow_and_channel_failure_end_only_affected_owners() {
                 },
             )
             .unwrap();
-        for index in 0..=DATA_RECEIVE_CAPACITY {
-            resources.notify(&message(mode, "alice", &format!("track-{index}"), 0, &[]));
-        }
-        assert_eq!(
-            resources.read(all),
-            Err(TrackResourceError::ReceiveOverflow)
-        );
+        resources.notify(&message(mode, "alice", "first", 0, &[]));
         assert_eq!(resources.read(bob).unwrap(), None);
         resources.notify(&TopicNotification::ChannelFailed {
             channel: TopicChannel::Subscriber(TopicSubscriber {
@@ -1298,14 +1331,17 @@ fn unrepresentable_overflow_and_channel_failure_end_only_affected_owners() {
             Err(TrackResourceError::ReceiveChannelFailed("closed".into()))
         );
         assert_eq!(resources.read(lossy).unwrap(), None);
-        assert_eq!(
-            resources.registrations().subscribers,
-            vec![TopicSubscriber {
-                room: "room".into(),
-                participant_id: "alice".into(),
-                topic: "events".into(),
-                mode: TopicMode::Lossy
-            }]
+        assert!(matches!(
+            resources.read(all),
+            Ok(Some(DataEvent::Message { .. }))
+        ));
+        let registrations = resources.registrations();
+        assert_eq!(registrations.subscribers.len(), 2);
+        assert!(
+            registrations
+                .subscribers
+                .iter()
+                .all(|subscriber| subscriber.participant_id == "alice")
         );
     }
 }
@@ -1364,4 +1400,40 @@ fn data_admission_is_transactional_without_a_legacy_channel_count_limit() {
         )
         .unwrap();
     assert_eq!(resources.registrations().subscribers.len(), 1);
+}
+
+#[test]
+fn discontinuity_precedes_replacement_messages_even_under_queue_pressure() {
+    for mode in [TopicMode::Latest, TopicMode::Lossy] {
+        let mut resources = TrackResources::default();
+        let owner = TrackOwner(1);
+        resources
+            .receive(
+                owner,
+                &data(mode),
+                TrackSelector {
+                    room: "room".into(),
+                    participant_id: "alice".into(),
+                    track_id: "events".into(),
+                },
+            )
+            .unwrap();
+        resources.notify(&message(mode, "alice", "first", 0, &[]));
+        resources.read(owner).unwrap().unwrap();
+        resources.notify(&message(mode, "alice", "intermediate", 0, &[]));
+        for sequence in 0..=DATA_RECEIVE_CAPACITY as u64 {
+            resources.notify(&message(mode, "alice", "current", sequence, &[]));
+        }
+        assert_eq!(
+            resources.read(owner).unwrap(),
+            Some(DataEvent::Discontinuity {
+                participant_id: "alice".into(),
+                previous_publication_id: "first".into(),
+                publication_id: "current".into(),
+            })
+        );
+        assert!(
+            matches!(resources.read(owner), Ok(Some(DataEvent::Message { publication_id, .. })) if publication_id == "current")
+        );
+    }
 }

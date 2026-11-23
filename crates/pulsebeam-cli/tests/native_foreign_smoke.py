@@ -116,13 +116,11 @@ async def witness(endpoint, token, reader_token, catalog_token, room, package):
                         return
             finally:
                 updates.close()
-        data = agent.data("foreign-bytes", core.TopicMode.ORDERED).publish()
+        data = agent.data("foreign-bytes").publish()
         room_cursor = reader.room(room).participant("foreign").data(
-            "foreign-bytes", core.TopicMode.ORDERED,
-        ).subscribe()
+            "foreign-bytes").subscribe()
         participant_cursor = reader.room(room).participant("foreign").data(
-            "foreign-bytes", core.TopicMode.ORDERED,
-        ).subscribe()
+            "foreign-bytes").subscribe()
         reader.join(room)
         camera = await agent.create_video_input(native.VideoSourceConfig(
             encodings=[native.Encoding(
@@ -155,9 +153,8 @@ async def witness(endpoint, token, reader_token, catalog_token, room, package):
 
         async def message(cursor, expected, participant_id="foreign"):
             while True:
-                update = await cursor.next()
-                assert update.is_EVENT() and update.event.is_MESSAGE(), update
-                event = update.event
+                event = await cursor.next()
+                assert event is not None and event.is_MESSAGE(), event
                 assert event.participant_id == participant_id and event.publication_id
                 if event.data == expected:
                     return event
@@ -188,16 +185,15 @@ async def witness(endpoint, token, reader_token, catalog_token, room, package):
         assert room_message.data == payload == participant_message.data
         assert room_message.sequence == participant_message.sequence
         await room_cursor.close()
-        assert (await room_cursor.next()).is_CLOSED()
+        assert await room_cursor.next() is None
         assert not participant_cursor.is_closed()
         await data.send(payload[::-1])
         assert (await message(participant_cursor, payload[::-1])).data == payload[::-1]
         await participant_cursor.close()
         await admitted_publication(core, publication)
-        exchange = agent.data("foreign-exchange", core.TopicMode.ORDERED).publish()
+        exchange = agent.data("foreign-exchange").publish()
         replies = agent.room(room).participant("publisher").data(
-            "foreign-exchange", core.TopicMode.ORDERED,
-        ).subscribe()
+            "foreign-exchange").subscribe()
 
         async def send_until_reply():
             while True:
@@ -320,7 +316,7 @@ async def publish_live(endpoint, token, room, package):
     microphone = await agent.create_audio_input()
     audio = agent.audio("microphone").publish()
     _audio_pipe = microphone.pipe_to(audio)
-    data = agent.data("frame-events", core.TopicMode.ORDERED).publish()
+    data = agent.data("frame-events").publish()
     agent.join(room)
     await asyncio.gather(admitted_publication(core, publication), admitted_publication(core, audio))
 
@@ -343,7 +339,12 @@ async def publish_live(endpoint, token, room, package):
                 data=bytes([180]) * (160 * 96) + bytes([90]) * (80 * 48)
                 + bytes([180]) * (80 * 48), rotation_degrees=0,
             )))
-            await data.send(bytes([0, 255, 128]) + sequence.to_bytes(8, "little"))
+            options = core.DataSendOptions(captured_at=core.CaptureTimestamp(
+                clock=core.CaptureClock.PUBLICATION,
+                nanoseconds=-9_007_199_254_740_993 + sequence,
+                uncertainty_nanoseconds=0,
+            ))
+            await data.send(bytes([0, 255, 128]) + sequence.to_bytes(8, "little"), options)
             sequence += 1
             # Live source cadence, not a retry of an accepted frame or payload.
             await asyncio.sleep(1 / 30)

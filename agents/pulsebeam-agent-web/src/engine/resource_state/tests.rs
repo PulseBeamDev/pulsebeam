@@ -270,7 +270,7 @@ fn queued_owned_data_send_cannot_outlive_its_owner_or_join() {
         else {
             panic!("expected data publication");
         };
-        let mut pending = handle.send_owned_data(owner, vec![0, 255]).unwrap();
+        let mut pending = handle.send_owned_data(owner, vec![0, 255], None).unwrap();
         if released {
             handle
                 .resource_now(ResourceCommand::Release { owner })

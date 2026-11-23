@@ -2,6 +2,11 @@ import {
   Agent,
   AgentError,
   AgentStatus,
+  CaptureClock,
+  DataDelivery,
+  DataEvent,
+  DataPublishOptions,
+  DataSendOptions,
   ErrorCode,
   PipeStatus,
   PublicationAdmissionStatus,
@@ -188,6 +193,17 @@ export async function receiveGenerated(config: {
     const publicationData = localData.publish();
     const subscriptionData = remoteData.subscribe();
     try {
+      const pendingData = subscriptionData.next();
+      try {
+        await subscriptionData.next();
+        throw new Error("overlapping generated Web data read was admitted");
+      } catch (error) {
+        if (
+          !AgentError.Operation.instanceOf(error) ||
+          error.inner.info.code !== ErrorCode.Conflict
+        )
+          throw error;
+      }
       for (const owner of [publicationData, subscriptionData]) {
         const updates = owner.updates();
         try {
@@ -213,6 +229,42 @@ export async function receiveGenerated(config: {
           updates.close();
           updates.uniffiDestroy();
         }
+      }
+      const reliable = localData.publish(
+        DataPublishOptions.create({ delivery: DataDelivery.Reliable }),
+      );
+      try {
+        if (reliable.state().delivery !== publicationData.state().delivery) {
+          throw new Error(
+            "omitting generated publish options did not select reliable delivery",
+          );
+        }
+      } finally {
+        await reliable.close();
+        reliable.uniffiDestroy();
+      }
+      if ((await pendingData) !== undefined)
+        throw new Error(
+          "closed generated data subscription did not end pending read",
+        );
+      try {
+        await publicationData.send(
+          new Uint8Array([0, 255]),
+          DataSendOptions.create({
+            capturedAt: {
+              clock: CaptureClock.Publication,
+              nanoseconds: -(1n << 63n),
+              uncertaintyNanoseconds: 0,
+            },
+          }),
+        );
+        throw new Error("closed generated data publication accepted bytes");
+      } catch (error) {
+        if (
+          !AgentError.Operation.instanceOf(error) ||
+          error.inner.info.code !== ErrorCode.Closed
+        )
+          throw error;
       }
     } finally {
       await publicationData.close();
@@ -325,6 +377,49 @@ export async function receiveGenerated(config: {
     } finally {
       await output.close();
       output.uniffiDestroy();
+    }
+    const events = participant.data("frame-events");
+    const stream = events.subscribe();
+    try {
+      const event = await stream.next();
+      if (!DataEvent.Message.instanceOf(event)) {
+        throw new Error(
+          "generated exact subscription did not receive a complete message",
+        );
+      }
+      const { data, participantId, publicationId, sequence, capturedAt } =
+        event.inner;
+      if (
+        data.length !== 11 ||
+        data[0] !== 0 ||
+        data[1] !== 255 ||
+        data[2] !== 128 ||
+        participantId !== "native-publisher" ||
+        !publicationId ||
+        typeof sequence !== "bigint"
+      ) {
+        throw new Error(
+          "generated data lost its payload or source attribution",
+        );
+      }
+      const sourceSequence = new DataView(
+        data.buffer,
+        data.byteOffset,
+        data.byteLength,
+      ).getBigUint64(3, true);
+      if (
+        capturedAt?.clock !== CaptureClock.Publication ||
+        capturedAt.nanoseconds !== -9007199254740993n + sourceSequence ||
+        capturedAt.uncertaintyNanoseconds !== 0
+      ) {
+        throw new Error(
+          "generated data lost capture timestamp precision or clock attribution",
+        );
+      }
+    } finally {
+      await stream.close();
+      stream.uniffiDestroy();
+      events.uniffiDestroy();
     }
     const microphone = participant.audio("microphone");
     const listening = microphone.subscribe();

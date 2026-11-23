@@ -36,6 +36,7 @@ pub enum DataSendFailure {
 }
 
 pub(super) struct Admission {
+    pub(super) captured_at: Option<crate::ffi::CaptureTimestamp>,
     publisher: TopicPublisher,
     payload: Option<Vec<u8>>,
     generation: Option<Generation>,
@@ -87,6 +88,7 @@ impl Topics {
     pub(crate) fn begin_data_send(
         &mut self,
         send: TopicSend,
+        captured_at: Option<crate::ffi::CaptureTimestamp>,
         ids: &mut IdGenerator,
         effects: &mut VecDeque<Effect>,
     ) -> OperationId {
@@ -95,6 +97,7 @@ impl Topics {
         self.admissions.insert(
             ticket,
             Admission {
+                captured_at,
                 publisher: send.publisher,
                 payload: Some(send.payload),
                 generation: None,

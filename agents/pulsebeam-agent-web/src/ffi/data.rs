@@ -1,14 +1,11 @@
 use super::{Agent, Arc, ErrorCode, ErrorInfo, WebAgentError, video::Participant};
-use agent_core::{TopicMode, TrackSpec, ffi};
+use agent_core::{TrackSpec, ffi};
 
-fn ordered_track(label: String) -> Result<TrackSpec, WebAgentError> {
-    let spec = TrackSpec::Data {
+fn track_spec(label: String, delivery: ffi::DataDelivery) -> TrackSpec {
+    TrackSpec::Data {
         track_id: label,
-        delivery: TopicMode::Ordered,
-    };
-    spec.validate()
-        .map_err(|_| ErrorInfo::new(ErrorCode::InvalidArgument, "Invalid data track label"))?;
-    Ok(spec)
+        delivery: delivery.into(),
+    }
 }
 
 #[derive(uniffi::Object)]
@@ -16,33 +13,37 @@ pub struct LocalDataTrack {
     #[cfg(target_arch = "wasm32")]
     agent: Arc<Agent>,
     #[cfg(target_arch = "wasm32")]
-    spec: TrackSpec,
+    label: String,
 }
 
 #[uniffi::export]
 impl Agent {
     pub fn data(self: Arc<Self>, label: String) -> Result<Arc<LocalDataTrack>, WebAgentError> {
-        let spec = ordered_track(label)?;
-        #[cfg(not(target_arch = "wasm32"))]
-        let _ = spec;
+        track_spec(label.clone(), ffi::DataDelivery::default())
+            .validate()
+            .map_err(|_| ErrorInfo::new(ErrorCode::InvalidArgument, "Invalid data track label"))?;
         Ok(Arc::new(LocalDataTrack {
             #[cfg(target_arch = "wasm32")]
             agent: self,
             #[cfg(target_arch = "wasm32")]
-            spec,
+            label,
         }))
     }
 }
 
 #[uniffi::export]
 impl LocalDataTrack {
-    pub fn publish(&self) -> Result<Arc<DataPublication>, WebAgentError> {
+    #[uniffi::method(default(options = None))]
+    pub fn publish(
+        &self,
+        options: Option<ffi::DataPublishOptions>,
+    ) -> Result<Arc<DataPublication>, WebAgentError> {
         #[cfg(target_arch = "wasm32")]
         {
-            let (owner, observer) = self
-                .agent
-                .runtime
-                .claim_data_publication(self.spec.clone())?;
+            let (owner, observer) = self.agent.runtime.claim_data_publication(track_spec(
+                self.label.clone(),
+                options.and_then(|value| value.delivery).unwrap_or_default(),
+            ))?;
             Ok(Arc::new(DataPublication {
                 agent: self.agent.clone(),
                 owner,
@@ -50,7 +51,10 @@ impl LocalDataTrack {
             }))
         }
         #[cfg(not(target_arch = "wasm32"))]
-        Err(super::browser_required())
+        {
+            let _ = options;
+            Err(super::browser_required())
+        }
     }
 }
 
@@ -59,23 +63,18 @@ pub struct RemoteDataTrack {
     #[cfg(target_arch = "wasm32")]
     agent: Arc<Agent>,
     #[cfg(target_arch = "wasm32")]
-    spec: TrackSpec,
-    #[cfg(target_arch = "wasm32")]
     selector: agent_core::TrackSelector,
 }
 
 #[uniffi::export]
 impl Participant {
     pub fn data(&self, label: String) -> Result<Arc<RemoteDataTrack>, WebAgentError> {
-        let spec = ordered_track(label.clone())?;
         let selector = self.selector(label)?;
         #[cfg(not(target_arch = "wasm32"))]
-        let _ = (spec, selector);
+        let _ = selector;
         Ok(Arc::new(RemoteDataTrack {
             #[cfg(target_arch = "wasm32")]
             agent: self.agent.clone(),
-            #[cfg(target_arch = "wasm32")]
-            spec,
             #[cfg(target_arch = "wasm32")]
             selector,
         }))
@@ -84,18 +83,75 @@ impl Participant {
 
 #[uniffi::export]
 impl RemoteDataTrack {
-    pub fn subscribe(&self) -> Result<Arc<DataSubscription>, WebAgentError> {
+    #[uniffi::method(default(options = None))]
+    pub fn subscribe(
+        &self,
+        options: Option<ffi::DataSubscribeOptions>,
+    ) -> Result<Arc<DataSubscription>, WebAgentError> {
         #[cfg(target_arch = "wasm32")]
         {
-            let (owner, observer) = self
-                .agent
-                .runtime
-                .claim_data_subscription(self.spec.clone(), self.selector.clone())?;
+            let (owner, observer) = self.agent.runtime.claim_data_subscription(
+                track_spec(
+                    self.selector.track_id.clone(),
+                    options.and_then(|value| value.delivery).unwrap_or_default(),
+                ),
+                self.selector.clone(),
+            )?;
             Ok(Arc::new(DataSubscription {
                 agent: self.agent.clone(),
                 owner,
                 observer,
             }))
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = options;
+            Err(super::browser_required())
+        }
+    }
+}
+
+#[uniffi::export]
+impl DataPublication {
+    #[uniffi::method(default(options = None))]
+    pub async fn send(
+        &self,
+        bytes: Vec<u8>,
+        options: Option<ffi::DataSendOptions>,
+    ) -> Result<(), WebAgentError> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            if self.observer.state().closed {
+                return Err(ErrorInfo::new(ErrorCode::Closed, "Data publication is closed").into());
+            }
+            self.agent
+                .runtime
+                .send_exact_data(
+                    self.owner,
+                    bytes,
+                    options.and_then(|value| value.captured_at),
+                )
+                .await?;
+            Ok(())
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = (bytes, options);
+            Err(super::browser_required())
+        }
+    }
+}
+
+#[uniffi::export]
+impl DataSubscription {
+    pub async fn next(&self) -> Result<Option<agent_core::DataEvent>, WebAgentError> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            Ok(self
+                .agent
+                .runtime
+                .next_exact_data(self.owner, &self.observer)
+                .await?)
         }
         #[cfg(not(target_arch = "wasm32"))]
         Err(super::browser_required())

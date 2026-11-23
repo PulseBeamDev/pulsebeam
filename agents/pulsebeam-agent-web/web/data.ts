@@ -31,6 +31,11 @@ export interface DataMessage {
   readonly publicationId: string;
   readonly sequence: bigint;
   readonly data: Uint8Array;
+  readonly capturedAt?: {
+    readonly clock: "publication";
+    readonly nanoseconds: bigint;
+    readonly uncertaintyNanoseconds?: number;
+  };
 }
 export interface DataGap {
   readonly type: "gap";
@@ -39,9 +44,15 @@ export interface DataGap {
   readonly from: bigint;
   readonly to: bigint;
 }
+export interface DataDiscontinuity {
+  readonly type: "discontinuity";
+  readonly participantId: string;
+  readonly previousPublicationId: string;
+  readonly publicationId: string;
+}
 export type DataEvent<D extends Delivery = Delivery> =
   | DataMessage
-  | (D extends "ordered" ? DataGap : never);
+  | (D extends "ordered" ? DataGap : DataDiscontinuity);
 export type DataUpdate<D extends Delivery = Delivery> =
   | { readonly type: "event"; readonly event: DataEvent<D> }
   | { readonly type: "closed" };

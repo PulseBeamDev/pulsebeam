@@ -356,6 +356,7 @@ enum Command {
         owner: u64,
         expected_join: u64,
         data: Vec<u8>,
+        captured_at: Option<agent_core::ffi::CaptureTimestamp>,
         response: oneshot::Sender<Result<(), Error>>,
     },
     #[cfg(test)]
@@ -1221,8 +1222,12 @@ where
                 owner,
                 expected_join,
                 data,
+                captured_at,
                 response,
-            } => match self.core.send_owned_data(owner, expected_join, data) {
+            } => match self
+                .core
+                .send_owned_data(owner, expected_join, data, captured_at)
+            {
                 Ok(send) => {
                     self.data_sends.insert(send, response);
                 }

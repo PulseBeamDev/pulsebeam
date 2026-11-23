@@ -402,6 +402,7 @@ fn topic_input(
 
 fn wire_message(id: &str, sequence: u64, payload: &[u8]) -> TopicBody {
     TopicBody::Message(WireTopicMessage {
+        captured_at: None,
         publication_id: id.into(),
         sequence,
         payload: payload.to_vec(),
@@ -5546,14 +5547,15 @@ fn owned_receive_uses_transport_deduplication_and_last_owner_registration_lifeti
     assert!(agent.next_effect_after_turn().is_none());
     drain_notifications(&mut agent);
     let remote = native_connection::REMOTE_SOURCE.to_string();
+    let mut wire = wire_message(&remote, 0, &[255, 0]);
+    if let TopicBody::Message(message) = &mut wire {
+        message.captured_at = Some(pulsebeam_proto::topic::TopicCaptureTimestamp {
+            nanoseconds: -9_007_199_254_740_993,
+            uncertainty_nanoseconds: Some(0),
+        });
+    }
     for _ in 0..2 {
-        topic_input(
-            &mut agent,
-            generation,
-            receiving.channel,
-            wire_message(&remote, 0, &[255, 0]),
-        )
-        .unwrap();
+        topic_input(&mut agent, generation, receiving.channel, wire.clone()).unwrap();
     }
     let notifications = drain_notifications(&mut agent);
     assert_eq!(notifications.iter().filter(|notification| matches!(notification, Notification::DataReady { owners: ready } if ready == &owners[..])).count(), 1);
@@ -5564,6 +5566,11 @@ fn owned_receive_uses_transport_deduplication_and_last_owner_registration_lifeti
                 .unwrap(),
             ResourceResult::Event {
                 event: Some(DataEvent::Message {
+                    captured_at: Some(crate::ffi::CaptureTimestamp {
+                        clock: crate::ffi::CaptureClock::Publication,
+                        nanoseconds: -9_007_199_254_740_993,
+                        uncertainty_nanoseconds: Some(0),
+                    }),
                     participant_id: "remote-app-user".into(),
                     publication_id: remote.clone(),
                     sequence: 0,

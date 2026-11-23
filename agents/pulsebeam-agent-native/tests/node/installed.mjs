@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { Agent, InputFrame, NativeError, PublicationUpdates, ReceiveMode } from "@pulsebeam/agent/native";
-import { AgentStatus, ErrorCode, LogLevel, PlayoutDelay, PublicationAdmissionStatus, PublicationDemand, TopicMode } from "@pulsebeam/agent/core";
+import { AgentStatus, ErrorCode, LogLevel, PlayoutDelay, PublicationAdmissionStatus, PublicationDemand } from "@pulsebeam/agent/core";
 
 const room = process.argv[4];
 assert.ok(room, "an explicit room is required");
@@ -16,8 +16,8 @@ assert.equal(agent.state().room, undefined);
 assert.equal(agent.state().desiredRoom, undefined);
 try {
   const updates = agent.updates();
-  const exchange = agent.data("foreign-exchange", TopicMode.Ordered).publish();
-  const replies = agent.room(room).participant("publisher").data("foreign-exchange", TopicMode.Ordered).subscribe();
+  const exchange = agent.data("foreign-exchange").publish();
+  const replies = agent.room(room).participant("publisher").data("foreign-exchange").subscribe();
   const camera = await agent.createVideoInput({
     encodings: [{ rid: undefined, scaleDownBy: 1, maxBitrateBps: undefined, maxFramerate: undefined, temporalLayers: 1 }],
     dependencyDescriptor: true,
@@ -72,9 +72,8 @@ try {
   })();
   try {
     while (true) {
-      const update = await Promise.race([replies.next(), sending]);
-      assert.equal(update.tag, "Event");
-      const event = update.inner.event;
+      const event = await Promise.race([replies.next(), sending]);
+      assert(event, "data subscription ended before reply");
       assert.equal(event.tag, "Message");
       const message = event.inner;
       assert.equal(message.participantId, "publisher");

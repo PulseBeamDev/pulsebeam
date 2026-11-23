@@ -77,9 +77,36 @@ def main():
         raise RuntimeError("native Kotlin bindings do not import the shared core AgentConfig")
     if re.search(r"^data class (AgentConfig|DesiredState|MediaFrame|Snapshot)\b", text, re.MULTILINE):
         raise RuntimeError("native Kotlin bindings duplicated a shared core DTO")
-    for name in ("PulseBeamAgent.swift", "pulsebeam_agent_native.py", "pulsebeam_agent_core.py"):
+    for name in ("PulseBeamAgent.swift", "pulsebeam_agent_core.swift", "pulsebeam_agent_native.py", "pulsebeam_agent_core.py"):
         if not (output / name).is_file():
             raise RuntimeError(f"UniFFI did not emit {name}")
+
+    signatures = {
+        native: (
+            "`publish`(`options`: DataPublishOptions? = null)",
+            "`subscribe`(`options`: DataSubscribeOptions? = null)",
+            "`send`(`data`: kotlin.ByteArray, `options`: DataSendOptions? = null)",
+        ),
+        core: (
+            "`capturedAt`: CaptureTimestamp? = null",
+            "`nanoseconds`: kotlin.Long",
+            "`uncertaintyNanoseconds`: kotlin.UInt? = null",
+        ),
+        output / "PulseBeamAgent.swift": (
+            "publish(options: DataPublishOptions? = nil)",
+            "subscribe(options: DataSubscribeOptions? = nil)",
+            "send(data: Data, options: DataSendOptions? = nil)",
+        ),
+        output / "pulsebeam_agent_core.swift": (
+            "init(capturedAt: CaptureTimestamp? = nil)",
+            "init(clock: CaptureClock, nanoseconds: Int64, uncertaintyNanoseconds: UInt32? = nil)",
+        ),
+    }
+    for source, expected in signatures.items():
+        generated = source.read_text()
+        for signature in expected:
+            if signature not in generated:
+                raise RuntimeError(f"{source.name} lacks data API signature {signature}")
 
 
 if __name__ == "__main__":

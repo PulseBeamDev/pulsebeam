@@ -17,6 +17,7 @@ export function useReaction(agent: Agent) {
     Reactions,
     reactions,
     onEvent(event: DataEvent<"lossy">) {
+      if (event.type !== "message") return;
       const emoji = decodeText(event.data);
       if (emoji !== null && reactionEmojis.includes(emoji)) {
         add({ key: `${event.publicationId}:${event.sequence}`, emoji });

@@ -165,6 +165,9 @@ async fn foreign_witness(
                 Ok(DataUpdate::Event {
                     event: DataEvent::Gap { from, to, .. },
                 }) => bail!("owned data stream gap: {from}..{to}"),
+                Ok(DataUpdate::Event {
+                    event: DataEvent::Discontinuity { .. },
+                }) => bail!("owned data stream unexpectedly changed source"),
             }
         }
     });

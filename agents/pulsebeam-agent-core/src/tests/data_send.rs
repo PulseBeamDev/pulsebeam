@@ -46,6 +46,7 @@ fn owned_sends_wait_for_host_acceptance_and_latest_supersession_is_explicit() {
         panic!("binary message")
     };
     assert!(message.payload.is_empty());
+    assert_eq!(message.captured_at, None);
     agent
         .handle(HostEvent::Timer(TimerEvent::Fired { timer: first_timer }))
         .unwrap();
@@ -60,7 +61,15 @@ fn owned_sends_wait_for_host_acceptance_and_latest_supersession_is_explicit() {
     let second = agent.send_data(spec(TopicMode::Latest), vec![1]).unwrap();
     let second_timer = deadline(&mut agent);
     let third = agent
-        .send_data(spec(TopicMode::Latest), vec![0, 255, 128])
+        .send_data_at(
+            spec(TopicMode::Latest),
+            vec![0, 255, 128],
+            Some(crate::ffi::CaptureTimestamp {
+                clock: crate::ffi::CaptureClock::Publication,
+                nanoseconds: i64::MIN,
+                uncertainty_nanoseconds: Some(0),
+            }),
+        )
         .unwrap();
     let third_timer = deadline(&mut agent);
     assert_eq!(
@@ -79,6 +88,13 @@ fn owned_sends_wait_for_host_acceptance_and_latest_supersession_is_explicit() {
         panic!("binary message")
     };
     assert_eq!(message.payload, [0, 255, 128]);
+    assert_eq!(
+        message.captured_at,
+        Some(pulsebeam_proto::topic::TopicCaptureTimestamp {
+            nanoseconds: i64::MIN,
+            uncertainty_nanoseconds: Some(0),
+        })
+    );
     assert_eq!(finished(&mut agent), vec![(first, None)]);
     agent
         .handle(HostEvent::DataChannel(DataChannelEvent::SendFailed {

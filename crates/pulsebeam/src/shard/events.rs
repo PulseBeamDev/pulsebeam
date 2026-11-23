@@ -285,7 +285,10 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
         self.pipeline
             .participant_events
             .push_back(ParticipantEvent::Internal(
-                ShardInternalEvent::ReverseRequested { stream, packet },
+                ShardInternalEvent::ReverseRequested {
+                    stream,
+                    packet: packet.with_requester(self.connection_id),
+                },
             ));
     }
 

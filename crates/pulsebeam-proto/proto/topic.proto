@@ -8,6 +8,13 @@ message TopicMessage {
   string publication_id = 1;
   uint64 sequence = 2;
   bytes payload = 3;
+  TopicCaptureTimestamp captured_at = 4;
+}
+
+// Acquisition time in the clock domain bound to this publication, not ingress time.
+message TopicCaptureTimestamp {
+  sint64 nanoseconds = 1;
+  optional uint32 uncertainty_nanoseconds = 2;
 }
 
 message TopicNack {

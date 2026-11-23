@@ -155,10 +155,16 @@ pub enum TrackResourceError {
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum DataEvent {
     Message {
+        captured_at: Option<crate::ffi::CaptureTimestamp>,
         participant_id: String,
         publication_id: String,
         sequence: u64,
         data: Vec<u8>,
+    },
+    Discontinuity {
+        participant_id: String,
+        previous_publication_id: String,
+        publication_id: String,
     },
     Gap {
         participant_id: String,
@@ -182,25 +188,16 @@ impl DataEvent {
                 publication_id,
                 ..
             }
+            | Self::Discontinuity {
+                participant_id,
+                publication_id,
+                ..
+            }
             | Self::Gap {
                 participant_id,
                 publication_id,
                 ..
             } => (participant_id, publication_id),
-        }
-    }
-
-    fn from(&self) -> u64 {
-        match self {
-            Self::Message { sequence, .. } => *sequence,
-            Self::Gap { from, .. } => *from,
-        }
-    }
-
-    fn end(&self) -> Option<u64> {
-        match self {
-            Self::Message { sequence, .. } => sequence.checked_add(1),
-            Self::Gap { to, .. } => Some(*to),
         }
     }
 }
@@ -383,6 +380,8 @@ impl PublicationOwner {
 
 struct DataReceiver {
     subscriber: TopicSubscriber,
+    source: Option<String>,
+    discontinuity: Option<DataEvent>,
     queue: VecDeque<DataEvent>,
     failure: Option<TrackResourceError>,
 }
@@ -391,6 +390,29 @@ impl DataReceiver {
     fn push(&mut self, event: DataEvent) {
         if self.failure.is_some() || self.subscriber.participant_id != event.identity().0 {
             return;
+        }
+        let (participant, publication) = event.identity();
+        if self.source.as_deref() != Some(publication) {
+            if let Some(previous) = self.source.take() {
+                if self.subscriber.mode == TopicMode::Ordered {
+                    self.lose_continuity("Reliable source was replaced");
+                    return;
+                }
+                let previous_publication_id = match self.discontinuity.take() {
+                    Some(DataEvent::Discontinuity {
+                        previous_publication_id,
+                        ..
+                    }) => previous_publication_id,
+                    _ => previous,
+                };
+                self.queue.clear();
+                self.discontinuity = Some(DataEvent::Discontinuity {
+                    participant_id: participant.into(),
+                    previous_publication_id,
+                    publication_id: publication.into(),
+                });
+            }
+            self.source = Some(publication.into());
         }
         match self.subscriber.mode {
             TopicMode::Latest => {
@@ -403,45 +425,19 @@ impl DataReceiver {
             TopicMode::Lossy | TopicMode::Ordered => {}
         }
         self.queue.push_back(event);
-        if self.queue.len() <= DATA_RECEIVE_CAPACITY {
-            return;
-        }
-        if self.subscriber.mode != TopicMode::Ordered || !self.compact_ordered() {
-            self.fail(TrackResourceError::ReceiveOverflow);
+        if self.queue.len() > DATA_RECEIVE_CAPACITY {
+            if self.subscriber.mode == TopicMode::Ordered {
+                self.lose_continuity("Reliable receive buffer was exhausted");
+            } else {
+                self.fail(TrackResourceError::ReceiveOverflow);
+            }
         }
     }
 
-    fn compact_ordered(&mut self) -> bool {
-        let mut first_by_track = BTreeMap::new();
-        for (second, later) in self.queue.iter().enumerate() {
-            let identity = later.identity();
-            let Some(first) = first_by_track.get(&identity).copied() else {
-                first_by_track.insert(identity, second);
-                continue;
-            };
-            let Some(earlier) = self.queue.get(first) else {
-                return false;
-            };
-            let Some(earlier_end) = earlier.end() else {
-                return false;
-            };
-            let Some(later_end) = later.end() else {
-                return false;
-            };
-            let gap = DataEvent::Gap {
-                participant_id: identity.0.into(),
-                publication_id: identity.1.into(),
-                from: earlier.from(),
-                to: earlier_end.max(later_end),
-            };
-            let Some(earlier) = self.queue.get_mut(first) else {
-                return false;
-            };
-            *earlier = gap;
-            self.queue.remove(second);
-            return true;
-        }
-        false
+    fn lose_continuity(&mut self, message: &str) {
+        self.fail(TrackResourceError::ReceiveFailed(
+            crate::ffi::ErrorInfo::new(crate::ffi::ErrorCode::ContinuityLost, message),
+        ));
     }
 
     fn fail(&mut self, error: TrackResourceError) {
@@ -1575,6 +1571,8 @@ impl TrackResources {
             owner,
             DataReceiver {
                 subscriber,
+                source: None,
+                discontinuity: None,
                 queue: VecDeque::new(),
                 failure: None,
             },
@@ -1621,7 +1619,10 @@ impl TrackResources {
         if let Some(failure) = &receiver.failure {
             return Err(failure.clone());
         }
-        Ok(receiver.queue.pop_front())
+        Ok(receiver
+            .discontinuity
+            .take()
+            .or_else(|| receiver.queue.pop_front()))
     }
 
     pub(crate) fn fail_receivers_for_source(
@@ -1662,27 +1663,18 @@ impl TrackResources {
                         && receiver.subscriber.mode == message.mode =>
                 {
                     receiver.push(DataEvent::Message {
+                        captured_at: message.captured_at,
                         participant_id: message.participant_id.clone(),
                         publication_id: message.publication_id.clone(),
                         sequence: message.sequence,
                         data: message.payload.clone(),
                     });
                 }
-                TopicNotification::RecoveryGap {
-                    subscriber,
-                    publication_id,
-                    participant_id,
-                    expected_sequence,
-                    available_sequence,
-                } if &receiver.subscriber == subscriber
-                    && subscriber.mode == TopicMode::Ordered =>
+                TopicNotification::RecoveryGap { subscriber, .. }
+                    if &receiver.subscriber == subscriber
+                        && subscriber.mode == TopicMode::Ordered =>
                 {
-                    receiver.push(DataEvent::Gap {
-                        participant_id: participant_id.clone(),
-                        publication_id: publication_id.clone(),
-                        from: *expected_sequence,
-                        to: *available_sequence,
-                    });
+                    receiver.lose_continuity("Reliable transport recovery was exhausted");
                 }
                 TopicNotification::ChannelFailed {
                     channel: TopicChannel::Subscriber(subscriber),

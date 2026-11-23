@@ -215,6 +215,7 @@ fn data_event(event: DataEvent) -> JsValue {
     let value = Object::new();
     match event {
         DataEvent::Message {
+            captured_at,
             participant_id,
             publication_id,
             sequence,
@@ -225,6 +226,25 @@ fn data_event(event: DataEvent) -> JsValue {
             set(&value, "publicationId", publication_id);
             set(&value, "sequence", BigInt::from(sequence));
             set(&value, "data", js_sys::Uint8Array::from(data.as_slice()));
+            if let Some(stamp) = captured_at {
+                let time = Object::new();
+                set(&time, "clock", "publication");
+                set(&time, "nanoseconds", BigInt::from(stamp.nanoseconds));
+                if let Some(uncertainty) = stamp.uncertainty_nanoseconds {
+                    set(&time, "uncertaintyNanoseconds", uncertainty);
+                }
+                set(&value, "capturedAt", Object::freeze(&time));
+            }
+        }
+        DataEvent::Discontinuity {
+            participant_id,
+            previous_publication_id,
+            publication_id,
+        } => {
+            set(&value, "type", "discontinuity");
+            set(&value, "participantId", participant_id);
+            set(&value, "previousPublicationId", previous_publication_id);
+            set(&value, "publicationId", publication_id);
         }
         DataEvent::Gap {
             participant_id,
@@ -292,15 +312,14 @@ pub(super) fn error(error: AgentError) -> JsValue {
     coded_error(code, &error.to_string())
 }
 
-pub(super) fn send_error(error: crate::engine::DataSendError) -> JsValue {
+pub(super) fn send_error_info(error: crate::engine::DataSendError) -> agent_core::ffi::ErrorInfo {
     use crate::engine::DataSendError;
     use agent_core::ffi::{ErrorCode, ErrorInfo};
-    let info = match error {
+    match error {
         DataSendError::Admission(error) => ErrorInfo::from(&error),
         DataSendError::Closed => ErrorInfo::new(ErrorCode::Closed, "Data runtime is closed"),
         DataSendError::Delivery(failure) => ErrorInfo::from(&failure),
-    };
-    super::operation_error_value(info)
+    }
 }
 
 pub(super) fn coded_error(code: &str, message: &str) -> JsValue {

@@ -235,13 +235,11 @@ impl Agent {
                 ),
             })
     }
-    pub fn data(
-        &self,
-        track_id: String,
-        delivery: core_ffi::TopicMode,
-    ) -> Result<Arc<LocalDataTrack>, NativeError> {
+    pub fn data(&self, track_id: String) -> Result<Arc<LocalDataTrack>, NativeError> {
         Ok(Arc::new(LocalDataTrack {
-            runtime: self.runtime.data(track_id, delivery.into())?,
+            runtime: self
+                .runtime
+                .data(track_id, agent_core::TopicMode::Ordered)?,
         }))
     }
     pub fn room(&self, name: String) -> Result<Arc<RoomRef>, NativeError> {
@@ -324,9 +322,18 @@ pub struct LocalDataTrack {
 
 #[uniffi::export]
 impl LocalDataTrack {
-    pub fn publish(&self) -> Result<Arc<DataPublication>, NativeError> {
+    #[uniffi::method(default(options = None))]
+    pub fn publish(
+        &self,
+        options: Option<core_ffi::DataPublishOptions>,
+    ) -> Result<Arc<DataPublication>, NativeError> {
         Ok(Arc::new(DataPublication {
-            runtime: self.runtime.publish()?,
+            runtime: self.runtime.publish_with_delivery(
+                options
+                    .and_then(|value| value.delivery)
+                    .unwrap_or_default()
+                    .into(),
+            )?,
         }))
     }
 }
@@ -349,8 +356,16 @@ impl DataPublication {
                 .map_err(resource_state::observer_limit)?,
         }))
     }
-    pub async fn send(&self, data: Vec<u8>) -> Result<(), NativeError> {
-        self.runtime.send(data).await.map_err(operation_error)
+    #[uniffi::method(default(options = None))]
+    pub async fn send(
+        &self,
+        data: Vec<u8>,
+        options: Option<core_ffi::DataSendOptions>,
+    ) -> Result<(), NativeError> {
+        self.runtime
+            .send_at(data, options.and_then(|options| options.captured_at))
+            .await
+            .map_err(operation_error)
     }
     pub fn close(&self) -> Result<(), NativeError> {
         self.runtime.close().map_err(operation_error)
@@ -471,12 +486,8 @@ impl CatalogParticipant {
         self.reference.audio(label)
     }
 
-    pub fn data(
-        &self,
-        label: String,
-        delivery: core_ffi::TopicMode,
-    ) -> Result<Arc<RemoteDataTrack>, NativeError> {
-        self.reference.data(label, delivery)
+    pub fn data(&self, label: String) -> Result<Arc<RemoteDataTrack>, NativeError> {
+        self.reference.data(label)
     }
 }
 
@@ -523,13 +534,11 @@ impl Participant {
     pub fn id(&self) -> String {
         self.runtime.id().into()
     }
-    pub fn data(
-        &self,
-        track_id: String,
-        delivery: core_ffi::TopicMode,
-    ) -> Result<Arc<RemoteDataTrack>, NativeError> {
+    pub fn data(&self, track_id: String) -> Result<Arc<RemoteDataTrack>, NativeError> {
         Ok(Arc::new(RemoteDataTrack {
-            runtime: self.runtime.data(track_id, delivery.into())?,
+            runtime: self
+                .runtime
+                .data(track_id, agent_core::TopicMode::Ordered)?,
         }))
     }
 }
@@ -541,9 +550,18 @@ pub struct RemoteDataTrack {
 
 #[uniffi::export]
 impl RemoteDataTrack {
-    pub fn subscribe(&self) -> Result<Arc<DataSubscription>, NativeError> {
+    #[uniffi::method(default(options = None))]
+    pub fn subscribe(
+        &self,
+        options: Option<core_ffi::DataSubscribeOptions>,
+    ) -> Result<Arc<DataSubscription>, NativeError> {
         Ok(Arc::new(DataSubscription {
-            runtime: self.runtime.subscribe()?,
+            runtime: self.runtime.subscribe_with_delivery(
+                options
+                    .and_then(|value| value.delivery)
+                    .unwrap_or_default()
+                    .into(),
+            )?,
         }))
     }
 }
@@ -569,8 +587,11 @@ impl DataSubscription {
     pub fn is_closed(&self) -> bool {
         self.runtime.is_closed()
     }
-    pub async fn next(&self) -> Result<agent_core::DataUpdate, NativeError> {
-        self.runtime.next().await.map_err(Into::into)
+    pub async fn next(&self) -> Result<Option<agent_core::DataEvent>, NativeError> {
+        match self.runtime.next().await.map_err(operation_error)? {
+            agent_core::DataUpdate::Event { event } => Ok(Some(event)),
+            agent_core::DataUpdate::Closed => Ok(None),
+        }
     }
     pub async fn close(&self) -> Result<(), NativeError> {
         self.runtime.close().await.map_err(Into::into)

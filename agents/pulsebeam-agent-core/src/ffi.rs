@@ -155,6 +155,55 @@ pub enum TopicMode {
     Ordered,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, uniffi::Enum)]
+pub enum DataDelivery {
+    #[default]
+    Reliable,
+    Unreliable,
+    Latest,
+}
+
+impl From<DataDelivery> for crate::TopicMode {
+    fn from(value: DataDelivery) -> Self {
+        match value {
+            DataDelivery::Reliable => Self::Ordered,
+            DataDelivery::Unreliable => Self::Lossy,
+            DataDelivery::Latest => Self::Latest,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, uniffi::Record)]
+pub struct DataPublishOptions {
+    #[uniffi(default = None)]
+    pub delivery: Option<DataDelivery>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, uniffi::Record)]
+pub struct DataSubscribeOptions {
+    #[uniffi(default = None)]
+    pub delivery: Option<DataDelivery>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum CaptureClock {
+    Publication,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct CaptureTimestamp {
+    pub clock: CaptureClock,
+    pub nanoseconds: i64,
+    #[uniffi(default = None)]
+    pub uncertainty_nanoseconds: Option<u32>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, uniffi::Record)]
+pub struct DataSendOptions {
+    #[uniffi(default = None)]
+    pub captured_at: Option<CaptureTimestamp>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct TopicPublisher {
     pub name: String,
@@ -1514,6 +1563,7 @@ mod tests {
     fn notification_conversion_keeps_topic_payload_and_identity() {
         let notification =
             model::Notification::Topic(model::TopicNotification::Message(model::TopicMessage {
+                captured_at: None,
                 room: "room".into(),
                 topic: "chat".to_string(),
                 mode: model::TopicMode::Ordered,

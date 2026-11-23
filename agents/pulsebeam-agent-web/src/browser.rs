@@ -595,6 +595,8 @@ struct RuntimeInner {
     local_tracks: RefCell<BTreeMap<String, LocalTrackState>>,
     publication_slots: RefCell<BTreeMap<u64, PublicationSlot>>,
     observations: RefCell<media_observation::Observations>,
+    #[cfg(feature = "uniffi")]
+    data_reads: RefCell<std::collections::HashMap<u64, Option<std::task::Waker>>>,
     peers: RefCell<BTreeMap<u64, Peer>>,
     requests: RefCell<BTreeMap<u64, AbortController>>,
     timers: RefCell<BTreeMap<u64, TimerHandle>>,
@@ -652,6 +654,8 @@ impl BrowserRuntime {
             local_tracks: RefCell::new(BTreeMap::new()),
             publication_slots: RefCell::new(BTreeMap::new()),
             observations: RefCell::new(media_observation::Observations::default()),
+            #[cfg(feature = "uniffi")]
+            data_reads: RefCell::default(),
             peers: RefCell::new(BTreeMap::new()),
             requests: RefCell::new(BTreeMap::new()),
             timers: RefCell::new(BTreeMap::new()),
@@ -1096,24 +1100,10 @@ impl BrowserRuntime {
 
     #[wasm_bindgen(unchecked_return_type = "Promise<void>")]
     pub fn send_owned_data(&self, owner: u64, payload: &[u8]) -> Result<js_sys::Promise, JsValue> {
-        use agent_core::ffi::{ErrorCode, ErrorInfo};
-        self.inner.ensure_open().map_err(|_| {
-            operation_error_value(ErrorInfo::new(ErrorCode::Closed, "Data runtime is closed"))
-        })?;
-        let completion = self
-            .inner
-            .actor
-            .borrow()
-            .as_ref()
-            .ok_or_else(|| {
-                operation_error_value(ErrorInfo::new(
-                    ErrorCode::NotReady,
-                    "Data runtime is not ready",
-                ))
-            })?
-            .send_owned_data(owner, payload.to_vec())
-            .map_err(operation_error_value)?;
-        Ok(data_send_promise(completion))
+        Ok(data_send_promise(
+            self.admit_owned_data(owner, payload.to_vec(), None)
+                .map_err(operation_error_value)?,
+        ))
     }
 
     #[wasm_bindgen(unchecked_return_type = "Promise<void>")]
@@ -1504,6 +1494,8 @@ impl RuntimeInner {
 
     fn request_abort(&self) {
         self.closing.set(true);
+        #[cfg(feature = "uniffi")]
+        self.wake_data_reads();
         self.close_publication_observers();
         self.close_agent_state();
         self.close_observations();
@@ -2066,6 +2058,17 @@ impl RuntimeInner {
     }
 
     fn release_resource(self: &Rc<Self>, owner: u64) {
+        #[cfg(feature = "uniffi")]
+        {
+            let wake = self
+                .data_reads
+                .borrow_mut()
+                .get_mut(&owner)
+                .and_then(Option::take);
+            if let Some(wake) = wake {
+                wake.wake();
+            }
+        }
         self.close_pipe_observers_for(owner);
         let binding = self.publication_slots.borrow_mut().remove(&owner);
         if let Some(binding) = binding {
@@ -2112,7 +2115,22 @@ impl RuntimeInner {
         notification
     }
 
+    #[cfg(feature = "uniffi")]
+    fn wake_data_reads(&self) {
+        let wakes: Vec<_> = self
+            .data_reads
+            .borrow_mut()
+            .values_mut()
+            .filter_map(Option::take)
+            .collect();
+        for wake in wakes {
+            wake.wake();
+        }
+    }
+
     fn publish_turn(&self, turn: &Turn) {
+        #[cfg(feature = "uniffi")]
+        self.wake_data_reads();
         if turn.snapshot.is_some() {
             self.agent_state();
         }
@@ -3042,19 +3060,114 @@ fn topic_registrations(topics: &[TopicRegistrationConfig]) -> Result<TopicRegist
     Ok(registrations)
 }
 
+impl BrowserRuntime {
+    fn admit_owned_data(
+        &self,
+        owner: u64,
+        payload: Vec<u8>,
+        captured_at: Option<agent_core::ffi::CaptureTimestamp>,
+    ) -> Result<
+        futures_channel::oneshot::Receiver<Result<(), crate::engine::DataSendError>>,
+        agent_core::ffi::ErrorInfo,
+    > {
+        use agent_core::ffi::{ErrorCode, ErrorInfo};
+        self.inner
+            .ensure_open()
+            .map_err(|_| ErrorInfo::new(ErrorCode::Closed, "Data runtime is closed"))?;
+        self.inner
+            .actor
+            .borrow()
+            .as_ref()
+            .ok_or_else(|| ErrorInfo::new(ErrorCode::NotReady, "Data runtime is not ready"))?
+            .send_owned_data(owner, payload, captured_at)
+    }
+
+    #[cfg(feature = "uniffi")]
+    pub(crate) async fn next_exact_data(
+        &self,
+        owner: u64,
+        observer: &agent_core::observer::DataSubscriptionStateObserver,
+    ) -> Result<Option<agent_core::DataEvent>, agent_core::ffi::ErrorInfo> {
+        use agent_core::ffi::{ErrorCode, ErrorInfo};
+        use std::{collections::hash_map::Entry, task::Poll};
+        struct Pending<'a>(&'a RuntimeInner, u64);
+        impl Drop for Pending<'_> {
+            fn drop(&mut self) {
+                self.0.data_reads.borrow_mut().remove(&self.1);
+            }
+        }
+        match self.inner.data_reads.borrow_mut().entry(owner) {
+            Entry::Vacant(entry) => {
+                entry.insert(None);
+            }
+            Entry::Occupied(_) => {
+                return Err(ErrorInfo::new(
+                    ErrorCode::Conflict,
+                    "A data read is already pending",
+                ));
+            }
+        }
+        let _pending = Pending(&self.inner, owner);
+        std::future::poll_fn(|cx| {
+            let state = observer.state();
+            if let Some(error) = state.terminal_error {
+                return Poll::Ready(Err(error));
+            }
+            if state.closed || self.inner.is_closed() {
+                return Poll::Ready(Ok(None));
+            }
+            match self
+                .inner
+                .intent_actor()
+                .and_then(|actor| actor.read_owned_data(owner))
+            {
+                Ok(None) => {
+                    *self
+                        .inner
+                        .data_reads
+                        .borrow_mut()
+                        .get_mut(&owner)
+                        .expect("reserved read") = Some(cx.waker().clone());
+                    Poll::Pending
+                }
+                result => Poll::Ready(result),
+            }
+        })
+        .await
+    }
+
+    #[cfg(feature = "uniffi")]
+    pub(crate) async fn send_exact_data(
+        &self,
+        owner: u64,
+        payload: Vec<u8>,
+        captured_at: Option<agent_core::ffi::CaptureTimestamp>,
+    ) -> Result<(), agent_core::ffi::ErrorInfo> {
+        complete_data_send(self.admit_owned_data(owner, payload, captured_at)?).await
+    }
+}
+
+async fn complete_data_send(
+    completion: futures_channel::oneshot::Receiver<Result<(), crate::engine::DataSendError>>,
+) -> Result<(), agent_core::ffi::ErrorInfo> {
+    completion
+        .await
+        .map_err(|_| {
+            agent_core::ffi::ErrorInfo::new(
+                agent_core::ffi::ErrorCode::Closed,
+                "Data send was closed",
+            )
+        })?
+        .map_err(resources::send_error_info)
+}
+
 fn data_send_promise(
     completion: futures_channel::oneshot::Receiver<Result<(), crate::engine::DataSendError>>,
 ) -> js_sys::Promise {
     future_to_promise(async move {
-        completion
+        complete_data_send(completion)
             .await
-            .map_err(|_| {
-                operation_error_value(agent_core::ffi::ErrorInfo::new(
-                    agent_core::ffi::ErrorCode::Closed,
-                    "Data send was closed",
-                ))
-            })?
-            .map_err(resources::send_error)?;
+            .map_err(operation_error_value)?;
         Ok(JsValue::UNDEFINED)
     })
 }

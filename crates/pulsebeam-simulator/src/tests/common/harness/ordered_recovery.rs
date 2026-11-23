@@ -486,6 +486,7 @@ mod tests {
 
     fn message(sequence: u64) -> TopicNotification {
         TopicNotification::Message(TopicMessage {
+            captured_at: None,
             room: "room".into(),
             topic: "state".into(),
             mode: TopicMode::Ordered,

@@ -71,7 +71,14 @@ async def witness():
         assert renewed_state.evaluated_credential_revision == 0
         assert renewed_state.desired_room is None
         revision = renewed_state.observation_revision
-        local = agent.data("control", core.TopicMode.ORDERED)
+        local = agent.data("control")
+        assert core.DataPublishOptions().delivery is None
+        latest = local.publish(core.DataPublishOptions(delivery=core.DataDelivery.LATEST))
+        assert latest.state().delivery == core.TopicMode.LATEST
+        latest.close()
+        default_publication = local.publish(core.DataPublishOptions())
+        assert default_publication.state().delivery == core.TopicMode.ORDERED
+        default_publication.close()
         room = agent.room("room")
         assert isinstance(room, native.RoomRef) and room.name() == "room"
         watch = room.watch()
@@ -91,7 +98,7 @@ async def witness():
         scoped_watch.close()
         assert not hasattr(agent, "participant") and not hasattr(local, "receive")
         participant = room.participant("remote")
-        remote = participant.data("control", core.TopicMode.ORDERED)
+        remote = participant.data("control")
         local_video = agent.video("camera")
         same_video = agent.video("camera")
         local_audio = agent.audio("microphone")
@@ -277,7 +284,7 @@ async def witness():
         assert (await sibling_data_updates.next()).observation_revision == data_state.observation_revision
         data_updates.close()
         try:
-            agent.data("control", core.TopicMode.ORDERED).publish()
+            agent.data("control").publish()
         except native.NativeError.Resource as error:
             assert error.reason.is_ALREADY_OWNED()
         else:
@@ -315,14 +322,23 @@ async def witness():
         pending_close = asyncio.create_task(closed_cursor.next())
         await closed_cursor.close()
         await closed_cursor.close()
-        assert (await pending_close).is_CLOSED()
+        assert await pending_close is None
         assert closed_cursor.is_closed()
         assert closed_cursor.state().closed and (await receiver_updates.next()).closed
         assert await receiver_updates.next() is None
         receiver_updates.close()
         assert not independent_cursor.is_closed()
         assert not participant_cursor.is_closed()
-        pending_independent = asyncio.create_task(independent_cursor.next())
+        overlapping_reads = [asyncio.create_task(independent_cursor.next()) for _ in range(2)]
+        completed, pending = await asyncio.wait(overlapping_reads, return_when=asyncio.FIRST_COMPLETED)
+        assert len(completed) == len(pending) == 1
+        try:
+            await completed.pop()
+        except native.NativeError.Operation as error:
+            assert error.info.code == core.ErrorCode.CONFLICT
+        else:
+            raise AssertionError("overlapping data read was admitted")
+        pending_independent = pending.pop()
         pending_participant = asyncio.create_task(participant_cursor.next())
         retiring = agent.updates()
         assert (await retiring.next()).observation_revision == agent.state().observation_revision
@@ -368,8 +384,8 @@ async def witness():
             pass
         else:
             raise AssertionError("terminal close did not end pending media acquisition")
-        assert (await pending_independent).is_CLOSED()
-        assert (await pending_participant).is_CLOSED()
+        assert await pending_independent is None
+        assert await pending_participant is None
         try:
             agent.join("room")
         except native.NativeError.Operation as error:

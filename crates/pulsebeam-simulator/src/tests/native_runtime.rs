@@ -567,9 +567,15 @@ struct OwnedData {
 
 impl OwnedData {
     async fn new(agent: &Agent, remote: String) -> anyhow::Result<Self> {
-        let sender = agent
-            .data("owned-bytes".into(), core_ffi::TopicMode::Ordered)?
-            .publish()?;
+        let sender = agent.data("owned-bytes".into())?.publish(None)?;
+        Self::with_sender(agent, remote, sender)
+    }
+
+    fn with_sender(
+        agent: &Agent,
+        remote: String,
+        sender: Arc<pulsebeam_agent_native::ffi::DataPublication>,
+    ) -> anyhow::Result<Self> {
         let source = agent
             .room(
                 agent
@@ -578,9 +584,9 @@ impl OwnedData {
                     .ok_or_else(|| anyhow::anyhow!("owned data has no admitted room"))?,
             )?
             .participant(remote.clone())?
-            .data("owned-bytes".into(), core_ffi::TopicMode::Ordered)?;
-        let room = source.subscribe()?;
-        let participant = source.subscribe()?;
+            .data("owned-bytes".into())?;
+        let room = source.subscribe(None)?;
+        let participant = source.subscribe(None)?;
         Ok(Self {
             sender,
             room,
@@ -595,7 +601,7 @@ impl OwnedData {
         expected: &[u8],
     ) -> anyhow::Result<pulsebeam_agent_core::DataEvent> {
         loop {
-            let pulsebeam_agent_core::DataUpdate::Event { event } = cursor.next().await? else {
+            let Some(event) = cursor.next().await? else {
                 anyhow::bail!("owned data cursor closed before its message");
             };
             let pulsebeam_agent_core::DataEvent::Message {
@@ -637,10 +643,10 @@ impl OwnedData {
             loop {
                 tokio::select! {
                     result = &mut ready => { result?; break; },
-                    _ = tick.tick() => self.sender.send(setup.clone()).await?,
+                    _ = tick.tick() => self.sender.send(setup.clone(), None).await?,
                 }
             }
-            self.sender.send(payload.clone()).await?;
+            self.sender.send(payload.clone(), None).await?;
             let room = self.message(&self.room, &payload).await?;
             let participant = self.message(&self.participant, &payload).await?;
             anyhow::ensure!(room == participant, "independent data cursors diverged");
@@ -932,8 +938,10 @@ async fn prove_joined_recovery(
     let feed = viewer
         .room(room.into())?
         .participant("alice".into())?
-        .data("feed".into(), core_ffi::TopicMode::Latest)?
-        .subscribe()?;
+        .data("feed".into())?
+        .subscribe(Some(core_ffi::DataSubscribeOptions {
+            delivery: Some(core_ffi::DataDelivery::Latest),
+        }))?;
     let feed_updates = feed.updates()?;
     subscriber.connect().await?;
     tokio::time::timeout(Duration::from_secs(3), async {
@@ -976,8 +984,10 @@ async fn prove_joined_recovery(
     tokio::task::spawn_local(actor);
     let agent = Agent::from_runtime(runtime.clone());
     let publisher = agent
-        .data("feed".into(), core_ffi::TopicMode::Latest)?
-        .publish()?;
+        .data("feed".into())?
+        .publish(Some(core_ffi::DataPublishOptions {
+            delivery: Some(core_ffi::DataDelivery::Latest),
+        }))?;
     agent.join(room.into())?;
     let first = wait_connected(&agent, None).await?;
     let first_support = agent.support_report();
@@ -999,16 +1009,16 @@ async fn prove_joined_recovery(
                 let mut ticks = tokio::time::interval(Duration::from_millis(25));
                 loop {
                     tokio::select! {
-                        _ = ticks.tick() => publisher.send(Vec::from(expected)).await?,
+                        _ = ticks.tick() => publisher.send(Vec::from(expected), None).await?,
                         update = feed.next() => {
-                            use pulsebeam_agent_core::{DataEvent, DataUpdate};
+                            use pulsebeam_agent_core::DataEvent;
                             match update? {
-                                DataUpdate::Event { event: DataEvent::Message { publication_id, participant_id, data, .. } }
+                                Some(DataEvent::Message { publication_id, participant_id, data, .. })
                                     if data == expected => {
                                         anyhow::ensure!(publication_id == expected_id && participant_id == "alice");
                                         return anyhow::Ok(());
                                     }
-                                DataUpdate::Closed => anyhow::bail!("feed closed during ownership change"),
+                                None => anyhow::bail!("feed closed during ownership change"),
                                 _ => {}
                             }
                         }
@@ -1319,7 +1329,7 @@ fn native_roomless_reception_survives_join_and_leave() {
 }
 
 async fn roomless_presence_scenario(client_ip: IpAddr, server_ip: IpAddr) -> anyhow::Result<()> {
-    use core_ffi::{ConnectionState, PublicationAdmissionStatus as Admission, TopicMode};
+    use core_ffi::{ConnectionState, PublicationAdmissionStatus as Admission};
     let host = NativeHost::bind(client_ip)?;
     let make_agent = |participant: &str, grants: serde_json::Value| -> anyhow::Result<_> {
         let key = pulsebeam_server::insecure_dev_api_key().unwrap();
@@ -1368,8 +1378,10 @@ async fn roomless_presence_scenario(client_ip: IpAddr, server_ip: IpAddr) -> any
     let replacement_receiver = replacement_viewer
         .room("stage".into())?
         .participant("present-publisher".into())?
-        .data("replacement".into(), TopicMode::Lossy)?
-        .subscribe()?;
+        .data("replacement".into())?
+        .subscribe(Some(core_ffi::DataSubscribeOptions {
+            delivery: Some(core_ffi::DataDelivery::Unreliable),
+        }))?;
     replacement_transport.connect().await?;
     let updates = &replacement_receiver.updates()?;
     let await_source = |present| async move {
@@ -1398,25 +1410,35 @@ async fn roomless_presence_scenario(client_ip: IpAddr, server_ip: IpAddr) -> any
     let replacement_generation = replacement_viewer.snapshot().generation;
     anyhow::ensure!(replacement_generation.is_some());
 
-    let sender = publisher
-        .data("events".into(), TopicMode::Ordered)?
-        .publish()?;
+    let sender = publisher.data("events".into())?.publish(None)?;
     publisher.join("stage".into())?;
     wait_connected(&publisher, None).await?;
 
-    let replacement_topic = publisher.data("replacement".into(), TopicMode::Lossy)?;
+    let replacement_topic = publisher.data("replacement".into())?;
     let mut first_source = None;
     for value in [b"original", b"replaced"] {
-        let source = replacement_topic.publish()?;
+        let source = replacement_topic.publish(Some(core_ffi::DataPublishOptions {
+            delivery: Some(core_ffi::DataDelivery::Unreliable),
+        }))?;
         let id = await_source(true)
             .await?
             .ok_or_else(|| anyhow::anyhow!("missing installed publication ID"))?;
-        source.send(value.to_vec()).await?;
-        let update =
+        source.send(value.to_vec(), None).await?;
+        let mut update =
             tokio::time::timeout(Duration::from_secs(3), replacement_receiver.next()).await??;
-        anyhow::ensure!(matches!(update, pulsebeam_agent_core::DataUpdate::Event {
-            event: pulsebeam_agent_core::DataEvent::Message { publication_id, participant_id, data, .. }
-        } if publication_id == id && participant_id == "present-publisher" && data == value));
+        if let Some(previous) = &first_source {
+            anyhow::ensure!(
+                matches!(update, Some(pulsebeam_agent_core::DataEvent::Discontinuity {
+                previous_publication_id, publication_id, participant_id,
+            }) if &previous_publication_id == previous && publication_id == id && participant_id == "present-publisher")
+            );
+            update =
+                tokio::time::timeout(Duration::from_secs(3), replacement_receiver.next()).await??;
+        }
+        anyhow::ensure!(
+            matches!(update, Some(pulsebeam_agent_core::DataEvent::Message { publication_id, participant_id, data, .. })
+            if publication_id == id && participant_id == "present-publisher" && data == value)
+        );
         anyhow::ensure!(first_source.as_ref() != Some(&id));
         first_source = Some(id);
         source.close()?;
@@ -1431,8 +1453,8 @@ async fn roomless_presence_scenario(client_ip: IpAddr, server_ip: IpAddr) -> any
     let receiver = viewer
         .room("stage".into())?
         .participant("present-publisher".into())?
-        .data("events".into(), TopicMode::Ordered)?
-        .subscribe()?;
+        .data("events".into())?
+        .subscribe(None)?;
     let local = viewer
         .audio("microphone".into())?
         .publish(Default::default())?;
@@ -1502,11 +1524,11 @@ async fn roomless_presence_scenario(client_ip: IpAddr, server_ip: IpAddr) -> any
                     .await?
                     .ok_or_else(|| anyhow::anyhow!("watch closed"))?;
                 if let Some(page) = state.page {
-                    let participants = page.participants();
+                    let participants = page.participants()?;
                     if participants.iter().any(|entry| {
-                        entry.id == "present-publisher"
+                        entry.id() == "present-publisher"
                             && entry
-                                .publications
+                                .tracks()
                                 .iter()
                                 .any(|track| track.track_id == "events")
                     }) {
@@ -1524,20 +1546,21 @@ async fn roomless_presence_scenario(client_ip: IpAddr, server_ip: IpAddr) -> any
             let mut interval = tokio::time::interval(Duration::from_millis(25));
             loop {
                 tokio::select! {
-                    _ = interval.tick() => sender.send(payload.to_vec()).await?,
+                    _ = interval.tick() => sender.send(payload.to_vec(), None).await?,
                     update = receiver.next() => match update? {
-                        pulsebeam_agent_core::DataUpdate::Event { event: pulsebeam_agent_core::DataEvent::Message {
+                        Some(pulsebeam_agent_core::DataEvent::Message {
                             participant_id, publication_id, data, ..
-                        }} if data == payload => {
+                        }) if data == payload => {
                             anyhow::ensure!(participant_id == "present-publisher");
                             return anyhow::Ok(publication_id);
                         }
-                        pulsebeam_agent_core::DataUpdate::Closed => anyhow::bail!("receiver closed across presence change"),
+                        None => anyhow::bail!("receiver closed across presence change"),
                         _ => {}
                     }
                 }
             }
-        }).await??;
+        })
+        .await??;
         if let Some(expected) = &source {
             anyhow::ensure!(*expected == publication);
         }
@@ -2245,7 +2268,36 @@ async fn run_peer(
     )
     .await?;
     drop(events);
-    owned_data.exchange(&barriers.before_close, 2).await?;
+    let owned_data = if reconnect {
+        owned_data.exchange(&barriers.before_close, 2).await?;
+        owned_data
+    } else {
+        let replacement = OwnedData::with_sender(&agent, remote.into(), owned_data.sender.clone())?;
+        replacement.exchange(&barriers.before_close, 2).await?;
+        for retired in [&owned_data.room, &owned_data.participant] {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    match retired.next().await {
+                        Err(pulsebeam_agent_native::ffi::NativeError::Operation { info })
+                            if info.code == core_ffi::ErrorCode::ContinuityLost =>
+                        {
+                            return Ok(());
+                        }
+                        Ok(Some(pulsebeam_agent_core::DataEvent::Message { data, .. }))
+                            if data == [0, 255, 128, 0] =>
+                        {
+                            ()
+                        }
+                        other => {
+                            anyhow::bail!("retired reliable cursor unexpectedly returned {other:?}")
+                        }
+                    }
+                }
+            })
+            .await??;
+        }
+        replacement
+    };
     let second_expected = second.retained.clone();
     runtime.disconnect().await?;
     anyhow::ensure!(
@@ -2325,18 +2377,12 @@ async fn run_peer(
     );
     owned_data.room.close().await?;
     anyhow::ensure!(
-        matches!(
-            owned_data.room.next().await?,
-            pulsebeam_agent_core::DataUpdate::Closed
-        ) && !owned_data.participant.is_closed(),
+        matches!(owned_data.room.next().await?, None) && !owned_data.participant.is_closed(),
         "cursor close ended independent demand"
     );
     agent.close().await?;
     anyhow::ensure!(
-        matches!(
-            pending_data.await?,
-            pulsebeam_agent_core::DataUpdate::Closed
-        ),
+        matches!(pending_data.await?, None),
         "terminal Agent close did not finish a pending data read"
     );
 

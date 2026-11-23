@@ -692,6 +692,7 @@ fn repeated_retirement_keeps_the_receipt_and_does_not_erase_a_reused_channel_ind
         TopicFrame {
             body: Some(pulsebeam_proto::topic::topic_frame::Body::Message(
                 pulsebeam_proto::topic::TopicMessage {
+                    captured_at: None,
                     publication_id: source,
                     sequence: 0,
                     payload: vec![42],

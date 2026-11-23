@@ -73,6 +73,10 @@ mod tests {
     fn common_envelope_preserves_full_payload_and_lossless_sequence() {
         let frame = TopicFrame {
             body: Some(topic_frame::Body::Message(TopicMessage {
+                captured_at: Some(TopicCaptureTimestamp {
+                    nanoseconds: i64::MIN.saturating_add(17),
+                    uncertainty_nanoseconds: Some(u32::MAX),
+                }),
                 publication_id: "opaque-server-data-track".to_string(),
                 sequence: u64::MAX.saturating_sub(1),
                 payload: vec![42; MAX_PAYLOAD_BYTES],
@@ -84,6 +88,18 @@ mod tests {
         assert_eq!(frame.publication_id(), Some("opaque-server-data-track"));
         assert!(frame.is_publisher_output());
         assert!(!frame.is_subscriber_control());
+    }
+
+    #[test]
+    fn capture_timestamp_preserves_present_zero_uncertainty() {
+        let stamp = TopicCaptureTimestamp {
+            nanoseconds: 0,
+            uncertainty_nanoseconds: Some(0),
+        };
+        assert_eq!(
+            TopicCaptureTimestamp::decode(stamp.encode_to_vec().as_slice()),
+            Ok(stamp)
+        );
     }
 
     #[test]
@@ -112,6 +128,7 @@ mod tests {
         ] {
             let frame = TopicFrame {
                 body: Some(topic_frame::Body::Message(TopicMessage {
+                    captured_at: None,
                     publication_id: id.to_string(),
                     sequence,
                     payload: vec![],

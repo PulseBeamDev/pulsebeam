@@ -94,6 +94,7 @@ pub struct TopicSend {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TopicMessage {
+    pub captured_at: Option<crate::ffi::CaptureTimestamp>,
     pub room: String,
     pub topic: String,
     pub mode: TopicMode,
@@ -797,6 +798,15 @@ impl Topics {
         let sequence = state.next_sequence;
         state.next_sequence = state.next_sequence.saturating_add(1);
         let message = WireMessage {
+            captured_at: admission
+                .and_then(|ticket| self.admissions.get(&ticket)?.captured_at)
+                .map(|stamp| {
+                    let crate::ffi::CaptureClock::Publication = stamp.clock;
+                    pulsebeam_proto::topic::TopicCaptureTimestamp {
+                        nanoseconds: stamp.nanoseconds,
+                        uncertainty_nanoseconds: stamp.uncertainty_nanoseconds,
+                    }
+                }),
             publication_id: publication_id.clone(),
             sequence,
             payload: send.payload,
@@ -1192,6 +1202,13 @@ impl Topics {
             self.delivered_messages = self.delivered_messages.saturating_add(1);
             notifications.push_back(Notification::Topic(TopicNotification::Message(
                 TopicMessage {
+                    captured_at: message
+                        .captured_at
+                        .map(|stamp| crate::ffi::CaptureTimestamp {
+                            clock: crate::ffi::CaptureClock::Publication,
+                            nanoseconds: stamp.nanoseconds,
+                            uncertainty_nanoseconds: stamp.uncertainty_nanoseconds,
+                        }),
                     room: subscriber.room.clone(),
                     topic: subscriber.topic.clone(),
                     mode: subscriber.mode,
@@ -1547,6 +1564,7 @@ mod tests {
 
     fn message(sequence: u64) -> WireMessage {
         WireMessage {
+            captured_at: None,
             publication_id: "authoritative".into(),
             sequence,
             payload: alloc::vec![42],

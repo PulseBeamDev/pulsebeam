@@ -351,6 +351,7 @@ mod tests {
         };
         let message = |id: crate::entity::PublicationKey| TopicFrame {
             body: Some(Body::Message(TopicMessage {
+                captured_at: None,
                 publication_id: id.as_str(),
                 sequence: 0,
                 payload: vec![1],

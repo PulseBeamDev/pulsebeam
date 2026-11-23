@@ -402,6 +402,15 @@ impl Agent {
         spec: crate::TrackSpec,
         payload: Vec<u8>,
     ) -> Result<OperationId, AgentError> {
+        self.send_data_at(spec, payload, None)
+    }
+
+    pub fn send_data_at(
+        &mut self,
+        spec: crate::TrackSpec,
+        payload: Vec<u8>,
+        captured_at: Option<crate::ffi::CaptureTimestamp>,
+    ) -> Result<OperationId, AgentError> {
         if let Some(failure) = &self.snapshot.terminal_failure {
             return Err(AgentError::OperationFailed(failure.into()));
         }
@@ -414,9 +423,9 @@ impl Agent {
         };
         self.topics.validate_data_send(&send)?;
         self.resource_command(crate::ResourceCommand::RetainProducer { spec })?;
-        let ticket = self
-            .topics
-            .begin_data_send(send, &mut self.ids, &mut self.effects);
+        let ticket =
+            self.topics
+                .begin_data_send(send, captured_at, &mut self.ids, &mut self.effects);
         self.flush_notifications()?;
         Ok(ticket)
     }

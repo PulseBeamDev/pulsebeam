@@ -4,7 +4,6 @@ import {
   AgentUpdates,
   ErrorCode,
   AudioSubscriptionConfig,
-  DataUpdate,
   PlayoutDelay,
   PublicationConfig,
   PublicationAdmissionStatus,
@@ -92,7 +91,7 @@ if (renewed !== undefined || renewedState.desiredCredentialRevision !== 1n ||
     renewedState.evaluatedCredentialRevision !== 0n || renewedState.desiredRoom !== undefined) {
   throw new Error("renew did not synchronously commit inert credential intent");
 }
-const localData = agent.data("control", TopicMode.Ordered);
+const localData = agent.data("control");
 const room = agent.room("room");
 if (!RoomRef.instanceOf(room) || room.name() !== "room" || "participant" in agent || "receive" in localData) {
   throw new Error("reference factory retained a room-wide receive surface");
@@ -118,7 +117,7 @@ if (scopedWatch.state().limit !== 3 || scopedWatch.state().cursor[0] !== 7 ||
     scopedWatch.state().cursor[1] !== 8) throw new Error("watch scope was not retained");
 scopedWatch.close();
 const participant = room.participant("remote");
-const remoteData = participant.data("control", TopicMode.Ordered);
+const remoteData = participant.data("control");
 const localVideo = agent.video("camera");
 const sameVideo = agent.video("camera");
 const localAudio = agent.audio("microphone");
@@ -326,7 +325,7 @@ if (dataPublication instanceof Promise || dataState.trackId !== "control" ||
 }
 dataUpdates.close();
 try {
-  agent.data("control", TopicMode.Ordered).publish();
+  agent.data("control").publish();
   throw new Error("duplicate data publication was admitted");
 } catch (error) {
   if (!NativeError.Resource.instanceOf(error) ||
@@ -372,7 +371,7 @@ const pendingClose = closedCursor.next();
 await closedCursor.close();
 await closedCursor.close();
 if (
-  !DataUpdate.Closed.instanceOf(await pendingClose) ||
+  (await pendingClose) !== undefined ||
   !closedCursor.isClosed()
 ) {
   throw new Error("cursor close did not complete its read");
@@ -427,8 +426,8 @@ if (!audioSource.isClosed() || !audioPublication.isClosed() ||
   throw new Error("terminal close did not retire media owners and pending acquisition");
 }
 if (
-  !DataUpdate.Closed.instanceOf(await pendingIndependent) ||
-  !DataUpdate.Closed.instanceOf(await pendingParticipant)
+  (await pendingIndependent) !== undefined ||
+  (await pendingParticipant) !== undefined
 ) {
   throw new Error("Agent close did not complete owned data reads");
 }

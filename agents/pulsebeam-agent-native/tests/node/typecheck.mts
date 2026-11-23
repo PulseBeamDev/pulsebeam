@@ -1,4 +1,4 @@
-import { LogLevel, TopicMode, type AgentConfig } from "@pulsebeam/agent/core";
+import { LogLevel, type AgentConfig } from "@pulsebeam/agent/core";
 import { Agent, InputFrame, type AgentLike, type NativeAgentConfig } from "@pulsebeam/agent/native";
 
 declare const config: AgentConfig;
@@ -17,7 +17,7 @@ async function binaryInputs(agent: AgentLike) {
   await camera.submit(new InputFrame.I420({
     frame: { width: 160, height: 96, timestampUs: await camera.captureTimeUs(), data, rotationDegrees: 0 },
   }));
-  const address = agent.data("foreign-exchange", TopicMode.Ordered);
+  const address = agent.data("foreign-exchange");
   // @ts-expect-error Sending requires a publication owner.
   address.send(data);
   const publication = address.publish();

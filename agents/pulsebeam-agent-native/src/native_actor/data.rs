@@ -14,6 +14,16 @@ struct DataAddress {
 }
 
 impl DataAddress {
+    fn with_delivery(&self, delivery: TopicMode) -> Self {
+        Self {
+            spec: TrackSpec::Data {
+                track_id: self.spec.track_id().into(),
+                delivery,
+            },
+            ..self.clone()
+        }
+    }
+
     fn subscribe(&self) -> Result<DataReceiver, Error> {
         if self.closed.is_closed() || self.finished.is_closed() {
             return Err(Error::Closed);
@@ -59,6 +69,16 @@ pub struct LocalDataTrack {
 }
 
 impl LocalDataTrack {
+    pub(crate) fn publish_with_delivery(
+        &self,
+        delivery: TopicMode,
+    ) -> Result<DataPublication, Error> {
+        Self {
+            address: self.address.with_delivery(delivery),
+        }
+        .publish()
+    }
+
     pub fn publish(&self) -> Result<DataPublication, Error> {
         if self.address.closed.is_closed() || self.address.finished.is_closed() {
             return Err(Error::Closed);
@@ -131,6 +151,14 @@ impl DataPublication {
     }
 
     pub async fn send(&self, data: Vec<u8>) -> Result<(), Error> {
+        self.send_at(data, None).await
+    }
+
+    pub(crate) async fn send_at(
+        &self,
+        data: Vec<u8>,
+        captured_at: Option<agent_core::ffi::CaptureTimestamp>,
+    ) -> Result<(), Error> {
         if self.inner.closed.is_closed()
             || self.inner.address.closed.is_closed()
             || self.inner.address.finished.is_closed()
@@ -146,6 +174,7 @@ impl DataPublication {
                 owner: self.inner.owner,
                 expected_join,
                 data,
+                captured_at,
                 response,
             })
             .await
@@ -253,6 +282,13 @@ pub struct RemoteDataTrack {
 }
 
 impl RemoteDataTrack {
+    pub(crate) fn subscribe_with_delivery(
+        &self,
+        delivery: TopicMode,
+    ) -> Result<DataReceiver, Error> {
+        self.address.with_delivery(delivery).subscribe()
+    }
+
     pub fn subscribe(&self) -> Result<DataReceiver, Error> {
         self.address.subscribe()
     }
@@ -405,7 +441,14 @@ impl DataReceiver {
     }
 
     pub async fn next(&self) -> Result<DataUpdate, Error> {
-        let _reader = self.inner.reader.lock().await;
+        let _reader = self.inner.reader.try_lock().map_err(|_| {
+            Error::Core(agent_core::AgentError::OperationFailed(
+                agent_core::ffi::ErrorInfo::new(
+                    agent_core::ffi::ErrorCode::Conflict,
+                    "A data read is already pending",
+                ),
+            ))
+        })?;
         if self.is_closed() || self.inner.failure.get().is_some() {
             return self.inner.read_result(Ok(DataUpdate::Closed));
         }

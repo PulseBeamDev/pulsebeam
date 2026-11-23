@@ -172,8 +172,10 @@ async fn prove_payload(
     let feed = viewer
         .room(ROOM.into())?
         .participant(PUBLISHER.into())?
-        .data(TRACK.into(), core_ffi::TopicMode::Latest)?
-        .subscribe()?;
+        .data(TRACK.into())?
+        .subscribe(Some(core_ffi::DataSubscribeOptions {
+            delivery: Some(core_ffi::DataDelivery::Latest),
+        }))?;
     let changes = feed.updates()?;
     viewer_transport.connect().await?;
     tokio::time::timeout(Duration::from_secs(7), async {
@@ -199,8 +201,10 @@ async fn prove_payload(
         token(PUBLISHER, &["join", "publish"], 3600_u64)?.token,
     )?;
     let publication = origin
-        .data(TRACK.into(), core_ffi::TopicMode::Latest)?
-        .publish()?;
+        .data(TRACK.into())?
+        .publish(Some(core_ffi::DataPublishOptions {
+            delivery: Some(core_ffi::DataDelivery::Latest),
+        }))?;
     origin.join(ROOM.into())?;
     let published = wait_connected(&origin, None).await?;
     let pub_id = published
@@ -213,15 +217,15 @@ async fn prove_payload(
         let mut send = tokio::time::interval(Duration::from_millis(50));
         loop {
             tokio::select! {
-                _ = send.tick() => publication.send(PAYLOAD.to_vec()).await?,
+                _ = send.tick() => publication.send(PAYLOAD.to_vec(), None).await?,
                 state = feed.next() => {
-                    use pulsebeam_agent_core::{DataEvent, DataUpdate};
+                    use pulsebeam_agent_core::DataEvent;
                     match state? {
-                        DataUpdate::Event { event: DataEvent::Message { publication_id, participant_id, data, .. } } if data == PAYLOAD => {
+                        Some(DataEvent::Message { publication_id, participant_id, data, .. }) if data == PAYLOAD => {
                             anyhow::ensure!(publication_id == pub_id && participant_id == PUBLISHER);
                             return anyhow::Ok(());
                         }
-                        DataUpdate::Closed => anyhow::bail!("subscription closed before receiving relayed payload"),
+                        None => anyhow::bail!("subscription closed before receiving relayed payload"),
                         _ => {}
                     }
                 }
