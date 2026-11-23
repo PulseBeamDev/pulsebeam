@@ -65,6 +65,7 @@ fn parameters(binding: &client::Binding) -> anyhow::Result<wire::RtpParameters> 
             .collect(),
     };
     let rtp = wire::RtpParameters {
+        extmap_allow_mixed: Some(binding.extmap_allow_mixed),
         mid: binding.mid.clone(),
         codec: Some(wire::RtpCodecParameters {
             payload_type: Some(u32::from(codec.payload_type)),
@@ -123,11 +124,13 @@ fn declaration(binding: &client::Binding) -> anyhow::Result<wire::ResourceSpec> 
     Ok(spec)
 }
 
-fn send_frame(source: &EncodedAudioSource) -> anyhow::Result<()> {
+const SILENCE_OPUS: &[u8] = &[0xf8, 0xff, 0xfe];
+
+fn send_frame(source: &EncodedAudioSource, payload: &[u8]) -> anyhow::Result<()> {
     let now = u64::try_from(super::super::common::native::now_us()?)?;
     source.push_opus_at_with_audio_level(
         &OpusInputFrame {
-            data: vec![0xf8, 0xff, 0xfe],
+            data: payload.to_vec(),
             rtp_timestamp: u32::try_from(now / 1000)?.wrapping_mul(48),
             samples_per_channel: 960,
         },
@@ -138,8 +141,16 @@ fn send_frame(source: &EncodedAudioSource) -> anyhow::Result<()> {
 }
 
 async fn push(source: &EncodedAudioSource, count: u32) -> anyhow::Result<()> {
+    push_payload(source, count, SILENCE_OPUS).await
+}
+
+async fn push_payload(
+    source: &EncodedAudioSource,
+    count: u32,
+    payload: &[u8],
+) -> anyhow::Result<()> {
     for _ in 0..count {
-        send_frame(source)?;
+        send_frame(source, payload)?;
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     tokio::time::sleep(Duration::from_millis(60)).await;
@@ -158,7 +169,7 @@ async fn silence(
 ) -> anyhow::Result<()> {
     for tick in 0..300 {
         if tick < 100 && tick % 20 == 0 {
-            send_frame(source)?;
+            send_frame(source, SILENCE_OPUS)?;
         }
         anyhow::ensure!(
             !received(),
@@ -198,6 +209,76 @@ async fn operation(
     }
 }
 
+async fn sdp_audio_session(
+    peer: &PeerConnection,
+    server: IpAddr,
+    endpoint: &str,
+    identity: &str,
+    permissions: &[&str],
+) -> anyhow::Result<()> {
+    let expiry = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs()
+        + 60;
+    let token = pulsebeam_server::sign_participant_token(
+        &pulsebeam_server::insecure_dev_api_key()?,
+        &serde_json::from_value(
+            serde_json::json!([{"rooms":["native-state-wire"],"allow":permissions}]),
+        )?,
+        identity,
+        expiry,
+    )?
+    .token;
+    let mut gathered = false;
+    let offer = operation(peer, peer.create_offer()?, &mut gathered)
+        .await?
+        .context("RTP offer")?;
+    operation(peer, peer.set_local_description(offer)?, &mut gathered).await?;
+    while !gathered {
+        while let Some(event) = peer.try_next_event() {
+            if matches!(
+                event,
+                PeerConnectionEvent::IceGatheringStateChanged(IceGatheringState::Complete)
+            ) {
+                gathered = true;
+            }
+        }
+        if !gathered {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+    let offer = peer
+        .descriptions()?
+        .pending_local
+        .context("gathered RTP offer")?;
+    let request = http::Request::builder()
+        .method("POST")
+        .uri(format!("http://{server}:7070/api/v1/{endpoint}"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Content-Type", "application/sdp")
+        .body(offer.sdp.into_bytes())?;
+    let response = create_http_client()
+        .execute(request)
+        .await
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    anyhow::ensure!(
+        response.status() == http::StatusCode::CREATED,
+        "{endpoint} bootstrap {} {}",
+        response.status(),
+        String::from_utf8_lossy(response.body())
+    );
+    operation(
+        peer,
+        peer.set_remote_description(SessionDescription {
+            kind: SessionDescriptionType::Answer,
+            sdp: String::from_utf8(response.body().to_vec())?,
+        })?,
+        &mut gathered,
+    )
+    .await?;
+    Ok(())
+}
+
 impl WirePeer {
     async fn audio_state(
         &mut self,
@@ -230,6 +311,7 @@ impl WirePeer {
         &mut self,
         server: IpAddr,
         participant: &str,
+        cross_shard: bool,
     ) -> anyhow::Result<()> {
         let source = self._factory.create_encoded_audio_source(1)?;
         let track = self
@@ -364,8 +446,36 @@ impl WirePeer {
                 == id,
             "Native demand changed source"
         );
-        push(&source, 20).await?;
-        native.frames(5)?;
+        assert_opus_gcm(&self.peer, &media.mid)?;
+        let route = if cross_shard {
+            "fabric_rtp_opus_shard_enqueued"
+        } else {
+            "fabric_rtp_opus_local_enqueued"
+        };
+        let enqueued = || pulsebeam::sim_metrics::routing_counter(route);
+        let before = enqueued();
+        let udp = self._host.observe_udp_rtp(server);
+        // Opus code 3 with one 20 ms frame and 1,191 bytes of codec padding.
+        let mut payload = vec![0xfb, 0x41, 255, 255, 255, 255, 175, 0xff, 0xfe];
+        payload.resize(1_200, 0);
+        push_payload(&source, 20, &payload).await?;
+        let first = native.frames_with_payload(5, &payload)?;
+        let peaks = udp.peaks();
+        drop(udp);
+        anyhow::ensure!(
+            enqueued() > before,
+            "Native Opus did not use the expected Fabric path: {route}"
+        );
+        // Both peers carry only the exact constant Opus source in this window.
+        // Comparing the largest receiver primary with the smallest publisher
+        // primary bounds every corresponding pair without sequence-offset assumptions.
+        anyhow::ensure!(
+            peaks
+                .min_sent
+                .is_some_and(|min| (1_217..=min).contains(&peaks.received)),
+            "Native protected Opus did not exceed the old cap without growth: {peaks:?}"
+        );
+        assert_decoded_opus(first)?;
         native.enabled(31, false).await?;
         anyhow::ensure!(
             self.audio_state(
@@ -404,72 +514,12 @@ impl WirePeer {
             .create_encoded_audio_track("untransmitted-listener", &receiver_source)?;
         let receive = receiver
             .add_audio_transceiver(&receiver_track, RtpTransceiverDirection::ReceiveOnly)?;
-        let mut gathered = false;
-        let offer = operation(&receiver, receiver.create_offer()?, &mut gathered)
-            .await?
-            .context("WHEP offer")?;
-        operation(
+        sdp_audio_session(
             &receiver,
-            receiver.set_local_description(offer)?,
-            &mut gathered,
-        )
-        .await?;
-        while !gathered {
-            while let Some(event) = receiver.try_next_event() {
-                if matches!(
-                    event,
-                    PeerConnectionEvent::IceGatheringStateChanged(IceGatheringState::Complete)
-                ) {
-                    gathered = true;
-                }
-            }
-            if !gathered {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        }
-        let offer = receiver
-            .descriptions()?
-            .pending_local
-            .context("gathered WHEP offer")?;
-        let expiry = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs()
-            + 60;
-        let token = pulsebeam_server::sign_participant_token(
-            &pulsebeam_server::insecure_dev_api_key()?,
-            &serde_json::from_value(
-                serde_json::json!([{"rooms":["native-state-wire"],"allow":["subscribe"]}]),
-            )
-            .unwrap(),
+            server,
+            &format!("whep?track=native-state-wire.{participant}.audio.microphone"),
             "rtp-listener",
-            expiry,
-        )?
-        .token;
-        let request = http::Request::builder()
-            .method("POST")
-            .uri(format!(
-                "http://{server}:7070/api/v1/whep?track=native-state-wire.{participant}.audio.microphone"
-            ))
-            .header("Authorization", format!("Bearer {token}"))
-            .header("Content-Type", "application/sdp")
-            .body(offer.sdp.into_bytes())?;
-        let response = create_http_client()
-            .execute(request)
-            .await
-            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        anyhow::ensure!(
-            response.status() == http::StatusCode::CREATED,
-            "WHEP bootstrap {} {}",
-            response.status(),
-            String::from_utf8_lossy(response.body())
-        );
-        operation(
-            &receiver,
-            receiver.set_remote_description(SessionDescription {
-                kind: SessionDescriptionType::Answer,
-                sdp: String::from_utf8(response.body().to_vec())?,
-            })?,
-            &mut gathered,
+            &["subscribe"],
         )
         .await?;
         let sink = receive.receiver().attach_encoded_audio_sink()?;
@@ -577,4 +627,156 @@ impl WirePeer {
         receiver.close()?;
         Ok(())
     }
+
+    pub(super) async fn prove_whip_whep_opus(
+        &self,
+        server: IpAddr,
+        cross_shard: bool,
+    ) -> anyhow::Result<()> {
+        use pulsebeam_rtc_simulation::{CryptoOptions, DtlsTransportState, RtcConfiguration};
+
+        let peer_config = || {
+            let mut config: RtcConfiguration = PeerConfiguration::default().into();
+            config.options.crypto_options = CryptoOptions::prefer_gcm();
+            config
+        };
+        let mut publisher = self
+            ._factory
+            .create_peer_connection_with_configuration(peer_config())?;
+        let source = self._factory.create_encoded_audio_source(1)?;
+        let track = self
+            ._factory
+            .create_encoded_audio_track("whip-opus", &source)?;
+        let sender = publisher.add_audio_transceiver(&track, RtpTransceiverDirection::SendOnly)?;
+        let opus = publisher
+            .audio_sender_capabilities()?
+            .into_iter()
+            .find(|codec| {
+                codec.name().eq_ignore_ascii_case("opus")
+                    && codec
+                        .parameters()
+                        .iter()
+                        .any(|param| param.key == "stereo" && param.value == "0")
+            })
+            .context("WHIP Opus capability")?;
+        sender.set_audio_codec_preferences(&[opus])?;
+        sdp_audio_session(
+            &publisher,
+            server,
+            "whip?room=native-state-wire&track=audio.whip-opus",
+            "whip-speaker",
+            &["join", "publish"],
+        )
+        .await?;
+        push(&source, 20).await?;
+
+        let mut receiver = self
+            ._factory
+            .create_peer_connection_with_configuration(peer_config())?;
+        let receiver_source = self._factory.create_encoded_audio_source(1)?;
+        let receiver_track = self
+            ._factory
+            .create_encoded_audio_track("whep-opus", &receiver_source)?;
+        let receive = receiver
+            .add_audio_transceiver(&receiver_track, RtpTransceiverDirection::ReceiveOnly)?;
+        let counter = || pulsebeam::sim_metrics::routing_counter("fabric_whep_rtp_enqueued");
+        let before = counter();
+        sdp_audio_session(
+            &receiver,
+            server,
+            "whep?track=native-state-wire.whip-speaker.audio.whip-opus",
+            "whep-whip-listener",
+            &["subscribe"],
+        )
+        .await?;
+        let sink = receive.receiver().attach_encoded_audio_sink()?;
+        let mid = receive.mid().context("WHEP negotiated MID")?;
+        let transport = receiver
+            .dtls_transport_by_mid(mid.as_bytes())
+            .context("WHEP media transport")?;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while transport.information().state() != DtlsTransportState::Connected {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("WHEP DTLS connection deadline")?;
+        let udp = self._host.observe_udp_rtp(server);
+        push(&source, 20).await?;
+        let udp = udp.peaks();
+        for (peer, mid) in [(&publisher, sender.mid()), (&receiver, receive.mid())] {
+            let mid = mid.context("WHIP/WHEP negotiated MID")?;
+            let info = peer
+                .dtls_transport_by_mid(mid.as_bytes())
+                .context("WHIP/WHEP media transport")?
+                .information();
+            anyhow::ensure!(
+                matches!(info.srtp_cipher_suite(), Some(0x0007 | 0x0008)),
+                "WHIP/WHEP did not negotiate full-tag GCM"
+            );
+        }
+        let mut first = None;
+        let mut frames = 0;
+        while let Some(frame) = sink.try_next_frame() {
+            anyhow::ensure!(
+                frame.data == [0xf8, 0xff, 0xfe] && frame.samples_per_channel == 960,
+                "WHIP-to-WHEP Opus contents"
+            );
+            anyhow::ensure!(
+                frame.audio_level_dbov == Some(127) && frame.voice_activity == Some(false),
+                "WHIP-to-WHEP Opus audio level"
+            );
+            first.get_or_insert(frame);
+            frames += 1;
+        }
+        anyhow::ensure!(
+            frames >= 5 && counter() > before,
+            "WHIP-to-WHEP Fabric route (cross_shard={cross_shard}): {frames} frames, {} Fabric enqueues, UDP {udp:?}",
+            counter().saturating_sub(before)
+        );
+        anyhow::ensure!(
+            udp.min_sent
+                .is_some_and(|min| (31..=min).contains(&udp.received)),
+            "protected WHIP/WHEP Opus output grew: {udp:?}",
+        );
+
+        assert_decoded_opus(first.context("first authenticated WHEP Opus frame")?)?;
+        receiver.close()?;
+        publisher.close()?;
+        Ok(())
+    }
+}
+
+fn assert_opus_gcm(peer: &PeerConnection, mid: &str) -> anyhow::Result<()> {
+    let transport = peer
+        .dtls_transport_by_mid(mid.as_bytes())
+        .context("installed Opus transport")?;
+    anyhow::ensure!(
+        matches!(
+            transport.information().srtp_cipher_suite(),
+            Some(0x0007 | 0x0008)
+        ),
+        "Opus did not negotiate full-tag GCM"
+    );
+    Ok(())
+}
+
+fn assert_decoded_opus(first: pulsebeam_rtc_simulation::EncodedAudioFrame) -> anyhow::Result<()> {
+    use pulsebeam_rtc_simulation::{AudioDecoderFactory, Environment, SdpAudioFormat};
+    let env = Environment::builder().build()?;
+    let mut format = SdpAudioFormat::new(b"opus".to_vec(), 48_000, 2);
+    format.parameters.insert(b"stereo".to_vec(), b"0".to_vec());
+    let decoder = AudioDecoderFactory::builtin_opus()?
+        .create(&env, &format)?
+        .context("stock mono Opus decoder")?;
+    let decoded = decoder
+        .parse_payload(first.data, first.rtp_timestamp)?
+        .into_iter()
+        .next()
+        .and_then(|packet| packet.frame)
+        .context("Opus access unit")?
+        .decode()?
+        .context("fresh PCM from Opus")?;
+    anyhow::ensure!(decoded.samples.len() == 960, "whole 20 ms Opus frame");
+    Ok(())
 }

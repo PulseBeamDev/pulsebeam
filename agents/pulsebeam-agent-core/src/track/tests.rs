@@ -1114,11 +1114,11 @@ fn unreliable_receive_owners_filter_participants_rebind_and_keep_independent_byt
         assert_eq!(
             resources.read(alice).unwrap(),
             Some(DataEvent::Message {
-                captured_at: None,
                 participant_id: "alice".into(),
                 publication_id: track.into(),
                 sequence: 1,
                 data: vec![255, 0],
+                captured_at: None,
             })
         );
     }
@@ -1167,11 +1167,11 @@ fn exact_receive_references_share_until_the_last_owner_and_rooms_stay_distinct()
     assert_eq!(
         resources.read(second).unwrap(),
         Some(DataEvent::Message {
-            captured_at: None,
             participant_id: "alice".into(),
             publication_id: "a-track".into(),
             sequence: 0,
-            data: b"a".to_vec()
+            data: b"a".to_vec(),
+            captured_at: None,
         })
     );
     resources.release_receiver(second);

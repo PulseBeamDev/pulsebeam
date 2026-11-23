@@ -1,3 +1,5 @@
+pub(in crate::control) mod fabric_data;
+mod media_repair;
 pub(crate) mod provisioned;
 pub(in crate::control) mod relay;
 pub(super) mod transfer;
@@ -24,6 +26,67 @@ pub(super) const MAX_PUBLICATIONS_PER_ORIGIN: usize = 4096;
 const MAX_REMOTE_FRESHNESS: Duration = Duration::from_secs(30);
 type Reply<T> = oneshot::Sender<Result<T, Error>>;
 
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "an invalid snapshot fails the simulation"
+)]
+pub(in crate::control) async fn transfer_fixture_snapshot(
+    source: &mut pulsebeam_link::PeerControl,
+    target: &mut pulsebeam_link::PeerControl,
+    bytes: Vec<u8>,
+) -> ownership::wire::Decoded {
+    use pulsebeam_link::LinkTime;
+    use transfer::Frame;
+
+    let mut reader = transfer::Reader::default();
+    let mut sender = transfer::Sender::default();
+    let mut bytes = Some(bytes);
+    assert!(reader.start(Instant::now()));
+    let ttl = LinkTime::from_nanos(u64::MAX);
+    loop {
+        let now = Instant::now();
+        if let Some(pull) = reader.pull(now) {
+            let _ = target.try_send(pull, ttl);
+        }
+        while let Some(pull) = source.try_recv() {
+            if let Some(Frame::Pull(pull)) = Frame::decode(&pull) {
+                if sender.needs_image(pull) {
+                    sender.set_image(now, bytes.take().unwrap());
+                }
+                for frame in sender.respond(now, pull) {
+                    if source.try_send(frame, ttl).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        while let Some(chunk) = target.try_recv() {
+            if let Some(Frame::Chunk(chunk)) = Frame::decode(&chunk)
+                && let Some((received, _)) = reader.receive(now, chunk)
+            {
+                return ownership::wire::decode(&received, None).unwrap();
+            }
+        }
+        pulsebeam_runtime::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+#[cfg(feature = "sim")]
+type AnchorSamples = Vec<(
+    crate::route::fabric::DataPublisher,
+    oneshot::Receiver<Option<u64>>,
+)>;
+
+#[cfg(feature = "sim")]
+type FabricRoutes = Box<[relay::fabric::LiveRouteAck]>;
+
+#[cfg(feature = "sim")]
+pub(super) struct SimFabricRelay {
+    network: NetworkId,
+    relays: relay::Relays,
+}
+
 #[derive(Debug)]
 pub struct Command(Box<Action>);
 
@@ -32,6 +95,16 @@ enum Action {
     Open(NodeId, NonZeroU64, Option<NetworkId>, Reply<Session>),
     Close(Session, Reply<()>),
     Read(Reply<Snapshot>),
+    #[cfg(feature = "sim")]
+    SampleData(Reply<AnchorSamples>),
+    #[cfg(feature = "sim")]
+    FabricImage(
+        NetworkId,
+        FabricRoutes,
+        ownership::wire::DataAnchors,
+        Instant,
+        Reply<FabricRoutes>,
+    ),
     Snapshot(Session, NonZeroU64, Snapshot, Instant, Reply<()>),
     RejectOversized(Session, NonZeroU64, Instant, Reply<()>),
     Delta(
@@ -92,6 +165,29 @@ impl Control {
 
     pub(crate) async fn read(&self) -> Result<Snapshot, Error> {
         self.exchange(Action::Read).await
+    }
+
+    #[cfg(feature = "sim")]
+    pub(super) async fn sample_data(&self) -> Result<ownership::wire::DataAnchors, Error> {
+        let mut anchors = ownership::wire::DataAnchors::new();
+        for (publisher, sample) in self.exchange(Action::SampleData).await? {
+            if let Ok(Some(sequence)) = sample.await {
+                anchors.insert(publisher.publication, (publisher, sequence));
+            }
+        }
+        Ok(anchors)
+    }
+
+    #[cfg(feature = "sim")]
+    pub(super) async fn fabric_image(
+        &self,
+        peer: NetworkId,
+        routes: FabricRoutes,
+        anchors: ownership::wire::DataAnchors,
+        until: Instant,
+    ) -> Result<FabricRoutes, Error> {
+        self.exchange(|reply| Action::FabricImage(peer, routes, anchors, until, reply))
+            .await
     }
 
     pub(crate) async fn snapshot(
@@ -165,6 +261,17 @@ impl ControllerActor {
             Action::Read(reply) => {
                 let _ = reply.send(self.local_endpoint_snapshot());
             }
+            #[cfg(feature = "sim")]
+            Action::SampleData(reply) => {
+                let samples = self
+                    .local_endpoint_snapshot()
+                    .map(|snapshot| self.sample_data_publisher_anchors(&snapshot));
+                let _ = reply.send(samples);
+            }
+            #[cfg(feature = "sim")]
+            Action::FabricImage(network, routes, anchors, until, reply) => {
+                let _ = reply.send(self.apply_sim_fabric_image(network, routes, anchors, until));
+            }
             Action::Snapshot(session, revision, endpoints, fresh_until, reply) => {
                 let _ = reply.send(self.apply_ownership_snapshot(
                     session,
@@ -198,6 +305,44 @@ impl ControllerActor {
                 ));
             }
         }
+    }
+
+    #[cfg(feature = "sim")]
+    fn apply_sim_fabric_image(
+        &mut self,
+        network: NetworkId,
+        routes: FabricRoutes,
+        anchors: ownership::wire::DataAnchors,
+        until: Instant,
+    ) -> Result<FabricRoutes, Error> {
+        if self
+            .links
+            .as_ref()
+            .is_none_or(|links| !links.fabric_peer(network))
+        {
+            return Err(Error::Closed);
+        }
+        let now = Instant::now();
+        let mut relay = self
+            .sim_fabric_relay
+            .take()
+            .filter(|relay| relay.network == network)
+            .unwrap_or_else(|| SimFabricRelay {
+                network,
+                relays: relay::Relays::default(),
+            });
+        relay.relays.install(
+            relay::Offers::new(),
+            routes,
+            anchors,
+            None,
+            locally_bounded_deadline(now, until),
+        );
+        relay.relays.step(self, network, now);
+        self.sim_fabric_relay = Some(relay);
+        let links = self.links.as_mut().ok_or(Error::Closed)?;
+        links.reap();
+        relay::fabric::decode(links.fabric_offers(network).into_boxed_slice()).ok_or(Error::Closed)
     }
 
     fn open_ownership_peer(
@@ -258,6 +403,13 @@ impl ControllerActor {
             }
             self.publish_staged();
         }
+        let retirements = self
+            .links
+            .as_mut()
+            .map_or_else(Vec::new, |links| links.take_fabric_retirements(network));
+        for (binding, change) in retirements {
+            self.stage_fabric_relay_retirement(binding, change);
+        }
     }
 
     pub(super) fn reconcile_peer_sources(&mut self, endpoint: EndpointKey, now: Instant) {
@@ -267,9 +419,16 @@ impl ControllerActor {
             .get_endpoint(endpoint)
             .is_none()
             .then(|| {
-                self.peer_ownership.ingress(endpoint, now, |rank| {
-                    !self.peer_lineage_retired(endpoint, rank)
-                })
+                self.peer_ownership.ingress(
+                    endpoint,
+                    now,
+                    |rank| !self.peer_lineage_retired(endpoint, rank),
+                    |peer| {
+                        self.links
+                            .as_ref()
+                            .is_some_and(|links| links.is_wan_peer(peer))
+                    },
+                )
             })
             .flatten();
         let mut install = Vec::new();
@@ -337,8 +496,9 @@ impl ControllerActor {
         let checkpoint = match self.receipt_trust.as_mut() {
             Some(ReceiptAuthority::Provisioned(trust)) => {
                 let image = checkpoint.ok_or(Error::Invalid)?;
+                let origin = self.peer_ownership.session_origin(session)?;
                 let validated = trust
-                    .validate_checkpoint(revision, image, now, deadline)
+                    .validate_checkpoint(origin, revision, image, now, deadline)
                     .map_err(|_| Error::Invalid)?;
                 if validated.blocked() {
                     endpoints = Box::new([]);
@@ -359,7 +519,10 @@ impl ControllerActor {
             .snapshot(session, revision, endpoints, now, deadline);
         if result.is_ok() {
             if let Some((trust, checkpoint)) = checkpoint {
-                for (endpoint, lineage) in trust.install_checkpoint(checkpoint) {
+                for (endpoint, lineage) in trust
+                    .install_checkpoint(checkpoint)
+                    .map_err(|_| Error::Invalid)?
+                {
                     affected.insert(endpoint);
                     self.apply_remote_retirement(endpoint, lineage);
                 }

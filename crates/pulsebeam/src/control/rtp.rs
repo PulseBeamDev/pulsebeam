@@ -10,6 +10,22 @@ use pulsebeam_rtc::{
     RtpConfigurationLimits,
 };
 
+const STOCK_AV1_PARAMETERS: [(&str, &str); 3] =
+    [("level-idx", "5"), ("profile", "0"), ("tier", "0")];
+
+pub(crate) fn is_stock_av1(codec: &RtpCodecParameters) -> bool {
+    codec.name == "av1"
+        && codec.clock_rate == 90_000
+        && codec.channels.is_none()
+        && codec.fmtp.len() == STOCK_AV1_PARAMETERS.len()
+        && STOCK_AV1_PARAMETERS.iter().all(|&(name, value)| {
+            codec
+                .fmtp
+                .get(name)
+                .is_some_and(|parameter| parameter == value)
+        })
+}
+
 pub(crate) fn capabilities() -> wire::RtpCapabilities {
     wire::RtpCapabilities {
         codecs: vec![
@@ -78,6 +94,48 @@ pub(crate) fn capabilities() -> wire::RtpCapabilities {
     }
 }
 
+pub(crate) fn bootstrap_capabilities(offer: &str) -> wire::RtpCapabilities {
+    let av1 = av1_rfc8888_capabilities();
+    if transport_capabilities(&av1).is_ok_and(|caps| {
+        caps.matches_single_video_rfc8888_offer(&pulsebeam_rtc::SdpOffer::new(offer))
+    }) {
+        av1
+    } else {
+        capabilities()
+    }
+}
+
+fn av1_rfc8888_capabilities() -> wire::RtpCapabilities {
+    wire::RtpCapabilities {
+        codecs: vec![wire::RtpCodecCapability {
+            format: Some(wire::CodecFormat {
+                mime_type: "video/av1".into(),
+                clock_rate: 90_000,
+                channels: None,
+                parameters: STOCK_AV1_PARAMETERS
+                    .iter()
+                    .map(|&(name, value)| wire::CodecParameter {
+                        name: name.into(),
+                        value: value.into(),
+                    })
+                    .collect(),
+            }),
+            feedback: vec![
+                wire::RtcpFeedback::Nack.as_str().into(),
+                wire::RtcpFeedback::NackPli.as_str().into(),
+                "ack ccfb".into(),
+            ],
+            rtx_supported: true,
+            scalability_modes: vec![wire::RtpScalabilityMode::L1t1.as_str().into()],
+        }],
+        header_extensions: vec![
+            wire::RtpHeaderExtensionType::RtpHeaderExtensionMid.into(),
+            wire::RtpHeaderExtensionType::RtpHeaderExtensionDependencyDescriptor.into(),
+        ],
+        rtcp_modes: capabilities().rtcp_modes,
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn initialize(
     connection: &mut pulsebeam_rtc::RtcConnection,
@@ -117,10 +175,21 @@ pub(crate) fn transport_capabilities(
         .iter()
         .map(|extension| extension_uri(extension).map(str::to_owned))
         .collect::<Result<_, _>>()?;
+    let codecs: Vec<pulsebeam_rtc::RtpCodecCapability> = codecs;
+    let feedback = match codecs.as_slice() {
+        [av1]
+            if is_stock_av1(&av1.parameters)
+                && av1.parameters.feedback.contains("ack ccfb")
+                && !av1.parameters.feedback.contains("transport-cc") =>
+        {
+            PacketFeedbackKind::Rfc8888
+        }
+        _ => PacketFeedbackKind::TransportWide,
+    };
     Ok(RtpCapabilities {
         codecs,
         extensions,
-        feedback: PacketFeedbackKind::TransportWide,
+        feedback,
         limits: RtpConfigurationLimits::default(),
     })
 }
@@ -228,6 +297,7 @@ fn binding(
         .collect::<Result<_, _>>()
         .map_err(failure_code)?;
     Ok(pulsebeam_rtc::RtpBinding {
+        extmap_allow_mixed: parameters.extmap_allow_mixed,
         mid: parameters.mid.clone(),
         kind: if kind == wire::TrackKind::Audio {
             pulsebeam_rtc::MediaKind::Audio
@@ -418,6 +488,7 @@ mod tests {
             Some("2")
         );
         let binding = pulsebeam_rtc::RtpBinding {
+            extmap_allow_mixed: None,
             mid: "typed".into(),
             kind: pulsebeam_rtc::MediaKind::Video,
             codec: pulsebeam_rtc::RtpCodec {

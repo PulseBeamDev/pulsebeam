@@ -59,7 +59,11 @@ impl VideoAllocator {
             && previous_ceiling != slot.height_ceiling
             && let Some(layer) = slot.target().cloned()
         {
-            slot.pause_at(&layer);
+            if slot.fabric_active.is_some() {
+                slot.fabric_gate = FabricGate::AwaitAllocation;
+            } else {
+                slot.pause_at(&layer);
+            }
         }
     }
 

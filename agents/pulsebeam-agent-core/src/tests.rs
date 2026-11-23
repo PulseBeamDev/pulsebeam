@@ -7,13 +7,7 @@ use alloc::{
 };
 use core::time::Duration;
 
-use pulsebeam_proto::{
-    prelude::Message,
-    topic::{
-        TopicFloor, TopicFrame, TopicFrontier, TopicMessage as WireTopicMessage, TopicNack,
-        TopicProbe, topic_frame::Body as TopicBody,
-    },
-};
+use pulsebeam_proto::prelude::Message;
 
 use crate::*;
 
@@ -387,51 +381,119 @@ fn subscriber(topic: &str, mode: TopicMode) -> TopicSubscriber {
     }
 }
 
-fn topic_input(
+fn data_record_input(
     agent: &mut Agent,
     generation: Generation,
     channel: ChannelId,
-    body: TopicBody,
-) -> Result<(), AgentError> {
-    agent.handle(HostEvent::DataChannel(DataChannelEvent::Message {
-        generation,
-        channel,
-        payload: TopicFrame {
-            recipient_connections: None,
-            repair_target: Default::default(),
-            body: Some(body),
-        }
-        .encode_to_vec(),
-    }))
-}
-
-fn wire_message(id: &str, sequence: u64, payload: &[u8]) -> TopicBody {
-    TopicBody::Message(WireTopicMessage {
-        captured_at: None,
-        publication_id: id.into(),
-        sequence,
-        payload: payload.to_vec(),
-    })
-}
-
-fn next_topic_send(agent: &mut Agent) -> (OperationId, ChannelId, TopicBody) {
-    let (operation, channel, frame) = next_topic_frame(agent);
-    (operation, channel, frame.body.unwrap())
-}
-
-fn next_topic_frame(agent: &mut Agent) -> (OperationId, ChannelId, TopicFrame) {
-    match next_effect(agent) {
-        Effect::DataChannel(DataChannelEffect::Send {
-            operation,
+    unit_seq: u64,
+    bytes: &[u8],
+) {
+    use pulsebeam_proto::data_record::{Header, Record};
+    let record = Record::new(
+        Header {
+            unit_seq,
+            index: 0,
+            count: 1,
+            unit_len: u32::try_from(bytes.len()).unwrap(),
+            capture: None,
+        },
+        bytes,
+        None,
+    )
+    .unwrap();
+    let mut payload = vec![0; record.encoded_len()];
+    record.write(&mut payload).unwrap();
+    agent
+        .handle(HostEvent::DataChannel(DataChannelEvent::Message {
+            generation,
             channel,
+            binary: true,
             payload,
-            ..
-        }) => (
-            operation,
-            channel,
-            TopicFrame::decode_bounded(&payload).unwrap(),
-        ),
-        effect => panic!("expected topic send, got {effect:?}"),
+        }))
+        .unwrap();
+}
+
+fn receive_data_owner(agent: &mut Agent, subscriber: &TopicSubscriber) -> u64 {
+    let ResourceResult::Owned { owner } = agent
+        .resource(ResourceCommand::ReceiveData {
+            spec: TrackSpec::Data {
+                track_id: subscriber.topic.clone(),
+                delivery: subscriber.mode,
+            },
+            source: TrackSelector {
+                room: subscriber.room.clone(),
+                participant_id: subscriber.participant_id.clone(),
+                track_id: subscriber.topic.clone(),
+            },
+        })
+        .unwrap()
+    else {
+        panic!("data owner")
+    };
+    owner
+}
+
+fn assert_data_read(
+    agent: &mut Agent,
+    owner: u64,
+    participant: &str,
+    source: &str,
+    sequence: u64,
+    bytes: &[u8],
+) {
+    assert_eq!(
+        agent.resource(ResourceCommand::ReadData { owner }).unwrap(),
+        ResourceResult::Event {
+            event: Some(DataEvent::Message {
+                participant_id: participant.into(),
+                publication_id: source.into(),
+                sequence,
+                data: bytes.to_vec(),
+                captured_at: None,
+            }),
+        }
+    );
+}
+
+fn data_timer(effect: &Effect) -> bool {
+    matches!(effect, Effect::Timer(TimerEffect::Cancel { .. }))
+        || matches!(effect, Effect::Timer(TimerEffect::Schedule { after, .. }) if *after == Duration::from_secs(2))
+}
+
+fn next_without_data_timer(agent: &mut Agent) -> Effect {
+    loop {
+        let effect = next_effect(agent);
+        if !data_timer(&effect) {
+            return effect;
+        }
+    }
+}
+
+fn assert_only_data_timers(agent: &mut Agent) {
+    while let Some(effect) = agent.next_effect_after_turn() {
+        assert!(
+            data_timer(&effect),
+            "unexpected work after DATA cutoff: {effect:?}"
+        );
+    }
+}
+
+fn next_data_record(agent: &mut Agent) -> (OperationId, ChannelId, Vec<u8>) {
+    loop {
+        match next_effect(agent) {
+            Effect::DataChannel(DataChannelEffect::Send {
+                operation,
+                channel,
+                binary: true,
+                payload,
+                ..
+            }) => {
+                return (operation, channel, payload);
+            }
+            Effect::Timer(TimerEffect::Schedule { after, .. })
+                if after == Duration::from_secs(2) => {}
+            effect => panic!("data record: {effect:?}"),
+        }
     }
 }
 
@@ -449,6 +511,7 @@ pub(crate) fn create_response(participant: &str, _etag: &str, uri: &str) -> Http
             "profile": "pulsebeam.media.v1",
             "rtp_capabilities": {},
             "data_delivery": ["LATEST", "LOSSY", "ORDERED"],
+            "data_version": pulsebeam_proto::data_endpoint::DATA_V1,
             "answer": "answer",
         }))
         .unwrap(),
@@ -637,6 +700,7 @@ fn activate_connection(
             generation,
             answer: "answer".to_string(),
             capabilities: BootstrapCapabilities {
+                data_v1: true,
                 rtp: Default::default(),
                 data_delivery: vec![
                     pulsebeam_proto::state::DataDelivery::Latest,
@@ -821,6 +885,7 @@ fn native_resource_rejection_is_nonfatal_without_advancing_accepted_state() {
         let event = HostEvent::DataChannel(DataChannelEvent::Message {
             generation,
             channel,
+            binary: true,
             payload: codec::encode_server(&state::ServerStateBatch {
                 records: vec![record],
                 initial_complete: false,
@@ -867,16 +932,18 @@ fn native_resource_rejection_is_nonfatal_without_advancing_accepted_state() {
             .unwrap();
         assert!(agent.next_effect_after_turn().is_none());
         agent
-            .command(AgentCommand::SendTopic(TopicSend {
-                publisher: publisher("state", TopicMode::Latest),
-                payload: b"still accepted".to_vec(),
-            }))
+            .send_data(
+                TrackSpec::Data {
+                    track_id: "state".into(),
+                    delivery: TopicMode::Latest,
+                },
+                b"still accepted".to_vec(),
+            )
             .unwrap();
-        let (_, output, body) = next_topic_send(&mut agent);
+        let (_, output, payload) = next_data_record(&mut agent);
         assert_eq!(output, accepted.channel);
-        assert!(matches!(body, TopicBody::Message(message)
-            if message.publication_id == native_connection::SOURCE
-                && message.payload == b"still accepted"));
+        let record = pulsebeam_proto::data_record::Record::decode(&payload, None).unwrap();
+        assert_eq!(record.bytes(), b"still accepted");
     }
 }
 
@@ -1991,6 +2058,7 @@ fn transport_loss_fences_incumbent_signaling_during_replacement() {
             .handle(HostEvent::DataChannel(DataChannelEvent::Message {
                 generation,
                 channel: control,
+                binary: true,
                 payload: vec![0xff],
             }))
             .unwrap();
@@ -2883,6 +2951,7 @@ fn native_state_received_before_activation_is_replayed_at_the_host_boundary() {
         .handle(HostEvent::DataChannel(DataChannelEvent::Message {
             generation,
             channel: signal,
+            binary: true,
             payload: codec::encode_server(&state::ServerStateBatch {
                 initial_complete: true,
                 catalog_records: Vec::new(),
@@ -3659,6 +3728,7 @@ fn malformed_native_state_is_transactional_and_cancels_a_pending_renewal() {
         agent.handle(HostEvent::DataChannel(DataChannelEvent::Message {
             generation,
             channel: control,
+            binary: true,
             payload: malformed,
         })),
         Err(AgentError::InvalidSignaling(SignalingError::Invalid(
@@ -3795,6 +3865,7 @@ fn cancelled_native_replacement_cleans_orphaned_http_resources_without_activatin
         .handle(HostEvent::DataChannel(DataChannelEvent::Message {
             generation: old,
             channel: control,
+            binary: true,
             payload: vec![0xff],
         }))
         .unwrap();
@@ -4252,6 +4323,7 @@ fn topic_registrations_validate_and_retire_only_omitted_sources() {
     use pulsebeam_proto::state::{self, codec};
     let (mut agent, generation, control) =
         native_connection::connected(TopicRegistrations::default());
+    agent.enable_reliable_data_fixture();
     let mut registrations = TopicRegistrations::default();
     let pinned_subscriber = |topic: &str, mode, external_id: &str| TopicSubscriber {
         room: "room".into(),
@@ -4318,11 +4390,6 @@ fn topic_registrations_validate_and_retire_only_omitted_sources() {
                 ..Default::default()
             }))
             .unwrap();
-        if mode == TopicMode::Ordered {
-            assert!(
-                matches!(next_effect(&mut agent), Effect::Timer(TimerEffect::Schedule { after, .. }) if after == Duration::from_secs(2))
-            );
-        }
         let lookup_references = native_connection::answer_source_lookup_batch(
             &mut agent,
             generation,
@@ -4347,17 +4414,10 @@ fn topic_registrations_validate_and_retire_only_omitted_sources() {
                     .negotiated_id
                     .is_some_and(|stream| stream != 0)
             );
-            assert_eq!(
-                prepared.requested_channel.ordered,
-                mode == TopicMode::Ordered
-            );
+            assert!(!prepared.requested_channel.ordered);
             assert_eq!(
                 prepared.requested_channel.reliability,
-                if mode == TopicMode::Ordered {
-                    DataChannelReliability::Reliable
-                } else {
-                    DataChannelReliability::MaxRetransmits(0)
-                }
+                DataChannelReliability::MaxRetransmits(0)
             );
             if index < 2 {
                 omitted.push((prepared.reference, prepared.channel));
@@ -4366,14 +4426,6 @@ fn topic_registrations_validate_and_retire_only_omitted_sources() {
     }
     assert_eq!(agent.snapshot().topics.publishers.len(), 3);
     assert_eq!(agent.snapshot().topics.subscribers.len(), 3);
-    assert!(
-        agent
-            .snapshot()
-            .topics
-            .publishers
-            .iter()
-            .all(|status| status.channel.is_some() && status.publication_id.is_some())
-    );
     let retained = DesiredState {
         revision: 8,
         connected: true,
@@ -4514,7 +4566,7 @@ fn native_owned_source_readiness_does_not_wait_for_discovery_completion() {
     use pulsebeam_proto::state::codec;
 
     for discovery_complete in [false, true] {
-        let subscriber = subscriber("events", TopicMode::Ordered);
+        let subscriber = subscriber("events", TopicMode::Latest);
         let (mut agent, generation, channel) = native_connection::joining(TopicRegistrations {
             subscribers: vec![subscriber.clone()],
             ..Default::default()
@@ -4535,15 +4587,12 @@ fn native_owned_source_readiness_does_not_wait_for_discovery_completion() {
             channel,
             vec![native_connection::grant(1)],
         );
-        let Effect::Timer(TimerEffect::Schedule { timer, after }) = next_effect(&mut agent) else {
-            panic!("source recovery timer")
-        };
-        assert_eq!(after, Duration::from_secs(2));
         if discovery_complete {
             agent
                 .handle(HostEvent::DataChannel(DataChannelEvent::Message {
                     generation,
                     channel,
+                    binary: true,
                     payload: codec::encode_server(&pulsebeam_proto::state::ServerStateBatch {
                         records: Vec::new(),
                         initial_complete: true,
@@ -4563,11 +4612,25 @@ fn native_owned_source_readiness_does_not_wait_for_discovery_completion() {
             },
             None,
         );
+        let receiving = native_connection::prepare_subscription(
+            &mut agent,
+            generation,
+            channel,
+            native_connection::REMOTE_SOURCE,
+            &subscriber,
+        );
+
+        assert!(matches!(
+            agent.test_native_owned(receiving.reference).and_then(|value| value.value.as_ref()),
+            Some(pulsebeam_proto::state::confirmed_state::Value::LogicalSubscription(logical))
+                if matches!(&logical.execution, Some(pulsebeam_proto::state::logical_subscription_state::Execution::Installed(_)))
+        ));
         if !discovery_complete {
             agent
                 .handle(HostEvent::DataChannel(DataChannelEvent::Message {
                     generation,
                     channel,
+                    binary: true,
                     payload: codec::encode_server(&pulsebeam_proto::state::ServerStateBatch {
                         records: Vec::new(),
                         initial_complete: true,
@@ -4577,30 +4640,6 @@ fn native_owned_source_readiness_does_not_wait_for_discovery_completion() {
                 }))
                 .unwrap();
         }
-        let receiving = native_connection::prepare_subscription(
-            &mut agent,
-            generation,
-            channel,
-            native_connection::REMOTE_SOURCE,
-            &subscriber,
-        );
-        agent
-            .handle(HostEvent::Timer(TimerEvent::Fired { timer }))
-            .unwrap();
-        let mut effects = Vec::new();
-        while let Some(effect) = agent.next_effect_after_turn() {
-            effects.push(effect);
-        }
-        assert!(effects.iter().any(|effect| matches!(effect,
-            Effect::DataChannel(DataChannelEffect::Send { channel, payload, .. })
-                if *channel == receiving.channel
-                    && matches!(TopicFrame::decode_bounded(payload).unwrap().body,
-                        Some(TopicBody::Probe(probe)) if probe.publication_id == native_connection::REMOTE_SOURCE))));
-        assert!(effects.iter().all(|effect| match effect {
-            Effect::Rtc(RtcEffect::CreateOffer { .. }) => false,
-            Effect::Timer(TimerEffect::Schedule { after, .. }) => *after == Duration::from_secs(2),
-            _ => true,
-        }));
         assert_eq!(agent.snapshot().generation, Some(generation));
         assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
         assert!(agent.snapshot().terminal_failure.is_none());
@@ -4610,118 +4649,6 @@ fn native_owned_source_readiness_does_not_wait_for_discovery_completion() {
                 .all(|notification| !matches!(notification, Notification::Failure(_)))
         );
     }
-}
-
-#[test]
-fn latest_topic_send_admission_freshness_and_failures_are_explicit() {
-    let registrations = TopicRegistrations {
-        publishers: vec![publisher("state", TopicMode::Latest)],
-        subscribers: vec![subscriber("state", TopicMode::Latest)],
-    };
-    let (mut agent, generation, control) = native_connection::connected(registrations);
-    let prepared = native_connection::prepare_data(&mut agent, generation, control);
-    native_connection::confirm_publication(
-        &mut agent,
-        generation,
-        control,
-        &prepared,
-        native_connection::SOURCE,
-    );
-    let receiving = native_connection::prepare_subscription_staged(
-        &mut agent,
-        generation,
-        control,
-        native_connection::REMOTE_SOURCE,
-        &subscriber("state", TopicMode::Latest),
-        Some(&prepared),
-    );
-    let publish_channel = prepared.channel;
-    let subscribe_channel = receiving.channel;
-    drain_notifications(&mut agent);
-    let publish = publisher("state", TopicMode::Latest);
-    for value in [b"first".as_slice(), b"second", b"third"] {
-        agent
-            .command(AgentCommand::SendTopic(TopicSend {
-                publisher: publish.clone(),
-                payload: value.to_vec(),
-            }))
-            .unwrap();
-    }
-    let (first, _, body) = next_topic_send(&mut agent);
-    let TopicBody::Message(first_message) = body else {
-        panic!("message envelope");
-    };
-    assert_eq!(first_message.payload, b"first");
-    assert_eq!(first_message.sequence, 0);
-    assert_eq!(first_message.publication_id, native_connection::SOURCE);
-    assert!(agent.next_effect_after_turn().is_none());
-    assert_eq!(agent.snapshot().topics.accepted_sends, 3);
-    assert_eq!(agent.snapshot().topics.dropped_sends, 1);
-    acknowledge_send(&mut agent, generation, publish_channel, first);
-    let (third, _, body) = next_topic_send(&mut agent);
-    let TopicBody::Message(third_message) = body else {
-        panic!("message envelope");
-    };
-    assert_eq!(
-        (third_message.sequence, third_message.payload),
-        (2, b"third".to_vec())
-    );
-    agent
-        .handle(HostEvent::DataChannel(DataChannelEvent::SendFailed {
-            operation: third,
-            generation,
-            channel: publish_channel,
-            message: "host queue full".into(),
-        }))
-        .unwrap();
-    assert_eq!(agent.snapshot().topics.dropped_sends, 2);
-    assert_eq!(agent.snapshot().topics.channel_failures, 1);
-    let notifications = drain_notifications(&mut agent);
-    assert!(notifications.iter().any(|event| matches!(
-        event,
-        Notification::Topic(TopicNotification::SendDropped {
-            reason: TopicDropReason::HostRejected,
-            ..
-        })
-    )));
-    assert!(notifications.iter().any(|event| matches!(
-        event,
-        Notification::Topic(TopicNotification::ChannelFailed { .. })
-    )));
-    let id = native_connection::REMOTE_SOURCE.to_string();
-    for sequence in [5, 3, 5, 6] {
-        topic_input(
-            &mut agent,
-            generation,
-            subscribe_channel,
-            wire_message(&id, sequence, b"latest"),
-        )
-        .unwrap();
-    }
-    let messages = drain_notifications(&mut agent)
-        .into_iter()
-        .filter_map(|event| match event {
-            Notification::Topic(TopicNotification::Message(message)) => Some(message),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        messages
-            .iter()
-            .map(|message| message.sequence)
-            .collect::<Vec<_>>(),
-        vec![5, 6]
-    );
-    assert!(messages.iter().all(|message| message.publication_id == id
-        && message.participant_id == "remote-app-user"
-        && message.mode == TopicMode::Latest));
-    assert!(matches!(
-        agent.command(AgentCommand::SendTopic(TopicSend {
-            publisher: publish,
-            payload: vec![0; MAX_TOPIC_PAYLOAD_BYTES + 1]
-        })),
-        Err(AgentError::InvalidTopic(TopicError::PayloadTooLarge { .. }))
-    ));
 }
 
 #[test]
@@ -4867,6 +4794,7 @@ fn accepted_room_roundtrip_preserves_owned_input_and_pinned_selector() {
             HostEvent::DataChannel(DataChannelEvent::Message {
                 generation,
                 channel: control,
+                binary: true,
                 payload: pulsebeam_proto::state::codec::encode_server(
                     &pulsebeam_proto::state::ServerStateBatch {
                         records: vec![native_connection::grant(1)],
@@ -5557,15 +5485,26 @@ fn owned_receive_uses_transport_deduplication_and_last_owner_registration_lifeti
     assert!(agent.next_effect_after_turn().is_none());
     drain_notifications(&mut agent);
     let remote = native_connection::REMOTE_SOURCE.to_string();
-    let mut wire = wire_message(&remote, 0, &[255, 0]);
-    if let TopicBody::Message(message) = &mut wire {
-        message.captured_at = Some(pulsebeam_proto::topic::TopicCaptureTimestamp {
-            nanoseconds: -9_007_199_254_740_993,
-            uncertainty_nanoseconds: Some(0),
-        });
+    // Legacy TopicFrame.message for this source with sequence zero.
+    const LEGACY_FRAME: &[u8] = b"\x0a\x25\x0a\x1bopaque/server/remote/source\x1a\x06legacy";
+    agent
+        .handle(HostEvent::DataChannel(DataChannelEvent::Message {
+            generation,
+            channel: receiving.channel,
+            binary: true,
+            payload: LEGACY_FRAME.to_vec(),
+        }))
+        .unwrap();
+    for owner in &owners {
+        assert_eq!(
+            agent
+                .resource(ResourceCommand::ReadData { owner: *owner })
+                .unwrap(),
+            ResourceResult::Event { event: None }
+        );
     }
     for _ in 0..2 {
-        topic_input(&mut agent, generation, receiving.channel, wire.clone()).unwrap();
+        data_record_input(&mut agent, generation, receiving.channel, 0, &[255, 0]);
     }
     let notifications = drain_notifications(&mut agent);
     assert_eq!(notifications.iter().filter(|notification| matches!(notification, Notification::DataReady { owners: ready } if ready == &owners[..])).count(), 1);
@@ -5576,15 +5515,11 @@ fn owned_receive_uses_transport_deduplication_and_last_owner_registration_lifeti
                 .unwrap(),
             ResourceResult::Event {
                 event: Some(DataEvent::Message {
-                    captured_at: Some(crate::ffi::CaptureTimestamp {
-                        clock: crate::ffi::CaptureClock::Publication,
-                        nanoseconds: -9_007_199_254_740_993,
-                        uncertainty_nanoseconds: Some(0),
-                    }),
                     participant_id: "remote-app-user".into(),
                     publication_id: remote.clone(),
                     sequence: 0,
                     data: vec![255, 0],
+                    captured_at: None,
                 })
             }
         );
@@ -5610,7 +5545,7 @@ fn owned_receive_uses_transport_deduplication_and_last_owner_registration_lifeti
         channel,
         payload,
         ..
-    }) = next_effect(&mut agent)
+    }) = next_without_data_timer(&mut agent)
     else {
         panic!("owned retirement")
     };
@@ -5651,635 +5586,11 @@ fn owned_receive_uses_transport_deduplication_and_last_owner_registration_lifeti
         .unwrap();
     assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
     assert_eq!(agent.snapshot().generation, Some(generation));
-    assert!(agent.next_effect_after_turn().is_none());
+    assert_only_data_timers(&mut agent);
 }
 
 #[test]
-fn ordered_topics_reorder_deduplicate_nack_replay_and_emit_inline_gaps() {
-    let registrations = TopicRegistrations {
-        publishers: vec![publisher("chat", TopicMode::Ordered)],
-        subscribers: vec![subscriber("chat", TopicMode::Ordered)],
-    };
-    let (mut agent, generation, control) = native_connection::connected(registrations);
-    let prepared = native_connection::prepare_data(&mut agent, generation, control);
-    native_connection::confirm_publication(
-        &mut agent,
-        generation,
-        control,
-        &prepared,
-        native_connection::SOURCE,
-    );
-    let receiving = native_connection::prepare_subscription_staged(
-        &mut agent,
-        generation,
-        control,
-        native_connection::REMOTE_SOURCE,
-        &subscriber("chat", TopicMode::Ordered),
-        Some(&prepared),
-    );
-    let publish_channel = prepared.channel;
-    let subscribe_channel = receiving.channel;
-    let local = native_connection::SOURCE.to_string();
-    let remote = native_connection::REMOTE_SOURCE.to_string();
-    drain_notifications(&mut agent);
-    for sequence in 0..3 {
-        agent
-            .command(AgentCommand::SendTopic(TopicSend {
-                publisher: publisher("chat", TopicMode::Ordered),
-                payload: vec![u8::try_from(sequence).unwrap()],
-            }))
-            .unwrap();
-        let (operation, channel, body) = next_topic_send(&mut agent);
-        let TopicBody::Message(message) = body else {
-            panic!("message");
-        };
-        assert_eq!(
-            (message.publication_id, message.sequence),
-            (local.clone(), sequence)
-        );
-        acknowledge_send(&mut agent, generation, channel, operation);
-    }
-    assert_eq!(agent.snapshot().topics.publishers[0].accepted_history, 3);
-    drain_notifications(&mut agent);
-    topic_input(
-        &mut agent,
-        generation,
-        subscribe_channel,
-        TopicBody::Frontier(TopicFrontier {
-            publication_id: remote.clone(),
-            next_sequence: 0,
-        }),
-    )
-    .unwrap();
-    topic_input(
-        &mut agent,
-        generation,
-        subscribe_channel,
-        wire_message(&remote, 0, b"zero"),
-    )
-    .unwrap();
-    topic_input(
-        &mut agent,
-        generation,
-        subscribe_channel,
-        wire_message(&remote, 2, b"two"),
-    )
-    .unwrap();
-    let (operation, channel, body) = next_topic_send(&mut agent);
-    assert_eq!(channel, subscribe_channel);
-    assert_eq!(
-        body,
-        TopicBody::Nack(TopicNack {
-            requester: Default::default(),
-            publication_id: remote.clone(),
-            from_sequence: 1
-        })
-    );
-    acknowledge_send(&mut agent, generation, channel, operation);
-    topic_input(
-        &mut agent,
-        generation,
-        subscribe_channel,
-        wire_message(&remote, 1, b"one"),
-    )
-    .unwrap();
-    let delivered = drain_notifications(&mut agent)
-        .into_iter()
-        .filter_map(|event| match event {
-            Notification::Topic(TopicNotification::Message(message)) => Some(message.sequence),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(delivered, vec![0, 1, 2]);
-    topic_input(
-        &mut agent,
-        generation,
-        subscribe_channel,
-        wire_message(&remote, 2, b"duplicate"),
-    )
-    .unwrap();
-    assert!(drain_notifications(&mut agent).is_empty());
-    topic_input(
-        &mut agent,
-        generation,
-        publish_channel,
-        TopicBody::Nack(TopicNack {
-            requester: Default::default(),
-            publication_id: local,
-            from_sequence: 1,
-        }),
-    )
-    .unwrap();
-    for sequence in 1..3 {
-        let (operation, channel, body) = next_topic_send(&mut agent);
-        assert!(matches!(body, TopicBody::Message(message) if message.sequence == sequence));
-        acknowledge_send(&mut agent, generation, channel, operation);
-    }
-    topic_input(
-        &mut agent,
-        generation,
-        subscribe_channel,
-        wire_message(&remote, 259, b"far"),
-    )
-    .unwrap();
-    assert!(drain_notifications(&mut agent).is_empty());
-    let (operation, channel, body) = next_topic_send(&mut agent);
-    assert_eq!(
-        body,
-        TopicBody::Nack(TopicNack {
-            requester: Default::default(),
-            publication_id: remote.clone(),
-            from_sequence: 3
-        })
-    );
-    acknowledge_send(&mut agent, generation, channel, operation);
-    topic_input(
-        &mut agent,
-        generation,
-        subscribe_channel,
-        TopicBody::Floor(TopicFloor {
-            publication_id: remote,
-            available_sequence: 259,
-        }),
-    )
-    .unwrap();
-    assert!(matches!(
-        drain_notifications(&mut agent).as_slice(),
-        [
-            Notification::Topic(TopicNotification::RecoveryGap {
-                expected_sequence: 3,
-                available_sequence: 259,
-                ..
-            }),
-            Notification::Topic(TopicNotification::Message(TopicMessage {
-                sequence: 259,
-                ..
-            }))
-        ]
-    ));
-}
-
-#[test]
-fn late_receiver_starts_live_and_existing_receiver_replays_from_its_checkpoint() {
-    let registrations = TopicRegistrations {
-        publishers: vec![publisher("events", TopicMode::Ordered)],
-        subscribers: vec![],
-    };
-    let (mut agent, generation, control) = native_connection::connected(registrations);
-    let prepared = native_connection::prepare_data(&mut agent, generation, control);
-    native_connection::confirm_publication(
-        &mut agent,
-        generation,
-        control,
-        &prepared,
-        native_connection::SOURCE,
-    );
-    let channel = prepared.channel;
-    let id = native_connection::SOURCE.to_string();
-    drain_notifications(&mut agent);
-    for sequence in 0..3 {
-        agent
-            .command(AgentCommand::SendTopic(TopicSend {
-                publisher: publisher("events", TopicMode::Ordered),
-                payload: vec![sequence],
-            }))
-            .unwrap();
-        let (operation, _, _) = next_topic_send(&mut agent);
-        acknowledge_send(&mut agent, generation, channel, operation);
-    }
-    topic_input(
-        &mut agent,
-        generation,
-        channel,
-        TopicBody::Probe(TopicProbe {
-            requester: Default::default(),
-            publication_id: id.clone(),
-            from_sequence: 0,
-            live: true,
-        }),
-    )
-    .unwrap();
-    let (operation, _, body) = next_topic_send(&mut agent);
-    assert_eq!(
-        body,
-        TopicBody::Frontier(TopicFrontier {
-            publication_id: id.clone(),
-            next_sequence: 3
-        })
-    );
-    acknowledge_send(&mut agent, generation, channel, operation);
-    assert!(agent.next_effect_after_turn().is_none());
-    topic_input(
-        &mut agent,
-        generation,
-        channel,
-        TopicBody::Probe(TopicProbe {
-            requester: vec![7; 16],
-            publication_id: id,
-            from_sequence: 1,
-            live: false,
-        }),
-    )
-    .unwrap();
-    for sequence in 1..3 {
-        let (operation, _, frame) = next_topic_frame(&mut agent);
-        assert_eq!(frame.repair_target, vec![7; 16]);
-        assert!(
-            matches!(frame.body, Some(TopicBody::Message(message)) if message.sequence == sequence)
-        );
-        acknowledge_send(&mut agent, generation, channel, operation);
-    }
-    assert!(agent.next_effect_after_turn().is_none());
-}
-
-#[test]
-fn recovery_floor_reports_only_missing_confirmed_sequences() {
-    let registrations = TopicRegistrations {
-        publishers: vec![],
-        subscribers: vec![subscriber("events", TopicMode::Ordered)],
-    };
-    let (mut agent, generation, control) = native_connection::connected(registrations);
-    let receiving = native_connection::prepare_subscription(
-        &mut agent,
-        generation,
-        control,
-        native_connection::REMOTE_SOURCE,
-        &subscriber("events", TopicMode::Ordered),
-    );
-    let channel = receiving.channel;
-    let id = native_connection::REMOTE_SOURCE.to_string();
-    drain_notifications(&mut agent);
-    topic_input(
-        &mut agent,
-        generation,
-        channel,
-        wire_message(&id, 4, b"before-frontier"),
-    )
-    .unwrap();
-    topic_input(
-        &mut agent,
-        generation,
-        channel,
-        TopicBody::Floor(TopicFloor {
-            publication_id: id.clone(),
-            available_sequence: 5,
-        }),
-    )
-    .unwrap();
-    assert!(drain_notifications(&mut agent).is_empty());
-    topic_input(
-        &mut agent,
-        generation,
-        channel,
-        TopicBody::Frontier(TopicFrontier {
-            publication_id: id.clone(),
-            next_sequence: 5,
-        }),
-    )
-    .unwrap();
-    topic_input(
-        &mut agent,
-        generation,
-        channel,
-        wire_message(&id, 5, b"live"),
-    )
-    .unwrap();
-    assert!(matches!(
-        drain_notifications(&mut agent).as_slice(),
-        [Notification::Topic(TopicNotification::Message(
-            TopicMessage { sequence: 5, .. }
-        ))]
-    ));
-    topic_input(
-        &mut agent,
-        generation,
-        channel,
-        TopicBody::Frontier(TopicFrontier {
-            publication_id: id.clone(),
-            next_sequence: 99,
-        }),
-    )
-    .unwrap();
-    topic_input(
-        &mut agent,
-        generation,
-        channel,
-        TopicBody::Floor(TopicFloor {
-            publication_id: id.clone(),
-            available_sequence: 9,
-        }),
-    )
-    .unwrap();
-    topic_input(
-        &mut agent,
-        generation,
-        channel,
-        wire_message(&id, 9, b"resumed"),
-    )
-    .unwrap();
-    assert!(matches!(
-        drain_notifications(&mut agent).as_slice(),
-        [
-            Notification::Topic(TopicNotification::RecoveryGap {
-                expected_sequence: 6,
-                available_sequence: 9,
-                ..
-            }),
-            Notification::Topic(TopicNotification::Message(TopicMessage { sequence: 9, .. }))
-        ]
-    ));
-}
-
-#[test]
-fn ordered_replay_exhaustion_emits_floor_before_the_retained_window() {
-    let registrations = TopicRegistrations {
-        publishers: vec![publisher("events", TopicMode::Ordered)],
-        subscribers: vec![],
-    };
-    let (mut agent, generation, control) = native_connection::connected(registrations);
-    let prepared = native_connection::prepare_data(&mut agent, generation, control);
-    native_connection::confirm_publication(
-        &mut agent,
-        generation,
-        control,
-        &prepared,
-        native_connection::SOURCE,
-    );
-    let channel = prepared.channel;
-    let id = native_connection::SOURCE.to_string();
-    for sequence in 0..=TOPIC_HISTORY_CAPACITY {
-        agent
-            .command(AgentCommand::SendTopic(TopicSend {
-                publisher: publisher("events", TopicMode::Ordered),
-                payload: vec![u8::try_from(sequence).unwrap_or(u8::MAX)],
-            }))
-            .unwrap();
-        let (operation, _, _) = next_topic_send(&mut agent);
-        acknowledge_send(&mut agent, generation, channel, operation);
-        drain_notifications(&mut agent);
-    }
-    assert_eq!(
-        agent.snapshot().topics.publishers[0].accepted_history,
-        TOPIC_HISTORY_CAPACITY
-    );
-    topic_input(
-        &mut agent,
-        generation,
-        channel,
-        TopicBody::Nack(TopicNack {
-            requester: Default::default(),
-            publication_id: id.clone(),
-            from_sequence: 0,
-        }),
-    )
-    .unwrap();
-    let (operation, _, body) = next_topic_send(&mut agent);
-    assert_eq!(
-        body,
-        TopicBody::Floor(TopicFloor {
-            publication_id: id.clone(),
-            available_sequence: 1
-        })
-    );
-    acknowledge_send(&mut agent, generation, channel, operation);
-    let mut recovered = Vec::new();
-    while let Some(effect) = agent.next_effect_after_turn() {
-        let Effect::DataChannel(DataChannelEffect::Send {
-            operation, payload, ..
-        }) = effect
-        else {
-            panic!("replay send");
-        };
-        let Some(TopicBody::Message(message)) = TopicFrame::decode_bounded(&payload).unwrap().body
-        else {
-            panic!("replay message");
-        };
-        recovered.push(message.sequence);
-        acknowledge_send(&mut agent, generation, channel, operation);
-    }
-    assert_eq!(recovered, (1..256).collect::<Vec<_>>());
-    topic_input(
-        &mut agent,
-        generation,
-        channel,
-        TopicBody::Probe(TopicProbe {
-            requester: Default::default(),
-            publication_id: id,
-            from_sequence: 256,
-            live: false,
-        }),
-    )
-    .unwrap();
-    let (operation, _, body) = next_topic_send(&mut agent);
-    assert!(matches!(body, TopicBody::Message(message) if message.sequence == 256));
-    acknowledge_send(&mut agent, generation, channel, operation);
-    assert!(agent.next_effect_after_turn().is_none());
-}
-
-#[test]
-fn topic_send_queue_overflow_and_channel_close_drop_every_admitted_message() {
-    use pulsebeam_proto::state::{self, codec};
-    for mode in [TopicMode::Lossy, TopicMode::Ordered] {
-        for cutoff_first in [false, true] {
-            let (mut agent, generation, control, old) =
-                native_connection::connected_publisher(mode);
-            let channel = old.channel;
-            for _ in 0..TOPIC_SEND_QUEUE_CAPACITY {
-                agent
-                    .command(AgentCommand::SendTopic(TopicSend {
-                        publisher: publisher("state", mode),
-                        payload: b"queued".to_vec(),
-                    }))
-                    .unwrap();
-            }
-            assert_eq!(
-                agent.snapshot().topics.publishers[0].queued_messages,
-                TOPIC_SEND_QUEUE_CAPACITY - 1
-            );
-            assert!(matches!(
-                agent.command(AgentCommand::SendTopic(TopicSend {
-                    publisher: publisher("state", mode),
-                    payload: b"overflow".to_vec(),
-                })),
-                Err(AgentError::InvalidTopic(TopicError::SendQueueFull(_)))
-            ));
-            let (late, _, _) = next_topic_send(&mut agent);
-            if cutoff_first {
-                native_connection::observe(
-                    &mut agent,
-                    generation,
-                    control,
-                    vec![native_connection::confirmed(
-                        state::resource_key::Key::Owned(old.reference),
-                        old.revision,
-                        state::confirmed_state::Value::Absent(state::AbsentState {
-                            reason: state::AbsenceReason::SourceEnded as i32,
-                        }),
-                    )],
-                );
-                assert_eq!(
-                    next_effect(&mut agent),
-                    Effect::Rtc(RtcEffect::CloseDataChannel {
-                        generation,
-                        channel
-                    })
-                );
-                assert!(
-                    agent.next_effect_after_turn().is_none(),
-                    "cutoff cannot substitute for actual closure"
-                );
-            }
-            agent
-                .handle(HostEvent::DataChannel(DataChannelEvent::Closed {
-                    generation,
-                    channel,
-                    reset_complete: true,
-                }))
-                .unwrap();
-            assert_eq!(
-                agent.snapshot().topics.dropped_sends,
-                TOPIC_SEND_QUEUE_CAPACITY as u64 + 1
-            );
-            assert_eq!(agent.snapshot().topics.publishers[0].queued_messages, 0);
-            assert_eq!(agent.snapshot().topics.publishers[0].accepted_history, 0);
-            assert_eq!(agent.snapshot().topics.publishers[0].publication_id, None);
-            assert_eq!(
-                agent.snapshot().topics.channel_failures,
-                u64::from(!cutoff_first)
-            );
-            assert_eq!(agent.snapshot().generation, Some(generation));
-            assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
-            if !cutoff_first {
-                let Effect::DataChannel(DataChannelEffect::Send {
-                    operation,
-                    channel: output,
-                    payload,
-                    ..
-                }) = next_effect(&mut agent)
-                else {
-                    panic!("retirement frame")
-                };
-                assert_eq!(output, control);
-                let batch = codec::decode_client(&payload).unwrap();
-                let [record] = batch.records.as_slice() else {
-                    panic!("one retirement")
-                };
-                assert_eq!(record.owned, old.reference);
-                let Some(desired) = &record.desired else {
-                    panic!("desired retirement")
-                };
-                assert!(matches!(
-                    desired.value,
-                    Some(state::desired_state::Value::Absent(true))
-                ));
-                assert!(desired.revision > old.revision);
-                acknowledge_send(&mut agent, generation, control, operation);
-                assert!(
-                    agent.next_effect_after_turn().is_none(),
-                    "closure cannot substitute for authoritative cutoff"
-                );
-                native_connection::observe(
-                    &mut agent,
-                    generation,
-                    control,
-                    vec![native_connection::confirmed(
-                        state::resource_key::Key::Owned(old.reference),
-                        desired.revision,
-                        state::confirmed_state::Value::Absent(state::AbsentState {
-                            reason: state::AbsenceReason::Removed as i32,
-                        }),
-                    )],
-                );
-            }
-            let fresh = native_connection::prepare_data(&mut agent, generation, control);
-            assert_ne!(fresh.channel, channel);
-            assert!(fresh.reference > old.reference);
-            let sctp = |spec: &state::ResourceSpec| {
-                let Some(state::resource_spec::Declaration::Publication(publication)) =
-                    &spec.declaration
-                else {
-                    panic!("publication")
-                };
-                let Some(state::publication_spec::Kind::Data(data)) = &publication.kind else {
-                    panic!("data")
-                };
-                let Some(state::track_binding::Transport::Sctp(binding)) = data
-                    .binding
-                    .as_ref()
-                    .and_then(|binding| binding.transport.as_ref())
-                else {
-                    panic!("SCTP")
-                };
-                binding.stream_id
-            };
-            assert_eq!(sctp(&fresh.spec), sctp(&old.spec));
-            native_connection::confirm_publication(
-                &mut agent,
-                generation,
-                control,
-                &fresh,
-                "opaque/recovered/source",
-            );
-            assert!(
-                agent.next_effect_after_turn().is_none(),
-                "old queued bytes must not be replayed"
-            );
-            agent
-                .command(AgentCommand::SendTopic(TopicSend {
-                    publisher: publisher("state", mode),
-                    payload: b"fresh".to_vec(),
-                }))
-                .unwrap();
-            let (operation, output, body) = next_topic_send(&mut agent);
-            assert_eq!(output, fresh.channel);
-            assert!(
-                matches!(body, TopicBody::Message(message) if message.publication_id == "opaque/recovered/source" && message.sequence == 0 && message.payload == b"fresh")
-            );
-            let before = agent.snapshot().clone();
-            acknowledge_send(&mut agent, generation, channel, late);
-            assert_eq!(agent.snapshot(), &before);
-            assert!(agent.next_effect_after_turn().is_none());
-            acknowledge_send(&mut agent, generation, fresh.channel, operation);
-            assert!(!agent.snapshot().topics.publishers[0].send_pending);
-            assert!(agent.next_effect_after_turn().is_none());
-            native_connection::observe(
-                &mut agent,
-                generation,
-                control,
-                vec![native_connection::confirmed(
-                    state::resource_key::Key::Owned(fresh.reference),
-                    fresh.revision,
-                    state::confirmed_state::Value::Absent(state::AbsentState {
-                        reason: state::AbsenceReason::PermissionRevoked as i32,
-                    }),
-                )],
-            );
-            assert_eq!(
-                next_effect(&mut agent),
-                Effect::Rtc(RtcEffect::CloseDataChannel {
-                    generation,
-                    channel: fresh.channel
-                })
-            );
-            agent
-                .handle(HostEvent::DataChannel(DataChannelEvent::Closed {
-                    generation,
-                    channel: fresh.channel,
-                    reset_complete: true,
-                }))
-                .unwrap();
-            assert!(
-                agent.next_effect_after_turn().is_none(),
-                "permission loss cannot implicitly reconstruct"
-            );
-            assert_eq!(agent.snapshot().generation, Some(generation));
-            assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
-        }
-    }
-}
-
-#[test]
-fn closed_logical_payload_waits_with_its_reservation_and_preserves_other_receivers() {
+fn logical_payload_replacement_preserves_receivers_and_waits_for_reset_to_reuse_sid() {
     use pulsebeam_proto::state;
     let pinned = |external_id: &str| TopicSubscriber {
         room: "room".into(),
@@ -6326,6 +5637,8 @@ fn closed_logical_payload_waits_with_its_reservation_and_preserves_other_receive
         "right",
         &right_subscriber,
     );
+    let right_owner = receive_data_owner(&mut agent, &right_subscriber);
+    let left_owner = receive_data_owner(&mut agent, &left_subscriber);
     agent
         .command(AgentCommand::RenewAuthorization(
             "surviving-credential".into(),
@@ -6341,19 +5654,8 @@ fn closed_logical_payload_waits_with_its_reservation_and_preserves_other_receive
     };
     assert_eq!(request.method, HttpMethod::Patch);
     drain_notifications(&mut agent);
-    topic_input(
-        &mut agent,
-        generation,
-        right.channel,
-        wire_message("right", 7, b"before"),
-    )
-    .unwrap();
-    assert!(matches!(
-        drain_notifications(&mut agent).as_slice(),
-        [Notification::Topic(TopicNotification::Message(
-            TopicMessage { sequence: 7, .. }
-        ))]
-    ));
+    data_record_input(&mut agent, generation, right.channel, 7, b"before");
+    assert_data_read(&mut agent, right_owner, "right", "right", 7, b"before");
     agent
         .handle(HostEvent::DataChannel(DataChannelEvent::Closed {
             generation,
@@ -6366,7 +5668,7 @@ fn closed_logical_payload_waits_with_its_reservation_and_preserves_other_receive
         channel,
         payload,
         ..
-    }) = next_effect(&mut agent)
+    }) = next_without_data_timer(&mut agent)
     else {
         panic!("scoped retirement")
     };
@@ -6397,6 +5699,7 @@ fn closed_logical_payload_waits_with_its_reservation_and_preserves_other_receive
             left.revision,
             state::confirmed_state::Value::LogicalSubscription(Box::new(
                 state::LogicalSubscriptionState {
+                    data_v1: None,
                     spec: Some(left.spec.clone()),
                     source_revision: 2,
                     source: None,
@@ -6411,51 +5714,24 @@ fn closed_logical_payload_waits_with_its_reservation_and_preserves_other_receive
     );
     assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
     assert_eq!(agent.snapshot().generation, Some(generation));
-    let subscribers = &agent.snapshot().topics.subscribers;
-    assert_eq!(subscribers.len(), 2);
-    assert_eq!(
-        subscribers
-            .iter()
-            .find(|status| status.registration.participant_id == "left")
-            .unwrap()
-            .publishers,
-        0
-    );
-    assert_eq!(
-        subscribers
-            .iter()
-            .find(|status| status.registration.participant_id == "right")
-            .unwrap()
-            .publishers,
-        1
-    );
     assert!(agent.snapshot().terminal_failure.is_none());
     drain_notifications(&mut agent);
-    topic_input(
-        &mut agent,
-        generation,
-        left.channel,
-        wire_message("left", 0, b"late"),
-    )
-    .unwrap();
-    topic_input(
-        &mut agent,
-        generation,
-        right.channel,
-        wire_message("right", 7, b"duplicate"),
-    )
-    .unwrap();
-    assert!(drain_notifications(&mut agent).is_empty());
-    topic_input(
-        &mut agent,
-        generation,
-        right.channel,
-        wire_message("right", 8, b"after"),
-    )
-    .unwrap();
-    assert!(
-        matches!(drain_notifications(&mut agent).as_slice(), [Notification::Topic(TopicNotification::Message(TopicMessage { publication_id, sequence: 8, payload, .. }))] if publication_id == "right" && payload == b"after")
+    data_record_input(&mut agent, generation, left.channel, 0, b"late");
+    data_record_input(&mut agent, generation, right.channel, 7, b"before");
+    assert_eq!(
+        agent
+            .resource(ResourceCommand::ReadData { owner: left_owner })
+            .unwrap(),
+        ResourceResult::Event { event: None }
     );
+    assert_eq!(
+        agent
+            .resource(ResourceCommand::ReadData { owner: right_owner })
+            .unwrap(),
+        ResourceResult::Event { event: None }
+    );
+    data_record_input(&mut agent, generation, right.channel, 8, b"after");
+    assert_data_read(&mut agent, right_owner, "right", "right", 8, b"after");
     let new_source = "right-replacement";
     native_connection::observe(
         &mut agent,
@@ -6466,6 +5742,11 @@ fn closed_logical_payload_waits_with_its_reservation_and_preserves_other_receive
             right.revision,
             state::confirmed_state::Value::LogicalSubscription(Box::new(
                 state::LogicalSubscriptionState {
+                    data_v1: Some(state::DataV1ReceiverOffer {
+                        source: 22,
+                        branch: 33,
+                        capture_clock: None,
+                    }),
                     spec: Some(right.spec.clone()),
                     source_revision: 3,
                     source: Some(state::Track {
@@ -6489,26 +5770,9 @@ fn closed_logical_payload_waits_with_its_reservation_and_preserves_other_receive
             channel: right.channel
         })
     );
-    assert!(
-        agent.next_effect_after_turn().is_none(),
-        "a coalesced replacement cannot skip local cutoff"
-    );
     drain_notifications(&mut agent);
-    topic_input(
-        &mut agent,
-        generation,
-        right.channel,
-        wire_message("right", 9, b"stale"),
-    )
-    .unwrap();
+    data_record_input(&mut agent, generation, right.channel, 9, b"stale");
     assert!(drain_notifications(&mut agent).is_empty());
-    agent
-        .handle(HostEvent::DataChannel(DataChannelEvent::Closed {
-            generation,
-            channel: right.channel,
-            reset_complete: true,
-        }))
-        .unwrap();
     let replacement = native_connection::prepare_subscription(
         &mut agent,
         generation,
@@ -6518,18 +5782,48 @@ fn closed_logical_payload_waits_with_its_reservation_and_preserves_other_receive
     );
     assert_eq!(replacement.reference, right.reference);
     assert_ne!(replacement.channel, right.channel);
+    assert_ne!(
+        replacement.requested_channel.negotiated_id, right.requested_channel.negotiated_id,
+        "the replacement cannot use the SID before the old channel resets"
+    );
     drain_notifications(&mut agent);
-    topic_input(
+    data_record_input(&mut agent, generation, replacement.channel, 0, b"fresh");
+    assert_eq!(
+        agent
+            .resource(ResourceCommand::ReadData { owner: right_owner })
+            .unwrap(),
+        ResourceResult::Event {
+            event: Some(DataEvent::Discontinuity {
+                participant_id: "right".into(),
+                previous_publication_id: "right".into(),
+                publication_id: new_source.into(),
+            }),
+        }
+    );
+    assert_data_read(&mut agent, right_owner, "right", new_source, 0, b"fresh");
+    agent
+        .handle(HostEvent::DataChannel(DataChannelEvent::Closed {
+            generation,
+            channel: right.channel,
+            reset_complete: true,
+        }))
+        .unwrap();
+    data_record_input(
         &mut agent,
         generation,
         replacement.channel,
-        wire_message(new_source, 0, b"fresh"),
-    )
-    .unwrap();
-    assert!(matches!(drain_notifications(&mut agent).as_slice(),
-        [Notification::Topic(TopicNotification::Message(TopicMessage { publication_id, sequence: 0, payload, .. }))]
-            if publication_id == new_source && payload == b"fresh"));
-    assert!(agent.next_effect_after_turn().is_none());
+        1,
+        b"after reset",
+    );
+    assert_data_read(
+        &mut agent,
+        right_owner,
+        "right",
+        new_source,
+        1,
+        b"after reset",
+    );
+    assert_only_data_timers(&mut agent);
     native_connection::observe(
         &mut agent,
         generation,
@@ -6574,669 +5868,37 @@ fn closed_logical_payload_waits_with_its_reservation_and_preserves_other_receive
 }
 
 #[test]
-fn explicit_disconnect_cancels_pending_topic_sends_and_releases_binding() {
-    let registrations = TopicRegistrations {
-        publishers: vec![publisher("chat", TopicMode::Ordered)],
-        subscribers: vec![],
+fn explicit_disconnect_fences_admitted_data_records() {
+    let (mut agent, generation, _, publication) =
+        native_connection::connected_publisher(TopicMode::Latest);
+    let declaration = TrackSpec::Data {
+        track_id: "state".into(),
+        delivery: TopicMode::Latest,
     };
-    let (mut agent, generation, control) = native_connection::connected(registrations.clone());
-    let prepared = native_connection::prepare_data(&mut agent, generation, control);
-    native_connection::confirm_publication(
-        &mut agent,
-        generation,
-        control,
-        &prepared,
-        native_connection::SOURCE,
-    );
-    for _ in 0..2 {
-        agent
-            .command(AgentCommand::SendTopic(TopicSend {
-                publisher: publisher("chat", TopicMode::Ordered),
-                payload: b"queued".to_vec(),
-            }))
-            .unwrap();
-    }
-    next_topic_send(&mut agent);
-    let disconnected = DesiredState {
-        revision: 2,
-        topics: registrations,
-        ..Default::default()
-    };
-    agent
-        .command(AgentCommand::ReplaceDesired(disconnected))
-        .unwrap();
-    assert_eq!(agent.snapshot().topics.dropped_sends, 2);
-    assert_eq!(agent.snapshot().topics.publishers[0].queued_messages, 0);
-    assert_eq!(agent.snapshot().topics.publishers[0].publication_id, None);
-    assert_eq!(agent.snapshot().topics.publishers[0].accepted_history, 0);
-    assert!(
-        drain_notifications(&mut agent)
-            .iter()
-            .filter(|event| matches!(
-                event,
-                Notification::Topic(TopicNotification::SendDropped {
-                    reason: TopicDropReason::ChannelClosed,
-                    ..
-                })
-            ))
-            .count()
-            >= 2
-    );
-}
-
-#[test]
-fn topic_boundaries_reject_malformed_cross_mode_unknown_and_oversized_input() {
-    let registrations = TopicRegistrations {
-        publishers: vec![publisher("state", TopicMode::Latest)],
-        subscribers: vec![subscriber("state", TopicMode::Latest)],
-    };
-    let (mut agent, generation, control) = native_connection::connected(registrations);
-    let latest = native_connection::prepare_data(&mut agent, generation, control);
-    native_connection::confirm_publication(
-        &mut agent,
-        generation,
-        control,
-        &latest,
-        native_connection::SOURCE,
-    );
-    let receiving = native_connection::prepare_subscription_staged(
-        &mut agent,
-        generation,
-        control,
-        native_connection::REMOTE_SOURCE,
-        &subscriber("state", TopicMode::Latest),
-        Some(&latest),
-    );
-    agent
-        .command(AgentCommand::ReplaceDesired(DesiredState {
-            revision: 2,
-            connected: true,
-            topics: TopicRegistrations {
-                publishers: vec![
-                    publisher("state", TopicMode::Latest),
-                    publisher("chat", TopicMode::Ordered),
-                ],
-                subscribers: vec![subscriber("state", TopicMode::Latest)],
-            },
-            ..Default::default()
-        }))
-        .unwrap();
-    let ordered = native_connection::prepare_data(&mut agent, generation, control);
-    native_connection::confirm_publication(
-        &mut agent,
-        generation,
-        control,
-        &ordered,
-        "opaque/server/chat/source",
-    );
-    drain_notifications(&mut agent);
-    let before = agent.snapshot().clone();
-    assert_eq!(
-        agent.handle(HostEvent::DataChannel(DataChannelEvent::Message {
-            generation,
-            channel: ordered.channel,
-            payload: b"not-protobuf".to_vec(),
-        })),
-        Err(AgentError::InvalidTopic(TopicError::MalformedMessage))
-    );
-    assert_eq!(
-        topic_input(
-            &mut agent,
-            generation,
-            latest.channel,
-            TopicBody::Nack(TopicNack {
-                requester: Default::default(),
-                publication_id: native_connection::SOURCE.into(),
-                from_sequence: 0,
-            })
-        ),
-        Err(AgentError::InvalidTopic(TopicError::InvalidControl))
-    );
-    assert_eq!(
-        topic_input(
-            &mut agent,
-            generation,
-            receiving.channel,
-            wire_message(native_connection::SOURCE, 0, b"wrong source")
-        ),
-        Err(AgentError::InvalidTopic(TopicError::InvalidControl))
-    );
-    assert_eq!(
-        agent.handle(HostEvent::DataChannel(DataChannelEvent::Message {
-            generation,
-            channel: channel(99),
-            payload: vec![],
-        })),
-        Ok(()),
-        "messages without a live source binding are inert, including late channel callbacks"
-    );
-    assert_eq!(
-        agent.handle(HostEvent::DataChannel(DataChannelEvent::Opened {
-            generation,
-            channel: channel(99)
-        })),
-        Ok(()),
-        "open callbacks without a live channel lease are inert"
-    );
-    assert_eq!(
-        topic_input(
-            &mut agent,
-            generation,
-            receiving.channel,
-            wire_message(
-                native_connection::REMOTE_SOURCE,
-                0,
-                &vec![0; MAX_TOPIC_PAYLOAD_BYTES + 1]
-            )
-        ),
-        Err(AgentError::InvalidTopic(TopicError::MalformedMessage))
-    );
-    assert_eq!(agent.snapshot(), &before);
-    assert!(drain_notifications(&mut agent).is_empty());
-}
-
-#[test]
-fn lossy_keeps_distinct_messages_without_duplicates_coalescing_or_ordering() {
-    let registrations = TopicRegistrations {
-        publishers: vec![publisher("events", TopicMode::Lossy)],
-        subscribers: vec![subscriber("events", TopicMode::Lossy)],
-    };
-    let (mut agent, generation, control) = native_connection::connected(registrations);
-    let prepared = native_connection::prepare_data(&mut agent, generation, control);
-    native_connection::confirm_publication(
-        &mut agent,
-        generation,
-        control,
-        &prepared,
-        native_connection::SOURCE,
-    );
-    let receiving = native_connection::prepare_subscription_staged(
-        &mut agent,
-        generation,
-        control,
-        native_connection::REMOTE_SOURCE,
-        &subscriber("events", TopicMode::Lossy),
-        Some(&prepared),
-    );
-    drain_notifications(&mut agent);
-    for value in 0..3 {
-        agent
-            .command(AgentCommand::SendTopic(TopicSend {
-                publisher: publisher("events", TopicMode::Lossy),
-                payload: vec![value],
-            }))
-            .unwrap();
-    }
-    for sequence in 0..3 {
-        let (operation, channel, body) = next_topic_send(&mut agent);
-        assert_eq!(
-            body,
-            wire_message(
-                native_connection::SOURCE,
-                sequence,
-                &[u8::try_from(sequence).unwrap()]
-            )
-        );
-        acknowledge_send(&mut agent, generation, channel, operation);
-    }
-    assert_eq!(agent.snapshot().topics.dropped_sends, 0);
-    drain_notifications(&mut agent);
-    let id = native_connection::REMOTE_SOURCE.to_string();
-    for sequence in [2, 2, 0, 1, 0] {
-        topic_input(
-            &mut agent,
-            generation,
-            receiving.channel,
-            wire_message(&id, sequence, &[u8::try_from(sequence).unwrap()]),
-        )
-        .unwrap();
-    }
-    let events = drain_notifications(&mut agent);
-    assert_eq!(
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Notification::Topic(TopicNotification::Message(message)) => Some(message.sequence),
-                _ => None,
-            })
-            .collect::<Vec<_>>(),
-        vec![2, 0, 1]
-    );
-    assert_eq!(agent.snapshot().topics.delivered_messages, 3);
-    assert!(events.iter().all(|event| !matches!(
-        event,
-        Notification::Topic(TopicNotification::RecoveryGap { .. })
-    )));
-}
-
-#[test]
-fn discovery_withdrawal_does_not_rebind_and_retired_sources_do_not_revive() {
-    use pulsebeam_proto::state;
-    let (mut agent, generation, control) = native_connection::connected(TopicRegistrations {
-        publishers: vec![publisher("state", TopicMode::Latest)],
-        subscribers: vec![subscriber("state", TopicMode::Latest)],
-    });
-    let old_publication = native_connection::prepare_data(&mut agent, generation, control);
-    native_connection::confirm_publication(
-        &mut agent,
-        generation,
-        control,
-        &old_publication,
-        native_connection::SOURCE,
-    );
-    let old_subscription = native_connection::prepare_subscription_staged(
-        &mut agent,
-        generation,
-        control,
-        native_connection::REMOTE_SOURCE,
-        &subscriber("state", TopicMode::Latest),
-        Some(&old_publication),
-    );
-    const NEW_REMOTE: &str = "Remote_Replacement";
-    const NEW_LOCAL: &str = "opaque/server/local/replacement";
-    drain_notifications(&mut agent);
-    assert_eq!(
-        topic_input(
-            &mut agent,
-            generation,
-            old_subscription.channel,
-            wire_message(NEW_REMOTE, 0, b"unresolved")
-        ),
-        Err(AgentError::InvalidTopic(TopicError::InvalidControl))
-    );
-    assert!(drain_notifications(&mut agent).is_empty());
-    native_connection::observe(
-        &mut agent,
-        generation,
-        control,
-        vec![native_connection::confirmed(
-            state::resource_key::Key::Publication(native_connection::REMOTE_SOURCE.into()),
-            0,
-            state::confirmed_state::Value::Absent(state::AbsentState {
-                reason: state::AbsenceReason::Removed as i32,
-            }),
-        )],
-    );
-    assert!(agent.next_effect_after_turn().is_none());
-    drain_notifications(&mut agent);
-    topic_input(
-        &mut agent,
-        generation,
-        old_subscription.channel,
-        wire_message(native_connection::REMOTE_SOURCE, 5, b"still-owned"),
-    )
-    .unwrap();
-    assert!(
-        matches!(drain_notifications(&mut agent).as_slice(), [Notification::Topic(TopicNotification::Message(TopicMessage { publication_id, sequence: 5, .. }))] if publication_id == native_connection::REMOTE_SOURCE)
-    );
-    agent
-        .command(AgentCommand::SendTopic(TopicSend {
-            publisher: publisher("state", TopicMode::Latest),
-            payload: b"old-pending".to_vec(),
-        }))
-        .unwrap();
-    let (old_operation, old_channel, _) = next_topic_send(&mut agent);
-    assert_eq!(old_channel, old_publication.channel);
-    native_connection::observe(
-        &mut agent,
-        generation,
-        control,
-        vec![
-            native_connection::confirmed(
-                state::resource_key::Key::Owned(old_publication.reference),
-                old_publication.revision,
-                state::confirmed_state::Value::Absent(state::AbsentState {
-                    reason: state::AbsenceReason::SourceEnded as i32,
-                }),
-            ),
-            native_connection::confirmed(
-                state::resource_key::Key::Owned(old_subscription.reference),
-                old_subscription.revision,
-                state::confirmed_state::Value::Absent(state::AbsentState {
-                    reason: state::AbsenceReason::SourceEnded as i32,
-                }),
-            ),
-        ],
-    );
-    assert_eq!(agent.snapshot().topics.publishers[0].next_sequence, 0);
-    assert_eq!(agent.snapshot().topics.publishers[0].accepted_history, 0);
-    assert!(!agent.snapshot().topics.publishers[0].send_pending);
-    for channel in [old_publication.channel, old_subscription.channel] {
-        assert_eq!(
-            next_effect(&mut agent),
-            Effect::Rtc(RtcEffect::CloseDataChannel {
-                generation,
-                channel
-            })
-        );
-    }
-    assert!(
-        agent.next_effect_after_turn().is_none(),
-        "cutoff does not substitute for closure"
-    );
-    for channel in [old_publication.channel, old_subscription.channel] {
-        agent
-            .handle(HostEvent::DataChannel(DataChannelEvent::Closed {
-                generation,
-                channel,
-                reset_complete: true,
-            }))
-            .unwrap();
-    }
-    let replacement_subscriber = TopicSubscriber {
-        room: "room".into(),
-        participant_id: NEW_REMOTE.into(),
-        topic: "state".into(),
-        mode: TopicMode::Latest,
-    };
-    let replacement_topics = TopicRegistrations {
-        publishers: vec![publisher("state", TopicMode::Latest)],
-        subscribers: vec![replacement_subscriber.clone()],
-    };
-    agent
-        .command(AgentCommand::ReplaceDesired(DesiredState {
-            revision: 2,
-            connected: true,
-            ..Default::default()
-        }))
-        .unwrap();
-    assert!(agent.next_effect_after_turn().is_none());
-    agent
-        .command(AgentCommand::ReplaceDesired(DesiredState {
-            revision: 3,
-            connected: true,
-            topics: TopicRegistrations {
-                publishers: replacement_topics.publishers.clone(),
-                subscribers: Vec::new(),
-            },
-            ..Default::default()
-        }))
-        .unwrap();
-    let publication = native_connection::prepare_data(&mut agent, generation, control);
-    assert_ne!(publication.channel, old_publication.channel);
-    assert!(publication.reference > old_publication.reference);
-    native_connection::confirm_publication(
-        &mut agent,
-        generation,
-        control,
-        &publication,
-        NEW_LOCAL,
-    );
-    agent
-        .command(AgentCommand::ReplaceDesired(DesiredState {
-            revision: 4,
-            connected: true,
-            topics: replacement_topics.clone(),
-            ..Default::default()
-        }))
-        .unwrap();
-    let _ = native_connection::answer_source_lookup_batch(
-        &mut agent,
-        generation,
-        control,
-        &replacement_topics,
-        Some(NEW_REMOTE),
-    );
-    let receiving = native_connection::prepare_subscription(
-        &mut agent,
-        generation,
-        control,
-        NEW_REMOTE,
-        &replacement_subscriber,
-    );
-    assert_ne!(receiving.channel, old_subscription.channel);
-    assert!(receiving.reference > old_subscription.reference);
-    assert!(
-        agent.next_effect_after_turn().is_none(),
-        "old pending bytes cannot replay"
-    );
-    drain_notifications(&mut agent);
-    topic_input(
-        &mut agent,
-        generation,
-        old_subscription.channel,
-        wire_message(native_connection::REMOTE_SOURCE, 999, b"retired"),
-    )
-    .unwrap();
-    topic_input(
-        &mut agent,
-        generation,
-        receiving.channel,
-        wire_message(NEW_REMOTE, 0, b"new"),
-    )
-    .unwrap();
-    let notifications = drain_notifications(&mut agent);
-    assert!(
-        matches!(notifications.as_slice(), [Notification::Topic(TopicNotification::Message(TopicMessage { participant_id, publication_id, sequence: 0, payload, .. }))] if participant_id == NEW_REMOTE && publication_id == NEW_REMOTE && payload == b"new"),
-        "notifications: {notifications:#?}"
-    );
-    agent
-        .command(AgentCommand::SendTopic(TopicSend {
-            publisher: publisher("state", TopicMode::Latest),
-            payload: b"new-local".to_vec(),
-        }))
-        .unwrap();
-    let (operation, channel, body) = next_topic_send(&mut agent);
+    agent.send_data(declaration, vec![42; 1025]).unwrap();
+    let (operation, channel, _) = next_data_record(&mut agent);
     assert_eq!(channel, publication.channel);
-    assert!(
-        matches!(body, TopicBody::Message(message) if message.publication_id == NEW_LOCAL && message.sequence == 0)
-    );
-    let before = agent.snapshot().clone();
-    acknowledge_send(&mut agent, generation, old_channel, old_operation);
-    assert_eq!(agent.snapshot(), &before);
-    assert!(agent.next_effect_after_turn().is_none());
+    agent.command(AgentCommand::Disconnect).unwrap();
     acknowledge_send(&mut agent, generation, channel, operation);
-}
-
-#[test]
-fn reconnect_starts_fresh_publications_without_old_history_or_generation_output() {
-    use pulsebeam_proto::state::{self, codec};
-    let registrations = TopicRegistrations {
-        publishers: vec![publisher("chat", TopicMode::Ordered)],
-        subscribers: vec![subscriber("chat", TopicMode::Ordered)],
-    };
-    let (mut agent, old_generation, old_control) =
-        native_connection::connected(registrations.clone());
-    let old_publication = native_connection::prepare_data(&mut agent, old_generation, old_control);
-    native_connection::confirm_publication(
-        &mut agent,
-        old_generation,
-        old_control,
-        &old_publication,
-        native_connection::SOURCE,
-    );
-    let old_subscription = native_connection::prepare_subscription_staged(
-        &mut agent,
-        old_generation,
-        old_control,
-        native_connection::REMOTE_SOURCE,
-        &subscriber("chat", TopicMode::Ordered),
-        Some(&old_publication),
-    );
-    let publish = publisher("chat", TopicMode::Ordered);
-    agent
-        .command(AgentCommand::SendTopic(TopicSend {
-            publisher: publish.clone(),
-            payload: b"accepted-before-reconnect".to_vec(),
-        }))
-        .unwrap();
-    let (accepted, _, body) = next_topic_send(&mut agent);
-    let TopicBody::Message(old_message) = body else {
-        panic!("message")
-    };
-    acknowledge_send(
-        &mut agent,
-        old_generation,
-        old_publication.channel,
-        accepted,
-    );
-    drain_notifications(&mut agent);
-    agent
-        .handle(HostEvent::Rtc(RtcEvent::Disconnected {
-            generation: old_generation,
-        }))
-        .unwrap();
-    let Effect::Rtc(RtcEffect::CreateOffer {
-        generation,
-        data_channels,
-        ..
-    }) = next_effect(&mut agent)
-    else {
-        panic!("replacement offer")
-    };
-    assert_ne!(generation, old_generation);
-    assert_eq!(data_channels.len(), 1);
-    assert_eq!(data_channels[0].negotiated_id, Some(0));
-    let signal = channel(50);
-    agent
-        .handle(HostEvent::Rtc(RtcEvent::OfferCreated {
-            generation,
-            offer: native_connection::OFFER.into(),
-            resources: OfferResources {
-                slots: Vec::new(),
-                signaling_channel: signal,
-                data_channels: Vec::new(),
-            },
-        }))
-        .unwrap();
-    let Effect::Http(HttpEffect::Request { operation, .. }) = next_effect(&mut agent) else {
-        panic!("replacement POST")
-    };
-    agent
-        .handle(HostEvent::Http(HttpEvent::Response {
-            operation,
-            response: create_response("p2", "unused", "https://sfu.test/sessions/p2"),
-        }))
-        .unwrap();
-    assert!(
-        matches!(next_effect(&mut agent), Effect::Rtc(RtcEffect::ApplyAnswer { generation: current, .. }) if current == generation)
-    );
-    agent
-        .handle(HostEvent::Rtc(RtcEvent::AnswerApplied { generation }))
-        .unwrap();
-    agent
-        .handle(HostEvent::Rtc(RtcEvent::Connected { generation }))
-        .unwrap();
-    agent
-        .handle(HostEvent::DataChannel(DataChannelEvent::Opened {
-            generation,
-            channel: signal,
-        }))
-        .unwrap();
-    agent
-        .handle(HostEvent::DataChannel(DataChannelEvent::Message {
-            generation,
-            channel: signal,
-            payload: codec::encode_server(&state::ServerStateBatch {
-                records: vec![native_connection::grant(1)],
-                initial_complete: true,
-                ..Default::default()
-            })
-            .unwrap(),
-        }))
-        .unwrap();
-    assert_eq!(
-        next_effect(&mut agent),
-        Effect::Rtc(RtcEffect::Close {
-            generation: old_generation
-        })
-    );
-    let _ = native_connection::answer_source_lookup_batch(
-        &mut agent,
-        generation,
-        signal,
-        &registrations,
-        Some("opaque/remote/root-two"),
-    );
-    assert_eq!(agent.snapshot().participant_id.as_deref(), Some("p2"));
-    assert_eq!(agent.snapshot().topics.publishers[0].publication_id, None);
-    assert_eq!(agent.snapshot().topics.publishers[0].next_sequence, 0);
-    assert_eq!(agent.snapshot().topics.publishers[0].accepted_history, 0);
-    assert!(matches!(
-        agent.command(AgentCommand::SendTopic(TopicSend {
-            publisher: publish.clone(),
-            payload: b"before-binding".to_vec()
-        })),
-        Err(AgentError::InvalidTopic(TopicError::PublisherUnavailable(
-            _
-        )))
-    ));
-    let publication = native_connection::prepare_data(&mut agent, generation, signal);
-    native_connection::confirm_publication(
-        &mut agent,
-        generation,
-        signal,
-        &publication,
-        "opaque/local/root-two",
-    );
-    let receiving = native_connection::prepare_subscription_staged(
-        &mut agent,
-        generation,
-        signal,
-        "opaque/remote/root-two",
-        &subscriber("chat", TopicMode::Ordered),
-        Some(&publication),
-    );
-    drain_notifications(&mut agent);
-    topic_input(
-        &mut agent,
-        old_generation,
-        old_subscription.channel,
-        wire_message(native_connection::REMOTE_SOURCE, 0, b"stale-generation"),
-    )
-    .unwrap();
-    acknowledge_send(
-        &mut agent,
-        old_generation,
-        old_publication.channel,
-        accepted,
-    );
-    assert!(drain_notifications(&mut agent).is_empty());
-    assert!(agent.next_effect_after_turn().is_none());
-    agent
-        .command(AgentCommand::SendTopic(TopicSend {
-            publisher: publish,
-            payload: b"after-reconnect".to_vec(),
-        }))
-        .unwrap();
-    let (_, new_publish_channel, body) = next_topic_send(&mut agent);
-    assert_eq!(new_publish_channel, publication.channel);
-    assert_ne!(publication.channel, old_publication.channel);
-    assert_ne!(receiving.channel, old_subscription.channel);
-    let TopicBody::Message(new_message) = body else {
-        panic!("new message")
-    };
-    assert_ne!(new_message.publication_id, old_message.publication_id);
-    assert_eq!(new_message.sequence, 0);
-    assert_eq!(
-        topic_input(
-            &mut agent,
-            generation,
-            new_publish_channel,
-            TopicBody::Nack(TopicNack {
-                requester: Default::default(),
-                publication_id: old_message.publication_id,
-                from_sequence: 0
-            })
-        ),
-        Err(AgentError::InvalidTopic(TopicError::InvalidControl))
-    );
-    topic_input(
-        &mut agent,
-        generation,
-        new_publish_channel,
-        TopicBody::Nack(TopicNack {
-            requester: Default::default(),
-            publication_id: new_message.publication_id.clone(),
-            from_sequence: 0,
-        }),
-    )
-    .unwrap();
-    assert_eq!(
-        next_topic_send(&mut agent).2,
-        TopicBody::Message(new_message)
-    );
-    assert_eq!(agent.snapshot().generation, Some(generation));
-    assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
-    assert!(agent.next_effect_after_turn().is_none());
+    let mut closed = false;
+    let mut delete = None;
+    while let Some(effect) = agent.next_effect_after_turn() {
+        match effect {
+            Effect::Rtc(RtcEffect::Close { generation: old }) if old == generation => closed = true,
+            Effect::Http(HttpEffect::Request {
+                operation, request, ..
+            }) if request.method == HttpMethod::Delete => {
+                assert!(delete.replace(operation).is_none());
+            }
+            Effect::DataChannel(DataChannelEffect::Send {
+                channel: output, ..
+            }) if output == channel => {
+                panic!("retired channel still emitted DATA records")
+            }
+            _ => {}
+        }
+    }
+    assert!(closed);
+    assert!(delete.is_some());
+    assert_eq!(agent.snapshot().connection, ConnectionState::Closing);
 }

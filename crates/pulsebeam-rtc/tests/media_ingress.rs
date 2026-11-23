@@ -74,6 +74,54 @@ fn mixed_direction_native_publisher_recovers_loss_as_primary_media() {
 }
 
 #[test]
+fn wire_observer_receives_bound_primary_before_normalized_delivery() {
+    let mut fixture = support::PeerFixture::connected();
+    let (arrival, input) = fixture.observe_source(b"wire-before-normalization");
+    let now = fixture.at();
+    assert!(fixture.connection.receive(now, arrival, input).is_ok());
+    let mut observed = None;
+    let delivered = (0..64).find_map(|_| {
+        let output = fixture.connection.poll_with_rtp_observer(
+            now,
+            &mut |rtp: pulsebeam_rtc::AuthenticatedRtp<'_>| {
+                let header = rtp.wire_header();
+                assert_eq!(rtp.arrival, arrival);
+                assert_eq!(rtp.primary_ssrc, header.ssrc);
+                assert_eq!(rtp.primary_payload_type(), header.payload_type);
+                assert_eq!(rtp.primary_codec.clock_rate, 48_000);
+                assert_eq!(rtp.primary_codec.channels, Some(2));
+                assert_eq!(
+                    rtp.primary_codec.profile,
+                    Some(pulsebeam_rtc::CodecProfile::Opus)
+                );
+                assert!(!rtp.is_repair);
+                assert!(rtp.wire_payload().ends_with(b"wire-before-normalization"));
+                assert_eq!(rtp.first_csrc(), None);
+                assert!(rtp.receive_extensions.iter().any(|ext| {
+                    ext.uri.as_ref() == pulsebeam_rtc::MID_EXTENSION && !ext.is_encrypted()
+                }));
+                assert!(
+                    observed
+                        .replace((header, rtp.wire_payload().to_vec()))
+                        .is_none()
+                );
+            },
+        );
+        match output {
+            Output::Event(pulsebeam_rtc::Event::Rtp { packet, .. }) => {
+                Some((packet.header, packet.payload.to_vec()))
+            }
+            _ => None,
+        }
+    });
+    assert!(
+        delivered.is_some(),
+        "deterministic peer did not deliver primary RTP"
+    );
+    assert_eq!(observed, delivered);
+}
+
+#[test]
 fn unauthenticated_rtp_never_creates_a_semantic_media_event() {
     let start = Instant::now();
     let mut connection = RtcConnection::accept(
@@ -120,7 +168,9 @@ fn unauthenticated_rtp_never_creates_a_semantic_media_event() {
         .expect("network input is dropped, not an API error");
 
     for _ in 0..16 {
-        match connection.poll(start) {
+        match connection.poll_with_rtp_observer(start, &mut |_| {
+            panic!("unauthenticated input reached the wire observer");
+        }) {
             Output::Idle { .. } => return,
             Output::Event(pulsebeam_rtc::Event::BandwidthEstimate(_)) => {}
             output => panic!("unauthenticated input produced output: {output:?}"),

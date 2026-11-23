@@ -215,7 +215,7 @@ fn real_quic_dtls_and_webrtc_share_udp_without_cross_peer_backpressure() {
             16,
             |datagram| send(&q_socket, datagram.destination, datagram.payload),
             |application| {
-                assert_eq!(application.context, [1, 2, 3, 4]);
+                assert_eq!(application.context, Some([1, 2, 3, 4]));
                 assert_eq!(application.payload, b"quic");
                 quic_delivered += 1;
             },

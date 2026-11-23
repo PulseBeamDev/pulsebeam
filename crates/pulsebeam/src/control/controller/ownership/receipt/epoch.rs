@@ -1,8 +1,9 @@
-//! Receipt authority for one fixed pair and one provisioned authority epoch.
+//! Receipt authority for a fixed peer set in one provisioned authority epoch.
 //! Neither an expired view nor a Link reconnect forgets terminal lineage facts.
 
 use std::{collections::BTreeMap, num::NonZeroU64};
 
+use pulsebeam_core::identity::NodeId;
 use pulsebeam_runtime::time::Instant;
 use serde::{Deserialize, Serialize};
 
@@ -63,6 +64,7 @@ struct View {
 }
 
 pub(in crate::control) struct Validated {
+    peer: NodeId,
     view: View,
     retired: Vec<Key>,
 }
@@ -73,14 +75,18 @@ impl Validated {
     }
 }
 
+struct Remote {
+    issuer: Issuer,
+    key: ApiPublicKey,
+    view: Option<View>,
+}
+
 pub(in crate::control) struct Trust {
     issuer: Issuer,
-    remote: Issuer,
     key: ApiSigningKey,
-    remote_key: ApiPublicKey,
+    peers: BTreeMap<NodeId, Remote>,
     blocked: bool,
     records: Ledger,
-    view: Option<View>,
 }
 
 impl Trust {
@@ -90,21 +96,46 @@ impl Trust {
         remote: Issuer,
         remote_key: ApiPublicKey,
     ) -> Result<Self, Error> {
-        if issuer.trust_domain != remote.trust_domain
-            || issuer.node == remote.node
-            || key.public_key() == remote_key
+        let mut trust = Self {
+            issuer,
+            key,
+            peers: BTreeMap::new(),
+            blocked: false,
+            records: Ledger::new(),
+        };
+        trust.pin_peer(remote, remote_key)?;
+        Ok(trust)
+    }
+
+    pub(in crate::control) fn matches_local(&self, issuer: Issuer, key: ApiPublicKey) -> bool {
+        self.issuer == issuer && self.key.public_key() == key
+    }
+
+    pub(in crate::control) fn pin_peer(
+        &mut self,
+        issuer: Issuer,
+        key: ApiPublicKey,
+    ) -> Result<(), Error> {
+        if issuer.trust_domain != self.issuer.trust_domain
+            || issuer.node == self.issuer.node
+            || key == self.key.public_key()
+            || self.peers.contains_key(&issuer.node)
+            || self.peers.values().any(|peer| peer.key == key)
         {
             return Err(Error::Invalid);
         }
-        Ok(Self {
-            issuer,
-            remote,
-            key,
-            remote_key,
-            blocked: false,
-            records: Ledger::new(),
-            view: None,
-        })
+        if self.peers.len() >= crate::link::host::PEERS {
+            return Err(Error::NoAuthority);
+        }
+        self.peers.insert(
+            issuer.node,
+            Remote {
+                issuer,
+                key,
+                view: None,
+            },
+        );
+        Ok(())
     }
 
     pub(in crate::control) fn checkpoint(&self) -> Checkpoint {
@@ -129,6 +160,7 @@ impl Trust {
     /// pull-start deadline before it drives admission or live source changes.
     pub(in crate::control) fn validate_checkpoint(
         &self,
+        origin: (NodeId, NonZeroU64),
         revision: NonZeroU64,
         checkpoint: Checkpoint,
         now: Instant,
@@ -137,7 +169,11 @@ impl Trust {
         if now >= deadline {
             return Err(Error::Unfresh);
         }
-        if checkpoint.issuer != self.remote || checkpoint.records.len() > CAPACITY {
+        let remote = self.peers.get(&origin.0).ok_or(Error::Invalid)?;
+        if remote.issuer.incarnation != origin.1
+            || checkpoint.issuer != remote.issuer
+            || checkpoint.records.len() > CAPACITY
+        {
             return Err(Error::Invalid);
         }
         let mut records = Ledger::new();
@@ -148,7 +184,7 @@ impl Trust {
                 return Err(Error::Invalid);
             }
         }
-        if let Some(old) = &self.view {
+        if let Some(old) = &remote.view {
             if old.revision >= revision || old.blocked && !checkpoint.blocked {
                 return Err(Error::Invalid);
             }
@@ -166,6 +202,7 @@ impl Trust {
             .filter_map(|(key, fact)| (fact.retired && !self.retired(*key)).then_some(*key))
             .collect();
         Ok(Validated {
+            peer: origin.0,
             view: View {
                 revision,
                 deadline,
@@ -176,32 +213,54 @@ impl Trust {
         })
     }
 
-    pub(in crate::control) fn install_checkpoint(&mut self, checkpoint: Validated) -> Vec<Key> {
-        self.view = Some(checkpoint.view);
-        checkpoint.retired
+    pub(in crate::control) fn install_checkpoint(
+        &mut self,
+        checkpoint: Validated,
+    ) -> Result<Vec<Key>, Error> {
+        self.peers
+            .get_mut(&checkpoint.peer)
+            .ok_or(Error::Invalid)?
+            .view = Some(checkpoint.view);
+        Ok(checkpoint.retired)
     }
 
     pub(in crate::control) fn admission_ready(&self, now: Instant) -> bool {
-        self.fresh_view(now).is_ok()
+        self.require_fresh_views(now).is_ok()
     }
 
     fn retired(&self, key: Key) -> bool {
         self.records.get(&key).is_some_and(|fact| fact.retired)
             || self
-                .view
-                .as_ref()
-                .and_then(|view| view.records.get(&key))
-                .is_some_and(|fact| fact.retired)
+                .views()
+                .any(|view| view.records.get(&key).is_some_and(|fact| fact.retired))
     }
 
-    fn fresh_view(&self, now: Instant) -> Result<&View, Error> {
-        if self.blocked || self.view.as_ref().is_some_and(|view| view.blocked) {
+    fn views(&self) -> impl Iterator<Item = &View> {
+        self.peers.values().filter_map(|peer| peer.view.as_ref())
+    }
+
+    fn blocked(&self) -> bool {
+        self.blocked || self.views().any(|view| view.blocked)
+    }
+
+    fn require_fresh_views(&self, now: Instant) -> Result<(), Error> {
+        if self.blocked() {
             return Err(Error::NoAuthority);
         }
-        self.view
-            .as_ref()
-            .filter(|view| now < view.deadline)
-            .ok_or(Error::Unfresh)
+        if self
+            .peers
+            .values()
+            .any(|peer| peer.view.as_ref().is_none_or(|view| now >= view.deadline))
+        {
+            return Err(Error::Unfresh);
+        }
+        Ok(())
+    }
+
+    fn remote(&self, issuer: Issuer) -> Option<&Remote> {
+        self.peers
+            .get(&issuer.node)
+            .filter(|peer| peer.issuer == issuer)
     }
 
     // Issuance and known retirement are monotone within an authority epoch.
@@ -211,21 +270,21 @@ impl Trust {
         if self.retired(key) {
             return Err(Error::Retired);
         }
-        if self.blocked || self.view.as_ref().is_some_and(|view| view.blocked) {
+        if self.blocked() {
             return Err(Error::NoAuthority);
         }
         let recorded = if issuer == self.issuer {
             self.records.get(&key).ok_or(Error::NoAuthority)?
-        } else if issuer == self.remote {
-            self.view
+        } else {
+            self.remote(issuer)
+                .ok_or(Error::NoAuthority)?
+                .view
                 .as_ref()
                 .and_then(|view| view.records.get(&key))
                 .ok_or(Error::Unfresh)?
-        } else {
-            return Err(Error::NoAuthority);
         };
         if recorded.issued_through < expires_at {
-            return Err(if issuer == self.remote {
+            return Err(if issuer != self.issuer {
                 Error::Unfresh
             } else {
                 Error::NoAuthority
@@ -248,7 +307,7 @@ impl PeerTrust for Trust {
         if issuer == self.issuer {
             Some(self.key.public_key())
         } else {
-            (issuer == self.remote).then_some(self.remote_key)
+            self.remote(issuer).map(|peer| peer.key)
         }
     }
 }
@@ -265,7 +324,7 @@ impl LineageTrust for Trust {
         if self.retired(key) {
             return Err(Error::Retired);
         }
-        self.fresh_view(Instant::now())?;
+        self.require_fresh_views(Instant::now())?;
         if self.records.len() >= CAPACITY && !self.records.contains_key(&key) {
             return Err(Error::NoAuthority);
         }

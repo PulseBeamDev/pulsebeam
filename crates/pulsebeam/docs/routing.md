@@ -169,33 +169,18 @@ to fan out the track.
 ### Local origin
 
 When a participant emits a packet, the shard pipeline already carries its
-compiled `TrackHandle`.
+compiled `TrackHandle`. It resolves the track plan, offers the packet to local
+subscribers, and sends any compiled same-node copies to the destination shards.
+The receiving shard validates the publication against its installed route.
 
-1. Resolve the track runtime and `TrackPlan` by `TrackHandle`.
-2. Deliver the packet to every `ParticipantHandle` in `plan.local`.
-3. If the packet originated locally, emit one copy for every route in
-   `plan.remote`.
+### Network arrival
 
-Each remote copy has a fixed envelope and an owned payload. The envelope route
-selects the destination shard. The payload contains `TrackId` plus the
-destination-independent track packet; the receiving shard validates the ID
-against the `TrackHandle` compiled into the destination route.
-
-### Remote arrival
-
-The destination shard:
-
-1. indexes the route table by slot and validates the epoch;
-2. resolves `RouteAction::Forward { target }`;
-3. resolves the destination-local plan by `target`;
-4. fans out only to `plan.local`.
-
-A remotely received packet is never forwarded remotely again. Only a local
-origin executes `plan.remote`, preventing loops and duplicate multi-hop fanout.
-
-The route runtime keeps mutable hop-local accounting beside the route action:
-sequence expansion, loss, reorder and duplicate counters. This state is owned
-by the destination shard and is not part of the controller's plan.
+Forward network packets require an explicitly selected Fabric association and
+an acknowledged receive binding that accepts the publication's full emission
+set. The authenticated association and route label select the installed
+children. An eligible compiled relay may forward the image again if its hop
+budget permits. Repair-only receives are separately bound to an acknowledged
+request and an exact branch; they are not live fanout routes.
 
 ### Reverse traffic
 
@@ -345,21 +330,13 @@ authentication command so its userspace demux cache protects the established
 entry. NAT rebinding returns through the same STUN bootstrap path. ICE-TCP uses
 the ufrag to hand the whole accepted connection to its owner once.
 
-## The envelope
+## Link wire boundaries
 
-Cross-shard media and reverse traffic use one fixed 16-byte header:
-
-```text
-version (1) | type (1) | epoch (2) | route (4) | extension (8)
-```
-
-The route is at a fixed offset so steering needs only a bounded load. For media,
-the extension carries a hop-local sequence and compact playout timestamp.
-Feedback uses the same header and interprets the body through the envelope type.
-
-In-process shard transport currently carries the typed envelope and owned
-payload through bounded mailboxes. The same envelope is the cross-node wire
-contract; semantic ids are not added when transport moves off-node.
+Same-node transfers use typed messages in bounded shard mailboxes. Network
+forwarding carries one Fabric image per protected datagram. There is no
+normalized media or DATA envelope on a network peer and no decoder fallback.
+A peer without Fabric carries only the separate reverse-control envelope and
+the peer control lane.
 
 ## Invariants
 

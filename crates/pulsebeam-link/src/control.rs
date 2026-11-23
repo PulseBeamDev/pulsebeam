@@ -2,9 +2,9 @@
 
 use super::{Fence, LinkTime, Ordering, SendErrorKind, Shared, network};
 
-pub const CONTROL_FRAME_BYTES: usize = 1024;
+pub(super) use pulsebeam_transport::CONTROL_CONTEXT as CONTEXT;
+pub use pulsebeam_transport::CONTROL_FRAME_BYTES;
 const CAPACITY: std::num::NonZeroUsize = const { std::num::NonZeroUsize::new(16).unwrap() };
-pub(super) const CONTEXT: [u8; 4] = [0; 4];
 
 pub struct PeerControl {
     state: Shared<Fence>,

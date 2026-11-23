@@ -13,6 +13,32 @@ pub mod state {
 
     include!(concat!(env!("OUT_DIR"), "/pulsebeam.media.v1.rs"));
 
+    impl SctpDataV1Parameters {
+        pub fn format(&self) -> Option<crate::data_endpoint::Format> {
+            use crate::data_endpoint::{Delivery, Format};
+            if !matches!(self.stream_id, Some(1..=65534)) || self.channel_incarnation == 0 {
+                return None;
+            }
+            let delivery = match DataV1Delivery::try_from(self.delivery).ok()? {
+                DataV1Delivery::Unreliable => Delivery::Unreliable,
+                DataV1Delivery::Latest => Delivery::Latest,
+                DataV1Delivery::Reliable => Delivery::Reliable,
+                DataV1Delivery::Unspecified => return None,
+            };
+            Format::negotiate(u8::try_from(self.version).ok(), delivery)
+        }
+    }
+
+    impl DataV1ReceiverOffer {
+        pub fn endpoint(&self) -> Option<crate::data_control::SubscriberBinding> {
+            use core::num::NonZeroU64;
+            Some(crate::data_control::SubscriberBinding {
+                source: NonZeroU64::new(self.source)?,
+                branch: NonZeroU64::new(self.branch)?,
+            })
+        }
+    }
+
     impl core::fmt::Debug for SuccessorReceipt {
         fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
             formatter.write_str("SuccessorReceipt([redacted])")
@@ -38,7 +64,9 @@ pub mod state {
 }
 
 pub mod catalog;
-pub mod topic;
+pub mod data_control;
+pub mod data_endpoint;
+pub mod data_record;
 pub mod rtp_extensions {
     /// RTP header extension IDs that are reserved by PulseBeam.
     ///

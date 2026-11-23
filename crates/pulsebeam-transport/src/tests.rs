@@ -19,7 +19,7 @@ pub(super) struct Pair {
     ba: SocketAddr,
     ab: VecDeque<Vec<u8>>,
     ba_out: VecDeque<Vec<u8>>,
-    received: Vec<(Vec<u8>, [u8; 4], ReceiveTime)>,
+    received: Vec<(Vec<u8>, Option<[u8; 4]>, ReceiveTime)>,
     pub(super) now: Time,
 }
 
@@ -32,6 +32,18 @@ impl Pair {
         if quic {
             return Self::quic(wrong_pin);
         }
+        Self::dtls(wrong_pin, None)
+    }
+
+    fn dtls(wrong_pin: bool, fabric: Option<FabricPath>) -> Self {
+        Self::dtls_profiles(wrong_pin, fabric, fabric)
+    }
+
+    fn dtls_profiles(
+        wrong_pin: bool,
+        initiator: Option<FabricPath>,
+        responder: Option<FabricPath>,
+    ) -> Self {
         let ca = Credential::generate().unwrap();
         let cb = Credential::generate().unwrap();
         let aa = "127.0.0.1:5000".parse().unwrap();
@@ -41,21 +53,31 @@ impl Pair {
         } else {
             cb.fingerprint()
         };
-        let a = Transport::new(Peer {
-            endpoint: ba,
-            credential: ca.clone(),
-            expected_peer,
-            role: PeerRole::Initiator,
-            class: NetworkClass::Lan,
-        })
+        let config = |dtls: Peer, fabric| match fabric {
+            Some(path) => PeerConfig::Fabric(FabricPeer { dtls, path }),
+            None => PeerConfig::Dtls(dtls),
+        };
+        let a = Transport::new(config(
+            Peer {
+                endpoint: ba,
+                credential: ca.clone(),
+                expected_peer,
+                role: PeerRole::Initiator,
+                class: NetworkClass::Lan,
+            },
+            initiator,
+        ))
         .unwrap();
-        let b = Transport::new(Peer {
-            endpoint: aa,
-            credential: cb,
-            expected_peer: ca.fingerprint(),
-            role: PeerRole::Responder,
-            class: NetworkClass::Wan,
-        })
+        let b = Transport::new(config(
+            Peer {
+                endpoint: aa,
+                credential: cb,
+                expected_peer: ca.fingerprint(),
+                role: PeerRole::Responder,
+                class: NetworkClass::Wan,
+            },
+            responder,
+        ))
         .unwrap();
         Self {
             a,
@@ -208,6 +230,112 @@ impl Pair {
 }
 
 #[test]
+fn pinned_dtls_without_matching_capability_never_enables_fabric() {
+    let path = FabricPath {
+        udp_payload_limit: 1200,
+        additional_overhead: 0,
+    };
+    for (offer, reply) in [(Some(path), None), (None, Some(path))] {
+        let mut pair = Pair::dtls_profiles(false, offer, reply);
+        pair.start();
+        let mut failure = None;
+        for _ in 0..2500 {
+            if let Err(error) = pair.step() {
+                failure = Some(error);
+                break;
+            }
+            let fabric = if offer.is_some() {
+                &mut pair.a
+            } else {
+                &mut pair.b
+            };
+            assert!(!fabric.health().ready);
+            assert_eq!(
+                fabric.try_submit_fabric(&[1; 1152], Time(pair.now.0 + 100_000_000)),
+                Err(Error::NotReady)
+            );
+        }
+        assert_eq!(failure, Some(Error::UnsupportedProfile));
+        let (fabric, legacy) = if offer.is_some() {
+            (&pair.a, &pair.b)
+        } else {
+            (&pair.b, &pair.a)
+        };
+        assert_eq!(fabric.health().closed, Some(Error::UnsupportedProfile));
+        assert!(legacy.health().ready);
+        assert_eq!(fabric.health().sent, 0);
+        assert!(pair.received.is_empty());
+    }
+}
+
+#[test]
+fn fabric_path_refuses_incapable_admission_and_rechecks_staged_datagrams() {
+    let good = FabricPath {
+        udp_payload_limit: 1200,
+        additional_overhead: 20,
+    };
+    let exceeds_overhead = FabricPath {
+        additional_overhead: 21,
+        ..good
+    };
+    let shrunk = FabricPath {
+        udp_payload_limit: 1199,
+        ..good
+    };
+    assert!(good.qualifies());
+    assert!(!exceeds_overhead.qualifies());
+    assert!(!shrunk.qualifies());
+    let mut pair = Pair::dtls(false, Some(good));
+    pair.connect();
+    let image: Vec<_> = (0_u16..1152)
+        .map(|position| position.to_be_bytes()[1])
+        .collect();
+    let expiry = Time(pair.now.0 + 1_000_000_000);
+    assert_eq!(pair.a.payload_capacity(), 1152);
+    assert_eq!(
+        pair.a.try_submit([0; 4], &image, expiry),
+        Err(Error::UnsupportedProfile)
+    );
+    assert_eq!(
+        pair.a.try_submit_fabric(&[0; 1153], expiry),
+        Err(Error::Oversize)
+    );
+    pair.a.set_fabric_path(exceeds_overhead).unwrap();
+    assert_eq!(
+        pair.a.try_submit_fabric(&image, expiry),
+        Err(Error::PathIncapable)
+    );
+    assert_eq!(pair.a.health().staging.datagrams, 0);
+    pair.a.set_fabric_path(good).unwrap();
+    pair.a.try_submit_fabric(&image, expiry).unwrap();
+    pair.a.set_fabric_path(shrunk).unwrap();
+    pair.step().unwrap();
+    assert!(pair.received.is_empty());
+    assert_eq!(pair.a.health().sent, 0);
+    assert_eq!(pair.a.health().send_failed, 1);
+    assert_eq!(pair.a.health().staging.datagrams, 0);
+    pair.a.set_fabric_path(good).unwrap();
+    for _ in 0..100 {
+        match pair.a.admission() {
+            Ok(()) => break,
+            Err(Error::Blocked) => pair.step().unwrap(),
+            Err(error) => panic!("unexpected admission result after restoring path: {error:?}"),
+        }
+    }
+    pair.a.try_submit_fabric(&image, expiry).unwrap();
+    pair.poll(16).unwrap();
+    assert_eq!(pair.ab.iter().map(Vec::len).collect::<Vec<_>>(), [1180]);
+    for _ in 0..100 {
+        pair.step().unwrap();
+    }
+    assert_eq!(pair.received.len(), 1);
+    assert_eq!(pair.received[0].0, image);
+    assert_eq!(pair.received[0].1, None);
+    assert_eq!(pair.a.health().sent, 1);
+    assert_eq!(pair.a.health().bytes_in_flight, 0);
+}
+
+#[test]
 fn standalone_datagrams_preserve_context_boundaries_and_original_observations() {
     for quic in [false, true] {
         standalone_datagrams_preserve_context_boundaries_and_original_observations_case(quic);
@@ -230,7 +358,7 @@ fn standalone_datagrams_preserve_context_boundaries_and_original_observations_ca
     assert_eq!(pair.a.health().staging.datagrams, 0);
     assert_eq!(pair.received.len(), 1);
     assert_eq!(pair.received[0].0, payload);
-    assert_eq!(pair.received[0].1, [1, 2, 3, 4]);
+    assert_eq!(pair.received[0].1, Some([1, 2, 3, 4]));
     assert_eq!(pair.received[0].2.wall, Some(SystemTime::UNIX_EPOCH));
     assert_eq!(pair.a.health().bytes_in_flight, 0);
     assert_eq!(pair.a.health().sent, 1);

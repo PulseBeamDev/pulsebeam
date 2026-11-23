@@ -121,6 +121,7 @@ fn live(revision: u64, spec: wire::ResourceSpec) -> wire::ConfirmedState {
         rejection: None,
         value: Some(wire::confirmed_state::Value::Owned(Box::new(
             wire::LiveResource {
+                data_v1_source: None,
                 spec: Some(spec),
                 participant: Some(participant()),
                 track: Some(wire::Track {
@@ -292,6 +293,7 @@ fn pending_resource_coalesces_without_blocking_other_resources_or_retirement() {
 
 fn audio_parameters(cname: String) -> wire::RtpParameters {
     wire::RtpParameters {
+        extmap_allow_mixed: None,
         mid: "receive".into(),
         codec: Some(wire::RtpCodecParameters {
             payload_type: Some(111),

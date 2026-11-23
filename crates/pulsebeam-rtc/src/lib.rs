@@ -33,7 +33,11 @@ mod test_support;
 pub use connection::{AcceptedConnection, RtcConnection};
 pub use id::DataChannelId;
 pub use io::*;
-pub use rtp::{RtpExtension, RtpHeader, RtpPacket, RtpWrite, SenderReport};
+pub use rtp::{
+    AuthenticatedRtp, BoundedRtp, MediaScope, RtpClockAnchor, RtpExtension, RtpExtensionForm,
+    RtpHeader, RtpPacket, RtpReceiveBinding, RtpReceiveCodec, RtpReceiveExtension, RtpWrite,
+    SenderReport,
+};
 pub use sctp::{DataChannelInstallation, DataChannelInstallationState};
 pub use session::{
     CodecInfo, CodecProfile, ConnectionConfig, ConnectionLimits, DataChannelConfig,

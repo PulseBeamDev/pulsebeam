@@ -5,6 +5,8 @@ mod extensions;
 pub use extensions::RtpExtensions;
 #[cfg(debug_assertions)]
 pub mod egress_guard;
+pub mod fabric_egress;
+pub mod fabric_ingress;
 pub mod frame_selector;
 pub mod h264;
 pub mod monitor;
@@ -189,11 +191,6 @@ impl RtpPacket {
             ext_vals: self.ext_vals.to_transit(),
             ..self.clone()
         }
-    }
-
-    pub fn with_playout_time(mut self, playout_time: Instant) -> Self {
-        self.playout_time = playout_time;
-        self
     }
 }
 

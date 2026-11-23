@@ -63,12 +63,13 @@ fn gso_validation_is_whole_input_and_never_implicitly_falls_back() {
         gro: true,
         max_gso_segments: MAX_GSO_SEGMENTS,
     };
-    assert!(validate_send(&[entry(b"abcde", Some(2))], caps).is_ok());
+    assert!(validate_send(&[entry(b"abcde", Some(2))], caps, MAX_DATAGRAM_BYTES).is_ok());
     for (payload, segment) in [(vec![0; 65], 1), (vec![0; 2], 2), (vec![0; 65_536], 1200)] {
         assert!(
             validate_send(
                 &[entry(b"valid", None), entry(&payload, Some(segment))],
-                caps
+                caps,
+                MAX_DATAGRAM_BYTES,
             )
             .is_err()
         );
@@ -79,13 +80,129 @@ fn gso_validation_is_whole_input_and_never_implicitly_falls_back() {
         max_batch_messages: 1,
     };
     assert_eq!(
-        validate_send(&[entry(b"abc", Some(2))], scalar)
+        validate_send(&[entry(b"abc", Some(2))], scalar, MAX_DATAGRAM_BYTES)
             .unwrap_err()
             .kind(),
         io::ErrorKind::Unsupported
     );
-    assert!(validate_send(&[entry(&[], None)], scalar).is_ok());
-    assert!(validate_send(&[entry(&vec![0; MAX_DATAGRAM_BYTES + 1], None)], caps).is_err());
+    assert!(validate_send(&[entry(&[], None)], scalar, MAX_DATAGRAM_BYTES).is_ok());
+    assert!(
+        validate_send(
+            &[entry(&vec![0; MAX_DATAGRAM_BYTES + 1], None)],
+            caps,
+            MAX_DATAGRAM_BYTES
+        )
+        .is_err()
+    );
+    let aggregate = [0; 2434];
+    assert!(validate_send(&[entry(&aggregate, Some(1216))], caps, 1216).is_ok());
+    assert!(validate_send(&[entry(&aggregate, Some(1217))], caps, 1216).is_err());
+}
+
+#[cfg(all(target_os = "linux", not(feature = "sim")))]
+#[tokio::test]
+async fn nonfragmenting_policy_allows_1216_and_rejects_1217_before_socket_submission() {
+    fn datagram(destination: SocketAddr, payload: &[u8]) -> SendDatagram<'_> {
+        SendDatagram {
+            destination,
+            ..entry(payload, None)
+        }
+    }
+    for addr in ["127.0.0.1:0", "[::1]:0"] {
+        let mut options = BindOptions::new(addr.parse().unwrap());
+        options.nonfragmenting_max_datagram_bytes = NonZeroU16::new(1216);
+        options.mode = Mode::Scalar;
+        let mut socket = bind(options).await.unwrap().activate().unwrap();
+        let receiver = tokio::net::UdpSocket::bind(addr).await.unwrap();
+        let destination = receiver.local_addr().unwrap();
+        assert_eq!(
+            socket.nonfragmenting_max_datagram_bytes(),
+            NonZeroU16::new(1216)
+        );
+        assert_eq!(
+            socket
+                .try_send_batch(&[
+                    datagram(destination, &[0; 1215]),
+                    datagram(destination, &[0; 1217])
+                ])
+                .accepted,
+            0
+        );
+        assert_eq!(socket.counters().submitted_datagrams, 0);
+        for bytes in [1215, 1216] {
+            socket.writable().await.unwrap();
+            let image = vec![0x7b; bytes];
+            let report = socket.try_send_batch(&[datagram(destination, &image)]);
+            assert_eq!(report.accepted, 1);
+            assert!(report.stop.is_none());
+            let mut received = [0; 1217];
+            let (len, _) = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                receiver.recv_from(&mut received),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(received[..len], image);
+        }
+        assert_eq!(socket.counters().submitted_datagrams, 2);
+    }
+}
+
+#[cfg(all(target_os = "linux", not(feature = "sim")))]
+#[tokio::test]
+async fn ecn_preserves_ip_codepoints_without_dscp_in_scalar_and_batch_receive() {
+    use nix::sys::socket::{setsockopt, sockopt};
+
+    for addr in ["127.0.0.1:0", "[::1]:0"] {
+        for mode in [Mode::Scalar, Mode::Batch] {
+            let mut options = BindOptions::new(addr.parse().unwrap());
+            options.mode = mode;
+            options.receive_ecn = true;
+            let mut receiver = bind(options).await.unwrap().activate().unwrap();
+            let sender = std::net::UdpSocket::bind(addr).unwrap();
+            let traffic_class = 0xa3;
+            if receiver.local_addr().is_ipv4() {
+                setsockopt(&sender, sockopt::Ipv4Tos, &traffic_class).unwrap();
+            } else {
+                setsockopt(&sender, sockopt::Ipv6TClass, &traffic_class).unwrap();
+            }
+            sender.send_to(b"mark", receiver.local_addr()).unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(1), receiver.readable())
+                .await
+                .unwrap()
+                .unwrap();
+            let batch = receiver.try_recv_batch().unwrap();
+            let datagram = batch.iter().next().unwrap();
+            assert_eq!(datagram.payload, b"mark");
+            assert_eq!(datagram.ecn, Some(Ecn::Ce));
+
+            let destination = receiver.local_addr();
+            for (payload, ecn) in [
+                (b"media".as_slice(), Ecn::Ect0),
+                (b"control".as_slice(), Ecn::NotEct),
+            ] {
+                let report = if ecn == Ecn::Ect0 {
+                    receiver.try_send_ect0(destination, payload)
+                } else {
+                    receiver.try_send_batch(&[SendDatagram {
+                        destination,
+                        payload,
+                        gso_segment_size: None,
+                    }])
+                };
+                assert_eq!(report.accepted, 1);
+                tokio::time::timeout(std::time::Duration::from_secs(1), receiver.readable())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let batch = receiver.try_recv_batch().unwrap();
+                let datagram = batch.iter().next().unwrap();
+                assert_eq!(datagram.payload, payload);
+                assert_eq!(datagram.ecn, Some(ecn));
+            }
+        }
+    }
 }
 
 #[test]
@@ -103,6 +220,7 @@ fn borrowed_receive_splits_short_gro_tail_and_zero_length_datagrams() {
         source,
         destination,
         received_at,
+        ecn: Some(Ecn::Ce),
         len: 7,
         stride: 3,
     });
@@ -110,11 +228,16 @@ fn borrowed_receive_splits_short_gro_tail_and_zero_length_datagrams() {
         source,
         destination,
         received_at,
+        ecn: None,
         len: 0,
         stride: 1,
     });
     let batch = RecvBatch { arena: &arena };
     let datagrams: Vec<_> = batch.iter().collect();
+    assert_eq!(
+        datagrams.iter().map(|d| d.ecn).collect::<Vec<_>>(),
+        [Some(Ecn::Ce), Some(Ecn::Ce), Some(Ecn::Ce), None]
+    );
     assert_eq!(
         datagrams.iter().map(|d| d.payload).collect::<Vec<_>>(),
         [b"abc".as_slice(), b"def", b"g", b""]

@@ -2,7 +2,6 @@ use std::time::Duration;
 
 use super::*;
 use crate::control::controller::ownership::receipt::{issue_accepted, validate_successor};
-use pulsebeam_core::identity::NodeId;
 
 const LEASE: Duration = Duration::from_secs(10);
 
@@ -14,8 +13,9 @@ impl Trust {
         now: Instant,
         deadline: Instant,
     ) -> Result<Vec<Key>, Error> {
-        let checkpoint = self.validate_checkpoint(rev, checkpoint, now, deadline)?;
-        Ok(self.install_checkpoint(checkpoint))
+        let origin = (checkpoint.issuer.node, checkpoint.issuer.incarnation);
+        let checkpoint = self.validate_checkpoint(origin, rev, checkpoint, now, deadline)?;
+        self.install_checkpoint(checkpoint)
     }
 }
 
@@ -125,6 +125,48 @@ fn retirement_cannot_be_forgotten_on_expiry_or_epoch_mismatch() {
         ),
         Err(Error::Invalid)
     );
+}
+
+#[test]
+fn pinned_peers_have_independent_revisions_and_cannot_install_each_others_checkpoints() {
+    let (mut a, mut b) = pair();
+    let c_key = ApiSigningKey::from_seed([33; 32]);
+    let c_id = Issuer {
+        node: NodeId::new(),
+        ..a.issuer()
+    };
+    a.pin_peer(c_id, c_key.public_key()).unwrap();
+    let mut c = Trust::new(c_id, c_key, a.issuer(), a.key.public_key()).unwrap();
+    let now = Instant::now();
+    let deadline = now + LEASE;
+    let wrong_origin = (b.issuer().node, b.issuer().incarnation);
+    assert!(matches!(
+        a.validate_checkpoint(wrong_origin, rev(2), c.checkpoint(), now, deadline),
+        Err(Error::Invalid)
+    ));
+    assert!(matches!(
+        a.validate_checkpoint((c_id.node, rev(2)), rev(1), c.checkpoint(), now, deadline),
+        Err(Error::Invalid)
+    ));
+
+    a.apply(rev(7), b.checkpoint(), now, deadline).unwrap();
+    assert!(!a.admission_ready(now));
+    a.apply(rev(1), c.checkpoint(), now, deadline).unwrap();
+    assert!(a.admission_ready(now));
+    let endpoint = endpoint();
+    let rank = ClaimRank::root(ConnectionId::new());
+    c.retire(endpoint, rank);
+    assert_eq!(
+        a.apply(rev(2), c.checkpoint(), now, deadline),
+        Ok(vec![(endpoint, rank.lineage())])
+    );
+    b.records
+        .entry((endpoint, rank.lineage()))
+        .or_default()
+        .issued_through = 100;
+    a.apply(rev(8), b.checkpoint(), now, deadline).unwrap();
+    assert!(a.is_retired(endpoint, rank));
+    assert!(!a.admission_ready(deadline));
 }
 
 #[test]

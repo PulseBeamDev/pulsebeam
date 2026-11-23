@@ -89,26 +89,30 @@ fn inactive_allocations() {
 #[test]
 fn rate_and_dimension_boundaries() {
     let mut wire = vec![1, 0];
-    wire.extend_from_slice(&[0xff; 8]);
-    wire.push(0x7f);
+    wire.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 0x8f, 0x80, 0x80, 0]);
     wire.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 255]);
     assert_eq!(
         VideoLayersAllocation::parse(&wire),
         Ok(VideoLayersAllocation {
             current_simulcast_stream_index: 0,
             simulcast_streams: vec![SimulcastStreamAllocation {
-                spatial_layers: vec![layer(&[u64::MAX >> 1], Some((65536, 65536, 255)))],
+                spatial_layers: vec![layer(&[u64::from(u32::MAX)], Some((65536, 65536, 255)))],
             }],
         })
     );
-    wire.clear();
-    wire.extend_from_slice(&[1, 0]);
-    wire.extend_from_slice(&[0x80; 9]);
-    wire.push(0);
-    assert_eq!(
-        VideoLayersAllocation::parse(&wire),
-        Err(VlaReadError::Invalid)
-    );
+    assert_eq!(validate(&wire), Ok(()));
+    for rate in [
+        &[0x80, 0x80, 0x80, 0x80, 0x10][..], // u32::MAX + 1
+        &[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0][..],
+    ] {
+        let mut wire = vec![1, 0];
+        wire.extend_from_slice(rate);
+        assert_eq!(
+            VideoLayersAllocation::parse(&wire),
+            Err(VlaReadError::Invalid)
+        );
+        assert_eq!(validate(&wire), Err(VlaReadError::Invalid));
+    }
 }
 
 #[test]
@@ -118,6 +122,13 @@ fn rejects_invalid_counts_rates_and_tails() {
             VideoLayersAllocation::parse(wire),
             Err(VlaReadError::Truncated)
         );
+    }
+    for wire in [[0, 0x11, 0, 1], [1, 0x01, 1, 0]] {
+        assert_eq!(
+            VideoLayersAllocation::parse(&wire),
+            Err(VlaReadError::Invalid)
+        );
+        assert_eq!(validate(&wire), Err(VlaReadError::Invalid));
     }
     assert_eq!(
         VideoLayersAllocation::parse(&[0xc1, 0, 1]),
@@ -204,7 +215,7 @@ proptest! {
                 for spatial in stream.spatial_layers {
                     prop_assert!(spatial.temporal_layers.len() <= 4);
                     for temporal in spatial.temporal_layers {
-                        prop_assert!(temporal.cumulative_kbps <= u64::MAX >> 1);
+                        prop_assert!(u32::try_from(temporal.cumulative_kbps).is_ok());
                     }
                     if let Some(size) = spatial.resolution_and_framerate {
                         prop_assert!((1..=65536).contains(&size.width));

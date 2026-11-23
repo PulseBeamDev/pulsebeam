@@ -77,8 +77,8 @@ impl IngressOwner {
                         .get(&media)?
                         .extensions
                         .iter()
-                        .find(|(id, _)| *id == value.id())
-                        .map(|(_, uri)| (uri.as_ref(), value.range()))
+                        .find(|ext| ext.id == value.id())
+                        .map(|ext| (ext.uri.as_ref(), value.range()))
                 })
         };
         let (count, strings) =

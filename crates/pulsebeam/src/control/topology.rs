@@ -251,6 +251,7 @@ impl TrackTopology {
         Some(&mut publication.track)
     }
 
+    #[cfg(test)]
     pub(crate) fn subscribe(
         &mut self,
         room_id: ProjectRoomKey,
@@ -343,6 +344,7 @@ impl TrackTopology {
         room.unsubscribe(id)
     }
 
+    #[cfg(test)]
     pub(crate) fn remove_matching(
         &mut self,
         room_id: ProjectRoomKey,

@@ -102,24 +102,17 @@ execution failure. Failure closes forwarding and demand for that lifetime;
 settings or source availability cannot revive it. Withdrawal and physical
 cleanup retain the existing authorization, source and retirement fences.
 
-## Enumeration and ordered recovery
+## Enumeration and DATA bindings
 
 The server's `initial_complete` marker means every initially visible key has
 been represented. It is not an atomic snapshot, a batch acknowledgment, latest
 desired-state convergence or evidence that an undiscovered source has ended.
 Apply records before observing the marker.
 
-Native data subscriptions name an exact opaque source and an actual prepared
-payload binding. Recovery must preserve still-owned ordered frontiers across
-transport replacement, without retaining queued payloads or using empty
-discovery to infer retirement. Probes need current owned confirmation and source
-facts; an unknown-source timeout or internal failure is not authoritative source
-termination.
-
-See [Core ordered recovery](../../agents/pulsebeam-agent-core/README.md#ordered-subscription-recovery)
-for frontier ownership. New source IDs start live; explicit unsubscribe and
-session close release frontiers. TopicFrame payload and bounded ordered-gap
-semantics are unchanged.
+Exchange payloads only after DATA v1 negotiation and confirmation of the exact
+source and payload binding. SCTP carries one binary DATA record per message.
+Reliable control is separate from payload records and reports per-unit outcomes;
+it does not guarantee ordering across units.
 
 ## Unsupported receive settings
 

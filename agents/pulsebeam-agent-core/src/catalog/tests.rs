@@ -38,7 +38,6 @@ fn records(
     tracks: usize,
 ) -> Vec<wire::CatalogPageRecord> {
     let entry = wire::CatalogParticipantEntry {
-        data_recipient_id: Some("pbr_00000000000070008000000000000004".into()),
         participant: Some(wire::Participant {
             participant_id: participant.into(),
 
@@ -119,17 +118,12 @@ fn agent_emits_raw_open_observes_page_and_closes_without_receive_demand() {
         .handle(HostEvent::DataChannel(DataChannelEvent::Message {
             generation,
             channel,
+            binary: true,
             payload: codec::encode_server(&response).unwrap(),
         }))
         .unwrap();
     let state = agent.catalog_watch_state(owner).unwrap();
     assert_eq!(state.status, WatchStatus::Live);
-    assert_eq!(
-        state.page.as_ref().unwrap().participants()[0]
-            .data_recipient_id
-            .as_deref(),
-        Some("pbr_00000000000070008000000000000004")
-    );
     assert!(
         state.page.as_ref().unwrap().participants()[0]
             .publications
@@ -152,6 +146,7 @@ fn agent_emits_raw_open_observes_page_and_closes_without_receive_demand() {
         .handle(HostEvent::DataChannel(DataChannelEvent::Message {
             generation,
             channel,
+            binary: true,
             payload: codec::encode_server(&response).unwrap(),
         }))
         .unwrap();
@@ -195,6 +190,7 @@ fn failed_watch_projection_survives_until_terminal_notification_transfer_without
         .handle(HostEvent::DataChannel(DataChannelEvent::Message {
             generation,
             channel,
+            binary: true,
             payload: codec::encode_server(&response).unwrap(),
         }))
         .unwrap();

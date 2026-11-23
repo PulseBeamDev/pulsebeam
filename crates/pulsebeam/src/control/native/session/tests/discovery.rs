@@ -243,7 +243,9 @@ fn scope_reconciliation_withholds_stale_catalog_rows_and_preserves_independent_r
     settle(&mut model, &[], &publisher);
     let owner = publisher;
     let connection = ConnectionId::new();
-    let mut tracks = vec![track(connection, owner, "allowed")];
+    let mut meta = track(connection, owner, "allowed").meta().clone();
+    meta.id = connection.fixture_publication(TrackKind::Audio, "allowed");
+    let mut tracks = vec![crate::control::native::fixture::audio_track(meta)];
     for index in 0..SELECT_WORK + 4 {
         tracks.push(track(connection, owner, &format!("hidden-{index}")));
     }
@@ -256,33 +258,21 @@ fn scope_reconciliation_withholds_stale_catalog_rows_and_preserves_independent_r
             .unwrap();
     }
     let target = tracks[0].id();
-    let spec = wire::ResourceSpec {
-        settings: Some(wire::ResourceSettings {
-            enabled: Some(true),
-            receive: None,
-        }),
-        declaration: Some(wire::resource_spec::Declaration::Subscription(
-            wire::SubscriptionSpec {
-                publication_id: target.as_str(),
-                kind: wire::TrackKind::Data as i32,
-                source_room: "room".into(),
-                binding: Some(wire::TrackBinding {
-                    transport: Some(wire::track_binding::Transport::Sctp(wire::SctpParameters {
-                        stream_id: Some(1),
-                    })),
-                }),
-            },
-        )),
-    };
+    let spec = crate::control::native::fixture::audio_receiver(target, "room");
     input(&mut model, vec![present(1, 1, spec)]).unwrap();
     let work = model.take_preparation().unwrap().unwrap();
     model
-        .prepare_execution(&work, 100, None, |_| {
-            Some(ResolvedSource {
-                track: &tracks[0],
-                publisher: &publisher,
-            })
-        })
+        .prepare_execution(
+            &work,
+            100,
+            Some(&crate::control::rtp::capabilities()),
+            |_| {
+                Some(ResolvedSource {
+                    track: &tracks[0],
+                    publisher: &publisher,
+                })
+            },
+        )
         .unwrap()
         .unwrap();
     model
@@ -308,7 +298,7 @@ fn scope_reconciliation_withholds_stale_catalog_rows_and_preserves_independent_r
             2,
             scope(
                 vec![Action::Subscribe],
-                Some(GrantKind::Data),
+                Some(GrantKind::Audio),
                 Some("allowed"),
             ),
         )
@@ -375,7 +365,7 @@ fn scope_reconciliation_withholds_stale_catalog_rows_and_preserves_independent_r
             3,
             scope(
                 vec![Action::Discover, Action::Subscribe],
-                Some(GrantKind::Data),
+                Some(GrantKind::Audio),
                 Some("allowed"),
             ),
         )

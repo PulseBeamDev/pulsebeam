@@ -134,78 +134,13 @@ fn data_channel_does_not_loop_back_to_publisher_test() {
         ]);
 }
 
-#[test]
-fn ordered_data_channel_does_not_loop_back_to_publisher_test() {
-    LocalNodeSim::new()
-        .with_room(
-            Room::new("room-ordered-data-no-loopback")
-                .with_participant(Participant::data_participant("publisher"))
-                .with_participant(Participant::data_participant("subscriber")),
-        )
-        .run(vec![
-            Step::DeclarePublishTopic {
-                mode: TopicMode::Ordered,
-                description: "Publisher declares the ordered topic",
-                participant: "publisher",
-                topic: "ordered_no_loopback",
-            },
-            Step::DeclareSubscribeTopic {
-                mode: TopicMode::Ordered,
-                description: "Publisher opens an ordered receive subscription to itself",
-                participant: "publisher",
-                topic: "ordered_no_loopback",
-            },
-            Step::DeclareSubscribeTopic {
-                mode: TopicMode::Ordered,
-                description: "A second participant subscribes to the ordered topic",
-                participant: "subscriber",
-                topic: "ordered_no_loopback",
-            },
-            Step::Run {
-                description: "Install both ordered subscriptions",
-                duration: Duration::from_secs(2),
-            },
-            Step::PublishData {
-                mode: TopicMode::Ordered,
-                description: "Publisher sends one ordered payload",
-                participant: "publisher",
-                topic: "ordered_no_loopback",
-                data: b"ordered-must-not-return",
-            },
-            Step::Run {
-                description: "Deliver the ordered payload",
-                duration: Duration::from_millis(500),
-            },
-            Step::CheckDataCount {
-                description: "The publisher receives no ordered loopback",
-                participant: "publisher",
-                topic: "ordered_no_loopback",
-                expected: 0,
-            },
-            Step::CheckDataSequence {
-                description: "The subscriber receives the ordered payload",
-                participant: "subscriber",
-                topic: "ordered_no_loopback",
-                expected: &[b"ordered-must-not-return"],
-            },
-        ]);
-}
-
 /// Long per-mode labels retain independent same-label publisher tracks.
 #[test]
-fn all_topic_modes_preserve_same_label_fanin_without_cross_delivery() {
+fn latest_and_lossy_preserve_same_label_fanin_without_cross_delivery() {
     const LATEST_TOPIC: &str = "latest-12345678901234567890123456789";
     const LOSSY_TOPIC: &str = "lossy-123456789012345678901234567890";
-    const ORDERED_TOPIC: &str = "ordered-1234567890123456789012345678";
     let mut room = Room::new("data-modes");
-    for name in [
-        "pub-a",
-        "pub-b",
-        "latest-sub",
-        "lossy-sub",
-        "ordered-sub",
-        "all-sub",
-    ] {
+    for name in ["pub-a", "pub-b", "latest-sub", "lossy-sub", "all-sub"] {
         room = room.with_participant(Participant::data_participant(name));
     }
     let modes = [
@@ -222,13 +157,6 @@ fn all_topic_modes_preserve_same_label_fanin_without_cross_delivery() {
             "lossy-sub",
             b"lossy-a".as_slice(),
             b"lossy-b".as_slice(),
-        ),
-        (
-            TopicMode::Ordered,
-            ORDERED_TOPIC,
-            "ordered-sub",
-            b"ordered-a".as_slice(),
-            b"ordered-b".as_slice(),
         ),
     ];
     let mut plan = Vec::new();
@@ -251,7 +179,7 @@ fn all_topic_modes_preserve_same_label_fanin_without_cross_delivery() {
         }
     }
     plan.push(Step::Run {
-        description: "bind authoritative publications and ordered live frontiers",
+        description: "bind the authoritative DATA tracks",
         duration: Duration::from_secs(2),
     });
     for (mode, topic, _, first, second) in modes {
@@ -289,7 +217,6 @@ fn all_topic_modes_preserve_same_label_fanin_without_cross_delivery() {
                 topic,
                 mode,
                 publishers: &["pub-a", "pub-b"],
-                gap: None,
             });
             for expected in [first, second] {
                 plan.push(Step::CheckDataReceived {
@@ -377,7 +304,7 @@ fn latest_is_monotonic_per_publisher_when_old_packets_arrive_after_new_state() {
             participant,
             topic: "pose",
             mode: TopicMode::Latest,
-            next_sequence: 1,
+            sent_units: 1,
         });
     }
     plan.push(Step::Run {
@@ -433,7 +360,6 @@ fn latest_is_monotonic_per_publisher_when_old_packets_arrive_after_new_state() {
         topic: "pose",
         mode: TopicMode::Latest,
         publishers: &["pub-a", "pub-b"],
-        gap: None,
     });
     plan.push(Step::CheckDataCount {
         description: "a non-subscriber receives no state",
@@ -534,78 +460,78 @@ fn latest_data_topic_survives_same_identity_connection_recovery() {
 }
 
 #[test]
-fn ordered_data_topic_survives_same_identity_connection_recovery() {
+fn lossy_data_topic_survives_same_identity_connection_recovery() {
     LocalNodeSim::new()
         .with_room(
-            Room::new("room-ordered-data-reconnect")
+            Room::new("room-lossy-data-reconnect")
                 .with_participant(Participant::data_participant("pub"))
                 .with_participant(Participant::data_participant("sub")),
         )
         .run(vec![
             Step::DeclarePublishTopic {
-                mode: TopicMode::Ordered,
-                description: "Declare the ordered reconnecting publisher",
+                mode: TopicMode::Lossy,
+                description: "Declare the lossy reconnecting publisher",
                 participant: "pub",
                 topic: "state",
             },
             Step::DeclareSubscribeTopic {
-                mode: TopicMode::Ordered,
-                description: "Declare the ordered subscriber",
+                mode: TopicMode::Lossy,
+                description: "Declare the lossy subscriber",
                 participant: "sub",
                 topic: "state",
             },
             Step::Run {
-                description: "Open the ordered channels",
+                description: "Open the lossy channels",
                 duration: Duration::from_secs(2),
             },
             Step::PublishData {
-                mode: TopicMode::Ordered,
-                description: "Send the first ordered update",
+                mode: TopicMode::Lossy,
+                description: "Send the first lossy update",
                 participant: "pub",
                 topic: "state",
                 data: b"before",
             },
             Step::Run {
-                description: "Deliver the first ordered update",
+                description: "Deliver the first lossy update",
                 duration: Duration::from_secs(1),
             },
             Step::CheckDataSequence {
-                description: "The first ordered update arrived",
+                description: "The first lossy update arrived",
                 participant: "sub",
                 topic: "state",
                 expected: &[b"before"],
             },
             Step::Partition {
-                description: "Partition the ordered publisher connection",
+                description: "Partition the lossy publisher connection",
                 from: "pub",
                 to: "server",
             },
             Step::Run {
-                description: "Wait for the ordered publisher connection to expire",
+                description: "Wait for the lossy publisher connection to expire",
                 duration: Duration::from_secs(12),
             },
             Step::Repair {
-                description: "Repair the ordered publisher path",
+                description: "Repair the lossy publisher path",
                 from: "pub",
                 to: "server",
             },
             Step::Run {
-                description: "Reconnect without redeclaring the ordered topic",
+                description: "Reconnect without redeclaring the lossy topic",
                 duration: Duration::from_secs(12),
             },
             Step::PublishData {
-                mode: TopicMode::Ordered,
-                description: "Send the second ordered update on the remapped channels",
+                mode: TopicMode::Lossy,
+                description: "Send the second lossy update on the remapped channels",
                 participant: "pub",
                 topic: "state",
                 data: b"after",
             },
             Step::Run {
-                description: "Deliver the second ordered update",
+                description: "Deliver the second lossy update",
                 duration: Duration::from_secs(2),
             },
             Step::CheckDataSequence {
-                description: "Both ordered stream generations arrived in order",
+                description: "Both lossy track incarnations delivered exactly once",
                 participant: "sub",
                 topic: "state",
                 expected: &[b"before", b"after"],
@@ -614,16 +540,16 @@ fn ordered_data_topic_survives_same_identity_connection_recovery() {
 }
 
 #[test]
-fn ordered_topic_reconfiguration_preserves_cross_shard_delivery() {
-    ordered_topic_reconfiguration(true);
+fn lossy_topic_reconfiguration_preserves_cross_shard_delivery() {
+    lossy_topic_reconfiguration(true);
 }
 
 #[test]
-fn ordered_topic_subscribers_can_precede_publisher() {
-    ordered_topic_reconfiguration(false);
+fn lossy_topic_subscribers_can_precede_publisher() {
+    lossy_topic_reconfiguration(false);
 }
 
-fn ordered_topic_reconfiguration(publisher_first: bool) {
+fn lossy_topic_reconfiguration(publisher_first: bool) {
     const PREFIX: &[&[u8]] = &[b"pub/v1/first", b"pub/v1/second"];
     const COMPLETE: &[&[u8]] = &[
         b"pub/v1/first",
@@ -633,20 +559,20 @@ fn ordered_topic_reconfiguration(publisher_first: bool) {
     ];
     let mut declarations = vec![
         Step::DeclarePublishTopic {
-            mode: TopicMode::Ordered,
+            mode: TopicMode::Lossy,
             description: "Declare the publisher after initial connection",
             participant: "pub",
             topic: "state",
         },
         Step::DeclareSubscribeTopic {
-            mode: TopicMode::Ordered,
-            description: "First receiver declares the ordered topic",
+            mode: TopicMode::Lossy,
+            description: "First receiver declares the lossy topic",
             participant: "sub_a",
             topic: "state",
         },
         Step::DeclareSubscribeTopic {
-            mode: TopicMode::Ordered,
-            description: "Second receiver declares the ordered topic",
+            mode: TopicMode::Lossy,
+            description: "Second receiver declares the lossy topic",
             participant: "sub_b",
             topic: "state",
         },
@@ -668,13 +594,13 @@ fn ordered_topic_reconfiguration(publisher_first: bool) {
         }
     }
     plan.push(Step::Run {
-        description: "Open the ordered paths after transport reconfiguration",
+        description: "Open the lossy paths after transport reconfiguration",
         duration: Duration::from_secs(2),
     });
     for data in PREFIX {
         plan.push(Step::PublishData {
-            mode: TopicMode::Ordered,
-            description: "Send the original publisher's ordered prefix",
+            mode: TopicMode::Lossy,
+            description: "Send the original publisher's lossy prefix",
             participant: "pub",
             topic: "state",
             data,
@@ -705,8 +631,8 @@ fn ordered_topic_reconfiguration(publisher_first: bool) {
             duration: Duration::from_secs(2),
         },
         Step::DeclarePublishTopic {
-            mode: TopicMode::Ordered,
-            description: "Declare the ordered publisher on the new connection",
+            mode: TopicMode::Lossy,
+            description: "Declare the lossy publisher on the new connection",
             participant: "pub",
             topic: "state",
         },
@@ -717,8 +643,8 @@ fn ordered_topic_reconfiguration(publisher_first: bool) {
     ]);
     for data in &COMPLETE[2..] {
         plan.push(Step::PublishData {
-            mode: TopicMode::Ordered,
-            description: "Send fresh ordered data after publisher rejoin",
+            mode: TopicMode::Lossy,
+            description: "Send fresh lossy data after publisher rejoin",
             participant: "pub",
             topic: "state",
             data,
@@ -745,7 +671,7 @@ fn ordered_topic_reconfiguration(publisher_first: bool) {
     }
     for participant in ["pub", "bystander"] {
         plan.push(Step::CheckDataCount {
-            description: "Unsubscribed participants receive no ordered payloads",
+            description: "Unsubscribed participants receive no lossy payloads",
             participant,
             topic: "state",
             expected: 0,
@@ -756,7 +682,7 @@ fn ordered_topic_reconfiguration(publisher_first: bool) {
         .with_shards(2)
         .with_link(LinkProfile::fiber())
         .with_room(
-            Room::new("ordered-reconfiguration")
+            Room::new("lossy-reconfiguration")
                 .with_participant(Participant::data_participant("pub"))
                 .with_participant(Participant::data_participant("sub_a"))
                 .with_participant(Participant::data_participant("sub_b"))
@@ -766,57 +692,79 @@ fn ordered_topic_reconfiguration(publisher_first: bool) {
 }
 
 #[test]
-fn ordered_recovery_reports_retention_gaps_without_replaying_late_history() {
+fn late_lossy_subscriber_receives_fresh_units_without_replay() {
+    const TRACK: &str = "events";
     LocalNodeSim::new()
         .with_udp_only()
         .with_room(
-            Room::new("room-reliable-xshard")
+            Room::new("late-data-subscriber")
                 .with_participant(Participant::data_participant("pub"))
-                .with_participant(Participant::data_participant("sub_a"))
-                .with_participant(Participant::data_participant("sub_b"))
+                .with_participant(Participant::data_participant("current"))
                 .with_participant(Participant::data_participant("late").starts_disconnected()),
         )
         .run(vec![
             Step::DeclarePublishTopic {
-                mode: TopicMode::Ordered,
-                description: "Declare ordered publisher",
+                mode: TopicMode::Lossy,
+                description: "Publish the lossy track",
                 participant: "pub",
-                topic: "state",
+                topic: TRACK,
             },
             Step::DeclareSubscribeTopic {
-                mode: TopicMode::Ordered,
-                description: "Declare subscriber A",
-                participant: "sub_a",
-                topic: "state",
+                mode: TopicMode::Lossy,
+                description: "Subscribe the initial receiver",
+                participant: "current",
+                topic: TRACK,
             },
             Step::DeclareSubscribeTopic {
-                mode: TopicMode::Ordered,
-                description: "Declare subscriber B",
-                participant: "sub_b",
-                topic: "state",
-            },
-            Step::DeclareSubscribeTopic {
-                mode: TopicMode::Ordered,
-                description: "Reserve late subscriber transport topology",
+                mode: TopicMode::Lossy,
+                description: "Prepare the late receiver",
                 participant: "late",
-                topic: "state",
+                topic: TRACK,
             },
-            Step::OrderedTopicRecovery {
-                publisher: "pub",
-                topic: "state",
-                recovering: ["sub_a", "sub_b"],
-                late: "late",
+            Step::Run {
+                description: "Install the current branch",
+                duration: Duration::from_secs(1),
+            },
+            Step::PublishData {
+                mode: TopicMode::Lossy,
+                description: "Send before the late receiver joins",
+                participant: "pub",
+                topic: TRACK,
+                data: b"prior",
+            },
+            Step::WaitForDataSequence {
+                participant: "current",
+                topic: TRACK,
+                expected: &[b"prior"],
+            },
+            Step::Reconnect {
+                description: "Join the late receiver",
+                participant: "late",
+            },
+            Step::Run {
+                description: "Install the new branch",
+                duration: Duration::from_secs(1),
+            },
+            Step::PublishData {
+                mode: TopicMode::Lossy,
+                description: "Send with both branches installed",
+                participant: "pub",
+                topic: TRACK,
+                data: b"fresh",
+            },
+            Step::WaitForDataSequence {
+                participant: "current",
+                topic: TRACK,
+                expected: &[b"prior", b"fresh"],
+            },
+            Step::WaitForDataSequence {
+                participant: "late",
+                topic: TRACK,
+                expected: &[b"fresh"],
             },
         ]);
 }
 
-/// Data crossing a shard boundary.
-///
-/// The latest data lane has its own route family, its own import lifecycle
-/// and its own wildcard resolution, none of which a co-located room touches.
-/// The hardened simulator default uses multiple shards, so the payload is addressed by a route
-/// the destination allocated, resolved against its `RouteAction::Unreliable { lane }`, and handed
-/// to the subscriber's channel.
 #[test]
 fn cross_shard_data_channel_forwarding_test() {
     LocalNodeSim::new()

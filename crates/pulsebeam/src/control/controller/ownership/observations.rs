@@ -18,6 +18,7 @@ use crate::{
 #[derive(Clone, PartialEq)]
 pub(crate) struct PublicationFact {
     pub(crate) descriptor: Track,
+    pub(crate) fabric_data_source: Option<std::num::NonZeroU64>,
     pub(super) layers: Box<[(SourceEncoding, Option<Rid>, LayerQuality)]>,
 }
 
@@ -25,12 +26,40 @@ impl PublicationFact {
     pub(crate) fn from_track(track: &MediaTrack) -> Option<Self> {
         Some(Self {
             descriptor: crate::control::native::track_descriptor(track)?,
+            fabric_data_source: track.fabric_data_source(),
             layers: track
                 .layers()
                 .iter()
                 .map(|layer| (layer.encoding, layer.rid, layer.quality))
                 .collect(),
         })
+    }
+
+    pub(in crate::control) fn data_publisher(
+        &self,
+        connection: ConnectionId,
+    ) -> Option<crate::route::fabric::DataPublisher> {
+        if !matches!(self.descriptor.kind, Some(track::Kind::Data(_))) {
+            return None;
+        }
+        Some(crate::route::fabric::DataPublisher {
+            publication: PublicationKey::Data(self.descriptor.publication_id.parse().ok()?),
+            connection,
+            incarnation: self.fabric_data_source?,
+        })
+    }
+
+    pub(in crate::control) fn opus_publication(&self) -> Option<PublicationKey> {
+        let track::Kind::Audio(audio) = self.descriptor.kind.as_ref()? else {
+            return None;
+        };
+        let format = audio.format.as_ref()?;
+        if !format.mime_type.eq_ignore_ascii_case("audio/opus") || format.clock_rate != 48_000 {
+            return None;
+        }
+        Some(PublicationKey::Audio(
+            self.descriptor.publication_id.parse().ok()?,
+        ))
     }
 
     pub(crate) fn media_track(
@@ -81,7 +110,7 @@ impl PublicationFact {
                     wire::DataDelivery::Lossy => DataLane::Lossy,
                     wire::DataDelivery::Unspecified => return None,
                 };
-                MediaTrack::data_publication(meta, lane)
+                MediaTrack::native_data_publication(meta, lane, self.fabric_data_source)
             }
         })
     }
@@ -128,6 +157,7 @@ pub(super) fn validate_publications<'a>(
                 None => return Err(Error::Invalid),
             };
             if fact.layers.len() > 3
+                || (fact.fabric_data_source.is_some() && kind != TrackKind::Data)
                 || (kind == TrackKind::Video) == fact.layers.is_empty()
                 || validation::validate_track(publication).is_err()
                 || publication.room_id != endpoint.room.room.as_str()
@@ -423,6 +453,7 @@ impl Observations {
         endpoint: EndpointKey,
         now: Instant,
         eligible: impl Fn(ClaimRank) -> bool,
+        replica_peer: impl Fn(NetworkId) -> bool,
     ) -> Option<(NetworkId, &EndpointFact)> {
         let mut winner: Option<(Option<NetworkId>, &EndpointFact)> = None;
         let mut tied = false;
@@ -435,7 +466,11 @@ impl Observations {
             }
             match winner {
                 Some((_, current)) if current.claim > fact.claim => continue,
-                Some((_, current)) if current.claim == fact.claim => tied = true,
+                Some((current_peer, current)) if current.claim == fact.claim => {
+                    tied |= current != fact
+                        || !current_peer.is_some_and(&replica_peer)
+                        || !origin.network.is_some_and(&replica_peer);
+                }
                 _ => {
                     winner = Some((origin.network, fact));
                     tied = false;
@@ -444,6 +479,31 @@ impl Observations {
         }
         let (network, fact) = winner?;
         (!tied).then_some((network?, fact))
+    }
+
+    pub(crate) fn network_fact(
+        &self,
+        peer: NetworkId,
+        endpoint: EndpointKey,
+        now: Instant,
+    ) -> Option<&EndpointFact> {
+        self.origins
+            .values()
+            .find(|origin| origin.network == Some(peer) && origin.is_fresh(now))?
+            .endpoints
+            .get(&endpoint)
+    }
+
+    pub(crate) fn session_facts(
+        &self,
+        session: Session,
+        now: Instant,
+    ) -> impl Iterator<Item = (&EndpointKey, &EndpointFact)> {
+        self.origins
+            .get(&session.node)
+            .filter(move |origin| origin.session == Some(session.serial) && origin.is_fresh(now))
+            .into_iter()
+            .flat_map(|origin| origin.endpoints.iter())
     }
 
     #[cfg(test)]
@@ -458,6 +518,15 @@ impl Observations {
             .filter(|origin| origin.session == Some(session.serial) && origin.is_fresh(now))?
             .endpoints
             .get(&endpoint)
+    }
+
+    pub(crate) fn session_origin(&self, session: Session) -> Result<(NodeId, NonZeroU64), Error> {
+        let origin = self
+            .origins
+            .get(&session.node)
+            .filter(|origin| origin.session == Some(session.serial))
+            .ok_or(Error::Stale)?;
+        Ok((session.node, origin.incarnation.ok_or(Error::Stale)?))
     }
 
     fn origin(&mut self, session: Session) -> Result<&mut Origin, Error> {
@@ -553,6 +622,7 @@ mod tests {
         };
         let publication_fact = |descriptor| PublicationFact {
             descriptor,
+            fabric_data_source: None,
             layers: Box::new([]),
         };
         let snapshot = |endpoint, descriptor| {
@@ -737,7 +807,7 @@ mod tests {
             role: PeerRole::Initiator,
             class: NetworkClass::Lan,
         };
-        let codec = || crate::link::ShardCodec { origin: now };
+        let codec = || crate::link::ReverseCodec;
         let network = link.open_network(peer.clone(), codec()).unwrap();
         let mut view = Observations::new(2, 1, 2);
         let remote = NodeId::new();
@@ -755,22 +825,90 @@ mod tests {
         install(&mut view, session, 2).unwrap();
         assert_eq!(view.highest(alice, now, |_| true), Some(rank(1)));
         assert_eq!(
-            view.ingress(alice, now, |_| true).map(|(id, _)| id),
+            view.ingress(alice, now, |_| true, |_| false)
+                .map(|(id, _)| id),
             Some(network)
         );
         link.close_network(network);
         assert_eq!(view.close_network(network), vec![alice]);
         assert_eq!(view.highest(alice, now, |_| true), None);
-        assert!(view.ingress(alice, now, |_| true).is_none());
+        assert!(view.ingress(alice, now, |_| true, |_| false).is_none());
         assert_eq!(install(&mut view, session, 3), Err(Error::Stale));
         let next_network = link.open_network(peer, codec()).unwrap();
         let next_session = view.open(remote, revision(1), Some(next_network)).unwrap();
         assert_eq!(install(&mut view, next_session, 2), Err(Error::Stale));
         install(&mut view, next_session, 3).unwrap();
         assert_eq!(
-            view.ingress(alice, now, |_| true).map(|(id, _)| id),
+            view.ingress(alice, now, |_| true, |_| false)
+                .map(|(id, _)| id),
             Some(next_network)
         );
+    }
+
+    #[test]
+    fn exact_wan_replicas_converge_in_either_order_and_conflicts_fail_closed() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(1);
+        let alice = endpoint("alice");
+        let mut link =
+            pulsebeam_link::LinkControl::<()>::new(|| pulsebeam_link::LinkTime::from_nanos(0))
+                .unwrap();
+        let mut peers = [NodeId::new(), NodeId::new()];
+        peers.sort_unstable();
+        let networks = [
+            link.reserve_network_id().unwrap(),
+            link.reserve_network_id().unwrap(),
+        ];
+        for order in [[0, 1], [1, 0]] {
+            let mut view = Observations::new(2, 1, 1);
+            let sessions = std::array::from_fn::<_, 2, _>(|index| {
+                view.open(peers[index], revision(1), Some(networks[index]))
+                    .unwrap()
+            });
+            let selected = |view: &Observations| {
+                view.ingress(alice, now, |_| true, |_| true)
+                    .map(|(peer, _)| peer)
+            };
+            for (step, index) in order.into_iter().enumerate() {
+                view.snapshot(
+                    sessions[index],
+                    revision(1),
+                    claims(&[(alice, rank(1))]),
+                    now,
+                    deadline,
+                )
+                .unwrap();
+                assert_eq!(
+                    selected(&view),
+                    Some(networks[if step == 0 { index } else { 0 }])
+                );
+            }
+            assert!(view.ingress(alice, now, |_| true, |_| false).is_none());
+            let different = PublicationFact {
+                descriptor: Track {
+                    publication_id: PublicationId::mint().to_string(),
+                    room_id: alice.room.room.to_string(),
+                    participant_id: alice.participant.to_string(),
+                    track_id: "conflict".into(),
+                    kind: Some(track::Kind::Data(pulsebeam_proto::state::DataTrack {
+                        delivery: pulsebeam_proto::state::DataDelivery::Latest as i32,
+                    })),
+                },
+                fabric_data_source: None,
+                layers: Box::new([]),
+            };
+            view.snapshot(
+                sessions[0],
+                revision(2),
+                Box::new([(alice, fact(rank(1), [different]))]),
+                now,
+                deadline,
+            )
+            .unwrap();
+            assert_eq!(selected(&view), None);
+            view.close(sessions[0]).unwrap();
+            assert_eq!(selected(&view), Some(networks[1]));
+        }
     }
 
     #[test]

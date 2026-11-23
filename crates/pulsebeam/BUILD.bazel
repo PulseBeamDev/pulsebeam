@@ -25,7 +25,10 @@ rust_library(
     proc_macro_deps = all_crate_deps(proc_macro = True),
 )
 
-filegroup(name = "calibration_inputs", srcs = ["src/shard/router.rs", "src/control/controller.rs"])
+filegroup(
+    name = "calibration_inputs",
+    srcs = ["src/control/controller.rs", "src/route/fabric/local.rs", "src/shard/router.rs"],
+)
 sfu_variant_sources(glob(["README.md", "src/**"], exclude = ["src/bin/**"]))
 
 [rust_library(
@@ -85,11 +88,27 @@ rust_test(
     name = "transport_conformance",
     crate = ":pulsebeam",
     crate_features = ["transport-conformance"],
-    args = ["node::transport_conformance::", "--nocapture"],
+    args = [
+        "node::transport_conformance::",
+        "sparse_repair_requires_exact_receipt_and_live_parent",
+        "filtered_fabric_dd_switch_on_installed_fid_and_nonfragmenting_socket",
+        "dd_free_h264_repairs_at_exact_protected_ceiling_on_participant_udp",
+        "maximum_native_data_record_crosses_capped_dtls13_udp",
+        "stock_h264_repairs_and_refreshes_on_capped_udp_without_primary_growth",
+        "stock_av1_crosses_shard_mailbox_and_decodes_without_primary_growth",
+        "stock_av1_repairs_and_refreshes_on_capped_udp_without_primary_growth",
+        "stock_opus_decodes_across_capped_whip_and_whep_udp",
+        "native_maximum_encoded_opus_reaches_authenticated_rtp",
+        # The controlled native driver takes an exclusive process-wide lease.
+        "--test-threads=1",
+        "--nocapture",
+    ],
+    compile_data = ["//crates/pulsebeam-rtc:controlled_peer_fixture_source"],
     lint_config = ":lints",
     aliases = aliases(normal_dev = True, proc_macro_dev = True),
     deps = all_crate_deps(normal_dev = True) + [
         "//agents/pulsebeam-agent-native:pulsebeam-agent-native-transport",
+        "//crates/pulsebeam-rtc/simulation:pulsebeam-rtc-simulation",
         "//server/rust:pulsebeam-server",
     ],
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),

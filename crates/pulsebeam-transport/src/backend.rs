@@ -25,6 +25,9 @@ impl Engine {
                 peer.association(now)
                     .map(|engine| Self::Dtls(Box::new(engine)))
             }
+            PeerConfig::Fabric(peer) => peer
+                .association(now, limit)
+                .map(|engine| Self::Dtls(Box::new(engine))),
             PeerConfig::Quic(peer) => {
                 Quic::new(peer, now).map(|engine| Self::Quic(Box::new(engine)))
             }

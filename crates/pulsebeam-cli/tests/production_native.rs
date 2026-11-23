@@ -1,5 +1,6 @@
 //! One production constructor/HTTP/kernel-socket witness, not a media matrix.
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use pulsebeam_agent_native::agent_core::ffi::PublicationExecution;
 use pulsebeam_agent_native::agent_core::{
     AgentConfig, ConnectionState, DataEvent, DataUpdate, Generation, TopicMode, VideoObservation,
 };
@@ -137,6 +138,23 @@ async fn foreign_witness(
     let (received_tx, mut received_rx) = tokio::sync::oneshot::channel();
     let responder = tokio::spawn(async move {
         let mut received_tx = Some(received_tx);
+        let updates = exchange
+            .updates()
+            .map_err(|_| anyhow!("Rust exchange publication observer capacity exceeded"))?;
+        while exchange.state().execution != PublicationExecution::Installed {
+            let Some(state) = updates
+                .next()
+                .map_err(|_| anyhow!("Rust exchange observation already pending"))?
+                .await
+            else {
+                bail!("Rust exchange publisher closed before installation");
+            };
+            ensure!(
+                !state.closed,
+                "Rust exchange publisher closed before installation"
+            );
+        }
+        drop(updates);
         loop {
             match messages.next().await {
                 // A terminal read cannot be reused by the next installed consumer.

@@ -13,6 +13,7 @@ pub struct Metadata {
     pub len: usize,
     pub stride: usize,
     pub received_at: ReceiveTime,
+    pub ecn: Option<Ecn>,
 }
 
 /// Only the simulator implements this adapter. Production callers use the
@@ -153,6 +154,7 @@ impl Socket {
                             len: meta.len,
                             stride: meta.stride,
                             received_at: meta.received_at,
+                            ecn: meta.ecn,
                         });
                     }
                 }
@@ -213,6 +215,7 @@ impl Io for Turmoil {
             len,
             stride: len.max(1),
             received_at: ReceiveTime::now(),
+            ecn: None,
         })
     }
     fn submit(&mut self, entry: &SendDatagram<'_>) -> io::Result<()> {

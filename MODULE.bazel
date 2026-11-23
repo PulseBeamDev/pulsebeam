@@ -198,13 +198,25 @@ crate.annotation(
 # Cargo's custom tokio_unstable cfg is applied by .bazelrc, but crate-universe
 # does not include cfg-gated edges in its generated platform selects.
 crate.annotation(crate = "tokio", deps = ["@crates//tracing"], repositories = ["crates"])
-# Link credits actual UDP departures, not security-control records. Preserve
-# application-record provenance without changing DTLS wire bytes or cryptography.
+# Link needs application-record provenance for UDP accounting. Endpoint DTLS
+# also needs explicit cipher ordering to take effect when selecting a suite.
 crate.annotation(
     crate = "dimpl",
     version = "=0.9.0",
     repositories = ["crates"],
-    patches = ["//tools:patches/dimpl-application-provenance.patch"],
+    patches = [
+        "//tools:patches/dimpl-application-provenance.patch",
+        "//tools:patches/dimpl-dtls13-cipher-order.patch",
+    ],
+    patch_args = ["-p1"],
+)
+# DATA_V1 streams bound partial payload at the reassembly owner, not after
+# handing a complete SCTP message to the application.
+crate.annotation(
+    crate = "dcsctp",
+    version = "=0.1.14",
+    repositories = ["crates"],
+    patches = ["//tools:patches/dcsctp-receive-budget.patch"],
     patch_args = ["-p1"],
 )
 # Readiness must not prefetch outside the bounded ring. Keep the existing

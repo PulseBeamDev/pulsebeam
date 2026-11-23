@@ -92,6 +92,7 @@ pub enum DataChannelEvent {
     Message {
         generation: Generation,
         channel: ChannelId,
+        binary: bool,
         payload: Vec<u8>,
     },
     Sent {

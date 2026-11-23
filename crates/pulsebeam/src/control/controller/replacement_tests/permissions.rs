@@ -210,33 +210,29 @@ async fn whip_checks_all_canonical_publications_before_materialization_and_retai
     lease.permissions = ResourcePermissions::Grants {
         joined_room: Some(RoomId::new("sdp-scope").unwrap()),
         grants: GrantSet::new(
-            [
-                (GrantKind::Audio, "mic"),
-                (GrantKind::Video, "camera"),
-                (GrantKind::Data, "v2/latest/chat"),
-            ]
-            .into_iter()
-            .map(|(kind, label)| {
-                Grant::new(
-                    vec!["sdp-scope".into()],
-                    vec![Action::Publish],
-                    None,
-                    Some(kind),
-                    Some(label.into()),
-                )
-                .unwrap()
-            })
-            .chain(std::iter::once(
-                Grant::new(
-                    vec!["sdp-scope".into()],
-                    vec![Action::Join],
-                    None,
-                    None,
-                    None,
-                )
-                .unwrap(),
-            ))
-            .collect(),
+            [(GrantKind::Audio, "mic"), (GrantKind::Video, "camera")]
+                .into_iter()
+                .map(|(kind, label)| {
+                    Grant::new(
+                        vec!["sdp-scope".into()],
+                        vec![Action::Publish],
+                        None,
+                        Some(kind),
+                        Some(label.into()),
+                    )
+                    .unwrap()
+                })
+                .chain(std::iter::once(
+                    Grant::new(
+                        vec!["sdp-scope".into()],
+                        vec![Action::Join],
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+                ))
+                .collect(),
         )
         .unwrap(),
     };
@@ -254,26 +250,6 @@ async fn whip_checks_all_canonical_publications_before_materialization_and_retai
         panic!("authorized materialization")
     };
     assert_eq!(config.resources.media_sections().len(), 2);
-    assert!(config.topic_publications.allows("v2/latest/chat"));
-    for denied in [
-        "v2/latest/other",
-        "v2/ordered/chat",
-        "v2/latest/pub/chat",
-        "audio",
-        "video",
-    ] {
-        assert!(!config.topic_publications.allows(denied));
-    }
-    assert!(
-        ResourcePermissions::RoomBound
-            .topic_publications()
-            .allows("v2/latest/other")
-    );
-    assert!(
-        !ResourcePermissions::Denied
-            .topic_publications()
-            .allows("v2/latest/chat")
-    );
     for media in config.resources.media_sections() {
         assert!(matches!(
             media

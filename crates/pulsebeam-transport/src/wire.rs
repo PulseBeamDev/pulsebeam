@@ -1,4 +1,4 @@
-//! Legacy v1 DTLS framing. The four context bytes are opaque application data.
+//! Association-selected datagram framing. Fabric carries only an attempt ID outside its image.
 
 use pulsebeam_feedback::{PacketId, ReceiverTime, SendStatus};
 
@@ -7,6 +7,13 @@ pub(crate) const UDP_BUDGET: usize = 1200;
 // encrypted-content-type allowance. The driver also enforces the sealed size.
 pub(crate) const SECURITY_OVERHEAD: usize = 64;
 pub(crate) const DATA_HEADER: usize = 10;
+pub(crate) const FABRIC_HEADER: usize = 6;
+pub(crate) const FABRIC_IMAGE: usize = 1152;
+const FABRIC_DATA: [u8; 2] = [2, 0];
+const FABRIC_CONTROL: [u8; 2] = [2, 2];
+pub const CONTROL_CONTEXT: [u8; 4] = [0; 4];
+pub const CONTROL_FRAME_BYTES: usize = 1024;
+const _: () = assert!(FABRIC_IMAGE == 0x0480);
 pub(crate) const PAYLOAD_BUDGET: usize = UDP_BUDGET - SECURITY_OVERHEAD - DATA_HEADER;
 pub(crate) const MAX_STATUSES: usize = 64;
 const FEEDBACK_HEADER: usize = 20;
@@ -15,9 +22,26 @@ const STATUS_BYTES: usize = 9;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct InvalidFrame;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Capability {
+    Offer,
+    Accept,
+}
+
+impl Capability {
+    pub(crate) fn encode(self) -> [u8; 5] {
+        let kind = match self {
+            Self::Offer => 1,
+            Self::Accept => 2,
+        };
+        [2, 1, kind, 0x04, 0x80]
+    }
+}
+
 pub(crate) enum Frame<'a> {
+    Capability(Capability),
     Data {
-        context: [u8; 4],
+        context: Option<[u8; 4]>,
         attempt: u32,
         payload: &'a [u8],
     },
@@ -45,21 +69,64 @@ pub(crate) fn data_header(
     Ok(())
 }
 
+pub(crate) fn fabric_header(
+    dst: &mut [u8],
+    attempt: u32,
+    control: bool,
+) -> Result<(), InvalidFrame> {
+    let prefix = if control { FABRIC_CONTROL } else { FABRIC_DATA };
+    let header = dst.get_mut(..FABRIC_HEADER).ok_or(InvalidFrame)?;
+    for (byte, value) in header
+        .iter_mut()
+        .zip(prefix.into_iter().chain(attempt.to_be_bytes()))
+    {
+        *byte = value;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 pub(crate) fn decode(wire: &[u8]) -> Result<Frame<'_>, InvalidFrame> {
+    decode_for(wire, false)
+}
+
+pub(crate) fn decode_for(wire: &[u8], fabric: bool) -> Result<Frame<'_>, InvalidFrame> {
     let (prefix, body) = wire.split_at_checked(2).ok_or(InvalidFrame)?;
     match prefix {
-        [1, 0] => {
+        [1, 0] if !fabric => {
             let (context, body) = take::<4>(body)?;
             let (attempt, payload) = take::<4>(body)?;
             if payload.len() > PAYLOAD_BUDGET {
                 return Err(InvalidFrame);
             }
             Ok(Frame::Data {
-                context,
+                context: Some(context),
                 attempt: u32::from_be_bytes(attempt),
                 payload,
             })
         }
+        prefix if fabric && (prefix == FABRIC_DATA || prefix == FABRIC_CONTROL) => {
+            let (attempt, payload) = take::<4>(body)?;
+            let control = prefix == FABRIC_CONTROL;
+            let limit = if control {
+                CONTROL_FRAME_BYTES
+            } else {
+                FABRIC_IMAGE
+            };
+            if payload.len() > limit || (!control && payload.is_empty()) {
+                return Err(InvalidFrame);
+            }
+            Ok(Frame::Data {
+                context: control.then_some(CONTROL_CONTEXT),
+                attempt: u32::from_be_bytes(attempt),
+                payload,
+            })
+        }
+        [2, 1] if fabric => match body {
+            [1, 0x04, 0x80] => Ok(Frame::Capability(Capability::Offer)),
+            [2, 0x04, 0x80] => Ok(Frame::Capability(Capability::Accept)),
+            _ => Err(InvalidFrame),
+        },
         [1, 1] => {
             let (base, body) = take::<8>(body)?;
             let (generation, body) = take::<8>(body)?;

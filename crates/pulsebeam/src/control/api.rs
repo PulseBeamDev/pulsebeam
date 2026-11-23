@@ -361,7 +361,9 @@ struct NativeResponse<'a> {
     #[schema(value_type = Object)]
     rtp_capabilities: &'a pulsebeam_proto::state::RtpCapabilities,
     #[schema(value_type = Vec<String>)]
-    data_delivery: [pulsebeam_proto::state::DataDelivery; 3],
+    data_delivery: &'static [pulsebeam_proto::state::DataDelivery],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data_version: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     room_id: Option<&'a str>,
     #[schema(value_type = String)]
@@ -377,15 +379,13 @@ impl<'a> NativeResponse<'a> {
         connection_id: ConnectionId,
         rtp_capabilities: &'a pulsebeam_proto::state::RtpCapabilities,
         answer: &'a str,
+        data_profile: super::native::DataProfile,
     ) -> Self {
         Self {
             profile: pulsebeam_proto::state::PROFILE,
             rtp_capabilities,
-            data_delivery: [
-                pulsebeam_proto::state::DataDelivery::Latest,
-                pulsebeam_proto::state::DataDelivery::Lossy,
-                pulsebeam_proto::state::DataDelivery::Ordered,
-            ],
+            data_delivery: data_profile.delivery_modes(),
+            data_version: data_profile.version(),
             room_id: authorization
                 .room_id
                 .as_ref()
@@ -593,7 +593,7 @@ fn native_message(
         Instant::now(),
     )?;
     lease.native_expiry()?;
-    let rtp_capabilities = crate::control::rtp::capabilities();
+    let rtp_capabilities = crate::control::rtp::bootstrap_capabilities(&offer);
     let message = controller::CreateParticipant {
         state: ParticipantState {
             selection: super::sdp::Selection::Native,
@@ -1502,6 +1502,7 @@ mod tests {
             message.state.connection_id,
             &capabilities,
             "v=0\r\n",
+            crate::control::native::DataProfile::Legacy,
         ))
         .unwrap();
         assert_eq!(
@@ -1518,6 +1519,7 @@ mod tests {
                 message.state.connection_id,
                 &capabilities,
                 &escaped,
+                crate::control::native::DataProfile::Legacy,
             )
             .validate(),
             Err(creation::Error::TooLarge)

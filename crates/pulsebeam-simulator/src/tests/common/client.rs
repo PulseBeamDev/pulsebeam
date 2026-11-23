@@ -9,13 +9,14 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use pulsebeam_agent_native::agent_core::{
-    AgentConfig, AudioSubscription, ConnectionState, DesiredState, MediaKind,
-    Publication as CatalogPublication, TopicMode, TopicNotification, TopicPublisher, TopicSend,
-    TopicSubscriber, TrackSelector, VideoObservation, VideoSubscription,
+    AgentConfig, AudioSubscription, ConnectionState, DataEvent, DataUpdate, DesiredState,
+    MediaKind, Publication as CatalogPublication, TopicMessage, TopicMode, TopicNotification,
+    TopicPublisher, TopicSubscriber, TrackSelector, VideoObservation, VideoSubscription,
 };
 use pulsebeam_agent_native::{
-    Agent, AgentEvent, AsyncHttpClient, AudioInput, Config, Encoding, Host, InputFrame,
-    MediaConfig, ProducerInput, VideoInput, VideoPublicationConfig, VideoSourceConfig,
+    Agent, AgentEvent, AsyncHttpClient, AudioInput, Config, DataPublication, DataReceiver,
+    Encoding, Host, InputFrame, MediaConfig, ProducerInput, VideoInput, VideoPublicationConfig,
+    VideoSourceConfig,
 };
 use pulsebeam_core::identity::{ParticipantId, RoomId};
 use pulsebeam_core::net::{HttpError, HttpRequest, HttpResult};
@@ -745,7 +746,6 @@ impl SimClientBuilder {
         let desired = DesiredState {
             revision: 1,
             connected: true,
-            topics: self.initial_topics,
             ..DesiredState::default()
         };
         agent.replace_desired(desired.clone()).await?;
@@ -796,7 +796,7 @@ impl SimClientBuilder {
         let audio_rx = self
             .audio_rx
             .unwrap_or_else(|| Arc::new(Mutex::new(AudioReceiveLog::default())));
-        let ctx = ClientContext {
+        let mut ctx = ClientContext {
             agent: agent.clone(),
             admission: self.admission,
             current_admission: None,
@@ -815,6 +815,10 @@ impl SimClientBuilder {
             discovered_tracks: HashSet::new(),
             remote_tracks: HashMap::new(),
             topic_events: Vec::new(),
+            data_publishers: BTreeMap::new(),
+            data_subscribers: BTreeMap::new(),
+            data_catalog: BTreeMap::new(),
+            sent_data_units: BTreeMap::new(),
             media_kinds: HashMap::new(),
             owned_receivers: Arc::default(),
             video_rx,
@@ -840,6 +844,12 @@ impl SimClientBuilder {
             video_subscriptions: BTreeMap::new(),
             retained_video_subscriptions: None,
         };
+        for publisher in self.initial_topics.publishers {
+            ctx.register_publisher(publisher.topic, publisher.mode)?;
+        }
+        for subscriber in self.initial_topics.subscribers {
+            ctx.register_subscriber(subscriber)?;
+        }
         let mut client = SimClient {
             ctx,
             join_set,
@@ -3520,6 +3530,12 @@ pub struct ClientObservation {
     pub admission: Option<pulsebeam::entity::ConnectionId>,
     pub snapshot: pulsebeam_agent_native::agent_core::Snapshot,
     pub owned_receivers: Vec<OwnedReceiverEvidence>,
+    pub data_publishers:
+        BTreeMap<TopicPublisher, pulsebeam_agent_native::agent_core::ffi::DataPublicationState>,
+    pub data_subscribers:
+        BTreeMap<TopicSubscriber, pulsebeam_agent_native::agent_core::ffi::DataSubscriptionState>,
+    pub data_catalog: BTreeMap<(String, TopicPublisher), String>,
+    pub sent_data_units: BTreeMap<TopicPublisher, u64>,
     pub video_operation: u64,
     pub submitted: DesiredState,
     pub video_capacity: usize,
@@ -3565,20 +3581,11 @@ impl NativeEventCollector {
         let mut task = JoinSet::new();
         let output = log.clone();
         let notify = changed.clone();
-        // Driver commands can await this same actor while a recovery input
-        // releases a full history. Consume the ordinary bounded public stream
-        // independently; do not increase its capacity or hide actual loss.
         task.spawn(async move {
             loop {
                 let update = events.next().await;
                 let mut log = output.lock().unwrap();
                 match update {
-                    pulsebeam_agent_native::StreamUpdate::Value(AgentEvent::Core(
-                        pulsebeam_agent_native::agent_core::Notification::Topic(
-                            notification @ (TopicNotification::Message(_)
-                            | TopicNotification::RecoveryGap { .. }),
-                        ),
-                    )) => log.topics.push(notification),
                     pulsebeam_agent_native::StreamUpdate::Value(AgentEvent::Core(
                         pulsebeam_agent_native::agent_core::Notification::ServerError(message),
                     )) => {
@@ -3650,6 +3657,10 @@ pub struct ClientContext {
     pub discovered_tracks: HashSet<String>,
     pub remote_tracks: HashMap<String, String>,
     pub topic_events: Vec<TopicNotification>,
+    data_publishers: BTreeMap<TopicPublisher, DataPublication>,
+    data_subscribers: BTreeMap<TopicSubscriber, DataReceiver>,
+    data_catalog: BTreeMap<(String, TopicPublisher), String>,
+    sent_data_units: BTreeMap<TopicPublisher, u64>,
     pub media_kinds: HashMap<String, (bool, bool)>,
     owned_receivers: OwnedReceivers,
     snapshots: tokio::sync::watch::Receiver<pulsebeam_agent_native::agent_core::Snapshot>,
@@ -3708,6 +3719,18 @@ impl ClientContext {
                 .map(|(_, evidence)| evidence.clone())
                 .collect(),
             submitted: self.desired.clone(),
+            data_publishers: self
+                .data_publishers
+                .iter()
+                .map(|(intent, handle)| (intent.clone(), handle.state()))
+                .collect(),
+            data_subscribers: self
+                .data_subscribers
+                .iter()
+                .map(|(intent, handle)| (intent.clone(), handle.state()))
+                .collect(),
+            data_catalog: self.data_catalog.clone(),
+            sent_data_units: self.sent_data_units.clone(),
             video_operation: self.video_operation,
             video_capacity: self.video_capacity,
             audio_capacity: self.audio_capacity,
@@ -3828,6 +3851,7 @@ impl ClientContext {
             self.catalog_watch = None;
             self.catalog_revision = None;
             self.catalog.clear();
+            self.data_catalog.clear();
             self.catalog_participants.clear();
             if let Some(room) = room {
                 let watch = self
@@ -3846,6 +3870,7 @@ impl ClientContext {
         }
         self.catalog_revision = Some(state.observation_revision);
         self.catalog.clear();
+        self.data_catalog.clear();
         self.catalog_participants.clear();
         if let Some(page) = state.page {
             anyhow::ensure!(!page.has_more(), "simulation catalog exceeds one page");
@@ -3860,7 +3885,19 @@ impl ClientContext {
                     let kind = match entry.kind {
                         CatalogPublicationKind::Audio => MediaKind::Audio,
                         CatalogPublicationKind::Video => MediaKind::Video,
-                        CatalogPublicationKind::Data { .. } => continue,
+                        CatalogPublicationKind::Data { delivery } => {
+                            self.data_catalog.insert(
+                                (
+                                    participant.id.clone(),
+                                    TopicPublisher {
+                                        topic: entry.track_id,
+                                        mode: delivery.into(),
+                                    },
+                                ),
+                                entry.id,
+                            );
+                            continue;
+                        }
                     };
                     let publication = CatalogPublication {
                         id: entry.id.clone(),
@@ -4372,76 +4409,126 @@ impl ClientContext {
         Ok(true)
     }
 
-    pub async fn register_publisher(
-        &mut self,
-        topic: String,
-        mode: TopicMode,
-    ) -> anyhow::Result<bool> {
+    pub fn register_publisher(&mut self, topic: String, mode: TopicMode) -> anyhow::Result<bool> {
+        use pulsebeam_agent_native::agent_core::ffi::PublicationExecution;
+        use std::collections::btree_map::Entry;
+
         let registration = TopicPublisher { topic, mode };
-        if !self.desired.topics.publishers.contains(&registration) {
-            let mut desired = self.desired.clone();
-            desired.topics.publishers.push(registration.clone());
-            self.replace_desired(desired).await?;
-        }
-        Ok(self
-            .agent
-            .snapshot()
-            .topics
-            .publishers
-            .iter()
-            .any(|status| {
-                status.registration == registration
-                    && status.channel.is_some()
-                    && status.publication_id.is_some()
-            }))
+        let publication = match self.data_publishers.entry(registration) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let publication = self
+                    .agent
+                    .data(entry.key().topic.clone(), mode)?
+                    .publish()?;
+                entry.insert(publication)
+            }
+        };
+        Ok(publication.state().execution == PublicationExecution::Installed)
     }
 
-    pub async fn register_subscriber(
-        &mut self,
-        registration: TopicSubscriber,
-    ) -> anyhow::Result<bool> {
-        if !self.desired.topics.subscribers.contains(&registration) {
-            let mut desired = self.desired.clone();
-            desired.topics.subscribers.push(registration.clone());
-            self.replace_desired(desired).await?;
+    pub fn register_subscriber(&mut self, registration: TopicSubscriber) -> anyhow::Result<bool> {
+        if self.data_subscribers.contains_key(&registration) {
+            return Ok(true);
         }
-        Ok(self
+        let receiver = self
             .agent
-            .snapshot()
-            .topics
-            .subscribers
-            .iter()
-            .any(|status| status.registration == registration))
+            .room(registration.room.clone())?
+            .participant(registration.participant_id.clone())?
+            .data(registration.topic.clone(), registration.mode)?
+            .subscribe()?;
+        self.data_subscribers
+            .insert(registration.clone(), receiver.clone());
+        let output = self.events.log.clone();
+        let changed = self.events.changed.clone();
+        self.events.task.spawn_local(async move {
+            loop {
+                let update = receiver.next().await;
+                let mut log = output.lock().unwrap();
+                match update {
+                    Ok(DataUpdate::Event {
+                        event:
+                            DataEvent::Message {
+                                participant_id,
+                                publication_id,
+                                sequence,
+                                data,
+                                captured_at,
+                            },
+                    }) => log.topics.push(TopicNotification::Message(TopicMessage {
+                        room: registration.room.clone(),
+                        topic: registration.topic.clone(),
+                        mode: registration.mode,
+                        participant_id,
+                        publication_id,
+                        sequence,
+                        payload: data,
+                        captured_at,
+                    })),
+                    Ok(DataUpdate::Event {
+                        event:
+                            DataEvent::Gap {
+                                participant_id,
+                                publication_id,
+                                from,
+                                to,
+                            },
+                    }) => log.topics.push(TopicNotification::RecoveryGap {
+                        subscriber: registration.clone(),
+                        publication_id,
+                        participant_id,
+                        expected_sequence: from,
+                        available_sequence: to,
+                    }),
+                    // This compatibility log counts payloads and gaps, not source changes.
+                    Ok(DataUpdate::Event {
+                        event: DataEvent::Discontinuity { .. },
+                    }) => (),
+                    Ok(DataUpdate::Closed) => break,
+                    Err(error) => {
+                        log.failure.get_or_insert_with(|| {
+                            format!("reading DATA for {registration:?}: {error}")
+                        });
+                        changed.notify_one();
+                        break;
+                    }
+                }
+                changed.notify_one();
+            }
+        });
+        Ok(true)
     }
 
     pub async fn send_topic(
-        &self,
+        &mut self,
         topic: &str,
         mode: TopicMode,
         payload: Vec<u8>,
     ) -> anyhow::Result<bool> {
-        let publisher = TopicPublisher {
+        use pulsebeam_agent_native::agent_core::ffi::PublicationExecution;
+
+        let registration = TopicPublisher {
             topic: topic.to_owned(),
             mode,
         };
-        let ready = self
-            .agent
-            .snapshot()
-            .topics
-            .publishers
-            .iter()
-            .any(|status| {
-                status.registration == publisher
-                    && status.channel.is_some()
-                    && status.publication_id.is_some()
-            });
-        if !ready {
+        let Some(publication) = self.data_publishers.get(&registration) else {
+            return Ok(false);
+        };
+        if publication.state().execution != PublicationExecution::Installed {
             return Ok(false);
         }
-        self.agent
-            .send_topic(TopicSend { publisher, payload })
-            .await?;
-        Ok(true)
+        match publication.send(payload).await {
+            Ok(()) => {
+                *self.sent_data_units.entry(registration).or_default() += 1;
+                Ok(true)
+            }
+            Err(pulsebeam_agent_native::Error::Core(
+                pulsebeam_agent_native::agent_core::AgentError::InvalidTopic(
+                    pulsebeam_agent_native::agent_core::TopicError::SendQueueFull(_),
+                ),
+            )) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
     }
 
     async fn replace_desired(&mut self, mut desired: DesiredState) -> anyhow::Result<()> {

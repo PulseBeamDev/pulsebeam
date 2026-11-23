@@ -41,7 +41,12 @@ pub(super) fn facts_bytes(facts: &IngressMediaFacts) -> Option<usize> {
     .into_iter()
     .chain(facts.payloads.iter().map(|payload| payload.name.len()))
     .chain(facts.rids.iter().map(|rid| rid.len()))
-    .chain(facts.extensions.iter().map(|(_, uri)| uri.len()))
+    .chain(
+        facts
+            .extensions
+            .iter()
+            .flat_map(|ext| [ext.uri.len(), ext.attributes.as_deref().map_or(0, str::len)]),
+    )
     .try_fold(0usize, usize::checked_add)
 }
 
@@ -72,7 +77,7 @@ pub(super) fn media_bytes(facts: &IngressMediaFacts) -> Option<usize> {
             if facts
                 .extensions
                 .iter()
-                .any(|(_, uri)| uri.as_ref() == crate::MID_EXTENSION)
+                .any(|ext| ext.uri.as_ref() == crate::MID_EXTENSION)
             {
                 size_of::<(u64, u8)>()
             } else {
@@ -95,7 +100,7 @@ pub(super) fn bytes(facts: &IngressMediaFacts, strict: bool) -> Option<usize> {
     } else if facts
         .extensions
         .iter()
-        .any(|(_, uri)| uri.as_ref() == crate::RID_EXTENSION)
+        .any(|ext| ext.uri.as_ref() == crate::RID_EXTENSION)
     {
         // Bootstrap can learn a RID later, up to the RTP two-byte extension limit.
         usize::from(u8::MAX)
@@ -364,10 +369,12 @@ mod tests {
             kind: crate::MediaKind::Video,
             rtcp: None,
             mid: "v".into(),
-            payloads: Box::new([crate::RtpPayloadInfo {
+            payloads: Box::new([crate::RtpReceiveCodec {
                 payload_type: 96,
                 name: "h264".into(),
                 clock_rate: 90_000,
+                channels: None,
+                profile: None,
             }]),
             feedback_payloads: Box::new([96]),
             repairs: Box::new([]),
@@ -376,13 +383,14 @@ mod tests {
             ssrcs: Box::new([11]),
             rids: Box::new([]),
             extensions: Box::new([]),
+            allow_mixed_extensions: false,
         };
         let baseline = facts_bytes(&facts).unwrap();
         assert_eq!(
             baseline,
             size_of::<(u64, IngressMediaFacts)>()
                 + 1
-                + size_of::<crate::RtpPayloadInfo>()
+                + size_of::<crate::RtpReceiveCodec>()
                 + "h264".len()
                 + 2
                 + size_of::<u32>()
@@ -392,7 +400,11 @@ mod tests {
             ssrc: 11,
             kind: facts.kind,
             rid: Some("h".into()),
-            payloads: facts.payloads.clone(),
+            payloads: facts
+                .payloads
+                .iter()
+                .map(crate::RtpReceiveCodec::discovery_info)
+                .collect(),
         });
         assert_eq!(
             events::owned_bytes(&discovery),
@@ -431,7 +443,10 @@ mod tests {
             )
         );
         let mut rid_facts = facts.clone();
-        rid_facts.extensions = Box::new([(2, crate::RID_EXTENSION.into())]);
+        rid_facts.extensions = Box::new([crate::RtpReceiveExtension::without_attributes(
+            2,
+            crate::RID_EXTENSION,
+        )]);
         rid_facts.rids = Box::new(["h".into()]);
         let index = size_of::<(Box<str>, u32)>();
         assert_eq!(
@@ -442,7 +457,10 @@ mod tests {
             bytes(&rid_facts, false),
             bytes(&facts, false).map(|base| base + index + 2 * usize::from(u8::MAX))
         );
-        rid_facts.extensions = Box::new([(2, crate::REPAIRED_RID_EXTENSION.into())]);
+        rid_facts.extensions = Box::new([crate::RtpReceiveExtension::without_attributes(
+            2,
+            crate::REPAIRED_RID_EXTENSION,
+        )]);
         assert_eq!(bytes(&rid_facts, false), bytes(&facts, false));
         let mut repair_facts = facts.clone();
         repair_facts.repairs = Box::new([(97, 96)]);
@@ -468,7 +486,7 @@ mod tests {
                     payloads.push(extra);
                     f.payloads = payloads.into_boxed_slice();
                 },
-                size_of::<crate::RtpPayloadInfo>() + "h264".len(),
+                size_of::<crate::RtpReceiveCodec>() + "h264".len(),
                 0,
             ),
             (|f| f.feedback_payloads = Box::new([96, 98]), 1, 0),
@@ -490,8 +508,14 @@ mod tests {
                 0,
             ),
             (
-                |f| f.extensions = Box::new([(1, MID_URI.into())]),
-                size_of::<(u8, Box<str>)>() + MID_URI.len(),
+                |f| {
+                    f.extensions = Box::new([crate::RtpReceiveExtension {
+                        id: 1,
+                        uri: MID_URI.into(),
+                        attributes: Some("example".into()),
+                    }]);
+                },
+                size_of::<crate::RtpReceiveExtension>() + MID_URI.len() + "example".len(),
                 0,
             ),
         ];
@@ -502,7 +526,7 @@ mod tests {
             let mid = if grown
                 .extensions
                 .iter()
-                .any(|(_, uri)| uri.as_ref() == MID_URI)
+                .any(|ext| ext.uri.as_ref() == MID_URI)
             {
                 size_of::<(u64, u8)>()
             } else {

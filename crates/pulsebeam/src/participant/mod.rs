@@ -1,6 +1,6 @@
 pub(crate) mod batcher;
 mod core;
-mod data;
+pub(crate) mod data_fabric;
 pub(crate) mod downstream;
 pub mod effect;
 pub(crate) mod event;

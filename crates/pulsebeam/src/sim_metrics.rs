@@ -16,9 +16,12 @@
 //! Thread-local storage isolates parallel simulations driven on separate threads.
 //! Compiled only under the `sim` feature.
 
+pub mod wan_repair;
+
 use pulsebeam_runtime::{sync::oneshot, time::Instant};
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::time::Duration;
 
 use crate::entity::ParticipantId;
@@ -47,6 +50,12 @@ struct Samples {
     /// suspension and resumption can legitimately reverse an optional stream's direction.
     quality_reversals: HashMap<ParticipantId, u64>,
     routing_counters: HashMap<String, u64>,
+    fabric_udp_submission_peak: usize,
+    wan_opus_wire_peak: usize,
+    wan_live_data: HashMap<(IpAddr, IpAddr), (u64, u64)>,
+    wan_data_loss: Option<WanDataLoss>,
+    shard_data: Option<ShardDataTrace>,
+    wan_data_sends: HashMap<String, pulsebeam_link::BindingCutoff>,
     /// Direction of each origin's last forwarded-layer change: `true` for an upgrade.
     last_quality_direction: HashMap<ParticipantId, bool>,
     /// Every downstream estimate as `(elapsed, estimate_bps, desired_bps)`, keyed by the
@@ -140,7 +149,515 @@ pub fn record_downstream_bwe_for(subscriber: ParticipantId, bwe_bps: u64, desire
     });
 }
 
-/// Record a named diagnostic or fault-consumption event.
+#[derive(Clone, Debug, Default)]
+pub struct WanDataLossReport {
+    pub dropped: std::collections::BTreeSet<u64>,
+    pub repaired: std::collections::BTreeSet<u64>,
+    receipt_acks: std::collections::BTreeSet<(u64, u64)>,
+}
+
+type RawDataRecords = std::collections::BTreeMap<(u64, u64, u16), Box<[u8]>>;
+
+#[derive(Clone, Debug)]
+struct WanDataLoss {
+    edge: (IpAddr, IpAddr),
+    report: WanDataLossReport,
+    ingress: RawDataRecords,
+    egress: RawDataRecords,
+    conflicting_records: bool,
+}
+
+pub(crate) fn record_wan_data_send(publication: String, cutoff: pulsebeam_link::BindingCutoff) {
+    SAMPLES.with_borrow_mut(|samples| {
+        samples.wan_data_sends.insert(publication, cutoff);
+    });
+}
+
+pub fn wan_data_send_ready(publication: &str) -> bool {
+    SAMPLES.with_borrow(|samples| {
+        samples
+            .wan_data_sends
+            .get(publication)
+            .is_some_and(pulsebeam_link::BindingCutoff::is_live)
+    })
+}
+
+pub fn arm_wan_data_loss(from: IpAddr, to: IpAddr) {
+    SAMPLES.with_borrow_mut(|samples| {
+        samples.wan_data_loss = Some(WanDataLoss {
+            edge: (from, to),
+            report: WanDataLossReport::default(),
+            ingress: RawDataRecords::new(),
+            egress: RawDataRecords::new(),
+            conflicting_records: false,
+        });
+    });
+}
+
+pub(crate) fn record_wan_data_sctp(
+    source: u64,
+    unit: u64,
+    index: u16,
+    bytes: &[u8],
+    ingress: bool,
+) {
+    SAMPLES.with_borrow_mut(|samples| {
+        let Some(loss) = samples.wan_data_loss.as_mut() else {
+            return;
+        };
+        let records = if ingress {
+            &mut loss.ingress
+        } else {
+            &mut loss.egress
+        };
+        let key = (source, unit, index);
+        if let Some(existing) = records.get(&key) {
+            loss.conflicting_records |= existing.as_ref() != bytes;
+        } else if records.len() < usize::from(pulsebeam_proto::data_record::MAX_FRAGMENTS) {
+            records.insert(key, bytes.into());
+        }
+    });
+}
+
+pub fn wan_data_raw_records_match(source: u64, unit: u64, count: u16) -> bool {
+    SAMPLES.with_borrow(|samples| {
+        samples.wan_data_loss.as_ref().is_some_and(|loss| {
+            !loss.conflicting_records
+                && (0..count).all(|index| {
+                    let key = (source, unit, index);
+                    loss.ingress
+                        .get(&key)
+                        .is_some_and(|input| loss.egress.get(&key) == Some(input))
+                })
+        })
+    })
+}
+
+pub(crate) fn record_wan_data_receipt_ack(source: u64, unit: u64) {
+    SAMPLES.with_borrow_mut(|samples| {
+        if let Some(loss) = samples.wan_data_loss.as_mut() {
+            loss.report.receipt_acks.insert((source, unit));
+        }
+    });
+}
+
+pub fn wan_data_receipt_ack(source: u64, unit: u64) -> bool {
+    SAMPLES.with_borrow(|samples| {
+        samples
+            .wan_data_loss
+            .as_ref()
+            .is_some_and(|loss| loss.report.receipt_acks.contains(&(source, unit)))
+    })
+}
+
+pub fn take_wan_data_loss() -> Option<WanDataLossReport> {
+    SAMPLES.with_borrow_mut(|samples| samples.wan_data_loss.take().map(|loss| loss.report))
+}
+
+pub(crate) fn wan_data_loss_armed(edge: (IpAddr, IpAddr)) -> bool {
+    SAMPLES.with_borrow(|samples| {
+        samples
+            .wan_data_loss
+            .as_ref()
+            .is_some_and(|loss| loss.edge == edge)
+    })
+}
+
+pub(crate) fn drop_wan_live_data(edge: (IpAddr, IpAddr), position: u64) -> bool {
+    SAMPLES.with_borrow_mut(|samples| {
+        let Some(loss) = samples
+            .wan_data_loss
+            .as_mut()
+            .filter(|loss| loss.edge == edge)
+        else {
+            return false;
+        };
+        loss.report.dropped.insert(position);
+        true
+    })
+}
+
+pub(crate) fn record_wan_data_repair(edge: (IpAddr, IpAddr), position: u64) {
+    SAMPLES.with_borrow_mut(|samples| {
+        if let Some(loss) = samples
+            .wan_data_loss
+            .as_mut()
+            .filter(|loss| loss.edge == edge)
+        {
+            loss.report.repaired.insert(position);
+        }
+    });
+}
+
+pub(crate) fn record_wan_live_data(from: IpAddr, to: IpAddr, position: u64) {
+    SAMPLES.with_borrow_mut(|samples| {
+        let entry = samples.wan_live_data.entry((from, to)).or_default();
+        *entry = (entry.0.saturating_add(1), position);
+    });
+}
+
+/// Count and newest observed position on one authenticated WAN ingress.
+pub fn wan_live_data(from: IpAddr, to: IpAddr) -> (u64, u64) {
+    SAMPLES.with_borrow(|samples| {
+        samples
+            .wan_live_data
+            .get(&(from, to))
+            .copied()
+            .unwrap_or_default()
+    })
+}
+
+type ShardFragment = pulsebeam_proto::data_record::FragmentIdentity;
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ShardDataFault {
+    #[default]
+    None,
+    FirstLiveOffer,
+    FirstReceipt,
+    BindingCutoff,
+    ReceiptExpiry,
+    LateJoin,
+}
+
+#[derive(Debug, Default, Clone)]
+struct HeldShardData {
+    initial_notice_seen: bool,
+    notice: Option<crate::route::fabric::ShardDataExpectation>,
+    repair: Option<crate::route::fabric::ShardDataRepairImage>,
+    release: bool,
+    original_receivers: Box<[crate::route::fabric::ShardDataReceiver]>,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct ShardDataTrace {
+    fault: ShardDataFault,
+    receipt: Option<(crate::route::fabric::ShardDataReceipt, Instant)>,
+    notice: Option<(crate::route::fabric::ShardBinding, u64, Instant)>,
+    held: HeldShardData,
+    pub replayed_before_cutoff_deadline: bool,
+    pub stale_writes: usize,
+    pub receipt_retried_within_deadline: bool,
+    pub late_receipt_rejected: bool,
+    pub expired_unit_reclaimed: bool,
+    pub accepted_receipt: Option<(u64, u64, u64)>,
+    pub live: Vec<ShardFragment>,
+    pub dropped: Option<ShardFragment>,
+    pub repaired: Vec<ShardFragment>,
+}
+
+pub fn arm_shard_data_trace(fault: ShardDataFault) {
+    SAMPLES.with_borrow_mut(|s| {
+        s.shard_data = Some(ShardDataTrace {
+            fault,
+            ..ShardDataTrace::default()
+        });
+    });
+}
+
+pub fn take_shard_data_trace() -> Option<ShardDataTrace> {
+    SAMPLES.with_borrow_mut(|s| s.shard_data.take())
+}
+
+pub(crate) fn drop_shard_data_offer(record: &[u8]) -> bool {
+    SAMPLES.with_borrow_mut(|s| {
+        let Some(trace) = &mut s.shard_data else {
+            return false;
+        };
+        let Ok(fragment) = pulsebeam_proto::data_record::wire_identity(record) else {
+            return false;
+        };
+        trace.live.push(fragment);
+        if matches!(
+            trace.fault,
+            ShardDataFault::FirstLiveOffer
+                | ShardDataFault::BindingCutoff
+                | ShardDataFault::LateJoin
+        ) && trace.dropped.is_none()
+        {
+            trace.dropped = Some(fragment);
+            true
+        } else {
+            false
+        }
+    })
+}
+
+pub(crate) fn record_shard_data_repair(fragment: ShardFragment) {
+    SAMPLES.with_borrow_mut(|s| {
+        if let Some(trace) = &mut s.shard_data {
+            trace.repaired.push(fragment);
+        }
+    });
+}
+
+pub(crate) fn record_shard_data_notice(notice: &crate::route::fabric::ShardDataExpectation) {
+    SAMPLES.with_borrow_mut(|s| {
+        if let Some(trace) = &mut s.shard_data
+            && matches!(
+                trace.fault,
+                ShardDataFault::FirstReceipt
+                    | ShardDataFault::BindingCutoff
+                    | ShardDataFault::ReceiptExpiry
+                    | ShardDataFault::LateJoin
+            )
+            && trace.notice.is_none()
+        {
+            trace.notice = Some((notice.binding, notice.unit.unit_seq, notice.expires));
+        }
+    });
+}
+
+pub(crate) fn drop_shard_data_receipt(
+    receipt: crate::route::fabric::ShardDataReceipt,
+    now: Instant,
+) -> bool {
+    SAMPLES.with_borrow_mut(|s| {
+        let Some(trace) = s.shard_data.as_mut().filter(|trace| {
+            matches!(
+                trace.fault,
+                ShardDataFault::FirstReceipt | ShardDataFault::ReceiptExpiry
+            )
+        }) else {
+            return false;
+        };
+        if !trace.notice.is_some_and(|(binding, unit, _)| {
+            binding == receipt.binding && unit == receipt.unit.unit_seq
+        }) || (trace.fault == ShardDataFault::FirstReceipt && trace.receipt.is_some())
+        {
+            return false;
+        }
+        trace.receipt.get_or_insert((receipt, now));
+        true
+    })
+}
+
+pub(crate) fn record_shard_data_receipt(
+    receipt: crate::route::fabric::ShardDataReceipt,
+    now: Instant,
+) {
+    SAMPLES.with_borrow_mut(|s| {
+        if let Some(trace) = &mut s.shard_data {
+            trace.accepted_receipt = Some((
+                receipt.binding.incarnation.get(),
+                receipt.unit.unit_seq,
+                receipt.branch.get(),
+            ));
+            trace.receipt_retried_within_deadline =
+                trace.receipt.is_some_and(|(dropped, first)| {
+                    receipt == dropped
+                        && first < now
+                        && trace.notice.is_some_and(|(_, _, end)| now < end)
+                });
+        }
+    });
+}
+
+pub fn shard_data_expired() -> bool {
+    SAMPLES.with_borrow(|s| {
+        s.shard_data.as_ref().is_some_and(|trace| {
+            trace.receipt.is_some()
+                && trace
+                    .notice
+                    .is_some_and(|(_, _, deadline)| Instant::now() >= deadline)
+        })
+    })
+}
+
+pub(crate) fn take_expired_shard_data_receipt(
+    frame: &crate::shard::worker::ShardFrame,
+    now: Instant,
+) -> Option<crate::shard::worker::ShardFrame> {
+    use crate::shard::worker::ShardFrame;
+    let ShardFrame::FabricDataReceipt(fresh) = frame else {
+        return None;
+    };
+    SAMPLES.with_borrow(|s| {
+        let trace = s.shard_data.as_ref().filter(|trace| {
+            trace.fault == ShardDataFault::ReceiptExpiry && !trace.late_receipt_rejected
+        })?;
+        let (binding, unit, deadline) = trace.notice?;
+        let (receipt, _) = trace.receipt?;
+        (fresh.binding == binding && fresh.unit.unit_seq != unit && now >= deadline)
+            .then_some(ShardFrame::FabricDataReceipt(receipt))
+    })
+}
+
+pub(crate) fn record_rejected_shard_data_receipt(
+    receipt: crate::route::fabric::ShardDataReceipt,
+    now: Instant,
+) {
+    SAMPLES.with_borrow_mut(|s| {
+        if let Some(trace) = s.shard_data.as_mut()
+            && trace.fault == ShardDataFault::ReceiptExpiry
+            && trace.receipt.is_some_and(|(held, _)| held == receipt)
+            && trace.notice.is_some_and(|(_, _, deadline)| now >= deadline)
+        {
+            trace.late_receipt_rejected = true;
+        }
+    });
+}
+
+pub(crate) fn record_expired_shard_data_reclaimed(unit_seq: u64) {
+    SAMPLES.with_borrow_mut(|s| {
+        if let Some(trace) = s.shard_data.as_mut()
+            && trace.fault == ShardDataFault::ReceiptExpiry
+            && trace.notice.is_some_and(|(_, unit, _)| unit == unit_seq)
+        {
+            trace.expired_unit_reclaimed = true;
+        }
+    });
+}
+
+pub fn shard_data_cutoff_held() -> bool {
+    SAMPLES.with_borrow(|s| {
+        s.shard_data
+            .as_ref()
+            .is_some_and(|trace| trace.held.notice.is_some() && trace.held.repair.is_some())
+    })
+}
+
+pub fn release_shard_data_cutoff() {
+    SAMPLES.with_borrow_mut(|s| {
+        if let Some(trace) = &mut s.shard_data {
+            trace.held.release = true;
+        }
+    });
+}
+
+pub(crate) fn delay_shard_data_frame(frame: &crate::shard::worker::ShardFrame) -> bool {
+    use crate::shard::worker::ShardFrame;
+    SAMPLES.with_borrow_mut(|s| {
+        let Some(trace) = &mut s.shard_data else {
+            return false;
+        };
+        let Some((binding, unit, _)) = trace.notice.filter(|_| {
+            matches!(
+                trace.fault,
+                ShardDataFault::BindingCutoff | ShardDataFault::LateJoin
+            )
+        }) else {
+            return false;
+        };
+        match frame {
+            ShardFrame::FabricDataExpectation(notice)
+                if notice.binding == binding && notice.unit.unit_seq == unit =>
+            {
+                if !std::mem::replace(&mut trace.held.initial_notice_seen, true) {
+                    return false;
+                }
+                trace.held.notice.get_or_insert_with(|| notice.clone());
+                true
+            }
+            ShardFrame::FabricDataRepairImage(image)
+                if image.repair.binding == binding
+                    && image.repair.request.fragment.unit_seq == unit =>
+            {
+                trace.held.repair.get_or_insert_with(|| image.clone());
+                true
+            }
+            _ => false,
+        }
+    })
+}
+
+pub(crate) fn take_released_shard_data(
+    frame: &crate::shard::worker::ShardFrame,
+    now: Instant,
+) -> Option<[crate::shard::worker::ShardFrame; 2]> {
+    use crate::shard::worker::ShardFrame;
+    let ShardFrame::FabricDataExpectation(fresh) = frame else {
+        return None;
+    };
+    SAMPLES.with_borrow_mut(|s| {
+        let trace = s.shard_data.as_mut()?;
+        let (binding, unit, deadline) = trace.notice?;
+        let held = &mut trace.held;
+        if !held.release
+            || fresh.binding.destination.shard() != binding.destination.shard()
+            || fresh.unit.unit_seq == unit
+            || held.notice.is_none()
+            || held.repair.is_none()
+        {
+            return None;
+        }
+        let notice = held.notice.take()?;
+        let repair = held.repair.take()?;
+        let correct_cohort = match trace.fault {
+            ShardDataFault::BindingCutoff => fresh
+                .receivers
+                .iter()
+                .all(|receiver| !notice.receivers.contains(receiver)),
+            ShardDataFault::LateJoin => {
+                held.original_receivers.clone_from(&notice.receivers);
+                fresh.binding == binding
+                    && fresh.receivers.len() == notice.receivers.len().saturating_add(1)
+                    && notice
+                        .receivers
+                        .iter()
+                        .all(|receiver| fresh.receivers.contains(receiver))
+            }
+            _ => false,
+        };
+        trace.replayed_before_cutoff_deadline = now < deadline && correct_cohort;
+        held.release = false;
+        Some([
+            ShardFrame::FabricDataExpectation(notice),
+            ShardFrame::FabricDataRepairImage(repair),
+        ])
+    })
+}
+
+pub(crate) fn is_stale_shard_data(record: &[u8], receiver: crate::entity::ConnectionId) -> bool {
+    SAMPLES.with_borrow(|s| {
+        s.shard_data
+            .as_ref()
+            .filter(|trace| trace.held.release || trace.replayed_before_cutoff_deadline)
+            .filter(|trace| {
+                trace.fault != ShardDataFault::LateJoin
+                    || !trace
+                        .held
+                        .original_receivers
+                        .iter()
+                        .any(|original| original.connection == receiver)
+            })
+            .and_then(|trace| trace.notice)
+            .is_some_and(|(_, unit, _)| {
+                pulsebeam_proto::data_record::wire_identity(record)
+                    .is_ok_and(|id| id.unit_seq == unit)
+            })
+    })
+}
+
+pub(crate) fn record_stale_shard_data_write() {
+    SAMPLES.with_borrow_mut(|s| {
+        if let Some(trace) = &mut s.shard_data {
+            trace.stale_writes = trace.stale_writes.saturating_add(1);
+        }
+    });
+}
+
+pub(crate) fn record_fabric_udp_submission(protected_bytes: usize) {
+    SAMPLES.with_borrow_mut(|samples| {
+        samples.fabric_udp_submission_peak =
+            samples.fabric_udp_submission_peak.max(protected_bytes);
+    });
+}
+
+pub fn fabric_udp_submission_peak() -> usize {
+    SAMPLES.with_borrow(|samples| samples.fabric_udp_submission_peak)
+}
+
+pub(crate) fn record_wan_opus_wire_bytes(protected_bytes: usize) {
+    SAMPLES.with_borrow_mut(|samples| {
+        samples.wan_opus_wire_peak = samples.wan_opus_wire_peak.max(protected_bytes);
+    });
+}
+
+pub fn wan_opus_wire_peak() -> usize {
+    SAMPLES.with_borrow(|samples| samples.wan_opus_wire_peak)
+}
+
 pub fn record_routing_counter(name: &'static str) {
     SAMPLES.with_borrow_mut(|s| {
         *s.routing_counters.entry(name.to_owned()).or_default() += 1;

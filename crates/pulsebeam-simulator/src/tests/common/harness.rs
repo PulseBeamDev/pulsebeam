@@ -11,7 +11,7 @@ use crate::tests::common::decoder::{
 };
 use crate::tests::common::media::{KeyframeRecoveryProbe, VbrProfile};
 use crate::tests::common::{
-    DEFAULT_SIM_SHARDS, reserve_subnet, start_sfu_node_with_transport, subnet_ip, subnet_ip_v6,
+    DEFAULT_SIM_SHARDS, reserve_subnet, sfu_node_builder, subnet_ip, subnet_ip_v6,
 };
 use anyhow::Context;
 use pulsebeam_agent_native::agent_core::{
@@ -31,7 +31,6 @@ use tokio::sync::mpsc;
 use std::time::Instant;
 
 mod histories;
-mod ordered_recovery;
 
 #[derive(Clone, Copy, Debug)]
 pub enum Role {
@@ -513,13 +512,7 @@ pub enum Step {
         participant: &'static str,
         topic: &'static str,
         mode: TopicMode,
-        next_sequence: u64,
-    },
-    OrderedTopicRecovery {
-        publisher: &'static str,
-        topic: &'static str,
-        recovering: [&'static str; 2],
-        late: &'static str,
+        sent_units: u64,
     },
     WaitForDataSequence {
         participant: &'static str,
@@ -1118,7 +1111,6 @@ pub enum Step {
         topic: &'static str,
         mode: TopicMode,
         publishers: &'static [&'static str],
-        gap: Option<(u64, u64)>,
     },
 }
 
@@ -1692,6 +1684,7 @@ async fn run_participant(
                 _ = interval.tick() => {
                     let operations = std::mem::take(&mut shared.pending_ops.lock().unwrap().pending);
                     let mut retry = Vec::new();
+                    let mut blocked_data = BTreeSet::new();
                     for (sequence, operation) in operations {
                         let complete = match operation.clone() {
                             PendingDriverOp::SetSubscriptions(subscriptions) => client
@@ -1731,17 +1724,25 @@ async fn run_participant(
                                 true
                             }
                             PendingDriverOp::DeclarePublishTopic(topic, mode) => {
-                                client.ctx.register_publisher(topic, mode).await?
+                                client.ctx.register_publisher(topic, mode)?
                             }
                             PendingDriverOp::DeclareSubscribeTopic(registrations) => {
                                 let mut complete = true;
                                 for registration in registrations {
-                                    complete &= client.ctx.register_subscriber(registration).await?;
+                                    complete &= client.ctx.register_subscriber(registration)?;
                                 }
                                 complete
                             }
                             PendingDriverOp::PublishData(topic, mode, data) => {
-                                client.ctx.send_topic(&topic, mode, data).await?
+                                let track = (topic, mode);
+                                if blocked_data.contains(&track) {
+                                    false
+                                } else if client.ctx.send_topic(&track.0, mode, data).await? {
+                                    true
+                                } else {
+                                    blocked_data.insert(track);
+                                    false
+                                }
                             }
                             PendingDriverOp::SetAudioIntent(participants, automatic) => {
                                 client.ctx.set_audio_intent(&participants, automatic).await?
@@ -1920,7 +1921,6 @@ fn step_name(step: &Step) -> &'static str {
         Step::StopServer => "StopServer",
         Step::RestartServer => "RestartServer",
         Step::WaitForTopicPublisher { .. } => "WaitForTopicPublisher",
-        Step::OrderedTopicRecovery { .. } => "OrderedTopicRecovery",
         Step::WaitForDataSequence { .. } => "WaitForDataSequence",
         Step::SetAudioIntent { .. } => "SetAudioIntent",
         Step::CheckSpeakerHeld { .. } => "CheckSpeakerHeld",
@@ -2141,12 +2141,16 @@ async fn execute_plan(
                 participant,
                 topic,
                 mode,
-                next_sequence,
+                sent_units,
             } => {
                 let handle = get_handle(handles, participant, kind)?;
-                tokio::time::timeout(Duration::from_secs(30), async {
+                let registration = TopicPublisher {
+                    topic: (*topic).into(),
+                    mode: *mode,
+                };
+                tokio::time::timeout(Duration::from_secs(5), async {
                     loop {
-                        let ready = handle
+                        if handle
                             .shared
                             .observation
                             .lock()
@@ -2154,39 +2158,20 @@ async fn execute_plan(
                             .as_ref()
                             .is_some_and(|observation| {
                                 observation
-                                    .snapshot
-                                    .topics
-                                    .publishers
-                                    .iter()
-                                    .any(|publisher| {
-                                        publisher.registration.topic == *topic
-                                            && publisher.registration.mode == *mode
-                                            && publisher.publication_id.is_some()
-                                            && !publisher.send_pending
-                                            && publisher.queued_messages == 0
-                                            && publisher.next_sequence == *next_sequence
-                                    })
-                            });
-                        if ready {
+                                    .sent_data_units
+                                    .get(&registration)
+                                    .is_some_and(|sent| sent >= sent_units)
+                            })
+                        {
                             break;
                         }
                         tokio::time::sleep(Duration::from_millis(10)).await;
                     }
                 })
                 .await
-                .map_err(|_| {
-                    anyhow::anyhow!("{participant} did not transmit topic sequence {next_sequence}")
+                .with_context(|| {
+                    format!("{participant} did not submit {sent_units} DATA units for {topic}")
                 })?;
-            }
-            Step::OrderedTopicRecovery {
-                publisher,
-                topic,
-                recovering,
-                late,
-            } => {
-                ordered_recovery::execute(handles, name_to_ip, publisher, topic, *recovering, late)
-                    .await?;
-                changed_paths.extend(recovering);
             }
             Step::WaitForDataSequence {
                 participant,
@@ -2224,8 +2209,8 @@ async fn execute_plan(
                     let observation = handle.shared.observation.lock().unwrap();
                     let generation = observation.as_ref().and_then(|state| state.snapshot.generation).map(pulsebeam_agent_native::agent_core::Generation::get);
                     let connection = observation.as_ref().map(|state| &state.snapshot.connection);
-                    let subscribers = observation.as_ref().map(|state| state.snapshot.topics.subscribers.iter().filter(|status| status.registration.topic == *topic).take(16).collect::<Vec<_>>());
-                    anyhow::anyhow!("{participant} did not receive ordered sequence on {topic}: actual_len={actual_len} expected_len={} first_sequences={first:?} last_sequences={last:?} gaps={gaps:?} generation={generation:?} connection={connection:?} subscribers={subscribers:?}", expected.len())
+                    let subscribers = observation.as_ref().map(|state| state.data_subscribers.iter().filter(|(selector, _)| selector.topic == *topic).take(16).collect::<Vec<_>>());
+                    anyhow::anyhow!("{participant} did not receive the expected payloads on {topic}: actual_len={actual_len} expected_len={} first_sequences={first:?} last_sequences={last:?} gaps={gaps:?} generation={generation:?} connection={connection:?} subscribers={subscribers:?}", expected.len())
                 })??;
             }
             Step::Run {
@@ -4759,50 +4744,41 @@ async fn execute_plan(
                 topic,
                 mode,
                 publishers,
-                gap,
             } => {
+                let handle = handles
+                    .get(participant)
+                    .with_context(|| format!("{description}: unknown participant {participant}"))?;
+                let observation = handle.shared.observation.lock().unwrap();
+                let catalog = &observation
+                    .as_ref()
+                    .context("recipient lacks an observation")?
+                    .data_catalog;
+                let registration = TopicPublisher {
+                    topic: (*topic).into(),
+                    mode: *mode,
+                };
                 let mut expected = BTreeMap::new();
                 for publisher in *publishers {
-                    let handle = get_handle(handles, publisher, description)?;
-                    let observation = handle.shared.observation.lock().unwrap();
-                    let id = observation
-                        .as_ref()
-                        .and_then(|observation| {
-                            observation
-                                .snapshot
-                                .topics
-                                .publishers
-                                .iter()
-                                .find(|status| {
-                                    status.registration.topic == *topic
-                                        && status.registration.mode == *mode
-                                })
-                                .and_then(|status| status.publication_id.clone())
-                        })
-                        .ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "publisher {publisher} has no authoritative topic binding"
-                            )
-                        })?;
-                    let participant_id = observation
-                        .as_ref()
-                        .and_then(|observation| observation.snapshot.participant_id.clone())
-                        .ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "publisher {publisher} has no admitted external identity"
-                            )
+                    let publisher_handle = handles
+                        .get(publisher)
+                        .with_context(|| format!("{description}: unknown publisher {publisher}"))?;
+                    let participant_id = publisher_handle.participant_id().with_context(|| {
+                        format!("publisher {publisher} lacks an admitted identity")
+                    })?;
+                    let id = catalog
+                        .get(&(participant_id.clone(), registration.clone()))
+                        .with_context(|| {
+                            format!("publisher {publisher} has no authoritative DATA catalog entry")
                         })?;
                     anyhow::ensure!(
-                        expected.insert(participant_id, id).is_none(),
+                        expected.insert(participant_id, id.clone()).is_none(),
                         "duplicate admitted publisher identity"
                     );
                 }
-                let handle = get_handle(handles, participant, description)?;
+                drop(observation);
                 let events = handle.shared.topic_events.lock().unwrap();
-                let mut next_sequence = BTreeMap::<String, u64>::new();
                 let mut latest_sequence = BTreeMap::<String, u64>::new();
                 let mut seen = BTreeSet::new();
-                let mut gaps = Vec::new();
                 for event in events.get(*topic).into_iter().flatten() {
                     match event {
                         TopicNotification::Message(message) if message.mode == *mode => {
@@ -4822,43 +4798,7 @@ async fn execute_plan(
                                         "{description}: latest sequence regressed or duplicated"
                                     );
                                 }
-                            } else if *mode == TopicMode::Ordered {
-                                if let Some(next) = next_sequence.get(&message.publication_id) {
-                                    anyhow::ensure!(
-                                        message.sequence == *next,
-                                        "{description}: ordered message skipped a sequence without an inline gap"
-                                    );
-                                }
-                                next_sequence.insert(
-                                    message.publication_id.clone(),
-                                    message
-                                        .sequence
-                                        .checked_add(1)
-                                        .expect("valid wire sequence"),
-                                );
                             }
-                        }
-                        TopicNotification::RecoveryGap {
-                            subscriber,
-                            publication_id,
-                            participant_id,
-                            expected_sequence,
-                            available_sequence,
-                        } if *mode == TopicMode::Ordered => {
-                            anyhow::ensure!(
-                                subscriber.mode == *mode
-                                    && expected.get(participant_id) == Some(publication_id)
-                                    && expected_sequence < available_sequence,
-                                "{description}: invalid inline gap identity or range"
-                            );
-                            if let Some(next) = next_sequence.get(publication_id) {
-                                anyhow::ensure!(
-                                    next == expected_sequence,
-                                    "{description}: gap does not start at the last confirmed sequence"
-                                );
-                            }
-                            next_sequence.insert(publication_id.clone(), *available_sequence);
-                            gaps.push((*expected_sequence, *available_sequence));
                         }
                         _ => {}
                     }
@@ -4866,10 +4806,6 @@ async fn execute_plan(
                 anyhow::ensure!(
                     seen == expected.keys().cloned().collect::<BTreeSet<_>>(),
                     "{description}: missing application messages from an expected publisher"
-                );
-                anyhow::ensure!(
-                    gaps.as_slice() == gap.as_slice(),
-                    "{description}: wrong inline gaps: {gaps:?}, expected {gap:?}"
                 );
             }
         }
@@ -6109,6 +6045,7 @@ pub struct LocalNodeSim {
     tcp_only: bool,
     udp_only: bool,
     num_shards: usize,
+    local_rtp_v1: bool,
     link: LinkProfile,
     ip_version: turmoil::IpVersion,
     predeclare_topics: bool,
@@ -6132,6 +6069,7 @@ impl LocalNodeSim {
             // exercise reliable-stream framing only in explicit TCP scenarios.
             udp_only: true,
             num_shards: DEFAULT_SIM_SHARDS,
+            local_rtp_v1: false,
             link: LinkProfile::default(),
             ip_version: turmoil::IpVersion::V4,
             predeclare_topics: true,
@@ -6212,6 +6150,11 @@ impl LocalNodeSim {
     /// reaches is chosen by the `SO_REUSEPORT` group, which hashes its 4-tuple
     /// exactly as the kernel does — so a plan that sets this is also exercising
     /// the demuxer's shard check and the arrival path a real deployment uses.
+    pub fn with_local_rtp_v1(mut self) -> Self {
+        self.local_rtp_v1 = true;
+        self
+    }
+
     pub fn with_shards(mut self, n: usize) -> Self {
         assert!(n > 0, "a simulation node must have at least one shard");
         self.num_shards = n;
@@ -6303,6 +6246,7 @@ impl LocalNodeSim {
         let tcp_only = self.tcp_only;
         let udp_only = self.udp_only;
         let num_shards = self.num_shards;
+        let local_rtp_v1 = self.local_rtp_v1;
         let mut name_to_ip = PlanIps::new();
         name_to_ip.insert("server", server_ip);
         let mut endpoints = BTreeMap::new();
@@ -6327,6 +6271,10 @@ impl LocalNodeSim {
         }
         let planned_topics = initial_topic_registrations(&plan, &endpoints)
             .expect("topic declarations name configured participants");
+        let local_data_v1 = !planned_topics.is_empty()
+            || plan
+                .iter()
+                .any(|step| matches!(step, Step::IntentHistory { .. }));
         let initial_topics = if self.predeclare_topics {
             planned_topics.clone()
         } else {
@@ -6339,16 +6287,23 @@ impl LocalNodeSim {
             let startup_tx = startup_tx.clone();
             async move {
                 let rng = pulsebeam_runtime::rand::seeded_rng(seed);
-                start_sfu_node_with_transport(
-                    server_ip,
-                    rng,
-                    num_shards,
-                    tcp_only,
-                    udp_only,
-                    Some(startup_tx),
-                )
-                .await
-                .map_err(Into::into)
+                let mut builder = sfu_node_builder(server_ip, rng, num_shards);
+                if local_data_v1 {
+                    builder = builder.with_local_data_v1();
+                }
+                if local_rtp_v1 {
+                    builder = builder.with_local_rtp_v1();
+                }
+                builder = builder.with_sim_startup_notification(startup_tx);
+                if tcp_only {
+                    builder = builder.tcp_only();
+                } else if udp_only {
+                    builder = builder.udp_only();
+                }
+                builder
+                    .run(tokio_util::sync::CancellationToken::new())
+                    .await
+                    .map_err(Into::into)
             }
         });
 

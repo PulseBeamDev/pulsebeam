@@ -179,10 +179,9 @@ participant, and has a `bigint` sequence and binary data. Source replacement may
 produce a discontinuity; an unrecoverable Reliable gap rejects `next()` and
 ends only that subscription. Read one event at a time.
 
-`send(bytes, { recipients })` accepts server-issued `dataRecipientId()` values
-from the catalog. Recipients must already be authorized subscribers. Omit the
-list to address all current authorized subscribers. A successful send is local
-admission, not a receipt. Transport is live and finite, not durable storage.
+Messages go to current authorized subscribers. A successful `send(bytes)`
+confirms local admission, not receipt. Transport is live and finite, not
+durable storage.
 
 ## Observe state and release ownership
 

@@ -118,6 +118,60 @@ impl SimOwnershipPeer {
             .await
     }
 
+    pub async fn relay_fabric_data(
+        &self,
+        publisher_link: pulsebeam_link::NetworkId,
+        receive_link: pulsebeam_link::NetworkId,
+        connection: crate::entity::ConnectionId,
+        fresh_until: Instant,
+    ) -> anyhow::Result<(crate::entity::PublicationKey, pulsebeam_link::NodeRouteKey)> {
+        let (source, destination) =
+            self.with_facts(|local, remote| (local.control.clone(), remote.control.clone()));
+        let source = source.ok_or_else(|| anyhow::anyhow!("source controller is not ready"))?;
+        let destination =
+            destination.ok_or_else(|| anyhow::anyhow!("destination controller is not ready"))?;
+        let map_error = |error| anyhow::anyhow!("ownership Fabric image: {error:?}");
+        let (publication, anchors) = loop {
+            anyhow::ensure!(Instant::now() < fresh_until, "publisher anchor unavailable");
+            let mut anchors = source.sample_data().await.map_err(map_error)?;
+            anchors.retain(|_, (publisher, _)| publisher.connection == connection);
+            anyhow::ensure!(anchors.len() <= 1, "expected one simulation publisher");
+            if let Some(publication) = anchors.keys().next().copied() {
+                break (publication, anchors);
+            }
+            pulsebeam_runtime::time::sleep(std::time::Duration::from_millis(5)).await;
+        };
+        self.deliver_linked_snapshot(receive_link, fresh_until)
+            .await?;
+        let ack = loop {
+            anyhow::ensure!(
+                Instant::now() < fresh_until,
+                "Fabric receive was not acknowledged"
+            );
+            let routes = destination
+                .fabric_image(receive_link, Box::default(), anchors.clone(), fresh_until)
+                .await
+                .map_err(map_error)?;
+            if let Some(ack) = routes
+                .into_iter()
+                .find(|ack| ack.publication == publication)
+            {
+                break ack;
+            }
+            pulsebeam_runtime::time::sleep(std::time::Duration::from_millis(5)).await;
+        };
+        source
+            .fabric_image(
+                publisher_link,
+                Box::new([ack]),
+                Default::default(),
+                fresh_until,
+            )
+            .await
+            .map_err(map_error)?;
+        Ok((publication, ack.key))
+    }
+
     async fn deliver_snapshot(
         &self,
         ingress: Option<pulsebeam_link::NetworkId>,

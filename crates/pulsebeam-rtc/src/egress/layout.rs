@@ -1,5 +1,8 @@
-use super::{Sender, media_extension_id, sender_uses_one_byte_extensions};
-use crate::RtpWrite;
+use super::{
+    Sender, media_extension_id, repair_header_extensions, retains_repair_extension,
+    sender_extension_form,
+};
+use crate::{RtpExtensionForm, RtpWrite};
 
 #[derive(Clone, Copy)]
 pub(super) struct PacketLayout {
@@ -14,13 +17,14 @@ pub(super) struct ExtensionLayout {
 }
 
 impl PacketLayout {
-    pub(super) fn original(sender: &Sender, media: &RtpWrite) -> Option<Self> {
+    pub(super) fn original(sender: &Sender, media: &RtpWrite, emit_mid: bool) -> Option<Self> {
         let forwarded = media.extensions.iter().filter_map(|value| {
             media_extension_id(sender, &value.uri).map(|id| (id, value.value.len()))
         });
         let mid = sender
             .facts
             .mid_extension_id
+            .filter(|_| emit_mid)
             .map(|id| (id, sender.facts.mid.len()));
         let rid_id = if sender.ssrc == sender.rtx_ssrc {
             sender.repaired_rid_extension_id
@@ -34,14 +38,26 @@ impl PacketLayout {
         Self::new(
             media.payload.len(),
             forwarded.chain(mid).chain(rid).chain(twcc),
-            sender_uses_one_byte_extensions(sender),
+            sender_extension_form(sender),
+        )
+    }
+
+    pub(super) fn repair(sender: &Sender, media: &RtpWrite, emit_mid: bool) -> Option<Self> {
+        let forwarded = media.extensions.iter().filter_map(|value| {
+            let id = media_extension_id(sender, &value.uri)?;
+            retains_repair_extension(sender, id).then_some((id, value.value.len()))
+        });
+        Self::new(
+            media.payload.len().checked_add(2)?,
+            forwarded.chain(repair_header_extensions(sender, emit_mid)),
+            sender_extension_form(sender),
         )
     }
 
     pub(super) fn new(
         payload: usize,
         mut extensions: impl Iterator<Item = (u8, usize)> + Clone,
-        allow_one_byte: bool,
+        form: RtpExtensionForm,
     ) -> Option<Self> {
         let base = 12usize.checked_add(payload)?;
         if extensions.clone().next().is_none() {
@@ -56,10 +72,17 @@ impl PacketLayout {
         {
             return None;
         }
-        let one_byte = allow_one_byte
-            && extensions
+        let fits_one_byte = || {
+            extensions
                 .clone()
-                .all(|(id, len)| (1..=14).contains(&id) && (1..=16).contains(&len));
+                .all(|(id, len)| (1..=14).contains(&id) && (1..=16).contains(&len))
+        };
+        let one_byte = match form {
+            RtpExtensionForm::OneByte if fits_one_byte() => true,
+            RtpExtensionForm::OneByte => return None,
+            RtpExtensionForm::TwoByte => false,
+            RtpExtensionForm::Mixed => fits_one_byte(),
+        };
         let data = extensions.try_fold(0usize, |bytes, (_, len)| {
             bytes
                 .checked_add(if one_byte { 1 } else { 2 })?

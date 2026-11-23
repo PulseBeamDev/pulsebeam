@@ -11,7 +11,7 @@ use std::time::Duration;
 mod search;
 const MAX_OPS: usize = 32;
 const MAX_REDUCTIONS: usize = 8;
-const HEADER: &str = "pulsebeam-history-v2";
+const HEADER: &str = "pulsebeam-history-v3";
 
 pub const CAST: [&str; 3] = ["a", "b", "c"];
 pub const CASE: &str = "tests::histories::required_intent_histories";
@@ -40,7 +40,6 @@ impl Claim {
 pub enum Delivery {
     Latest,
     Lossy,
-    Ordered,
 }
 
 impl Delivery {
@@ -48,7 +47,6 @@ impl Delivery {
         match self {
             Self::Latest => "latest",
             Self::Lossy => "lossy",
-            Self::Ordered => "ordered",
         }
     }
 
@@ -57,7 +55,6 @@ impl Delivery {
         match self {
             Self::Latest => TopicMode::Latest,
             Self::Lossy => TopicMode::Lossy,
-            Self::Ordered => TopicMode::Ordered,
         }
     }
 
@@ -65,7 +62,6 @@ impl Delivery {
         match value {
             "latest" => Ok(Self::Latest),
             "lossy" => Ok(Self::Lossy),
-            "ordered" => Ok(Self::Ordered),
             _ => Err("invalid delivery mode".into()),
         }
     }
@@ -142,8 +138,7 @@ impl History {
         }
         let delivery = match self.claim {
             Claim::Replacement | Claim::Stall => Delivery::Latest,
-            Claim::Generation | Claim::Materialization => Delivery::Ordered,
-            Claim::Exploration => Delivery::Lossy,
+            Claim::Generation | Claim::Materialization | Claim::Exploration => Delivery::Lossy,
         };
         let position = self
             .ops
@@ -941,7 +936,7 @@ fn concrete_replay_uses_saved_program_in_a_fresh_process() {
             "admission-regression",
             saved,
             vec![
-                "topic-ordered-fresh-replacement-owner-delivery",
+                "topic-lossy-fresh-replacement-owner-delivery",
                 "planned-admission-retry",
             ],
         ),
@@ -1124,6 +1119,6 @@ fn concrete_format_and_reduction_preserve_validity() {
     }
     assert_eq!(
         deliveries,
-        BTreeSet::from([Delivery::Latest, Delivery::Lossy, Delivery::Ordered])
+        BTreeSet::from([Delivery::Latest, Delivery::Lossy])
     );
 }

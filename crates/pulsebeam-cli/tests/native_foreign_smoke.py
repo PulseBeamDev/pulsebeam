@@ -196,6 +196,13 @@ async def witness(endpoint, token, reader_token, catalog_token, room, package):
             "foreign-exchange").subscribe()
 
         async def send_until_reply():
+            updates = exchange.updates()
+            try:
+                while exchange.state().execution != core.PublicationExecution.INSTALLED:
+                    state = await updates.next()
+                    assert state is not None and not state.closed, state
+            finally:
+                updates.close()
             while True:
                 await exchange.send(b"python-bytes-\0\xff")
                 await asyncio.sleep(0.2)

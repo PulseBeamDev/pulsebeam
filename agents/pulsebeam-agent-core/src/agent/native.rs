@@ -8,6 +8,64 @@ use pulsebeam_proto::state;
 
 pub(super) const STATE_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 
+impl Session {
+    pub(super) fn reliable_subscriber_control_deadline(&self) -> Option<Duration> {
+        if !self.reliable_data_enabled || self.signaling_terminal {
+            return None;
+        }
+        self.payloads
+            .values()
+            .filter(|physical| current_reliable_source(&self.state, physical).is_some())
+            .filter_map(|physical| {
+                let receiver = physical.data_v1_receiver.as_ref()?;
+                receiver
+                    .receipt_deadline()
+                    .into_iter()
+                    .chain(receiver.repair_deadline())
+                    .min()
+            })
+            .min()
+    }
+
+    pub(super) fn next_reliable_subscriber_control(
+        &mut self,
+        now: Duration,
+    ) -> Option<crate::data_v1::ReceiverReceipt> {
+        if !self.reliable_data_enabled || self.signaling_terminal {
+            return None;
+        }
+        for physical in self.payloads.values_mut() {
+            if current_reliable_source(&self.state, physical).is_some()
+                && let Some(receiver) = &mut physical.data_v1_receiver
+            {
+                if let Ok(Some(control)) = receiver.next_receipt_control(now) {
+                    return Some(control);
+                }
+                if let Ok(Some(control)) = receiver.next_repair_control(now) {
+                    return Some(crate::data_v1::ReceiverReceipt::Send(control));
+                }
+            }
+        }
+        None
+    }
+}
+
+fn current_reliable_source<'a>(
+    state: &'a NativeState,
+    physical: &PayloadChannel,
+) -> Option<&'a state::Track> {
+    if physical.state != PayloadState::Active
+        || physical.data_v1.delivery != state::DataV1Delivery::Reliable as i32
+    {
+        return None;
+    }
+    let (offer, current) = state.logical_offer(&physical.resource)?;
+    if physical.offer != Some(offer) || !installed_payload(physical, current) {
+        return None;
+    }
+    current.source.as_ref()
+}
+
 pub(super) struct PayloadChannel {
     pub resource: Resource,
     pub registration: crate::TopicChannel,
@@ -15,6 +73,216 @@ pub(super) struct PayloadChannel {
     pub state: PayloadState,
     pub restart: bool,
     pub offer: Option<Offer>,
+    pub(super) data_v1: state::SctpDataV1Parameters,
+    pub(super) data_v1_receiver: Option<Box<crate::data_v1::ReceiveChannel>>,
+    pub(super) data_v1_sender: Option<Box<crate::data_v1::SendChannel>>,
+}
+
+impl PayloadChannel {
+    fn install_data_v1_receiver(
+        &mut self,
+        generation: Generation,
+        channel_id: ChannelId,
+        logical: &state::LogicalSubscriptionState,
+        prepared: Option<&crate::PreparedDataChannel>,
+        control: Option<(u64, ChannelId)>,
+    ) {
+        use core::num::{NonZeroU16, NonZeroU64};
+        use pulsebeam_proto::data_endpoint::{Binding, Channel, Endpoint};
+
+        if !installed_payload(self, logical) {
+            self.data_v1_receiver = None;
+            return;
+        }
+        if self.data_v1_receiver.is_some() {
+            return;
+        }
+        let receiver = || {
+            let parameters = self.data_v1;
+            let offer = logical.data_v1.as_ref()?;
+            let accepted = match logical.execution.as_ref()? {
+                state::logical_subscription_state::Execution::Installed(binding) => binding,
+                state::logical_subscription_state::Execution::Failure(_) => return None,
+            };
+            let binding = Binding {
+                channel: Channel {
+                    association: generation,
+                    stream: NonZeroU16::new(self.stream)?,
+                    incarnation: NonZeroU64::new(parameters.channel_incarnation)?,
+                },
+                format: parameters.format()?,
+                endpoint: Endpoint::Subscriber(offer.endpoint()?),
+            };
+            let channel =
+                crate::data_v1::Channel::from_accepted(channel_id, binding, prepared?, accepted)
+                    .ok()?;
+            let clock = offer
+                .capture_clock
+                .as_ref()
+                .map(|clock| crate::ffi::CaptureClock {
+                    id: clock.id.clone(),
+                    epoch: clock.epoch,
+                });
+            if binding.format.delivery() == pulsebeam_proto::data_endpoint::Delivery::Reliable {
+                let (owned, signaling) = control?;
+                crate::data_v1::ReceiveChannel::new_reliable(
+                    channel,
+                    clock,
+                    NonZeroU64::new(owned)?,
+                    signaling,
+                )
+                .ok()
+            } else {
+                crate::data_v1::ReceiveChannel::new(channel, clock).ok()
+            }
+        };
+        self.data_v1_receiver = receiver().map(Box::new);
+    }
+
+    pub(super) fn data_v1_publisher(
+        &mut self,
+        generation: Generation,
+        channel_id: ChannelId,
+        live: &state::LiveResource,
+        prepared: &crate::PreparedDataChannel,
+        control: Option<(core::num::NonZeroU64, ChannelId)>,
+    ) -> Option<&mut crate::data_v1::SendChannel> {
+        use pulsebeam_proto::data_endpoint::Delivery;
+        let (binding, channel) =
+            self.prepared_publisher(generation, channel_id, live, prepared, control.is_some())?;
+        if self.data_v1_sender.is_none() {
+            let sender = if binding.format.delivery() == Delivery::Reliable {
+                let (owned, signaling) = control?;
+                crate::data_v1::SendChannel::new_reliable(channel, None, 0, owned, signaling)
+            } else {
+                crate::data_v1::SendChannel::new(channel, None, 0)
+            }
+            .ok()?;
+            self.data_v1_sender = Some(Box::new(sender));
+        }
+        self.data_v1_sender
+            .as_deref_mut()
+            .filter(|sender| sender.matches_binding(binding))
+    }
+
+    pub(super) fn prepared_publisher(
+        &self,
+        generation: Generation,
+        channel: ChannelId,
+        live: &state::LiveResource,
+        prepared: &crate::PreparedDataChannel,
+        has_control: bool,
+    ) -> Option<(
+        pulsebeam_proto::data_endpoint::Binding<Generation>,
+        crate::data_v1::Channel,
+    )> {
+        let (binding, accepted) = self.publisher_binding(generation, live)?;
+        if (binding.format.delivery() == pulsebeam_proto::data_endpoint::Delivery::Reliable
+            && !has_control)
+            || self
+                .data_v1_sender
+                .as_ref()
+                .is_some_and(|sender| !sender.matches_binding(binding))
+        {
+            return None;
+        }
+        let prepared =
+            crate::data_v1::Channel::from_accepted(channel, binding, prepared, accepted).ok()?;
+        Some((binding, prepared))
+    }
+
+    pub(super) fn current_data_v1_publisher(
+        &self,
+        generation: Generation,
+        live: &state::LiveResource,
+    ) -> bool {
+        self.publisher_binding(generation, live)
+            .is_some_and(|(binding, _)| {
+                self.data_v1_sender
+                    .as_ref()
+                    .is_some_and(|sender| sender.matches_binding(binding))
+            })
+    }
+
+    pub(super) fn settle_data_sender(
+        &mut self,
+        generation: Generation,
+        now: core::time::Duration,
+        retiring: bool,
+        notifications: &mut VecDeque<Notification>,
+    ) {
+        let (Some(sender), crate::TopicChannel::Publisher(publisher)) =
+            (&mut self.data_v1_sender, &self.registration)
+        else {
+            return;
+        };
+        sender.expire(now);
+        if let Some(source) = sender.reliable_source() {
+            while let Some(unit_seq) = sender.take_unconfirmed(now, retiring) {
+                notifications.push_back(Notification::ReliableData {
+                    track_id: publisher.topic.clone(),
+                    generation,
+                    source: source.get(),
+                    event: crate::ffi::ReliablePublishEvent::AdmissionUnknown { unit_seq },
+                });
+            }
+        }
+        if retiring {
+            sender.discard_unit();
+        }
+    }
+
+    fn publisher_binding<'a>(
+        &self,
+        generation: Generation,
+        live: &'a state::LiveResource,
+    ) -> Option<(
+        pulsebeam_proto::data_endpoint::Binding<Generation>,
+        &'a state::TrackBinding,
+    )> {
+        use core::num::{NonZeroU16, NonZeroU64};
+        use pulsebeam_proto::{
+            data_control::PublisherBinding,
+            data_endpoint::{Binding, Channel, Endpoint},
+        };
+        let parameters = self.data_v1;
+        if self.state != PayloadState::Active {
+            return None;
+        }
+        let state::resource_spec::Declaration::Publication(publication) =
+            live.spec.as_ref()?.declaration.as_ref()?
+        else {
+            return None;
+        };
+        let state::publication_spec::Kind::Data(data) = publication.kind.as_ref()? else {
+            return None;
+        };
+        let accepted = data.binding.as_ref()?;
+        if *accepted != self.binding() {
+            return None;
+        }
+        let source = NonZeroU64::new(live.data_v1_source?)?;
+        Some((
+            Binding {
+                channel: Channel {
+                    association: generation,
+                    stream: NonZeroU16::new(self.stream)?,
+                    incarnation: NonZeroU64::new(parameters.channel_incarnation)?,
+                },
+                format: parameters.format()?,
+                endpoint: Endpoint::Publisher(PublisherBinding { source }),
+            },
+            accepted,
+        ))
+    }
+
+    fn binding(&self) -> state::TrackBinding {
+        use state::track_binding::Transport;
+
+        state::TrackBinding {
+            transport: Some(Transport::SctpDataV1(self.data_v1)),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -251,6 +519,7 @@ fn logical_subscription(
     selector: &crate::TrackSelector,
     kind: state::TrackKind,
     receive: Option<state::resource_settings::Receive>,
+    data_version: Option<u32>,
 ) -> state::ResourceSpec {
     state::ResourceSpec {
         settings: Some(state::ResourceSettings {
@@ -259,6 +528,7 @@ fn logical_subscription(
         }),
         declaration: Some(state::resource_spec::Declaration::LogicalSubscription(
             state::LogicalSubscriptionSpec {
+                data_version,
                 source: Some(state::LogicalSourceAddress {
                     room: selector.room.clone(),
                     participant_id: selector.participant_id.clone(),
@@ -439,21 +709,31 @@ fn source_room_for_track(session: &Session, desired: &DesiredState, track: &str)
     None
 }
 
+fn data_v1_delivery(mode: crate::TopicMode, reliable: bool) -> Option<state::DataV1Delivery> {
+    match mode {
+        crate::TopicMode::Lossy => Some(state::DataV1Delivery::Unreliable),
+        crate::TopicMode::Latest => Some(state::DataV1Delivery::Latest),
+        crate::TopicMode::Ordered if reliable => Some(state::DataV1Delivery::Reliable),
+        crate::TopicMode::Ordered => None,
+    }
+}
+
 fn payload(
     session: &mut Session,
     resource: &Resource,
     registration: crate::TopicChannel,
     offer: Option<Offer>,
+    data_v1: state::DataV1Delivery,
     ids: &mut IdGenerator,
     effects: &mut VecDeque<Effect>,
 ) -> Option<state::TrackBinding> {
-    let mode = match &registration {
-        crate::TopicChannel::Publisher(value) => value.mode,
-        crate::TopicChannel::Subscriber(value) => value.mode,
-    };
     let channel = if let Some(channel) = session.payload_resources.get(resource).copied() {
         let physical = session.payloads.get(&channel)?;
-        if physical.registration != registration || physical.state != PayloadState::Active {
+        if physical.registration != registration
+            || physical.offer != offer
+            || physical.state != PayloadState::Active
+            || physical.data_v1.delivery != data_v1 as i32
+        {
             return None;
         }
         channel
@@ -494,6 +774,14 @@ fn payload(
                 state: PayloadState::Active,
                 restart: false,
                 offer,
+                data_v1: state::SctpDataV1Parameters {
+                    stream_id: Some(u32::from(stream)),
+                    version: u32::from(pulsebeam_proto::data_endpoint::DATA_V1),
+                    channel_incarnation: channel.get(),
+                    delivery: data_v1 as i32,
+                },
+                data_v1_receiver: None,
+                data_v1_sender: None,
             },
         );
         session.payload_resources.insert(resource.clone(), channel);
@@ -502,12 +790,8 @@ fn payload(
             channel,
             specification: DataChannelSpec {
                 label: format!("native/payload/{}", channel.get()),
-                ordered: mode == crate::TopicMode::Ordered,
-                reliability: if mode == crate::TopicMode::Ordered {
-                    DataChannelReliability::Reliable
-                } else {
-                    DataChannelReliability::MaxRetransmits(0)
-                },
+                ordered: false,
+                reliability: DataChannelReliability::MaxRetransmits(0),
                 negotiated_id: Some(stream),
             },
         }));
@@ -515,26 +799,14 @@ fn payload(
     };
     let prepared = session.data_preparations.get(&channel)?.as_ref().ok()?;
     let physical = session.payloads.get(&channel)?;
-    let reliable = mode == crate::TopicMode::Ordered;
     if prepared.stream_id != physical.stream
         || !prepared.negotiated
-        || prepared.ordered != reliable
-        || prepared.reliability
-            != if reliable {
-                DataChannelReliability::Reliable
-            } else {
-                DataChannelReliability::MaxRetransmits(0)
-            }
+        || prepared.ordered
+        || prepared.reliability != DataChannelReliability::MaxRetransmits(0)
     {
         return None;
     }
-    Some(state::TrackBinding {
-        transport: Some(state::track_binding::Transport::Sctp(
-            state::SctpParameters {
-                stream_id: Some(u32::from(prepared.stream_id)),
-            },
-        )),
-    })
+    Some(physical.binding())
 }
 
 pub(super) fn project_retired_receivers(session: &Session, snapshot: &mut Snapshot) -> bool {
@@ -607,7 +879,7 @@ pub(super) fn reconcile(
             },
         ));
         if let Some(selector) = &video.selector {
-            let spec = logical_subscription(selector, state::TrackKind::Video, receive);
+            let spec = logical_subscription(selector, state::TrackKind::Video, receive, None);
             let resource = Resource::LogicalReception(slot.clone());
             reconcile_logical_media(session, &mut media, &slot, &resource, &spec)?;
             wanted.insert(resource, spec);
@@ -733,29 +1005,38 @@ pub(super) fn reconcile(
             .get(selector)
             .copied()
             .unwrap_or_default();
-        let spec =
-            logical_subscription(selector, state::TrackKind::Audio, audio_options(buffering));
+        let spec = logical_subscription(
+            selector,
+            state::TrackKind::Audio,
+            audio_options(buffering),
+            None,
+        );
         reconcile_logical_media(session, &mut media, &slot, &resource, &spec)?;
         wanted.insert(resource, spec);
     }
     let mut data = BTreeMap::new();
-    let subscribers: BTreeMap<_, Vec<_>> =
-        desired
-            .topics
-            .subscribers
-            .iter()
-            .fold(BTreeMap::new(), |mut by_source, subscriber| {
-                by_source
-                    .entry(crate::TrackSelector {
-                        room: subscriber.room.clone(),
-                        participant_id: subscriber.participant_id.clone(),
-                        track_id: subscriber.topic.clone(),
-                    })
-                    .or_default()
-                    .push(subscriber);
-                by_source
-            });
-    for publisher in desired.topics.publishers.iter().filter(|_| joined) {
+    let subscribers: BTreeMap<_, Vec<_>> = desired
+        .topics
+        .subscribers
+        .iter()
+        .filter(|_| session.capabilities.data_v1)
+        .fold(BTreeMap::new(), |mut by_source, subscriber| {
+            by_source
+                .entry(crate::TrackSelector {
+                    room: subscriber.room.clone(),
+                    participant_id: subscriber.participant_id.clone(),
+                    track_id: subscriber.topic.clone(),
+                })
+                .or_default()
+                .push(subscriber);
+            by_source
+        });
+    for publisher in desired
+        .topics
+        .publishers
+        .iter()
+        .filter(|_| joined && session.capabilities.data_v1)
+    {
         data.insert(
             Resource::Publication {
                 kind: state::TrackKind::Data,
@@ -768,11 +1049,19 @@ pub(super) fn reconcile(
         let resource = Resource::LogicalData(selector.clone());
         wanted.insert(
             resource.clone(),
-            logical_subscription(&selector, state::TrackKind::Data, None),
+            logical_subscription(
+                &selector,
+                state::TrackKind::Data,
+                None,
+                Some(u32::from(pulsebeam_proto::data_endpoint::DATA_V1)),
+            ),
         );
         let Some((offer, logical)) = session.state.logical_offer(&resource) else {
             continue;
         };
+        if logical.data_v1.is_none() {
+            continue;
+        }
         let Some(track) = logical.source.as_ref() else {
             continue;
         };
@@ -789,16 +1078,29 @@ pub(super) fn reconcile(
         }) else {
             continue;
         };
+        let Some(mode) = data_v1_delivery(registration.mode, session.reliable_data_enabled) else {
+            continue;
+        };
         if let Some(channel) = session.payload_resources.get(&resource).copied() {
-            let Some(physical) = session.payloads.get(&channel) else {
+            let Some(physical) = session.payloads.get_mut(&channel) else {
                 continue;
             };
             if physical.offer != Some(offer) {
-                // A replacement offer certifies that the old server binding has been cut off.
-                if !matches!(physical.state, PayloadState::Closed { .. }) {
-                    continue;
+                // The new offer fences the old server binding. Only SID reuse, not
+                // installation on another SID, needs the local reset barrier.
+                session.payload_resources.remove(&resource);
+                match physical.state {
+                    PayloadState::Active => {
+                        physical.data_v1_receiver = None;
+                        physical.state = PayloadState::Closing;
+                        effects.push_back(Effect::Rtc(RtcEffect::CloseDataChannel {
+                            generation: session.generation,
+                            channel,
+                        }));
+                    }
+                    PayloadState::Closing => {}
+                    PayloadState::Closed { .. } => release_payload(session, &resource, channel),
                 }
-                release_payload(session, &resource, channel);
             }
         }
         if let Some(binding) = payload(
@@ -806,6 +1108,7 @@ pub(super) fn reconcile(
             &resource,
             crate::TopicChannel::Subscriber(registration.clone()),
             Some(offer),
+            mode,
             ids,
             effects,
         ) {
@@ -875,11 +1178,21 @@ pub(super) fn reconcile(
         release_payload(session, &resource, channel);
     }
     for (resource, registration) in data {
-        if let Some(binding) = payload(session, &resource, registration.clone(), None, ids, effects)
-        {
-            let crate::TopicChannel::Publisher(publisher) = registration else {
-                continue;
-            };
+        let crate::TopicChannel::Publisher(publisher) = &registration else {
+            continue;
+        };
+        let Some(mode) = data_v1_delivery(publisher.mode, session.reliable_data_enabled) else {
+            continue;
+        };
+        if let Some(binding) = payload(
+            session,
+            &resource,
+            registration.clone(),
+            None,
+            mode,
+            ids,
+            effects,
+        ) {
             wanted.insert(
                 resource,
                 publication(
@@ -1072,19 +1385,22 @@ pub(super) fn logical_payload_ready(session: &Session, resource: &Resource) -> b
         .state
         .logical_offer(resource)
         .is_some_and(|(offer, logical)| {
-            physical.offer == Some(offer) && installed_payload(physical, logical)
+            physical.offer == Some(offer)
+                && installed_payload(physical, logical)
+                && physical.data_v1_receiver.is_some()
         })
 }
 
 fn installed_payload(physical: &PayloadChannel, state: &state::LogicalSubscriptionState) -> bool {
     physical.state == PayloadState::Active
         && matches!(&state.execution, Some(state::logical_subscription_state::Execution::Installed(binding))
-            if matches!(&binding.transport, Some(state::track_binding::Transport::Sctp(sctp))
-                if sctp.stream_id == Some(u32::from(physical.stream))))
+            if *binding == physical.binding())
 }
 
-fn release_payload(session: &mut Session, resource: &Resource, channel: ChannelId) {
-    session.payload_resources.remove(resource);
+pub(super) fn release_payload(session: &mut Session, resource: &Resource, channel: ChannelId) {
+    if session.payload_resources.get(resource) == Some(&channel) {
+        session.payload_resources.remove(resource);
+    }
     if let Some(physical) = session.payloads.remove(&channel)
         && physical.state
             == (PayloadState::Closed {
@@ -1665,13 +1981,134 @@ impl Agent {
         self.request_reconciliation();
     }
 
+    fn apply_reliable_data_control(
+        &mut self,
+        control: state::NativeDataControl,
+    ) -> Result<(), AgentError> {
+        use crate::data_v1::{PublisherControl, ReceiverControl};
+        use crate::ffi::ReliablePublishEvent;
+        use state::native_data_control::Endpoint;
+        let active = self
+            .active
+            .as_mut()
+            .filter(|active| active.reliable_data_enabled && !active.signaling_terminal)
+            .ok_or(SignalingError::Malformed)?;
+        let (owned, publisher) = match &control.endpoint {
+            Some(Endpoint::Subscriber(frame)) => (frame.owned, false),
+            Some(Endpoint::Publisher(frame)) => (frame.owned, true),
+            None => return Ok(()),
+        };
+        let Some(channel) = active
+            .state
+            .resource_for_reference(owned)
+            .and_then(|resource| active.payload_resources.get(resource))
+        else {
+            return Ok(());
+        };
+        let Some(physical) = active.payloads.get_mut(channel) else {
+            return Ok(());
+        };
+        if publisher {
+            let generation = active.generation;
+            if !active
+                .state
+                .eligible(&physical.resource)
+                .is_some_and(|live| physical.current_data_v1_publisher(generation, live))
+            {
+                return Ok(());
+            }
+            let (Some(sender), crate::TopicChannel::Publisher(registration)) =
+                (&mut physical.data_v1_sender, &physical.registration)
+            else {
+                return Ok(());
+            };
+            let Some(source) = sender.reliable_source() else {
+                return Ok(());
+            };
+            if !self.desired.topics.publishers.contains(registration) {
+                return Ok(());
+            }
+            let signaling = active.signaling_channel;
+            let event = match sender.handle_publisher_control(
+                generation,
+                signaling,
+                control,
+                self.data_now,
+            ) {
+                Ok(PublisherControl::Admitted { unit_seq }) => {
+                    ReliablePublishEvent::SourceAdmitted { unit_seq }
+                }
+                Ok(PublisherControl::Delivery(outcome)) => ReliablePublishEvent::Delivery {
+                    unit_seq: outcome.unit_seq,
+                    branch: outcome.branch.get(),
+                    outcome: outcome.outcome.into(),
+                },
+                Ok(PublisherControl::Reply(response)) => {
+                    if self.pending_signal.is_none() && self.signal_retry.is_none() {
+                        let bytes = state::codec::encode_data_control(&response)
+                            .map_err(|_| SignalingError::Encode)?;
+                        self.send_native_signal(generation, signaling, bytes, false);
+                    }
+                    return Ok(());
+                }
+                _ => return Ok(()),
+            };
+            self.notifications.push_back(Notification::ReliableData {
+                track_id: registration.topic.clone(),
+                generation,
+                source: source.get(),
+                event,
+            });
+            return Ok(());
+        }
+        let Some(source) = current_reliable_source(&active.state, physical) else {
+            return Ok(());
+        };
+        let (Some(receiver), crate::TopicChannel::Subscriber(subscriber)) =
+            (&mut physical.data_v1_receiver, &physical.registration)
+        else {
+            return Ok(());
+        };
+        let (generation, signaling) = (active.generation, active.signaling_channel);
+        if let Ok(ReceiverControl::Expected {
+            response,
+            assembled,
+        }) = receiver.handle_control(generation, signaling, control, self.data_now)
+        {
+            if let Some(unit) = assembled {
+                let owners =
+                    self.resources
+                        .receive_data_v1(subscriber, &source.publication_id, unit);
+                if !owners.is_empty() {
+                    self.notifications
+                        .push_back(Notification::DataReady { owners });
+                }
+            }
+            // The parent retries expectations; never queue a stale outcome behind State.
+            if self.pending_signal.is_none() && self.signal_retry.is_none() {
+                let bytes = state::codec::encode_data_control(&response)
+                    .map_err(|_| SignalingError::Encode)?;
+                self.send_native_signal(generation, signaling, bytes, false);
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn apply_native(&mut self, payload: &[u8]) -> Result<(), AgentError> {
+        let batch = match state::codec::decode_server_frame(payload)
+            .map_err(|_| SignalingError::Malformed)?
+        {
+            state::codec::NativeFrame::State(batch) => batch,
+            state::codec::NativeFrame::Data(control) => {
+                return self.apply_reliable_data_control(control);
+            }
+        };
         let changes = self
             .active
             .as_mut()
             .ok_or(SignalingError::Invalid("inactive Session"))?
             .state
-            .apply(payload)?;
+            .apply_batch(batch)?;
         let progress = !changes.is_empty();
         let mut discovery_changed = false;
         for change in changes {
@@ -1922,100 +2359,32 @@ impl Agent {
                                 .logical_offer(&resource)
                                 .filter(|(current, _)| *current == offer)
                                 .map(|(_, state)| state);
-                            if current.is_none() {
-                                self.topics.detach_source(
+                            if let Some(logical) = current {
+                                let prepared = active
+                                    .data_preparations
+                                    .get(&channel)
+                                    .and_then(|result| result.as_ref().ok());
+                                physical.install_data_v1_receiver(
                                     active.generation,
                                     channel,
-                                    false,
-                                    &mut self.snapshot,
-                                    &mut self.notifications,
-                                    &mut self.effects,
+                                    logical,
+                                    prepared,
+                                    active
+                                        .reliable_data_enabled
+                                        .then_some((offer.reference, active.signaling_channel)),
                                 );
-                                if physical.state == PayloadState::Active {
-                                    physical.state = PayloadState::Closing;
-                                    self.effects.push_back(Effect::Rtc(
-                                        RtcEffect::CloseDataChannel {
-                                            generation: active.generation,
-                                            channel,
-                                        },
-                                    ));
-                                }
-                            } else if let Some(logical) = current
-                                && installed_payload(physical, logical)
-                                && let Some(track) = logical.source.as_ref()
-                            {
-                                let participant = state::Participant {
-                                    participant_id: track.participant_id.clone(),
-                                    room_id: track.room_id.clone(),
-                                };
-                                self.topics.install_source(
-                                    active.generation,
-                                    crate::topic::TopicSource {
+                                continue;
+                            }
+                            physical.data_v1_receiver = None;
+                            if physical.state == PayloadState::Active {
+                                physical.state = PayloadState::Closing;
+                                self.effects
+                                    .push_back(Effect::Rtc(RtcEffect::CloseDataChannel {
+                                        generation: active.generation,
                                         channel,
-                                        registration: physical.registration.clone(),
-                                        track,
-                                        participant: &participant,
-                                    },
-                                    &mut self.snapshot,
-                                    &mut self.notifications,
-                                    &mut self.ids,
-                                    &mut self.effects,
-                                );
-                            } else {
-                                self.topics.suspend_source(active.generation, channel);
+                                    }));
                             }
                             continue;
-                        }
-                        if let Some(live) = active.state.eligible(&resource)
-                            && let (Some(track), Some(participant), Some(physical)) = (
-                                &live.track,
-                                &live.participant,
-                                active
-                                    .payloads
-                                    .get(&channel)
-                                    .filter(|physical| physical.state == PayloadState::Active),
-                            )
-                        {
-                            self.topics.install_source(
-                                active.generation,
-                                crate::topic::TopicSource {
-                                    channel,
-                                    registration: physical.registration.clone(),
-                                    track,
-                                    participant,
-                                },
-                                &mut self.snapshot,
-                                &mut self.notifications,
-                                &mut self.ids,
-                                &mut self.effects,
-                            );
-                        } else if matches!(
-                            confirmed.value,
-                            Some(state::confirmed_state::Value::Absent(_))
-                        ) {
-                            let source_ended = matches!(
-                                &confirmed.value,
-                                Some(state::confirmed_state::Value::Absent(absent))
-                                    if absent.reason == state::AbsenceReason::SourceEnded as i32
-                            );
-                            if source_ended
-                                && let Resource::DataSubscription(source) = &resource
-                                && let Some(physical) = active.payloads.get(&channel)
-                                && let crate::TopicChannel::Subscriber(subscriber) =
-                                    &physical.registration
-                            {
-                                self.topics.end_source(subscriber, source);
-                            }
-                            self.topics.detach_source(
-                                active.generation,
-                                channel,
-                                source_ended,
-                                &mut self.snapshot,
-                                &mut self.notifications,
-                                &mut self.effects,
-                            );
-                        } else {
-                            self.topics.suspend_source(active.generation, channel);
                         }
                         if let Some(state::confirmed_state::Value::Absent(absent)) =
                             &confirmed.value

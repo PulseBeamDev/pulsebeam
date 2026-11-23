@@ -166,6 +166,114 @@ pub fn callback_clock() -> anyhow::Result<NativeCallbackClock> {
     Ok(Services::acquire()?.borrow().callback_clock)
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(in crate::tests) struct UdpRtpPeaks {
+    pub min_sent: Option<usize>,
+    pub sent: usize,
+    pub received: usize,
+    pub sent_count: usize,
+    pub received_count: usize,
+}
+
+pub(in crate::tests) struct UdpRtpWindow {
+    sent_to: IpAddr,
+    received_from: IpAddr,
+    peaks: RefCell<UdpRtpPeaks>,
+    repair: RefCell<Option<UdpRtpRepair>>,
+}
+
+#[derive(Debug)]
+pub(in crate::tests) struct UdpRtpRepair {
+    source: u32,
+    target: [u32; 2],
+    pub input: Vec<usize>,
+    pub output: Vec<usize>,
+    pub output_timestamp: Option<u32>,
+    pub dropped: Option<usize>,
+    pub repairs: Vec<usize>,
+}
+
+impl UdpRtpWindow {
+    pub(in crate::tests) fn drop_second_primary(&self, source: u32, target: [u32; 2]) {
+        *self.repair.borrow_mut() = Some(UdpRtpRepair {
+            source,
+            target,
+            input: Vec::new(),
+            output: Vec::new(),
+            output_timestamp: None,
+            dropped: None,
+            repairs: Vec::new(),
+        });
+    }
+
+    pub(in crate::tests) fn repaired_timestamp(&self) -> Option<u32> {
+        let repair = self.repair.borrow();
+        let repair = repair.as_ref()?;
+        if repair.repairs.is_empty() {
+            return None;
+        }
+        repair.output_timestamp
+    }
+
+    pub(in crate::tests) fn finish_repair(&self) -> Option<UdpRtpRepair> {
+        self.repair.borrow_mut().take()
+    }
+
+    pub fn peaks(&self) -> UdpRtpPeaks {
+        *self.peaks.borrow()
+    }
+
+    fn observe(&self, remote: IpAddr, bytes: &[u8], outgoing: bool) -> bool {
+        let endpoint = if outgoing {
+            self.sent_to
+        } else {
+            self.received_from
+        };
+        if remote == endpoint
+            && let [first, pt, ..] = bytes
+            && first >> 6 == 2
+            && first & 0x20 == 0
+            && !(64..=95).contains(&(pt & 127))
+        {
+            let mut peaks = self.peaks.borrow_mut();
+            if outgoing {
+                peaks.min_sent = Some(
+                    peaks
+                        .min_sent
+                        .map_or(bytes.len(), |min| min.min(bytes.len())),
+                );
+                peaks.sent = peaks.sent.max(bytes.len());
+                peaks.sent_count += 1;
+            } else {
+                peaks.received = peaks.received.max(bytes.len());
+                peaks.received_count += 1;
+            }
+            if let Some(repair) = self.repair.borrow_mut().as_mut()
+                && let Some(ssrc) = bytes.get(8..12).and_then(|value| value.try_into().ok())
+            {
+                let ssrc = u32::from_be_bytes(ssrc);
+                if outgoing && ssrc == repair.source {
+                    repair.input.push(bytes.len());
+                } else if !outgoing && ssrc == repair.target[0] {
+                    let timestamp = u32::from_be_bytes(bytes[4..8].try_into().unwrap());
+                    assert_eq!(*repair.output_timestamp.get_or_insert(timestamp), timestamp);
+                    repair.output.push(bytes.len());
+                    if repair.output.len() == 2 {
+                        repair.dropped = Some(bytes.len());
+                        return false;
+                    }
+                } else if !outgoing && ssrc == repair.target[1] {
+                    let timestamp = u32::from_be_bytes(bytes[4..8].try_into().unwrap());
+                    if repair.output_timestamp == Some(timestamp) {
+                        repair.repairs.push(bytes.len());
+                    }
+                }
+            }
+        }
+        true
+    }
+}
+
 struct HostState {
     interface: Rc<NetworkEndpoint>,
     io: Rc<Transport>,
@@ -192,6 +300,7 @@ impl NativeHost {
             services: services.clone(),
             flows: RefCell::new(Flows::default()),
             active: RefCell::new(Weak::new()),
+            udp_rtp: Rc::new(RefCell::new(Weak::new())),
         });
         let transport = io.clone();
         let task = tokio::task::spawn_local(async move {
@@ -209,22 +318,57 @@ impl NativeHost {
         Ok(Self(host))
     }
 
+    pub(in crate::tests) fn observe_udp_rtp(&self, remote: IpAddr) -> Rc<UdpRtpWindow> {
+        self.observe_udp_rtp_pair(remote, remote)
+    }
+
+    pub(in crate::tests) fn observe_udp_rtp_pair(
+        &self,
+        sent_to: IpAddr,
+        received_from: IpAddr,
+    ) -> Rc<UdpRtpWindow> {
+        let mut active = self.0.io.udp_rtp.borrow_mut();
+        assert!(
+            active.upgrade().is_none(),
+            "one UDP observation per native host"
+        );
+        let window = Rc::new(UdpRtpWindow {
+            sent_to,
+            received_from,
+            peaks: RefCell::default(),
+            repair: RefCell::default(),
+        });
+        *active = Rc::downgrade(&window);
+        window
+    }
+
     pub fn raw_peer_factory(
         &self,
+        video_encoder: Option<pulsebeam_rtc_simulation::VideoEncoderFactoryHandle>,
     ) -> anyhow::Result<pulsebeam_rtc_simulation::PeerConnectionFactory> {
+        use pulsebeam_rtc_simulation::{AudioDecoderFactory, AudioEncoderFactory};
         let services = self.0.io.services.borrow();
-        Ok(services
+        let builder = services
             .bridge
             .world
             .controlled
             .peer_factory_builder()?
             .network_manager(self.0.interface.network_manager()?)
             .packet_socket_factory(self.0.interface.packet_socket_factory()?)
-            .audio_encoder_factory(
-                pulsebeam_rtc_simulation::AudioEncoderFactory::with_opus_frames()?,
-            )
-            .audio_decoder_factory(pulsebeam_rtc_simulation::AudioDecoderFactory::builtin_opus()?)
-            .build()?)
+            .audio_encoder_factory(AudioEncoderFactory::with_opus_frames()?)
+            .audio_decoder_factory(AudioDecoderFactory::builtin_opus()?);
+        let builder = if let Some(encoder) = video_encoder {
+            builder.video_encoder_factory(encoder)
+        } else {
+            builder
+        };
+        Ok(builder.build()?)
+    }
+
+    pub fn av1_keyframe(&self) -> anyhow::Result<Vec<u8>> {
+        let services = self.0.io.services.borrow();
+        pulsebeam_rtc_simulation::stock_av1_keyframe(&services.bridge.world)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))
     }
 
     pub fn h264_fixture(
@@ -335,6 +479,7 @@ struct Transport {
     services: Rc<RefCell<Services>>,
     flows: RefCell<Flows>,
     active: RefCell<Weak<RuntimeLease>>,
+    udp_rtp: Rc<RefCell<Weak<UdpRtpWindow>>>,
 }
 
 fn socket_addr(address: NetworkAddress) -> SocketAddr {
@@ -420,6 +565,7 @@ impl Transport {
                         let reader = socket.clone();
                         let receiver_token = token.clone();
                         let services = self.services.clone();
+                        let udp_rtp = self.udp_rtp.clone();
                         let task = tokio::task::spawn_local(async move {
                             let mut data = vec![0; 65_535];
                             loop {
@@ -440,6 +586,11 @@ impl Transport {
                                 };
                                 if receiver_token.is_cancelled() {
                                     break;
+                                }
+                                if udp_rtp.borrow().upgrade().is_some_and(|window| {
+                                    !window.observe(remote.ip(), &data[..len], false)
+                                }) {
+                                    continue;
                                 }
                                 let result = network_addr(remote)
                                     .map_err(anyhow::Error::from)
@@ -474,6 +625,9 @@ impl Transport {
                             token.is_cancelled()
                         )
                     })?;
+                if let Some(window) = self.udp_rtp.borrow().upgrade() {
+                    window.observe(destination.ip(), &packet.packet().payload, true);
+                }
             }
             OutboundKind::TcpConnect => {
                 anyhow::ensure!(

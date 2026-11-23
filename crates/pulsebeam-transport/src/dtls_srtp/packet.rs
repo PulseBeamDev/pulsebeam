@@ -180,6 +180,24 @@ impl<'a> RtpPacket<'a> {
         self.marker
     }
 
+    /// First contributing source in the RTP header, if present.
+    pub fn first_csrc(&self) -> Option<u32> {
+        if self.bytes.first().is_none_or(|byte| byte & 0x0f == 0) {
+            return None;
+        }
+        read_u32(self.bytes, 12).ok()
+    }
+
+    /// Includes the two-byte extension profile's appbits, when present.
+    pub const fn extension_profile(&self) -> Option<u16> {
+        self.extension_profile
+    }
+
+    /// RTP padding was already validated and is excluded from `payload()`.
+    pub fn padding_len(&self) -> usize {
+        self.bytes.len().saturating_sub(self.payload.end)
+    }
+
     pub fn extensions(&self) -> Result<ExtensionIter<'a>, PacketError> {
         let Some(range) = &self.extensions else {
             return Ok(ExtensionIter {

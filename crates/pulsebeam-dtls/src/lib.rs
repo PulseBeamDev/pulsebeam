@@ -24,7 +24,29 @@ pub enum SrtpVersion {
 #[derive(Clone, Copy)]
 enum Profile {
     Datagrams,
+    SingleRecordDatagrams,
     DtlsSrtp(SrtpVersion),
+    FabricWan,
+}
+
+impl Profile {
+    fn exports_srtp(self) -> bool {
+        matches!(self, Self::DtlsSrtp(_) | Self::FabricWan)
+    }
+}
+
+/// Pinned DTLS 1.3 AES-128-GCM profile: five header bytes (no CID), one
+/// inner content-type byte and a sixteen-byte tag. Dimpl 0.9.0 adds no padding.
+pub const SINGLE_RECORD_OVERHEAD: usize = 5 + 1 + 16;
+// Pinned Native Opus RTP layout (1,200 payload + 12 RTP + 8 audio-level)
+// protected with the full 16-byte GCM tag.
+pub const FABRIC_WAN_DATAGRAM_BYTES: usize = 1_200 + 12 + 8 + 16;
+pub const FABRIC_WAN_BOOTSTRAP_BYTES: usize = 1200;
+
+struct SingleRecordState {
+    mtu: usize,
+    drained: bool,
+    expected: Option<usize>,
 }
 
 /// Public SHA-256 fingerprint of the entire DER leaf certificate.
@@ -117,6 +139,14 @@ pub enum Error {
     TimeWentBackwards,
     #[error("unsupported DTLS output event")]
     UnsupportedOutput,
+    #[error("datagram exceeds the configured single-record budget")]
+    DatagramBudget,
+    #[error("drain DTLS output before sending another application record")]
+    DrainRequired,
+    #[error("datagram violates the single-record profile")]
+    DatagramShape,
+    #[error("the Fabric WAN association did not negotiate AES-256-GCM SRTP")]
+    WanSrtpProfile,
     #[error("association is closed")]
     Closed,
 }
@@ -172,6 +202,8 @@ pub struct Association {
     peer_verified: bool,
     handshake_complete: bool,
     profile: Profile,
+    single_record: Option<SingleRecordState>,
+    wan_application_wire_bytes: Option<usize>,
     srtp_material: Option<(KeyingMaterial, SrtpProfile)>,
     srtp_profile: Option<SrtpProfile>,
     now: Instant,
@@ -201,10 +233,21 @@ fn config(
         .mtu(mtu)
         .max_queue_rx(32)
         .max_queue_tx(32);
-    if matches!(profile, Profile::Datagrams) {
-        builder = builder.dtls12_cipher_suites(&[]);
-    } else {
-        builder = builder.use_server_cookie(false);
+    match profile {
+        Profile::Datagrams => builder = builder.dtls12_cipher_suites(&[]),
+        Profile::SingleRecordDatagrams | Profile::FabricWan => {
+            builder = builder
+                .dtls12_cipher_suites(&[])
+                .dtls13_cipher_suites(&[dimpl::crypto::Dtls13CipherSuite::AES_128_GCM_SHA256]);
+        }
+        Profile::DtlsSrtp(_) => {
+            use dimpl::crypto::Dtls13CipherSuite as Suite;
+            builder = builder.use_server_cookie(false).dtls13_cipher_suites(&[
+                Suite::AES_256_GCM_SHA384,
+                Suite::AES_128_GCM_SHA256,
+                Suite::CHACHA20_POLY1305_SHA256,
+            ]);
+        }
     }
     if let Some(limit) = key_limit {
         builder = builder.aead_encryption_limit(limit);
@@ -233,6 +276,26 @@ impl Association {
         )
     }
 
+    /// Explicitly provisioned DTLS 1.3 profile for one application record per
+    /// protected datagram. Unlike `new`, this enforces the application budget.
+    pub fn single_record_datagrams(
+        role: Role,
+        local: &LocalIdentity,
+        expected_peer: Fingerprint,
+        mtu: usize,
+        now: Instant,
+    ) -> Result<Self, Error> {
+        Self::with_profile(
+            role,
+            local,
+            expected_peer,
+            mtu,
+            now,
+            None,
+            Profile::SingleRecordDatagrams,
+        )
+    }
+
     /// WebRTC-compatible DTLS-SRTP with a purpose-specific authenticated exporter.
     pub fn dtls_srtp(
         role: Role,
@@ -250,6 +313,30 @@ impl Association {
             now,
             None,
             Profile::DtlsSrtp(version),
+        )
+    }
+
+    /// Provision the dedicated Fabric WAN profile. Ordinary DTLS output stays
+    /// within the bootstrap MTU; single application records can carry probes
+    /// up to the WAN envelope. Route and probe authority are caller-owned.
+    pub fn fabric_wan(
+        role: Role,
+        local: &LocalIdentity,
+        expected_peer: Fingerprint,
+        bootstrap_mtu: usize,
+        now: Instant,
+    ) -> Result<Self, Error> {
+        if bootstrap_mtu > FABRIC_WAN_BOOTSTRAP_BYTES {
+            return Err(Error::DatagramBudget);
+        }
+        Self::with_profile(
+            role,
+            local,
+            expected_peer,
+            bootstrap_mtu,
+            now,
+            None,
+            Profile::FabricWan,
         )
     }
 
@@ -275,6 +362,26 @@ impl Association {
         )
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn single_record_with_test_key_limit(
+        role: Role,
+        local: &LocalIdentity,
+        expected_peer: Fingerprint,
+        mtu: usize,
+        now: Instant,
+        limit: u64,
+    ) -> Result<Self, Error> {
+        Self::with_profile(
+            role,
+            local,
+            expected_peer,
+            mtu,
+            now,
+            Some(limit),
+            Profile::SingleRecordDatagrams,
+        )
+    }
+
     fn with_profile(
         role: Role,
         local: &LocalIdentity,
@@ -284,12 +391,26 @@ impl Association {
         key_limit: Option<u64>,
         profile: Profile,
     ) -> Result<Self, Error> {
+        let wan = matches!(profile, Profile::FabricWan);
+        let single_record = if wan || matches!(profile, Profile::SingleRecordDatagrams) {
+            if mtu <= SINGLE_RECORD_OVERHEAD || mtu > usize::from(u16::MAX) {
+                return Err(Error::DatagramBudget);
+            }
+            Some(SingleRecordState {
+                mtu,
+                drained: false,
+                expected: None,
+            })
+        } else {
+            None
+        };
         // Only static certificate credentials are copied, never live traffic state.
         let config = config(mtu, key_limit, profile)?;
         let mut inner = match profile {
-            Profile::Datagrams | Profile::DtlsSrtp(SrtpVersion::Dtls13) => {
-                Dtls::new_13(config, local.0.clone(), now)
-            }
+            Profile::Datagrams
+            | Profile::SingleRecordDatagrams
+            | Profile::FabricWan
+            | Profile::DtlsSrtp(SrtpVersion::Dtls13) => Dtls::new_13(config, local.0.clone(), now),
             Profile::DtlsSrtp(SrtpVersion::Dtls12) => Dtls::new_12(config, local.0.clone(), now),
             Profile::DtlsSrtp(SrtpVersion::Auto) => Dtls::new_auto(config, local.0.clone(), now),
         };
@@ -300,6 +421,8 @@ impl Association {
             peer_verified: false,
             handshake_complete: false,
             profile,
+            single_record,
+            wan_application_wire_bytes: None,
             srtp_material: None,
             srtp_profile: None,
             now,
@@ -310,7 +433,7 @@ impl Association {
         self.inner.is_some()
             && self.peer_verified
             && self.handshake_complete
-            && (matches!(self.profile, Profile::Datagrams) || self.srtp_profile.is_some())
+            && (!self.profile.exports_srtp() || self.srtp_profile.is_some())
     }
 
     pub fn protocol_version(&self) -> Option<ProtocolVersion> {
@@ -323,12 +446,27 @@ impl Association {
 
     /// Queue a graceful close-notify, then drain output. `close` remains immediate.
     pub fn shutdown(&mut self) -> Result<(), Error> {
+        self.note_input();
         let result = self.inner.as_mut().ok_or(Error::Closed)?.close();
         self.protocol_result(result)
     }
 
     /// Feed a UDP payload from the selected peer after advancing time and draining.
     pub fn handle_packet(&mut self, datagram: &[u8]) -> Result<(), Error> {
+        if let Some(state) = &self.single_record {
+            let wan = matches!(self.profile, Profile::FabricWan);
+            if wan && !state.drained {
+                return Err(Error::DrainRequired);
+            }
+            if datagram.len() > state.mtu
+                && (!wan
+                    || datagram.len() > FABRIC_WAN_DATAGRAM_BYTES
+                    || Dtls::single_unified_record_len(datagram).is_none())
+            {
+                return Err(Error::DatagramBudget);
+            }
+        }
+        self.note_input();
         let result = self
             .inner
             .as_mut()
@@ -342,6 +480,7 @@ impl Association {
         if now < self.now {
             return Err(Error::TimeWentBackwards);
         }
+        self.note_input();
         let result = self
             .inner
             .as_mut()
@@ -351,14 +490,54 @@ impl Association {
         self.protocol_result(result)
     }
 
-    /// Queue one caller-sized application datagram, without splitting or capping it.
-    /// Drain output before the next call; dimpl errors remain fatal.
+    fn note_input(&mut self) {
+        if let Some(state) = &mut self.single_record {
+            state.drained = false;
+        }
+        self.wan_application_wire_bytes = None;
+    }
+
+    /// Queue one application datagram without splitting. The single-record
+    /// profile also enforces its protected byte limit before queueing.
     pub fn send_application_data(&mut self, data: &[u8]) -> Result<(), Error> {
+        self.send_application_record(data, false)
+    }
+
+    /// Queue the dedicated full-envelope probe, not ordinary control data.
+    pub fn send_fabric_wan_probe(&mut self, data: &[u8]) -> Result<(), Error> {
+        if self.inner.is_none() {
+            return Err(Error::Closed);
+        }
+        if !matches!(self.profile, Profile::FabricWan)
+            || data.len() != FABRIC_WAN_DATAGRAM_BYTES - SINGLE_RECORD_OVERHEAD
+        {
+            return Err(Error::DatagramBudget);
+        }
+        self.send_application_record(data, true)
+    }
+
+    fn send_application_record(&mut self, data: &[u8], full_probe: bool) -> Result<(), Error> {
         if self.inner.is_none() {
             return Err(Error::Closed);
         }
         if !self.is_connected() {
             return Err(Error::NotConnected);
+        }
+        if let Some(state) = &mut self.single_record {
+            let wire = data.len().saturating_add(SINGLE_RECORD_OVERHEAD);
+            let limit = if full_probe {
+                FABRIC_WAN_DATAGRAM_BYTES
+            } else {
+                state.mtu
+            };
+            if wire > limit {
+                return Err(Error::DatagramBudget);
+            }
+            if !state.drained {
+                return Err(Error::DrainRequired);
+            }
+            state.drained = false;
+            state.expected = Some(wire);
         }
         let result = self
             .inner
@@ -369,7 +548,14 @@ impl Association {
         self.protocol_result(result)
     }
 
+    /// The exact DTLS datagram length for the immediately preceding Fabric WAN
+    /// application output. A later poll clears this observation.
+    pub fn last_wan_application_wire_bytes(&self) -> Option<usize> {
+        self.wan_application_wire_bytes
+    }
+
     pub fn poll_output<'a>(&mut self, buffer: &'a mut [u8]) -> Result<Output<'a>, Error> {
+        self.wan_application_wire_bytes = None;
         if self.is_connected()
             && let Some((material, profile)) = self.srtp_material.take()
         {
@@ -380,11 +566,40 @@ impl Association {
             return Ok(Output::Closed);
         };
         match inner.poll_output(buffer) {
-            dimpl::Output::Packet(bytes) => return Ok(Output::Datagram(bytes)),
+            dimpl::Output::Packet(bytes) => {
+                if let Some(state) = &mut self.single_record {
+                    let records = inner.last_output_application_records();
+                    let wan_application =
+                        matches!(self.profile, Profile::FabricWan) && records != 0;
+                    let limit = if wan_application {
+                        FABRIC_WAN_DATAGRAM_BYTES
+                    } else {
+                        state.mtu
+                    };
+                    if bytes.len() > limit
+                        || (wan_application && Dtls::single_unified_record_len(bytes).is_none())
+                        || (records != 0
+                            && (records != 1 || state.expected.take() != Some(bytes.len())))
+                    {
+                        self.close();
+                        return Err(Error::DatagramShape);
+                    }
+                }
+                return Ok(Output::Datagram(bytes));
+            }
             dimpl::Output::ApplicationData(bytes) => {
+                let record = inner.last_input_application_datagram_len();
                 if !self.is_connected() {
                     self.close();
                     return Err(Error::NotConnected);
+                }
+                if matches!(self.profile, Profile::FabricWan) {
+                    let expected = bytes.len().saturating_add(SINGLE_RECORD_OVERHEAD);
+                    if record != Some(expected) {
+                        self.close();
+                        return Err(Error::DatagramShape);
+                    }
+                    self.wan_application_wire_bytes = record;
                 }
                 return Ok(Output::ApplicationData(bytes));
             }
@@ -396,12 +611,27 @@ impl Association {
                 self.peer_verified = true;
             }
             dimpl::Output::Connected => self.handshake_complete = true,
-            dimpl::Output::Timeout(at) => return Ok(Output::Timeout(at)),
+            dimpl::Output::Timeout(at) => {
+                if let Some(state) = &mut self.single_record {
+                    if state.expected.is_some() {
+                        self.close();
+                        return Err(Error::DatagramShape);
+                    }
+                    state.drained = true;
+                }
+                return Ok(Output::Timeout(at));
+            }
             dimpl::Output::BufferTooSmall { needed } => {
                 return Ok(Output::BufferTooSmall { needed });
             }
             dimpl::Output::KeyingMaterial(material, profile) => {
-                if matches!(self.profile, Profile::DtlsSrtp(_)) {
+                if self.profile.exports_srtp() {
+                    if matches!(self.profile, Profile::FabricWan)
+                        && profile != SrtpProfile::AEAD_AES_256_GCM
+                    {
+                        self.close();
+                        return Err(Error::WanSrtpProfile);
+                    }
                     if self.srtp_profile.is_some() {
                         self.close();
                         return Err(Error::UnsupportedOutput);
@@ -438,6 +668,8 @@ impl Association {
     /// Immediately discard local association state, without a peer-close guarantee.
     pub fn close(&mut self) {
         self.inner = None;
+        self.single_record = None;
+        self.wan_application_wire_bytes = None;
         self.peer_verified = false;
         self.handshake_complete = false;
         self.srtp_material = None;

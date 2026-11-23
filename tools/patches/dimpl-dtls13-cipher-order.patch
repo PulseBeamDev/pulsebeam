@@ -1,0 +1,94 @@
+diff --git a/src/config.rs b/src/config.rs
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -258,19 +258,25 @@
+     ///
+     /// Returns all provider DTLS 1.3 cipher suites when no filter is set.
+     /// When a filter is set via the builder's `dtls13_cipher_suites` method,
+-    /// only suites in both the provider and the filter are returned.
++    /// only supported suites are returned, in the explicitly configured order.
+     pub fn dtls13_cipher_suites(
+         &self,
+     ) -> impl Iterator<Item = &'static dyn SupportedDtls13CipherSuite> + '_ {
+-        let filter = self.dtls13_cipher_suites.as_ref();
+-        self.crypto_provider
+-            .dtls13_cipher_suites
+-            .iter()
+-            .copied()
+-            .filter(move |cs| match filter {
+-                Some(list) => list.contains(&cs.suite()),
+-                None => true,
+-            })
++        let provider = self.crypto_provider.dtls13_cipher_suites;
++        let configured = self.dtls13_cipher_suites.as_deref();
++        (0..configured.map_or(provider.len(), |suites| suites.len())).filter_map(
++            move |index| match configured {
++                Some(suites) if !suites[..index].contains(&suites[index]) => {
++                    provider.iter().copied().find(|cs| cs.suite() == suites[index])
++                }
++                Some(_) => None,
++                None => Some(provider[index]),
++            },
++        )
++    }
++
++    pub(crate) fn has_explicit_dtls13_cipher_order(&self) -> bool {
++        self.dtls13_cipher_suites.is_some()
+     }
+ 
+     /// Allowed key exchange groups, filtered by the config's allow-list.
+diff --git a/src/dtls13/server.rs b/src/dtls13/server.rs
+--- a/src/dtls13/server.rs
++++ b/src/dtls13/server.rs
+@@ -520,15 +520,24 @@
+             .into());
+         }
+ 
+-        // Select cipher suite: first from client's list that is in our provider
+-        let selected_cipher_suite = client_hello
+-            .cipher_suites
+-            .iter()
+-            .find(|cs| server.engine.is_cipher_suite_allowed(**cs))
+-            .copied()
+-            .ok_or(Error::SecurityError(
+-                crate::SecurityError::NoCommonCipherSuite,
+-            ))?;
++        // Keep client ordering for default configurations, but respect an
++        // explicit local order when selecting a mutually supported suite.
++        let config = server.engine.config();
++        let selected_cipher_suite = if config.has_explicit_dtls13_cipher_order() {
++            config
++                .dtls13_cipher_suites()
++                .map(|suite| suite.suite())
++                .find(|suite| client_hello.cipher_suites.contains(suite))
++        } else {
++            client_hello
++                .cipher_suites
++                .iter()
++                .copied()
++                .find(|suite| server.engine.is_cipher_suite_allowed(*suite))
++        }
++        .ok_or(Error::SecurityError(
++            crate::SecurityError::NoCommonCipherSuite,
++        ))?;
+ 
+         // Save the client random and session_id early so HRR can use them
+         let client_random = client_hello.random;
+@@ -716,12 +725,7 @@
+-        // Select SRTP profile: first from client list that the server supports.
+-        // Per RFC 5764 Section 4.1.1, the server MUST select a profile that
+-        // both sides support.
++        // Use the same local SRTP profile preference as DTLS 1.2.
+         if let Some(profiles) = client_srtp_profiles {
+-            for profile_id in profiles {
+-                let profile: SrtpProfile = (*profile_id).into();
+-                if SrtpProfile::ALL.contains(&profile) {
+-                    server.negotiated_srtp_profile = Some(profile);
+-                    break;
+-                }
+-            }
++            server.negotiated_srtp_profile = SrtpProfile::ALL
++                .iter()
++                .copied()
++                .find(|&preferred| profiles.iter().any(|&offered| preferred == offered.into()));
+         }

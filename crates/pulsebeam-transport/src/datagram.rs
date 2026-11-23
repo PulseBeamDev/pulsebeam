@@ -4,6 +4,7 @@ use std::time::{Instant, SystemTime};
 
 pub const UDP_BUDGET: usize = wire::UDP_BUDGET;
 pub const PAYLOAD_BUDGET: usize = wire::PAYLOAD_BUDGET;
+pub const FABRIC_V1_IMAGE_BYTES: usize = wire::FABRIC_IMAGE;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Time(pub u64);
@@ -101,6 +102,27 @@ impl Peer {
         }
     }
 
+    pub fn fabric_wan_config(
+        &self,
+        epoch: std::num::NonZeroU64,
+        generation: std::num::NonZeroU64,
+        limits: crate::dtls_srtp::wan::Limits,
+    ) -> crate::dtls_srtp::wan::session::Config<'_> {
+        use crate::dtls_srtp::wan::{path::Binding, session::Config};
+        Config {
+            binding: Binding {
+                epoch,
+                generation,
+                peer: self.endpoint,
+            },
+            role: self.dtls_role(),
+            local: &self.credential.0,
+            peer: pulsebeam_dtls::Fingerprint::from_bytes(self.expected_peer.0),
+            bootstrap_mtu: UDP_BUDGET,
+            limits,
+        }
+    }
+
     pub(crate) fn association(&self, now: Instant) -> Result<pulsebeam_dtls::Association, Error> {
         pulsebeam_dtls::Association::new(
             self.dtls_role(),
@@ -130,15 +152,87 @@ impl Peer {
     }
 }
 
+/// Effective protected UDP path and any additional framing outside this carrier.
+/// Unknown framing must not be provisioned as zero overhead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FabricPath {
+    pub udp_payload_limit: usize,
+    pub additional_overhead: usize,
+}
+
+impl FabricPath {
+    pub(crate) fn datagram_limit(self) -> usize {
+        self.udp_payload_limit
+            .min(UDP_BUDGET)
+            .saturating_sub(self.additional_overhead)
+    }
+
+    pub fn qualifies(self) -> bool {
+        const CARRIER_OVERHEAD: usize =
+            pulsebeam_dtls::SINGLE_RECORD_OVERHEAD + wire::FABRIC_HEADER;
+        const FULL_DATAGRAM: usize = wire::FABRIC_IMAGE + CARRIER_OVERHEAD;
+        CARRIER_OVERHEAD.saturating_add(self.additional_overhead) <= 48
+            && self.datagram_limit() >= FULL_DATAGRAM
+    }
+}
+
+/// Explicit candidate provisioning. The legacy and QUIC formats are not accepted.
+#[derive(Clone)]
+pub struct FabricPeer {
+    pub dtls: Peer,
+    pub path: FabricPath,
+}
+
+impl FabricPeer {
+    pub(crate) fn association(
+        &self,
+        now: Instant,
+        limit: Option<u64>,
+    ) -> Result<pulsebeam_dtls::Association, Error> {
+        if !self.path.qualifies() {
+            return Err(Error::PathIncapable);
+        }
+        let expected = pulsebeam_dtls::Fingerprint::from_bytes(self.dtls.expected_peer.0);
+        #[cfg(any(test, feature = "test-utils"))]
+        if let Some(limit) = limit {
+            return pulsebeam_dtls::Association::single_record_with_test_key_limit(
+                self.dtls.dtls_role(),
+                &self.dtls.credential.0,
+                expected,
+                self.path.datagram_limit(),
+                now,
+                limit,
+            )
+            .map_err(|_| Error::Security);
+        }
+        let _ = limit;
+        pulsebeam_dtls::Association::single_record_datagrams(
+            self.dtls.dtls_role(),
+            &self.dtls.credential.0,
+            expected,
+            self.path.datagram_limit(),
+            now,
+        )
+        .map_err(|_| Error::Security)
+    }
+}
+
 #[derive(Clone)]
 pub enum PeerConfig {
     Dtls(Peer),
+    Fabric(FabricPeer),
     Quic(QuicPeer),
 }
 
 impl From<Peer> for PeerConfig {
     fn from(peer: Peer) -> Self {
         Self::Dtls(peer)
+    }
+}
+
+impl From<FabricPeer> for PeerConfig {
+    fn from(peer: FabricPeer) -> Self {
+        Self::Fabric(peer)
     }
 }
 
@@ -151,22 +245,29 @@ impl From<QuicPeer> for PeerConfig {
 impl PeerConfig {
     pub fn expected_peer(&self) -> PeerFingerprint {
         match self {
-            Self::Dtls(peer) => peer.expected_peer,
+            Self::Dtls(peer) | Self::Fabric(FabricPeer { dtls: peer, .. }) => peer.expected_peer,
             Self::Quic(peer) => peer.expected_peer,
         }
     }
     pub fn endpoint(&self) -> SocketAddr {
         match self {
-            Self::Dtls(peer) => peer.endpoint,
+            Self::Dtls(peer) | Self::Fabric(FabricPeer { dtls: peer, .. }) => peer.endpoint,
             Self::Quic(peer) => peer.endpoint,
         }
     }
     pub(crate) fn class(&self) -> NetworkClass {
         match self {
-            Self::Dtls(peer) => peer.class,
+            Self::Dtls(peer) | Self::Fabric(FabricPeer { dtls: peer, .. }) => peer.class,
             Self::Quic(peer) => peer.class,
         }
     }
+    pub(crate) fn fabric_path(&self) -> Option<FabricPath> {
+        match self {
+            Self::Fabric(peer) => Some(peer.path),
+            _ => None,
+        }
+    }
+
     pub(crate) fn is_quic(&self) -> bool {
         matches!(self, Self::Quic(_))
     }

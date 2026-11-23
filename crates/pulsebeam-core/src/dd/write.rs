@@ -58,6 +58,22 @@ impl DependencyDescriptorWriter {
         dd: &DependencyDescriptor,
         out: &mut [u8],
     ) -> Result<usize, DdWriteError> {
+        let len = self.encode(dd, out)?;
+        self.commit(dd);
+        Ok(len)
+    }
+
+    pub(super) fn commit(&mut self, dd: &DependencyDescriptor) {
+        if let Some(s) = dd.attached_structure.as_deref() {
+            self.structure = Some(Box::new(s.clone()));
+        }
+    }
+
+    pub(super) fn encode(
+        &self,
+        dd: &DependencyDescriptor,
+        out: &mut [u8],
+    ) -> Result<usize, DdWriteError> {
         let active = match dd.attached_structure.as_deref() {
             Some(s) => s,
             None => self.structure.as_deref().ok_or(DdWriteError::NoStructure)?,
@@ -94,10 +110,6 @@ impl DependencyDescriptorWriter {
         let len = w.finish();
         debug_assert!(len >= MANDATORY_LEN);
         debug_assert!(len <= MAX_DD_LEN);
-
-        if let Some(s) = dd.attached_structure.as_deref() {
-            self.structure = Some(Box::new(s.clone()));
-        }
 
         Ok(len)
     }

@@ -122,24 +122,7 @@ fn install_receiver(
             desired: Some(wire::DesiredState {
                 revision: 1,
                 value: Some(wire::desired_state::Value::Present(Box::new(
-                    wire::ResourceSpec {
-                        settings: Some(wire::ResourceSettings {
-                            enabled: Some(true),
-                            receive: None,
-                        }),
-                        declaration: Some(wire::resource_spec::Declaration::Subscription(
-                            wire::SubscriptionSpec {
-                                publication_id: track.id().as_str(),
-                                kind: wire::TrackKind::Data as i32,
-                                source_room: "catalog-source".into(),
-                                binding: Some(wire::TrackBinding {
-                                    transport: Some(wire::track_binding::Transport::Sctp(
-                                        wire::SctpParameters { stream_id: Some(1) },
-                                    )),
-                                }),
-                            },
-                        )),
-                    },
+                    crate::control::native::fixture::audio_receiver(track.id(), "catalog-source"),
                 ))),
             }),
         }],
@@ -254,23 +237,20 @@ async fn live_catalog_uses_bounded_ordered_presence_pages_and_independent_watche
         .core
         .registry
         .update_authorization(&publisher, publisher_connection, publisher_lease);
-    let track = crate::track::Track::data_publication(
-        crate::track::TrackMeta {
-            room: crate::entity::ProjectRoomKey {
-                project,
-                room: source_room,
-            },
-            id: publisher_connection.fixture_publication_at(
-                crate::entity::TrackKind::Data,
-                "events",
-                std::num::NonZeroU64::new(1).unwrap(),
-            ),
-            origin: publisher,
-            connection_id: publisher_connection,
-            track_id: Some(crate::entity::TrackId::new("events").unwrap()),
+    let track = crate::control::native::fixture::audio_track(crate::track::TrackMeta {
+        room: crate::entity::ProjectRoomKey {
+            project,
+            room: source_room,
         },
-        crate::track::DataLane::Ordered,
-    );
+        id: publisher_connection.fixture_publication_at(
+            crate::entity::TrackKind::Audio,
+            "events",
+            std::num::NonZeroU64::new(1).unwrap(),
+        ),
+        origin: publisher,
+        connection_id: publisher_connection,
+        track_id: Some(crate::entity::TrackId::new("events").unwrap()),
+    });
     actor.handle_shard_event((ShardId::new(0), ShardEvent::TrackPublished(track.clone())));
     let external = crate::entity::ParticipantId::new("alice").unwrap();
     let participant = external;
@@ -309,8 +289,13 @@ async fn live_catalog_uses_bounded_ordered_presence_pages_and_independent_watche
         .registry
         .update_authorization(&participant, connection, lease.clone());
     let (controller, mut endpoint) = handoff::pair(connection, actor.native_ready_tx.clone());
-    let mut native =
-        StateProtocolHandler::new(participant, Some(viewer_room), None, controller).unwrap();
+    let mut native = StateProtocolHandler::new(
+        participant,
+        Some(viewer_room),
+        Some(crate::control::rtp::capabilities()),
+        controller,
+    )
+    .unwrap();
     native
         .model
         .authorization(i64::MAX, 1, lease.permissions().clone())

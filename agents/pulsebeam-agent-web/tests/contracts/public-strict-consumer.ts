@@ -26,10 +26,8 @@ agent.renew("renewed");
 const room = agent.room("demo");
 const watch: Catalog = room.watch({ limit: 10, cursor: new Uint8Array() });
 const page = watch.state();
-const participant = page.participants?.[0];
 const participants =
   watch.state().status === WatchStatus.Live ? page.participants : undefined;
-const recipient = participant?.dataRecipientId();
 const cursor: Uint8Array | undefined = page.nextCursor;
 const local = agent.video("camera");
 declare const media: MediaStreamTrack;
@@ -50,9 +48,7 @@ const reception = remote.video("camera").subscribe(videoOptions);
 const output = await reception.playbackOutput();
 const received: MediaStreamTrack | undefined = output.track();
 const data = agent.data("data").publish({ delivery: DataDelivery.Reliable });
-const sends: DataSendOptions | undefined = recipient
-  ? { recipients: [recipient] }
-  : undefined;
+const sends: DataSendOptions = {};
 await data.send(Uint8Array.of(0, 255), sends);
 const messages = remote.data("data").subscribe();
 const event = await messages.next();

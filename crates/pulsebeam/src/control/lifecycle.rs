@@ -12,11 +12,14 @@ use crate::{
     entity::{ConnectionId, EndpointKey, ParticipantId, ProjectRoomKey, PublicationKey},
     id::ShardId,
     participant::ParticipantEffect,
-    route::NodeRouteAddress,
+    route::{
+        NodeRouteAddress,
+        fabric::{RtpSourceEncoding, ShardDataReady, local::Emission},
+    },
     shard_update::{
         ShardUpdateOp, TrackDescriptor, TrackPlan, TrackPlanUpdate, TrackRouteAction, TrackRuntime,
     },
-    track::{SelectionPolicy, Track, TrackSelector},
+    track::{Track, TrackSelector},
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -176,6 +179,7 @@ impl TrackLifecycleStager {
 struct DesiredTrackState {
     track: Track,
     origin: Option<BoundParticipantLocation>,
+    transit: Option<ShardId>,
     candidates: HashSet<Subscriber>,
     bindings: HashSet<Subscriber>,
     locations: HashMap<Subscriber, BoundParticipantLocation>,
@@ -188,6 +192,7 @@ impl DesiredTrackState {
             .iter()
             .filter_map(|participant| self.locations.get(participant))
             .map(|location| location.shard)
+            .chain(self.transit)
             .filter(|shard| self.origin.is_none_or(|origin| *shard != origin.shard))
             .collect::<HashSet<_>>()
             .into_iter()
@@ -202,6 +207,7 @@ impl DesiredTrackState {
             .iter()
             .filter_map(|participant| self.locations.get(participant))
             .map(|location| location.shard)
+            .chain(self.transit)
             .filter(|shard| self.origin.is_none_or(|origin| *shard != origin.shard))
             .collect::<HashSet<_>>()
             .into_iter()
@@ -230,14 +236,28 @@ struct RuntimePlan<'a> {
     publication_id: PublicationKey,
     local: Vec<ConnectionId>,
     remote: Vec<NodeRouteAddress>,
+    wan_transit: bool,
     reverse: Option<NodeRouteAddress>,
+}
+
+#[derive(Clone, Copy)]
+struct LocalRtpSource {
+    encoding: RtpSourceEncoding,
+    incarnation: std::num::NonZeroU64,
+    emission: Emission,
 }
 
 pub(crate) struct TrackLifecycle {
     topology: TrackTopology,
     allocator: TrackPlacementAllocator,
     ingress: HashMap<TrackAncestry, pulsebeam_link::NetworkId>,
+    transit: HashMap<TrackAncestry, ShardId>,
+    local_rtp_sources: HashMap<
+        TrackAncestry,
+        arrayvec::ArrayVec<LocalRtpSource, { crate::track::MAX_SIMULCAST_LAYERS }>,
+    >,
     placements: HashMap<(TrackAncestry, ShardId), TrackDestination>,
+    ordered_receivers: HashMap<ConnectionId, HashMap<u64, ShardDataReady>>,
     candidates: HashMap<TrackAncestry, HashSet<Subscriber>>,
     bindings: HashMap<TrackAncestry, HashSet<Subscriber>>,
     // Removal effects still need the applied endpoint after its subscription is gone.
@@ -251,7 +271,10 @@ impl TrackLifecycle {
             topology: TrackTopology::default(),
             allocator: TrackPlacementAllocator::new(shard_count),
             ingress: HashMap::new(),
+            transit: HashMap::new(),
+            local_rtp_sources: HashMap::new(),
             placements: HashMap::new(),
+            ordered_receivers: HashMap::new(),
             candidates: HashMap::new(),
             bindings: HashMap::new(),
             locations: HashMap::new(),
@@ -288,6 +311,92 @@ impl TrackLifecycle {
         Some(self.reconcile(identity, registry, now))
     }
 
+    pub(super) fn record_ordered_receiver(
+        &mut self,
+        ready: ShardDataReady,
+    ) -> Option<ShardDataReady> {
+        self.ordered_receivers
+            .entry(ready.receiver.connection)
+            .or_default()
+            .insert(ready.reference, ready)
+    }
+
+    pub(super) fn withdraw_ordered_receiver(
+        &mut self,
+        connection: ConnectionId,
+        reference: u64,
+    ) -> Option<ShardDataReady> {
+        let receivers = self.ordered_receivers.get_mut(&connection)?;
+        let previous = receivers.remove(&reference);
+        if receivers.is_empty() {
+            self.ordered_receivers.remove(&connection);
+        }
+        previous
+    }
+
+    pub(super) fn withdraw_ordered_connection(
+        &mut self,
+        connection: ConnectionId,
+    ) -> Vec<ShardDataReady> {
+        self.ordered_receivers
+            .remove(&connection)
+            .into_iter()
+            .flat_map(HashMap::into_values)
+            .collect()
+    }
+
+    pub(super) fn set_local_rtp_source(
+        &mut self,
+        meta: &crate::track::TrackMeta,
+        encoding: RtpSourceEncoding,
+        incarnation: std::num::NonZeroU64,
+        emission: Emission,
+        registry: &RoomRegistry,
+        now: Instant,
+    ) -> Option<TrackLifecycleOutcome> {
+        use crate::entity::TrackKind;
+        use pulsebeam_core::fabric::Profile;
+        let identity = TrackAncestry {
+            room_id: meta.room,
+            publisher: meta.origin,
+            publication_id: meta.id,
+        };
+        let track = self.topology.track(identity)?;
+        if track.meta().connection_id != meta.connection_id
+            || self.ingress.contains_key(&identity)
+            || !matches!(
+                (track.kind(), emission.profile()),
+                (TrackKind::Audio, Profile::Opus)
+                    | (TrackKind::Video, Profile::H264 | Profile::Av1)
+            )
+        {
+            return None;
+        }
+        if track.kind() == TrackKind::Video
+            && !track.layers().iter().any(|layer| {
+                layer.encoding.matches(encoding.primary, encoding.rid) && layer.rid == encoding.rid
+            })
+        {
+            return None;
+        }
+        let sources = self.local_rtp_sources.entry(identity).or_default();
+        if (track.kind() == TrackKind::Audio && !sources.is_empty())
+            || sources.iter().any(|source| {
+                source.encoding.primary == encoding.primary || source.incarnation == incarnation
+            })
+        {
+            return None;
+        }
+        sources
+            .try_push(LocalRtpSource {
+                encoding,
+                incarnation,
+                emission,
+            })
+            .ok()?;
+        Some(self.reconcile(identity, registry, now))
+    }
+
     pub(super) fn publish_ingress(
         &mut self,
         track: Track,
@@ -298,6 +407,49 @@ impl TrackLifecycle {
         let identity = self.topology.publish(track)?;
         self.ingress.insert(identity, peer);
         Some(self.reconcile(identity, registry, now))
+    }
+
+    /// Add or remove a shard demand for an already authorized network source.
+    /// Transit uses the normal child receipt path without inventing a subscriber.
+    pub(super) fn set_wan_transit(
+        &mut self,
+        room: ProjectRoomKey,
+        publication: PublicationKey,
+        upstream: pulsebeam_link::NetworkId,
+        shard: Option<ShardId>,
+        registry: &RoomRegistry,
+        now: Instant,
+    ) -> Option<TrackLifecycleOutcome> {
+        let identity = TrackAncestry::from_track(self.topology.source(room, publication)?);
+        if self.ingress.get(&identity) != Some(&upstream)
+            || self.transit.get(&identity).copied() == shard
+        {
+            return None;
+        }
+        if let Some(shard) = shard {
+            if self.transit.len() >= super::controller::peer_ownership::relay::LIMIT
+                && !self.transit.contains_key(&identity)
+            {
+                return None;
+            }
+            self.transit.insert(identity, shard);
+        } else {
+            self.transit.remove(&identity);
+        }
+        Some(self.reconcile(identity, registry, now))
+    }
+
+    pub(super) fn wan_transit_demands(
+        &self,
+    ) -> impl Iterator<Item = (ProjectRoomKey, PublicationKey, pulsebeam_link::NetworkId)> + '_
+    {
+        self.transit.keys().filter_map(|identity| {
+            Some((
+                identity.room_id,
+                identity.publication_id,
+                *self.ingress.get(identity)?,
+            ))
+        })
     }
 
     pub(super) fn ingress_sources(
@@ -341,6 +493,8 @@ impl TrackLifecycle {
         let mut stager = TrackLifecycleStager::new(self.next_generation());
         self.stage_track_removal(identity, registry, &mut stager);
 
+        self.local_rtp_sources.remove(&identity);
+        self.transit.remove(&identity);
         let removed = self.topology.unpublish(identity);
         debug_assert!(
             removed.is_some(),
@@ -397,12 +551,13 @@ impl TrackLifecycle {
         self.reconcile(identity, registry, now)
     }
 
+    #[cfg(test)]
     pub(crate) fn subscribe(
         &mut self,
         room_id: ProjectRoomKey,
         subscriber: ParticipantId,
         selector: TrackSelector,
-        selection: SelectionPolicy,
+        selection: crate::track::SelectionPolicy,
         registry: &RoomRegistry,
         now: Instant,
     ) -> Vec<TrackLifecycleOutcome> {
@@ -413,6 +568,7 @@ impl TrackLifecycle {
         self.reconcile_all(identities, registry, now)
     }
 
+    #[cfg(test)]
     pub(crate) fn unsubscribe(
         &mut self,
         room_id: ProjectRoomKey,
@@ -478,6 +634,45 @@ impl TrackLifecycle {
         let publisher = registry.get_incarnation(meta.origin, meta.connection_id)?;
         (publisher.materialized && publisher.scope.joined_room() == Some(room_id))
             .then_some(publisher.shard_id)
+    }
+
+    pub(super) fn network_publisher_anchor(
+        &self,
+        room: ProjectRoomKey,
+        publication: PublicationKey,
+        registry: &RoomRegistry,
+    ) -> Option<(ShardId, crate::shard_update::PublisherAnchor)> {
+        use crate::route::fabric::local::Emission;
+        use pulsebeam_core::fabric::Profile;
+
+        let shard = self.network_source(room, publication, registry)?;
+        let track = self.source_exact(room, publication)?;
+        let (incarnation, emission) = match track {
+            Track::Data(_) => (track.fabric_data_source()?, Emission::DATA),
+            Track::Audio(_) => {
+                let [source] = self
+                    .local_rtp_sources
+                    .get(&TrackAncestry::from_track(track))?
+                    .as_slice()
+                else {
+                    return None;
+                };
+                if source.emission.profile() != Profile::Opus {
+                    return None;
+                }
+                (source.incarnation, source.emission)
+            }
+            Track::Video(_) => return None,
+        };
+        Some((
+            shard,
+            crate::shard_update::PublisherAnchor {
+                publication,
+                connection: track.meta().connection_id,
+                incarnation,
+                emission,
+            },
+        ))
     }
 
     pub(crate) fn allows_network_reverse(
@@ -761,6 +956,7 @@ impl TrackLifecycle {
         }
 
         for identity in retiring {
+            self.local_rtp_sources.remove(&identity);
             let removed = self.topology.unpublish(identity);
             debug_assert!(removed.is_some());
             if let Some(track) = removed {
@@ -845,6 +1041,11 @@ impl TrackLifecycle {
             .map(|origin| origin.shard);
         let mut candidate_shards = origin.into_iter().collect::<HashSet<_>>();
         let mut active_shards = HashSet::new();
+        if let Some(&shard) = self.transit.get(&identity) {
+            debug_assert!(origin.is_none());
+            candidate_shards.insert(shard);
+            active_shards.insert(shard);
+        }
         for participant in candidates {
             let location = BoundParticipantLocation::for_subscriber(registry, *participant)
                 .expect("retained candidate must remain bound in its admitted room");
@@ -972,6 +1173,11 @@ impl TrackLifecycle {
         DesiredTrackState {
             track,
             origin,
+            transit: self
+                .transit
+                .get(&identity)
+                .copied()
+                .filter(|_| origin.is_none()),
             candidates,
             bindings,
             locations,
@@ -1225,6 +1431,7 @@ impl TrackLifecycle {
                 publication_id: placement.placement.publication_id,
                 local: desired.local_bindings(origin.shard),
                 remote,
+                wan_transit: false,
                 reverse: desired.track.reverse(),
             },
         );
@@ -1254,6 +1461,18 @@ impl TrackLifecycle {
             self.stage_origin_view(identity, desired, origin, stager);
         }
         let active = desired.active_remote_shards();
+        let data = desired
+            .track
+            .fabric_data_source()
+            .map(|incarnation| (incarnation, None, Emission::DATA));
+        let sources = self
+            .local_rtp_sources
+            .get(&identity)
+            .cloned()
+            .unwrap_or_default();
+        let rtp = sources
+            .iter()
+            .map(|source| (source.incarnation, Some(source.encoding), source.emission));
         for shard in desired.candidate_remote_shards() {
             let destination = self
                 .placements
@@ -1271,10 +1490,34 @@ impl TrackLifecycle {
                     publication_id: destination.placement.publication_id,
                     local: desired.local_bindings(shard),
                     remote: Vec::new(),
+                    wan_transit: desired.transit == Some(shard),
                     reverse: desired.track.reverse(),
                 },
             );
             self.set_resident(identity, shard, true);
+            let Some(origin) = desired.origin.filter(|_| active.contains(&shard)) else {
+                continue;
+            };
+            for (incarnation, encoding, emission) in data.into_iter().chain(rtp.clone()) {
+                let binding = crate::route::fabric::ShardBinding {
+                    destination: destination.placement.route,
+                    publication: destination.placement.publication_id,
+                    origin: origin.shard,
+                    incarnation,
+                };
+                stager.update(
+                    shard,
+                    ShardUpdateOp::InstallShardFabricSource {
+                        binding,
+                        encoding,
+                        emission,
+                    },
+                );
+                stager.update(
+                    origin.shard,
+                    ShardUpdateOp::BindShardFabricDestination { binding },
+                );
+            }
         }
     }
 
@@ -1302,15 +1545,9 @@ impl TrackLifecycle {
         // Keep the generation/update-stream marker between preparing the runtime
         // and publishing the forwarding plan for that shard.
         stager.update(runtime.shard, ShardUpdateOp::Placeholder);
-        stager.plan(
-            runtime.shard,
-            runtime.publication_id,
-            Some(TrackPlan::new(
-                runtime.local,
-                runtime.remote,
-                runtime.reverse,
-            )),
-        );
+        let mut plan = TrackPlan::new(runtime.local, runtime.remote, runtime.reverse);
+        plan.wan_transit = runtime.wan_transit;
+        stager.plan(runtime.shard, runtime.publication_id, Some(plan));
     }
 
     fn stage_shard_withdrawal(
@@ -1573,7 +1810,7 @@ mod tests {
     use super::*;
     use crate::{
         entity::{RoomId, TrackKind},
-        track::{DataLane, Topic, TrackMeta},
+        track::{DataLane, SelectionPolicy, Topic, TrackMeta},
     };
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2129,6 +2366,48 @@ mod tests {
     }
 
     #[test]
+    fn authorized_transit_reserves_a_forward_route_without_a_subscriber() {
+        let now = Instant::now();
+        let mut links =
+            pulsebeam_link::LinkControl::<()>::new(|| pulsebeam_link::LinkTime::from_nanos(0))
+                .unwrap();
+        let upstream = links.reserve_network_id().unwrap();
+        let unrelated = links.reserve_network_id().unwrap();
+        let registry = RoomRegistry::new();
+        let mut lifecycle = TrackLifecycle::new(1);
+        let remote = track(TrackKind::Data, 1, 1, "transit");
+        let publication = remote.meta().id;
+        let shard = ShardId::new(0);
+        let published = lifecycle
+            .publish_ingress(remote, upstream, &registry, now)
+            .unwrap();
+        assert!(published.operations.is_empty());
+        assert!(
+            lifecycle
+                .set_wan_transit(room(1), publication, unrelated, Some(shard), &registry, now)
+                .is_none()
+        );
+        let installed = lifecycle
+            .set_wan_transit(room(1), publication, upstream, Some(shard), &registry, now)
+            .unwrap();
+        assert!(installed.operations.iter().any(|operation| matches!(operation, TrackLifecycleOperation::Update {
+            op: ShardUpdateOp::InstallRoute { action: TrackRouteAction::Forward { publication_id }, .. },
+            route_scope: Some(super::super::link::RouteScope { ingress: Some(peer), .. }), ..
+        } if *publication_id == publication && *peer == upstream)));
+        assert!(installed.operations.iter().any(|operation| matches!(operation, TrackLifecycleOperation::Plans { plans, .. }
+            if plans.iter().any(|update| update.publication_id == publication && update.plan.as_ref().is_some_and(|plan| plan.local.is_empty() && plan.wan_transit)))));
+        assert!(!installed.operations.iter().any(|operation| matches!(
+            operation,
+            TrackLifecycleOperation::ParticipantEffect { .. }
+        )));
+        let retired = lifecycle
+            .set_wan_transit(room(1), publication, upstream, None, &registry, now)
+            .unwrap();
+        assert!(op_kinds(&retired).contains(&OpKind::RetireRoute));
+        assert!(op_kinds(&retired).contains(&OpKind::RemoveRuntime));
+    }
+
+    #[test]
     fn remote_candidate_installs_a_catalog_runtime_without_a_forward_route() {
         let (mut lifecycle, registry) = setup(2, &[(1, 1, 0), (2, 1, 1)]);
         let (identity, _) = publish_audio(&mut lifecycle, &registry, 1, 1);
@@ -2200,6 +2479,134 @@ mod tests {
             vec![(remote.placement.publication_id, true)]
         );
         assert_internal_invariants(&lifecycle, &registry);
+    }
+
+    #[test]
+    fn rtp_shard_bindings_follow_committed_source_and_destination_plan() {
+        use pulsebeam_core::fabric::Profile;
+        let (mut lifecycle, registry) = setup(2, &[(1, 1, 0), (2, 1, 1)]);
+        let connection = registry.get_endpoint(endpoint(1, 1)).unwrap().connection_id;
+        let mut meta = track(TrackKind::Audio, 1, 1, "audio").meta().clone();
+        meta.connection_id = connection;
+        let track = Track::audio(meta, None);
+        let identity = TrackAncestry::from_track(&track);
+        let now = Instant::now();
+        lifecycle.publish(track, &registry, now).unwrap();
+        let anchor = |lifecycle: &TrackLifecycle| {
+            lifecycle.network_publisher_anchor(room(1), identity.publication_id, &registry)
+        };
+        assert!(anchor(&lifecycle).is_none());
+        lifecycle.subscribe(
+            room(1),
+            participant(2),
+            TrackSelector::audio(),
+            SelectionPolicy::Allocated,
+            &registry,
+            now,
+        );
+        let unqualified = lifecycle.activate(
+            room(1),
+            participant(1),
+            identity.publication_id,
+            endpoint(2, 1),
+            &registry,
+            now,
+        );
+        let fabric_ops = |outcome: &TrackLifecycleOutcome| {
+            outcome
+                .operations
+                .iter()
+                .filter_map(|operation| match operation {
+                    TrackLifecycleOperation::Update {
+                        shard,
+                        op:
+                            ShardUpdateOp::InstallShardFabricSource {
+                                binding, emission, ..
+                            },
+                        ..
+                    } => {
+                        assert_eq!(emission.profile(), Profile::Opus);
+                        Some((*shard, *binding))
+                    }
+                    TrackLifecycleOperation::Update {
+                        shard,
+                        op: ShardUpdateOp::BindShardFabricDestination { binding },
+                        ..
+                    } => Some((*shard, *binding)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(fabric_ops(&unqualified).is_empty());
+        let meta = lifecycle.topology.track(identity).unwrap().meta().clone();
+        let incarnation = std::num::NonZeroU64::new(27).unwrap();
+        let encoding = RtpSourceEncoding {
+            primary: 1_u32.into(),
+            rid: None,
+            payload_type: 96_u8.into(),
+        };
+        let emission = |profile| crate::route::fabric::local::Emission::new(profile, &[]).unwrap();
+        assert!(
+            lifecycle
+                .set_local_rtp_source(
+                    &meta,
+                    encoding,
+                    incarnation,
+                    emission(Profile::H264),
+                    &registry,
+                    now
+                )
+                .is_none()
+        );
+        let qualified = lifecycle
+            .set_local_rtp_source(
+                &meta,
+                encoding,
+                incarnation,
+                emission(Profile::Opus),
+                &registry,
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            anchor(&lifecycle),
+            Some((
+                ShardId::new(0),
+                crate::shard_update::PublisherAnchor {
+                    publication: identity.publication_id,
+                    connection,
+                    incarnation,
+                    emission: emission(Profile::Opus),
+                }
+            ))
+        );
+        let binding = crate::route::fabric::ShardBinding {
+            destination: destination(&lifecycle, identity, 1).placement.route,
+            publication: identity.publication_id,
+            origin: ShardId::new(0),
+            incarnation,
+        };
+        assert_eq!(
+            fabric_ops(&qualified),
+            [(ShardId::new(1), binding), (ShardId::new(0), binding)]
+        );
+        assert!(
+            lifecycle
+                .set_local_rtp_source(
+                    &meta,
+                    encoding,
+                    incarnation,
+                    emission(Profile::Opus),
+                    &registry,
+                    now
+                )
+                .is_none()
+        );
+        lifecycle
+            .unpublish(endpoint(1, 1), identity.publication_id, &registry, now)
+            .unwrap();
+        assert!(lifecycle.local_rtp_sources.is_empty());
+        assert!(anchor(&lifecycle).is_none());
     }
 
     #[test]

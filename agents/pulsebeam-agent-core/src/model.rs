@@ -331,6 +331,12 @@ pub enum Notification {
         send: crate::OperationId,
         error: Option<crate::DataSendFailure>,
     },
+    ReliableData {
+        track_id: String,
+        generation: crate::Generation,
+        source: u64,
+        event: crate::ffi::ReliablePublishEvent,
+    },
     Topic(TopicNotification),
     Failure(Failure),
     ServerError(String),

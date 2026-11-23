@@ -5,17 +5,17 @@ use std::{
     time::Duration,
 };
 
-use pulsebeam_agent_core::ffi as api;
+use pulsebeam_agent_core::{DataEvent, ffi as api};
 use pulsebeam_agent_native::AsyncHttpClient;
 use pulsebeam_agent_native::{
     Agent as RuntimeAgent, Config, Host,
-    ffi::{Agent, EventUpdate, NativeEvent, SnapshotUpdate},
+    ffi::{Agent, DataPublication, DataSubscription},
 };
 use pulsebeam_core::net::{HttpRequest, HttpResult};
 
 use super::common::{
-    client::create_http_client, native::NativeHost, reserve_subnet, run_sim_or_timeout, sim_seed,
-    start_sfu_node_with, subnet_ip,
+    client::create_http_client, native::NativeHost, reserve_subnet, run_sim_or_timeout,
+    sfu_node_builder, sim_seed, subnet_ip,
 };
 
 fn evidence(claim: &str, event: &str, details: serde_json::Value) {
@@ -58,19 +58,28 @@ impl AsyncHttpClient for HttpWitness {
 
 struct Peer {
     agent: Arc<Agent>,
-    transport: RuntimeAgent,
     statuses: Arc<Mutex<Vec<(String, u16)>>>,
     name: String,
-    publishes: bool,
+    data: DataResource,
 }
 
-const TOPIC: &str = "calibration-origin";
-fn publisher() -> api::TopicPublisher {
-    api::TopicPublisher {
-        name: TOPIC.into(),
-        mode: api::TopicMode::Lossy,
+enum DataResource {
+    Publisher(Arc<DataPublication>),
+    Subscriber(Arc<DataSubscription>),
+}
+
+impl DataResource {
+    fn installed(&self) -> bool {
+        let execution = match self {
+            Self::Publisher(publication) => publication.state().execution,
+            Self::Subscriber(subscription) => subscription.state().execution,
+        };
+        execution == api::PublicationExecution::Installed
     }
 }
+
+const ROOM: &str = "calibration";
+const TOPIC: &str = "calibration-origin";
 
 async fn peer(ip: IpAddr, server: IpAddr, name: &str, publishes: bool) -> anyhow::Result<Peer> {
     let session = pulsebeam_agent_core::AgentConfig {
@@ -96,77 +105,63 @@ async fn peer(ip: IpAddr, server: IpAddr, name: &str, publishes: bool) -> anyhow
         move || host.runtime(),
     )?;
     tokio::task::spawn_local(actor);
-    let agent = Agent::from_runtime(runtime.clone());
-    // Explicit transport registrations are native controlled-host fixture inputs.
-    runtime
-        .replace_desired(
-            api::DesiredState {
-                connected: true,
-                topic_publishers: if publishes { vec![publisher()] } else { vec![] },
-                topic_subscribers: if publishes {
-                    vec![]
-                } else {
-                    vec![api::TopicSubscriber {
-                        room: "calibration".into(),
-                        participant_id: "source".into(),
-                        name: TOPIC.into(),
-                        mode: api::TopicMode::Lossy,
-                    }]
-                },
+    let agent = Agent::from_runtime(runtime);
+    let delivery = api::DataDelivery::Unreliable;
+    let data = if publishes {
+        DataResource::Publisher(agent.data(TOPIC.into())?.publish(Some(
+            api::DataPublishOptions {
+                delivery: Some(delivery),
                 ..Default::default()
-            }
-            .into_core(1)
-            .map_err(|error| anyhow::anyhow!("{error:?}"))?,
+            },
+        ))?)
+    } else {
+        DataResource::Subscriber(
+            agent
+                .room(ROOM.into())?
+                .participant("source".into())?
+                .data(TOPIC.into())?
+                .subscribe(Some(api::DataSubscribeOptions {
+                    delivery: Some(delivery),
+                }))?,
         )
-        .await?;
-    agent.join("calibration".into())?;
+    };
+    agent.join(ROOM.into())?;
     Ok(Peer {
         agent,
-        transport: runtime,
         statuses,
         name: name.into(),
-        publishes,
+        data,
     })
 }
 
-async fn ready(peer: &Peer) -> anyhow::Result<api::Snapshot> {
-    let snapshots = peer.agent.snapshots();
+async fn ready(peer: &Peer) -> anyhow::Result<()> {
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
-            let SnapshotUpdate::Snapshot { snapshot } = snapshots.next().await else {
-                anyhow::bail!("snapshot stream closed")
-            };
+            let snapshot = peer.agent.snapshot();
             if snapshot.connection == api::ConnectionState::Connected
                 && snapshot.participant_id.as_deref() == Some(peer.name.as_str())
-                && snapshot.topics.publishers.len() == usize::from(peer.publishes)
-                && snapshot.topics.subscribers.len() == usize::from(!peer.publishes)
-                && snapshot.topics.publishers.iter().all(|p| {
-                    p.publisher == publisher() && p.connected && p.publication_id.is_some()
-                })
-                && snapshot.topics.subscribers.iter().all(|s| {
-                    s.subscriber.name == TOPIC
-                        && s.subscriber.mode == api::TopicMode::Lossy
-                        && s.connected
-                        && s.publishers == 1
-                })
+                && peer.data.installed()
             {
-                return Ok(snapshot);
+                return;
             }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .map_err(|_| anyhow::anyhow!("SDK readiness deadline"))?
+    .map_err(|_| anyhow::anyhow!("SDK readiness deadline for {}", peer.name))
 }
 
 /// Receipt is an actual public event with exact origin, topic, mode and payload.
 async fn delivery(
     claim: &str,
     source: &Peer,
-    origin: &str,
     recipients: &[&Peer],
     phase: &str,
 ) -> anyhow::Result<()> {
-    let events: Vec<_> = recipients.iter().map(|p| p.agent.events()).collect();
+    let origin = source.name.as_str();
+    let DataResource::Publisher(publication) = &source.data else {
+        anyhow::bail!("calibration source has no publication");
+    };
     let payload = format!("{claim}/{phase}/source-input").into_bytes();
     evidence(
         claim,
@@ -176,39 +171,32 @@ async fn delivery(
     let mut received = vec![false; recipients.len()];
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     while tokio::time::Instant::now() < deadline {
-        source
-            .transport
-            .send_topic(pulsebeam_agent_core::TopicSend {
-                publisher: publisher().into(),
-                payload: payload.clone(),
-            })
-            .await?;
-        for (index, events) in events.iter().enumerate() {
+        publication.send(payload.clone(), None).await?;
+        for (index, recipient) in recipients.iter().enumerate() {
             if received[index] {
                 continue;
             }
-            if let Ok(EventUpdate::Event {
-                event:
-                    NativeEvent::Core {
-                        notification:
-                            api::Notification::Topic {
-                                notification: api::TopicNotification::Message { message },
-                            },
-                    },
-            }) = tokio::time::timeout(Duration::from_millis(20), events.next()).await
+            let DataResource::Subscriber(subscription) = &recipient.data else {
+                anyhow::bail!("calibration recipient has no subscription");
+            };
+            if let Ok(update) =
+                tokio::time::timeout(Duration::from_millis(20), subscription.next()).await
+                && let Some(DataEvent::Message {
+                    participant_id,
+                    publication_id,
+                    data,
+                    ..
+                }) = update?
+                && participant_id == origin
+                && subscription.state().source_track_id.as_ref() == Some(&publication_id)
+                && data == payload
             {
-                if message.participant_id == origin
-                    && message.name == TOPIC
-                    && message.mode == api::TopicMode::Lossy
-                    && message.payload == payload
-                {
-                    received[index] = true;
-                    evidence(
-                        claim,
-                        "receipt",
-                        serde_json::json!({"recipient": index, "recipient_id": recipients[index].name, "origin": message.participant_id, "payload": message.payload, "phase": phase}),
-                    );
-                }
+                received[index] = true;
+                evidence(
+                    claim,
+                    "receipt",
+                    serde_json::json!({"recipient": index, "recipient_id": recipient.name, "origin": participant_id, "payload": data, "phase": phase}),
+                );
             }
         }
         if received.iter().all(|value| *value) {
@@ -238,23 +226,20 @@ fn run(claim: &'static str, shards: usize, admission: bool) {
     let server = subnet_ip(subnet, 1);
     let client = subnet_ip(subnet, 2);
     sim.host(server, move || async move {
-        start_sfu_node_with(
-            server,
-            pulsebeam_runtime::rand::seeded_rng(seed),
-            shards,
-            false,
-        )
-        .await
-        .map_err(Into::into)
+        sfu_node_builder(server, pulsebeam_runtime::rand::seeded_rng(seed), shards)
+            .with_local_data_v1()
+            .run(tokio_util::sync::CancellationToken::new())
+            .await
+            .map_err(Into::into)
     });
     sim.client(client, async move {
         let result: anyhow::Result<()> = async {
         let source = peer(client, server, "source", true).await?;
-        let origin = ready(&source).await?.participant_id.ok_or_else(|| anyhow::anyhow!("source identity missing"))?;
+        ready(&source).await?;
         let first = peer(client, server, "first", false).await?;
         ready(&first).await?;
         if admission {
-            delivery(claim, &source, &origin, &[&first], "before-fault").await?;
+            delivery(claim, &source, &[&first], "before-fault").await?;
             let before = pulsebeam::sim_metrics::routing_counter("materialization_failed");
             pulsebeam::sim_metrics::fail_next_materialization();
             let retrying = peer(client, server, "retrying", false).await?;
@@ -270,17 +255,17 @@ fn run(claim: &'static str, shards: usize, admission: bool) {
                 evidence(claim, "violation", serde_json::json!({"boundary": "public", "reason": "admission-status", "expected": 503, "actual": status}));
                 anyhow::bail!("negative materialization acknowledgement returned HTTP {status}, expected 503");
             }
-            delivery(claim, &source, &origin, &[&first], "unrelated-service").await?;
+            delivery(claim, &source, &[&first], "unrelated-service").await?;
             ready(&retrying).await?;
             anyhow::ensure!(retrying.statuses.lock().unwrap().iter().any(|(_, status)| *status == 201), "SDK did not retry admission successfully");
             evidence(claim, "retry", serde_json::json!({"statuses": retrying.statuses.lock().unwrap().iter().map(|(_, status)| *status).collect::<Vec<_>>()}));
-            delivery(claim, &source, &origin, &[&first, &retrying], "after-retry").await?;
+            delivery(claim, &source, &[&first, &retrying], "after-retry").await?;
             retrying.agent.close().await?;
         } else {
             let second = peer(client, server, "second", false).await?;
             ready(&second).await?;
             evidence(claim, "premise", serde_json::json!({"shards": shards, "sequential_participants": 3, "intended_recipients": 2}));
-            delivery(claim, &source, &origin, &[&first, &second], "fanout").await?;
+            delivery(claim, &source, &[&first, &second], "fanout").await?;
             second.agent.close().await?;
         }
         first.agent.close().await?;

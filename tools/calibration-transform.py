@@ -5,12 +5,12 @@ import json
 from pathlib import Path
 
 TRANSFORMS = {
-    "local-fanout": ("src/shard/router.rs",
-                     "for &subscriber in &plan.local {\n        deliver(subscriber);\n    }",
-                     "for &subscriber in plan.local.iter().take(1) {\n        deliver(subscriber);\n    }"),
+    "local-fanout": ("src/route/fabric/local.rs",
+                     "for branch in self.branches.values_mut() {\n            branch.discard_stale(now, &self.fates, |_| true);",
+                     "for branch in self.branches.values_mut().take(1) {\n            branch.discard_stale(now, &self.fates, |_| true);"),
     "remote-fanout": ("src/shard/router.rs",
-                      "for remote in &plan.remote {\n        let delivery = MediaDelivery {",
-                      "for remote in plan.remote.iter().take(1) {\n        let delivery = MediaDelivery {"),
+                      "for destination in destinations {\n                if ordered.is_some_and(|unit| {",
+                      "for destination in destinations.iter_mut().take(1) {\n                if ordered.is_some_and(|unit| {"),
     "materialization": ("src/control/controller.rs",
                         "let result = match (validation, materialized) {",
                         "let result = match (validation, materialized || pending.command.is_none()) {"),

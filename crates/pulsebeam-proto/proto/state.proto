@@ -52,8 +52,8 @@ message CatalogParticipantEntry {
   Participant participant = 1;
   // Complete authorized list, including the empty list for presence-only entries.
   repeated Track tracks = 2;
-  // Server-issued data recipient reference for this participant's current room connection.
-  optional string data_recipient_id = 3;
+  reserved 3;
+  reserved "data_recipient_id";
 }
 
 // Each record carries a bounded slice of one encoded complete entry. Fragments
@@ -89,6 +89,7 @@ message CatalogPageRecord {
 // Complete values applied individually in reliable stream order, not a map-wide
 // transaction. Send promptly; coalesce unsent updates by key. No batch ACK/cursor.
 message ClientStateBatch {
+  reserved 4, 5; // NativeDataControl, never mixed into a State batch.
   // Resource and catalog records share one 16-record, 4096-byte frame budget.
   repeated ClientStateRecord records = 1;
   repeated CatalogClientRecord catalog_records = 3;
@@ -145,6 +146,7 @@ message LogicalReceiverReport {
 }
 
 message ServerStateBatch {
+  reserved 4, 5; // NativeDataControl, never mixed into a State batch.
   // Resource and catalog records share one 16-record, 4096-byte frame budget.
   repeated ServerStateRecord records = 1;
 
@@ -154,6 +156,21 @@ message ServerStateBatch {
   // catch-up barrier, acknowledgment or application convergence.
   bool initial_complete = 2;
   repeated CatalogServerRecord catalog_records = 3;
+}
+
+// A standalone Native control-channel message for a negotiated Reliable DATA_V1
+// resource. The connection supplies direction and resolves the owned reference.
+// The role and record are not authority to address any other resource.
+message NativeDataControl {
+  oneof endpoint {
+    OwnedDataControl publisher = 4;
+    OwnedDataControl subscriber = 5;
+  }
+}
+
+message OwnedDataControl {
+  uint64 owned = 1;
+  bytes record = 2; // Canonical directional record from data_control.proto.
 }
 
 // Directional catalog response. An error is not a page fragment.
@@ -399,6 +416,10 @@ message SourceLookupSpec {
 // publication and receiver can change without replacing the owned reference.
 message LogicalSubscriptionSpec {
   LogicalSourceAddress source = 1;
+
+  // Only DATA subscriptions may request an explicit Fabric payload version.
+  // Absence is a legacy subscription and cannot receive a Fabric offer.
+  optional uint32 data_version = 2;
 }
 
 // Publication, lookup and data-subscription settings contain no receive variant.
@@ -492,6 +513,10 @@ message LiveResource {
   optional MediaActivity activity = 6;
 
   reserved 7;
+
+  // Authenticated source incarnation for an admitted DATA_V1 publication.
+  // Never inferred from the publication ID or SCTP stream.
+  optional fixed64 data_v1_source = 8;
 }
 
 // Read-only observation attached to an owned lookup declaration. Participant
@@ -522,6 +547,21 @@ message LogicalSubscriptionState {
     TrackBinding installed = 4;
     Failure failure = 5;
   }
+
+  // Explicit Fabric DATA selection for this source revision. Absence does not
+  // select DATA_V1. The source and branch handles are assigned by the server.
+  DataV1ReceiverOffer data_v1 = 6;
+}
+
+message DataV1ReceiverOffer {
+  fixed64 source = 1;
+  fixed64 branch = 2;
+  DataV1CaptureClock capture_clock = 3;
+}
+
+message DataV1CaptureClock {
+  string id = 1;
+  fixed64 epoch = 2;
 }
 
 enum ExecutionStatus {
@@ -607,7 +647,25 @@ message TrackBinding {
   oneof transport {
     RtpParameters rtp = 1;
     SctpParameters sctp = 2;
+    SctpDataV1Parameters sctp_data_v1 = 3;
   }
+}
+
+// Explicit DATA_V1 payload negotiation, never an opt-in flag on a legacy
+// SCTP binding. A peer that does not understand this oneof member cannot
+// interpret it as a TopicFrame channel.
+message SctpDataV1Parameters {
+  optional uint32 stream_id = 1;
+  uint32 version = 2;
+  fixed64 channel_incarnation = 3; // Nonzero; echoed with the complete binding.
+  DataV1Delivery delivery = 4;
+}
+
+enum DataV1Delivery {
+  DATA_V1_DELIVERY_UNSPECIFIED = 0;
+  DATA_V1_DELIVERY_UNRELIABLE = 1;
+  DATA_V1_DELIVERY_LATEST = 2;
+  DATA_V1_DELIVERY_RELIABLE = 3;
 }
 
 // One client-allocated negotiated payload channel, independent of DTLS role.
@@ -643,6 +701,10 @@ message RtpParameters {
 
   // REQUIRED actual RTCP mode/CNAME; cannot infer preparation from omission.
   RtcpParameters rtcp = 5;
+
+  // Actual negotiated mixed one-byte and two-byte extension support.
+  // Omission preserves any existing SDP negotiation, otherwise disabled.
+  optional bool extmap_allow_mixed = 6;
 }
 
 // One selected primary codec and optional associated repair payload type.

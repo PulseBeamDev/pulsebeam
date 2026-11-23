@@ -362,7 +362,7 @@ impl VideoSource {
         self.recovery_probe = probe;
         self
     }
-    fn request(&mut self, slot: &str, encoding: &Option<String>) {
+    fn request(&mut self, slot: &str, encoding: &Option<String>) -> bool {
         let mut probe = self.recovery_probe.lock().unwrap();
         if probe.armed {
             let target = (slot.to_owned(), encoding.clone());
@@ -372,11 +372,12 @@ impl VideoSource {
                 if probe.discarded_responses == 0 {
                     probe.discarded_responses += 1;
                     probe.discarded_targets.push(target);
-                    return;
+                    return false;
                 }
             }
         }
         self.index = self.first_idr;
+        true
     }
     fn frame(
         &mut self,
@@ -443,11 +444,18 @@ impl VideoSource {
         let capture_clock = super::native::callback_clock().expect("fixture capture clock anchor");
         let feedback = media.feedback();
         let mut last_keyframes = vec![true; sources.len()];
+        let mut repeat_keyframe = vec![false; sources.len()];
+        let mut response_capture = vec![None; sources.len()];
         let mut sequence = 0u64;
         let started = tokio::time::Instant::now();
         let mut interval = tokio::time::interval(Duration::from_secs_f64(1.0 / f64::from(fps)));
         loop {
             let capture = interval.tick().await;
+            for ((_, source), repeat) in sources.iter_mut().zip(&mut repeat_keyframe) {
+                if std::mem::take(repeat) {
+                    source.index = source.first_idr;
+                }
+            }
             while let Some(update) = feedback.try_next() {
                 match update {
                     StreamUpdate::Value(feedback) => {
@@ -461,7 +469,16 @@ impl VideoSource {
                             if feedback.encoding_keyframes_requested.get(index) == Some(&true)
                                 || (feedback.keyframe_requested && !indexed)
                             {
-                                source.request("v0", encoding);
+                                if source.request("v0", encoding) {
+                                    // A rapid repeat can mean the codec saw a delta after skipping
+                                    // our response. Answer that retry on adjacent captures to
+                                    // break the phase lock without doubling normal keyframes.
+                                    let previous = response_capture[index].replace(sequence);
+                                    repeat_keyframe[index] |= matches!(
+                                        previous.map(|capture| sequence - capture),
+                                        Some(1 | 2)
+                                    );
+                                }
                             }
                         }
                     }
@@ -626,24 +643,40 @@ impl VbrSource {
             .unwrap()
             .saturating_add(self.profile.loop_idle);
         let mut loop_started = started;
+        let mut refresh = false;
+        let mut next_capture = started;
+        let capture_period = Duration::from_secs_f64(1.0 / f64::from(self.source.fps));
         loop {
-            let due = loop_started + self.frame_times[self.source.index];
-            tokio::time::sleep_until(due).await;
-            let now = tokio::time::Instant::now();
-            while let Some(update) = feedback.try_next() {
-                match update {
-                    StreamUpdate::Value(feedback) => {
-                        require_encoder_feedback(&feedback, &[last_keyframe])
-                            .expect("unrecoverable native VBR encoder rejection");
-                        if feedback.keyframe_requested {
-                            self.source.index = self.source.first_idr;
-                            loop_started = now;
+            let due = if refresh {
+                next_capture
+            } else {
+                loop_started + self.frame_times[self.source.index]
+            };
+            tokio::select! {
+                biased;
+                update = feedback.next() => {
+                    match update {
+                        StreamUpdate::Value(feedback) => {
+                            require_encoder_feedback(&feedback, &[last_keyframe])
+                                .expect("unrecoverable native VBR encoder rejection");
+                            refresh |= feedback.keyframe_requested
+                                || feedback.encoding_keyframes_requested.first() == Some(&true);
                         }
+                        StreamUpdate::Lagged { .. } => panic!("VBR feedback lagged"),
+                        StreamUpdate::Closed => return,
                     }
-                    StreamUpdate::Lagged { .. } => panic!("VBR feedback lagged"),
-                    StreamUpdate::Closed => return,
+                    continue;
                 }
+                () = tokio::time::sleep_until(due) => {}
             }
+            let now = tokio::time::Instant::now();
+            if std::mem::take(&mut refresh) {
+                // The recovery frame starts a new coded dependency chain. Do not
+                // wait for the next sparse desktop update to supply that IDR.
+                self.source.index = self.source.first_idr;
+                loop_started = now - self.frame_times[self.source.index];
+            }
+            next_capture = now + capture_period;
             let elapsed = now.duration_since(started);
             let active = self.active(elapsed);
             let target = self.step_target(active);

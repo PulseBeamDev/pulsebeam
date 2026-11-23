@@ -6,19 +6,23 @@ use pulsebeam_runtime::time::Instant;
 use slotmap::SecondaryMap;
 
 use crate::clock::WallAnchor;
+#[cfg(test)]
+use crate::route::fabric::local::OwnedPacket;
+use crate::route::fabric::local::{Emission, Offers, PacketView, Rejection};
 use crate::route::{MediaDelivery, NodeTransportAddress};
 use crate::shard::events::{ParticipantBindingEvent, ParticipantEvent, ParticipantLifecycleEvent};
 use crate::{
+    id::ShardId,
     keys::ParticipantHandle,
     participant::{
         ConnectionConfig,
-        batcher::{AppendStatus, GsoSendBatch, NetworkEgress, OwnedPacketQueue},
+        batcher::{AppendStatus, GsoSendBatch, Handoff, NetworkEgress, OwnedPacketQueue},
     },
     shard::{
         dirty::DirtyTracker,
         events::EventPipeline,
         participants::ParticipantRegistry,
-        router::{Origin, ShardRuntime},
+        router::{FabricLocalBranch, FabricSourceHandle, Origin, ShardRuntime},
         timer::TimerWheel,
         updates::ShardUpdateApplication,
     },
@@ -43,7 +47,6 @@ fn record_routing_drop(lane: &'static str, stage: &'static str, origin: &'static
 
 struct ShardNetworkEgress<'a> {
     udp: &'a mut GsoSendBatch,
-    udp_socket: &'a mut pulsebeam_udp::UdpSocket,
 }
 
 impl NetworkEgress for ShardNetworkEgress<'_> {
@@ -63,8 +66,26 @@ impl NetworkEgress for ShardNetworkEgress<'_> {
     }
 
     fn flush(&mut self) -> bool {
-        self.udp.flush(self.udp_socket)
+        // The shard submits after releasing the current participant borrow.
+        false
     }
+}
+
+const FABRIC_CONTROL_TURN_BUDGET: usize = 16;
+const PUBLISHER_LOOKUP_LIMIT: usize = 32;
+const PUBLISHER_LOOKUP_RETRY: std::time::Duration = std::time::Duration::from_millis(100);
+
+struct PendingPublisherLookup {
+    lookup: crate::route::fabric::relay::PublisherRepairLookup,
+    result: pulsebeam_runtime::sync::oneshot::Sender<
+        Option<crate::route::fabric::relay::LocatedRepair>,
+    >,
+    due: Instant,
+}
+
+enum PublisherLookupResult {
+    Located(crate::route::fabric::relay::LocatedRepair),
+    RetryAt(Instant),
 }
 
 pub(crate) struct ShardCore {
@@ -78,7 +99,9 @@ pub(crate) struct ShardExecution {
     pending_replacements:
         std::collections::VecDeque<(crate::route::NodeTransportAddress, ConnectionConfig)>,
     pub(super) runtime: ShardRuntime,
+    pending_publisher_lookups: Vec<PendingPublisherLookup>,
     plans: SecondaryMap<crate::keys::TrackHandle, crate::shard::router::InstalledTrackPlan>,
+    local_rtp_v1: bool,
     timers: TimerWheel,
     dirty: DirtyTracker,
     udp_send_batch: GsoSendBatch,
@@ -99,6 +122,11 @@ impl ShardCore {
             execution: ShardExecution::new(shard_id, max_gso_segments, shard_count, wall),
             updates: ShardUpdateApplication::new(shard_id, update_rx),
         }
+    }
+
+    pub(super) fn with_local_rtp_v1(mut self, enabled: bool) -> Self {
+        self.execution.local_rtp_v1 = enabled;
+        self
     }
 
     pub(crate) fn observe_execution_time(&mut self, at: net::ReceiveTime) -> net::ReceiveTime {
@@ -131,6 +159,92 @@ impl ShardCore {
         router: &impl IngressTransport,
     ) {
         self.execution.on_shard_frames(frames, now, router);
+    }
+
+    pub(super) fn on_network_fabric(
+        &mut self,
+        address: crate::route::NodeRouteAddress,
+        ingress: pulsebeam_link::FabricIngress,
+        now: Instant,
+        arrival: Instant,
+        image: impl Into<crate::route::fabric::NetworkPacket>,
+    ) {
+        use crate::route::fabric::NetworkPacket;
+        let image = image.into();
+        let repair = ingress.purpose == pulsebeam_link::FabricPurpose::RepairOnly;
+        let (ingress, image) = if repair {
+            if matches!(&image, NetworkPacket::Wan { window, .. } if window.profile() != pulsebeam_core::fabric::Profile::Data)
+            {
+                let Some(repaired) = self
+                    .execution
+                    .runtime
+                    .take_media_repair(address, ingress, image, now)
+                else {
+                    return;
+                };
+                repaired
+            } else {
+                self.execution
+                    .receive_network_repair(address, ingress, now, image);
+                return;
+            }
+        } else {
+            (ingress, image)
+        };
+        let profile = match &image {
+            NetworkPacket::Legacy(packet) | NetworkPacket::Wan { packet, .. } => {
+                packet.header().profile
+            }
+        };
+        let data = profile == pulsebeam_core::fabric::Profile::Data;
+        #[cfg(feature = "sim")]
+        let wan_protected_bytes = match &image {
+            NetworkPacket::Wan { packet, .. } => packet.wan_received_bytes(),
+            _ => None,
+        };
+        let media_position = match &image {
+            NetworkPacket::Wan { position, .. } if !data => Some(*position),
+            _ => None,
+        };
+        let result = self
+            .execution
+            .runtime
+            .offer_live_network(address, ingress, now, arrival, image);
+        if let Ok(report) = result
+            && let Some(source) = self.execution.runtime.network_fabric_source(address)
+        {
+            if !data {
+                #[cfg(feature = "sim")]
+                if profile == pulsebeam_core::fabric::Profile::Opus && report.enqueued != 0 {
+                    crate::sim_metrics::record_routing_counter("fabric_network_opus_receive");
+                    if let Some(bytes) = wan_protected_bytes {
+                        crate::sim_metrics::record_wan_opus_wire_bytes(usize::from(bytes.get()));
+                    }
+                }
+                #[cfg(feature = "sim")]
+                if profile == pulsebeam_core::fabric::Profile::Opus
+                    && let Some(position) = media_position
+                {
+                    crate::sim_metrics::wan_repair::admitted(
+                        ingress.association,
+                        position,
+                        repair,
+                        report.enqueued,
+                    );
+                }
+                if let Some(position) = media_position
+                    && let Some(interest) = self
+                        .execution
+                        .runtime
+                        .observe_network_media_position(address, ingress, position, now)
+                {
+                    self.execution.pipeline.push_network_media_repair(interest);
+                }
+                self.execution.drain_fabric_rtp(source, now);
+            } else if report.enqueued != 0 {
+                self.execution.drain_fabric_data(source, now);
+            }
+        }
     }
 
     pub(crate) fn on_udp_batch_routed(
@@ -175,12 +289,8 @@ impl ShardCore {
         self.execution.dirty.mark(key, participant);
     }
 
-    pub(crate) fn flush_stream_buffers(
-        &mut self,
-        router: &impl IngressTransport,
-        budget: usize,
-    ) -> usize {
-        self.execution.flush_stream_buffers(router, budget)
+    pub(crate) fn flush_stream_buffers(&mut self, now: Instant, budget: usize) -> usize {
+        self.execution.flush_stream_buffers(now, budget)
     }
 
     pub(crate) fn flush_participant_events(
@@ -220,8 +330,10 @@ impl ShardCore {
         &mut self,
         udp_socket: &mut pulsebeam_udp::UdpSocket,
         budget: usize,
+        router: &impl IngressTransport,
     ) -> usize {
-        self.execution.poll_and_flush_dirty(udp_socket, budget)
+        self.execution
+            .poll_and_flush_dirty(udp_socket, budget, router)
     }
 
     pub(crate) fn drain_pending_close(
@@ -250,8 +362,10 @@ impl ShardExecution {
             shard_id,
             registry: ParticipantRegistry::new(shard_id, max_gso_segments, shard_count),
             pending_replacements: std::collections::VecDeque::new(),
+            pending_publisher_lookups: Vec::new(),
             runtime,
             plans: SecondaryMap::new(),
+            local_rtp_v1: false,
             timers: TimerWheel::new(PARTICIPANT_CAPACITY_HINT),
             dirty: DirtyTracker::with_capacity(PARTICIPANT_CAPACITY_HINT),
             udp_send_batch: GsoSendBatch::preallocated(),
@@ -265,13 +379,606 @@ impl ShardExecution {
         key: ParticipantHandle,
         udp_socket: &mut pulsebeam_udp::UdpSocket,
     ) {
+        self.dispatch_staged_media(key);
+        loop {
+            let Some(participant) = self.registry.resolve_mut(key) else {
+                return;
+            };
+            let mut egress = ShardNetworkEgress {
+                udp: &mut self.udp_send_batch,
+            };
+            participant.drain_network(&mut egress);
+            if !participant.network_pending() || !self.flush_udp(udp_socket) {
+                return;
+            }
+        }
+    }
+
+    fn dispatch_staged_media(&mut self, key: ParticipantHandle) {
+        if let Some(handoff) = self
+            .registry
+            .resolve_mut(key)
+            .and_then(|participant| participant.staged_handoff(key))
+        {
+            let authorized =
+                Self::authorize_media_handoff(&self.runtime, &mut self.registry, handoff);
+            if let Some(participant) = self.registry.resolve_mut(key) {
+                participant.dispatch_handoff(handoff, authorized);
+            }
+        }
+    }
+
+    fn flush_udp(&mut self, socket: &mut pulsebeam_udp::UdpSocket) -> bool {
+        let runtime = &self.runtime;
         let registry = &mut self.registry;
-        let udp = &mut self.udp_send_batch;
-        let Some(participant) = registry.resolve_mut(key) else {
+        let submission = self.udp_send_batch.flush_checked(socket, |handoff| {
+            Self::authorize_media_handoff(runtime, registry, handoff)
+        });
+        self.resolve_media_submissions(submission.handoffs);
+        submission.accepted != 0
+    }
+
+    fn resolve_media_submissions(&mut self, handoffs: impl IntoIterator<Item = (Handoff, bool)>) {
+        for (handoff, accepted) in handoffs {
+            if let Some(participant) = self.registry.resolve_mut(handoff.participant)
+                && participant.resolve_handoff(handoff.id, accepted)
+            {
+                self.timers.wake(handoff.participant);
+            }
+        }
+    }
+
+    fn authorize_media_handoff(
+        runtime: &ShardRuntime,
+        registry: &mut ParticipantRegistry,
+        handoff: Handoff,
+    ) -> bool {
+        use crate::shard::router::FabricOwner;
+        let allowed = match runtime.fabric_handoff_owner(handoff.branch, handoff.participant) {
+            Some(FabricOwner::Local(publisher)) => registry
+                .resolve_mut(publisher)
+                .is_some_and(|owner| owner.fabric_source_authorized(handoff.branch.source())),
+            Some(FabricOwner::Shard(_) | FabricOwner::Network) => true,
+            None => false,
+        };
+        allowed
+            && runtime.fabric_ingress_live(handoff.branch, handoff.ingress)
+            && registry
+                .resolve_mut(handoff.participant)
+                .is_some_and(|receiver| {
+                    receiver.fabric_io_authorized()
+                        && receiver.handoff_pending(handoff.id)
+                        && runtime
+                            .fabric_dd_source(handoff.branch.source())
+                            .is_none_or(|(track, encoding)| {
+                                runtime
+                                    .fabric_branch_target(handoff.branch)
+                                    .is_some_and(|target| {
+                                        receiver.fabric_video_output_selects(
+                                            handoff.branch,
+                                            track,
+                                            encoding,
+                                            target,
+                                        )
+                                    })
+                            })
+                })
+    }
+
+    pub(super) fn update_live_relay(
+        &mut self,
+        change: crate::route::fabric::LiveRelayChange,
+    ) -> bool {
+        use crate::route::fabric::LiveRelayChange;
+        match change {
+            LiveRelayChange::Install(relay) => {
+                self.runtime.install_live_relay(Instant::now(), relay)
+            }
+            LiveRelayChange::Retire(relay, retirement) => {
+                self.runtime
+                    .retire_live_relay(&relay, retirement, Instant::now())
+            }
+        }
+    }
+
+    pub(super) fn install_live_network_child(
+        &mut self,
+        child: crate::route::fabric::LiveNetworkChild,
+        lifetime: pulsebeam_link::BindingCutoff,
+    ) -> Option<crate::route::fabric::LiveNetworkChild> {
+        let track = self.runtime.track_handle(child.publication)?;
+        let plan = self.plans.get(track)?;
+        if !plan.local.iter().all(|member| {
+            self.registry
+                .resolve_mut(*member)
+                .is_some_and(|receiver| receiver.fabric_io_authorized())
+        }) {
+            return None;
+        }
+        let installed = self
+            .runtime
+            .install_live_network_child(child, lifetime, plan)?;
+        self.wake_installed_fabric_receivers(track, child.publication);
+        Some(installed)
+    }
+
+    fn wake_installed_fabric_receivers(
+        &mut self,
+        track: crate::keys::TrackHandle,
+        publication: crate::entity::PublicationKey,
+    ) {
+        if publication.kind() != crate::entity::TrackKind::Data {
+            self.bind_installed_fabric_rtp_receivers(track, publication);
+        } else if let Some(plan) = self.plans.get(track) {
+            for member in &plan.local {
+                if let Some(receiver) = self.registry.resolve_mut(*member) {
+                    receiver.wake_fabric_receiver(publication);
+                    self.dirty.mark(*member, receiver);
+                }
+            }
+        }
+    }
+
+    pub(super) fn observe_relay_data_expectation(
+        &mut self,
+        observation: crate::route::fabric::relay::RelayObservation,
+    ) {
+        if self.runtime.observe_relay_data_expectation(
+            &observation.route,
+            observation.unit,
+            observation.outcome,
+            Instant::now(),
+        ) {
+            self.record_relay_data_outcome(observation.outcome);
+        }
+    }
+
+    fn record_relay_data_outcome(&self, outcome: crate::route::fabric::local::PropagationOutcome) {
+        use crate::route::fabric::local::PropagationOutcome;
+        let outcome = match outcome {
+            PropagationOutcome::Confirmed => "confirmed",
+            PropagationOutcome::Failed => "failed",
+            PropagationOutcome::Unknown => "unknown",
+        };
+        metrics::counter!("fabric_relay_data_expectation_outcome", "outcome" => outcome)
+            .increment(1);
+    }
+
+    fn data_publisher_source(
+        &self,
+        publisher: crate::route::fabric::DataPublisher,
+    ) -> Option<(ParticipantHandle, FabricSourceHandle)> {
+        use crate::entity::TrackKind;
+        if publisher.publication.kind() != TrackKind::Data {
+            return None;
+        }
+        let participant = self.registry.resolve_connection(publisher.connection)?;
+        let track = self.runtime.track_handle(publisher.publication)?;
+        let source = self.runtime.fabric_source_for_track(track)?;
+        if self.runtime.fabric_incarnation(source) != Some(publisher.incarnation)
+            || self.runtime.local_fabric_publication(source, participant)
+                != Some(publisher.publication)
+        {
+            return None;
+        }
+        Some((participant, source))
+    }
+
+    pub(super) fn observe_publisher_data_expectation(
+        &mut self,
+        observation: crate::route::fabric::PublisherObservation,
+    ) {
+        let Some((participant, source)) = observation
+            .route
+            .publisher
+            .data_publisher()
+            .and_then(|publisher| self.data_publisher_source(publisher))
+        else {
             return;
         };
-        let mut egress = ShardNetworkEgress { udp, udp_socket };
-        participant.drain_network(&mut egress);
+        let outcome = observation.outcome;
+        if self.fabric_publisher_authorized(participant, source)
+            && self
+                .runtime
+                .observe_publisher_data_expectation(source, observation, Instant::now())
+        {
+            self.record_relay_data_outcome(outcome);
+        }
+    }
+
+    pub(super) fn sample_publisher_anchor(
+        &mut self,
+        publisher: crate::shard_update::PublisherAnchor,
+        now: Instant,
+    ) -> Option<u64> {
+        if let Some(data) = publisher.data_publisher() {
+            return self.data_publisher_anchor(data);
+        }
+        if publisher.emission.profile() != pulsebeam_core::fabric::Profile::Opus {
+            return None;
+        }
+        let (participant, source) = self.rtp_publisher_source(publisher)?;
+        if !self.fabric_publisher_authorized(participant, source) {
+            return None;
+        }
+        self.runtime.fabric_sequence_anchor(source, now)
+    }
+
+    fn rtp_publisher_source(
+        &self,
+        publisher: crate::shard_update::PublisherAnchor,
+    ) -> Option<(ParticipantHandle, FabricSourceHandle)> {
+        if publisher.emission.profile() == pulsebeam_core::fabric::Profile::Data {
+            return None;
+        }
+        let participant = self.registry.resolve_connection(publisher.connection)?;
+        let source = self
+            .runtime
+            .fabric_source_for_track(self.runtime.track_handle(publisher.publication)?)?;
+        if self.runtime.local_fabric_publication(source, participant) != Some(publisher.publication)
+            || self.runtime.fabric_incarnation(source) != Some(publisher.incarnation)
+            || self.runtime.fabric_emission(source) != Some(publisher.emission)
+        {
+            return None;
+        }
+        Some((participant, source))
+    }
+
+    fn data_publisher_anchor(
+        &mut self,
+        publisher: crate::route::fabric::DataPublisher,
+    ) -> Option<u64> {
+        let (participant, source) = self.data_publisher_source(publisher)?;
+        let installation = self
+            .registry
+            .resolve_mut(participant)?
+            .fabric_data_input_installation(source)?;
+        self.runtime
+            .data_publisher(source, participant, installation)?
+            .0
+            .sequence_anchor()
+    }
+
+    pub(super) fn update_publisher_send(
+        &mut self,
+        change: crate::route::fabric::PublisherSendChange,
+    ) -> bool {
+        use crate::route::fabric::PublisherSendChange;
+        match change {
+            PublisherSendChange::Install { route, lifetime } => {
+                let identity = route.publisher;
+                let now = Instant::now();
+                let binding = match identity.emission.profile() {
+                    pulsebeam_core::fabric::Profile::Data => identity
+                        .data_publisher()
+                        .and_then(|publisher| self.data_publisher_source(publisher)),
+                    pulsebeam_core::fabric::Profile::Opus
+                        if cfg!(feature = "sim") && self.local_rtp_v1 =>
+                    {
+                        self.rtp_publisher_source(identity)
+                    }
+                    _ => None,
+                };
+                let Some((publisher, source)) = binding else {
+                    return false;
+                };
+                #[cfg(feature = "sim")]
+                let wan_data = (identity.emission.profile()
+                    == pulsebeam_core::fabric::Profile::Data
+                    && route.tx.is_wan())
+                .then(|| (identity.publication.to_string(), lifetime.clone()));
+                let installed = self.fabric_publisher_authorized(publisher, source)
+                    && self
+                        .runtime
+                        .install_publisher_send(source, route, lifetime, now);
+                #[cfg(feature = "sim")]
+                if installed && let Some((publication, cutoff)) = wan_data {
+                    crate::sim_metrics::record_wan_data_send(publication, cutoff);
+                }
+                installed
+            }
+            PublisherSendChange::Retire(route) => self.runtime.retire_publisher_send(&route),
+        }
+    }
+
+    pub(super) fn accept_network_data_expectation(
+        &mut self,
+        notice: crate::route::fabric::NetworkDataExpectation,
+    ) -> bool {
+        let now = Instant::now();
+        let registry = &mut self.registry;
+        self.runtime
+            .accept_network_data_expectation(notice, now, |branch, destination| {
+                registry
+                    .resolve_mut(destination)
+                    .and_then(|owner| owner.reliable_subscriber_branch(branch))
+                    .filter(|lease| lease.endpoint.source == notice.parent.incarnation)
+                    .map(|lease| lease.endpoint.branch)
+            })
+    }
+
+    fn authorized_data_publisher_source(
+        &mut self,
+        identity: crate::route::fabric::DataPublisher,
+    ) -> Option<(ParticipantHandle, FabricSourceHandle)> {
+        let (publisher, source) = self.data_publisher_source(identity)?;
+        self.fabric_publisher_authorized(publisher, source)
+            .then_some((publisher, source))
+    }
+
+    pub(super) fn begin_peer_repair_lookup(
+        &mut self,
+        request: crate::shard_update::LocateRelayRepair,
+    ) {
+        use crate::route::fabric::relay::PeerRepairLookup;
+        if request.result.is_closed() {
+            return;
+        }
+        let now = Instant::now();
+        match request.lookup {
+            PeerRepairLookup::Media(lookup) => {
+                let located = self.locate_peer_media_repair(lookup, now);
+                let _ = request.result.send(located);
+            }
+            PeerRepairLookup::Relay(lookup) => {
+                let _ = request
+                    .result
+                    .send(self.runtime.locate_relay_repair(&lookup, now));
+            }
+            PeerRepairLookup::Publisher(lookup) => {
+                if self.pending_publisher_lookups.len() >= PUBLISHER_LOOKUP_LIMIT {
+                    let _ = request.result.send(None);
+                    return;
+                }
+                self.advance_publisher_lookup(
+                    PendingPublisherLookup {
+                        lookup,
+                        result: request.result,
+                        due: now,
+                    },
+                    now,
+                );
+            }
+        }
+    }
+
+    fn advance_publisher_lookup(&mut self, mut pending: PendingPublisherLookup, now: Instant) {
+        if pending.result.is_closed() {
+            return;
+        }
+        match self.resolve_publisher_lookup(&pending.lookup, now) {
+            Some(PublisherLookupResult::Located(located)) => {
+                let _ = pending.result.send(Some(located));
+            }
+            Some(PublisherLookupResult::RetryAt(due)) => {
+                pending.due = due;
+                self.pending_publisher_lookups.push(pending);
+            }
+            None => {
+                let _ = pending.result.send(None);
+            }
+        }
+    }
+
+    fn resolve_publisher_lookup(
+        &mut self,
+        lookup: &crate::route::fabric::relay::PublisherRepairLookup,
+        now: Instant,
+    ) -> Option<PublisherLookupResult> {
+        use crate::{
+            participant::data_fabric::OriginalResolution,
+            route::fabric::relay::{LocatedRepair, PeerRepairLookup},
+        };
+        let (publisher, source) =
+            self.authorized_data_publisher_source(lookup.route.publisher.data_publisher()?)?;
+        if let Some(located) = self.runtime.locate_publisher_repair(source, lookup, now) {
+            return Some(PublisherLookupResult::Located(located));
+        }
+        let (window, _) = self.runtime.publisher_repair_window(source, lookup, now)?;
+        let installation = self.runtime.reliable_data_installation(source)?;
+        let result = self.resolve_data_original(
+            publisher,
+            source,
+            installation,
+            lookup.request.fragment,
+            now,
+        );
+        match result {
+            OriginalResolution::Cached {
+                sequence, expires, ..
+            } => Some(PublisherLookupResult::Located(LocatedRepair {
+                lookup: Box::new(PeerRepairLookup::Publisher(lookup.clone())),
+                sequence,
+                expires: expires.min(window),
+            })),
+            OriginalResolution::Pending | OriginalResolution::Request(_) => {
+                let due = now
+                    .checked_add(PUBLISHER_LOOKUP_RETRY)
+                    .unwrap_or(window)
+                    .min(window);
+                Some(PublisherLookupResult::RetryAt(due))
+            }
+            OriginalResolution::Unavailable
+            | OriginalResolution::Exhausted
+            | OriginalResolution::Revoked => None,
+        }
+    }
+
+    fn retry_publisher_lookups(&mut self, now: Instant) {
+        for _ in 0..FABRIC_CONTROL_TURN_BUDGET {
+            let Some(index) = self
+                .pending_publisher_lookups
+                .iter()
+                .position(|pending| pending.due <= now || pending.result.is_closed())
+            else {
+                break;
+            };
+            let pending = self.pending_publisher_lookups.swap_remove(index);
+            self.advance_publisher_lookup(pending, now);
+        }
+    }
+
+    fn authorized_rtp_publisher_source(
+        &mut self,
+        publisher: crate::shard_update::PublisherAnchor,
+    ) -> Option<(ParticipantHandle, FabricSourceHandle)> {
+        let (participant, source) = self.rtp_publisher_source(publisher)?;
+        self.fabric_publisher_authorized(participant, source)
+            .then_some((participant, source))
+    }
+
+    fn locate_peer_media_repair(
+        &mut self,
+        lookup: crate::route::fabric::relay::MediaRepairLookup,
+        now: Instant,
+    ) -> Option<crate::route::fabric::relay::LocatedRepair> {
+        use crate::route::fabric::relay::MediaRepairParent;
+        let MediaRepairParent::Publisher(route) = &lookup.parent else {
+            return self.runtime.locate_media_repair(lookup, None, now);
+        };
+        let (publisher, source) = self.authorized_rtp_publisher_source(route.publisher)?;
+        if let Some(located) = self
+            .runtime
+            .locate_media_repair(lookup.clone(), Some(source), now)
+        {
+            return Some(located);
+        }
+        self.runtime
+            .request_peer_media_refresh(source, route, lookup.position, now, |ssrc| {
+                let Some(owner) = self.registry.resolve_mut(publisher) else {
+                    return false;
+                };
+                if !owner.request_fabric_refresh(ssrc) {
+                    return false;
+                }
+                self.dirty.mark(publisher, owner);
+                true
+            });
+        None
+    }
+
+    pub(super) fn send_peer_repair(
+        &mut self,
+        handoff: crate::route::fabric::relay::PeerRepairHandoff,
+    ) {
+        use crate::route::fabric::relay::PeerRepairLookup;
+        let now = Instant::now();
+        let (publisher_source, original) = match handoff.located.lookup.as_ref() {
+            PeerRepairLookup::Media(lookup) => {
+                use crate::route::fabric::relay::MediaRepairParent;
+                match &lookup.parent {
+                    MediaRepairParent::Publisher(route) => {
+                        let Some((_, source)) =
+                            self.authorized_rtp_publisher_source(route.publisher)
+                        else {
+                            return;
+                        };
+                        (Some(source), None)
+                    }
+                    MediaRepairParent::Relay(_) => (None, None),
+                }
+            }
+            PeerRepairLookup::Relay(_) => (None, None),
+            PeerRepairLookup::Publisher(lookup) => {
+                let Some((publisher, source)) = lookup
+                    .route
+                    .publisher
+                    .data_publisher()
+                    .and_then(|publisher| self.authorized_data_publisher_source(publisher))
+                else {
+                    return;
+                };
+                let cached = (|| {
+                    let installation = self.runtime.reliable_data_installation(source)?;
+                    self.registry
+                        .resolve_mut(publisher)?
+                        .reliable_publisher_lease(source, installation)?;
+                    let (data, fanout) =
+                        self.runtime
+                            .data_publisher(source, publisher, installation)?;
+                    let fragment = lookup.request.fragment;
+                    let (sequence, packet, expires) =
+                        data.cached_original(fanout, fragment.unit_seq, fragment.index, now)?;
+                    (sequence == handoff.located.sequence).then_some((packet, expires))
+                })();
+                (Some(source), cached)
+            }
+        };
+        self.runtime
+            .send_peer_repair(now, handoff, publisher_source, original);
+    }
+
+    pub(super) fn settle_unavailable_network_repair(
+        &mut self,
+        interest: crate::route::fabric::network_repair::Interest,
+    ) {
+        let Some(receiver) = self.registry.resolve_connection(interest.receiver) else {
+            return;
+        };
+        let Some(branch) = self
+            .runtime
+            .network_fabric_branch(interest.parent.destination, receiver)
+        else {
+            return;
+        };
+        let Some(lease) = self
+            .registry
+            .resolve_mut(receiver)
+            .and_then(|owner| owner.reliable_subscriber_branch(branch))
+            .filter(|lease| {
+                lease.endpoint.source == interest.parent.incarnation
+                    && lease.endpoint.branch == interest.branch
+            })
+        else {
+            return;
+        };
+        let target = branch.repair_target(receiver, lease.endpoint.branch);
+        if self.runtime.settle_unavailable_network_repair(
+            branch.source(),
+            target,
+            interest,
+            Instant::now(),
+        ) {
+            self.report_fabric_repair(
+                receiver,
+                lease,
+                interest.request,
+                pulsebeam_proto::data_control::RepairStatus::Unavailable,
+            );
+        }
+    }
+
+    pub(super) fn install_media_repair_child(
+        &mut self,
+        child: crate::route::fabric::network_repair::MediaRepairChild,
+        lifetime: pulsebeam_link::BindingCutoff,
+    ) -> Option<crate::route::fabric::network_repair::MediaRepairChild> {
+        self.runtime
+            .install_media_repair_child(child, lifetime, Instant::now())
+            .then_some(child)
+    }
+
+    pub(super) fn install_repair_network_child(
+        &mut self,
+        child: crate::route::fabric::network_repair::RepairChild,
+        lifetime: pulsebeam_link::BindingCutoff,
+    ) -> Option<crate::route::fabric::network_repair::RepairChild> {
+        let receiver = self.registry.resolve_connection(child.receiver)?;
+        let branch = self
+            .runtime
+            .network_fabric_branch(child.destination, receiver)?;
+        let lease = self
+            .registry
+            .resolve_mut(receiver)?
+            .reliable_subscriber_branch(branch)?;
+        if lease.endpoint.source != child.route.source
+            || lease.endpoint.branch != child.route.branch
+        {
+            return None;
+        }
+        let target = branch.repair_target(receiver, lease.endpoint.branch);
+        self.runtime
+            .install_network_repair(child, target, lifetime, Instant::now())
     }
 
     pub(super) fn apply_lifecycle_op(&mut self, op: &crate::shard_update::ShardUpdateOp) {
@@ -292,8 +999,36 @@ impl ShardExecution {
                 };
                 self.runtime.routes.install_action(*address, action);
             }
+            crate::shard_update::ShardUpdateOp::InstallShardFabricSource {
+                binding,
+                encoding,
+                emission,
+            } => {
+                if let Some(track) = self.runtime.track_handle(binding.publication)
+                    && let Some(plan) = self.plans.get(track)
+                    && self
+                        .runtime
+                        .install_shard_fabric_source(*binding, *encoding, *emission, plan)
+                        .is_some()
+                    && (emission.profile() == pulsebeam_core::fabric::Profile::Data
+                        || Self::local_rtp_profile_enabled(emission.profile()))
+                {
+                    self.wake_installed_fabric_receivers(track, binding.publication);
+                }
+            }
+            crate::shard_update::ShardUpdateOp::BindShardFabricDestination { binding } => {
+                if let Some(track) = self.runtime.track_handle(binding.publication)
+                    && let Some(plan) = self.plans.get(track)
+                {
+                    let _ = self.runtime.bind_shard_fabric_destination(*binding, plan);
+                }
+            }
+            crate::shard_update::ShardUpdateOp::SetShardDataReceiver { ready, enabled } => {
+                self.runtime.set_shard_data_ready(*ready, *enabled);
+            }
             crate::shard_update::ShardUpdateOp::RetireRoute { address } => {
                 let _ = self.runtime.routes.retire(*address);
+                self.runtime.retire_fabric_route(*address);
             }
             crate::shard_update::ShardUpdateOp::RetireTransport { address } => {
                 self.registry.retire_transport(*address);
@@ -313,6 +1048,7 @@ impl ShardExecution {
                         .is_some_and(|meta| meta.ingress == *address)
                 {
                     self.timers.cancel(handle);
+                    self.runtime.retire_fabric_participant(handle);
                 }
                 let removed = self.registry.remove(*connection, *address);
                 if let Some(removed) = removed
@@ -388,8 +1124,90 @@ impl ShardExecution {
         let Some(meta) = self.registry.resolve_mut(handle) else {
             return false;
         };
+        let fabric_rtp =
+            if let crate::participant::ParticipantEffect::TrackPublished { publication_id } =
+                &effect
+                && let Some(track) = track_handle
+            {
+                Some((*publication_id, track))
+            } else {
+                None
+            };
         meta.apply(effect, track_handle);
+        let ingress = fabric_rtp.and_then(|(publication, track)| {
+            meta.prepare_local_rtp_ingress(publication, track)
+                .or_else(|| {
+                    self.local_rtp_v1
+                        .then(|| meta.prepare_whip_opus_ingress(publication, track))
+                        .flatten()
+                })
+                .map(|prepared| (track, prepared))
+        });
+        let simulcast = fabric_rtp.and_then(|(publication, track)| {
+            meta.prepare_dd_fabric_ingress(publication, track)
+                .map(|prepared| (track, prepared))
+        });
         self.dirty.mark(handle, meta);
+        if let Some((track, (meta, encodings))) = simulcast {
+            let expected = encodings.len();
+            let mut installed =
+                arrayvec::ArrayVec::<_, { crate::track::MAX_SIMULCAST_LAYERS }>::new();
+            for ingress in encodings {
+                let Some((encoding, emission)) = ingress.source_encoding().zip(ingress.emission())
+                else {
+                    break;
+                };
+                let Some(source) = self.install_local_rtp_ingress(track, handle, ingress, emission)
+                else {
+                    break;
+                };
+                let Some(incarnation) = self.runtime.fabric_incarnation(source) else {
+                    if let Some(owner) = self.registry.resolve_mut(handle) {
+                        owner.detach_fabric_media_source(source);
+                    }
+                    self.runtime.retire_fabric_source(source);
+                    break;
+                };
+                installed.push((source, encoding, emission, incarnation));
+            }
+            if installed.len() == expected {
+                for (_, encoding, emission, incarnation) in installed {
+                    self.pipeline
+                        .push_shard_event(ShardEvent::LocalFabricRtpSourceReady {
+                            meta: meta.clone(),
+                            encoding,
+                            incarnation,
+                            emission,
+                        });
+                }
+                self.bind_installed_fabric_rtp_receivers(track, meta.id);
+            } else {
+                for (source, _, _, _) in installed {
+                    if let Some(owner) = self.registry.resolve_mut(handle) {
+                        owner.detach_fabric_media_source(source);
+                    }
+                    self.runtime.retire_fabric_source(source);
+                }
+            }
+        }
+        if let Some((track, (meta, ingress))) = ingress {
+            if let Some(emission) = ingress.emission()
+                && let Some(encoding) = ingress.source_encoding()
+                && let Some(source) =
+                    self.install_local_rtp_ingress(track, handle, ingress, emission)
+                && let Some(incarnation) = self.runtime.fabric_incarnation(source)
+            {
+                let publication = meta.id;
+                self.pipeline
+                    .push_shard_event(ShardEvent::LocalFabricRtpSourceReady {
+                        meta,
+                        encoding,
+                        incarnation,
+                        emission,
+                    });
+                self.bind_installed_fabric_rtp_receivers(track, publication);
+            }
+        }
         true
     }
 
@@ -428,12 +1246,8 @@ impl ShardExecution {
                     track_handle,
                     crate::shard::router::InstalledTrackPlan {
                         local,
-                        remote: plan
-                            .compiled_remote
-                            .iter()
-                            .chain(&plan.compiled_network)
-                            .cloned()
-                            .collect(),
+                        remote: plan.compiled_remote.clone(),
+                        wan_transit: plan.wan_transit,
                         reverse_route: plan
                             .compiled_network_reverse
                             .as_ref()
@@ -444,7 +1258,6 @@ impl ShardExecution {
                 plan.local
                     .len()
                     .saturating_add(plan.compiled_remote.len())
-                    .saturating_add(plan.compiled_network.len())
                     .saturating_add(usize::from(
                         plan.compiled_network_reverse.is_some() || plan.compiled_reverse.is_some(),
                     ))
@@ -454,10 +1267,10 @@ impl ShardExecution {
                 usize::from(self.plans.remove(track_handle).is_some())
             }
         };
-        let active = self
-            .plans
-            .get(track_handle)
-            .is_some_and(|plan| !plan.local.is_empty() || !plan.remote.is_empty());
+        let installed = self.plans.get(track_handle);
+        self.runtime.reconcile_fabric_plan(track_handle, installed);
+        let active =
+            installed.is_some_and(|plan| !plan.local.is_empty() || !plan.remote.is_empty());
         if previous != active
             && let Some(publisher) = self.runtime.source_origin(track_handle)
             && let Some(meta) = self.registry.resolve_mut(publisher)
@@ -465,7 +1278,1206 @@ impl ShardExecution {
             meta.native_rtp_demand(operation.publication_id, active);
             self.dirty.mark(publisher, meta);
         }
+        self.bind_installed_fabric_rtp_receivers(track_handle, operation.publication_id);
         cost
+    }
+
+    fn bind_installed_fabric_rtp_receivers(
+        &mut self,
+        track: crate::keys::TrackHandle,
+        publication: crate::entity::PublicationKey,
+    ) {
+        let whole_profile = self
+            .runtime
+            .fabric_source_for_track(track)
+            .and_then(|source| self.runtime.fabric_emission(source))
+            .filter(|emission| !emission.selects_dd_encoding())
+            .map(Emission::profile);
+        let Some(plan) = self.plans.get(track) else {
+            return;
+        };
+        for destination in plan.local.clone() {
+            let Some(receiver) = self.registry.resolve_mut(destination) else {
+                continue;
+            };
+            if let Some(profile) = whole_profile
+                && let Some((mid, primary)) = receiver.whep_rtp_output(publication)
+            {
+                self.bind_ready_fabric_rtp(destination, track, mid, primary, profile);
+                continue;
+            }
+            let bindings = receiver.ready_rtp_bindings_for(track).collect::<Vec<_>>();
+            for (mid, primary, negotiated) in bindings {
+                self.bind_ready_fabric_rtp(destination, track, mid, primary, negotiated);
+            }
+        }
+    }
+
+    fn install_local_rtp_ingress(
+        &mut self,
+        track: crate::keys::TrackHandle,
+        publisher: ParticipantHandle,
+        ingress: crate::rtp::fabric_ingress::RtpIngressShadow,
+        emission: Emission,
+    ) -> Option<FabricSourceHandle> {
+        let refresh = if matches!(
+            emission.profile(),
+            pulsebeam_core::fabric::Profile::H264 | pulsebeam_core::fabric::Profile::Av1
+        ) {
+            std::num::NonZeroU32::new(ingress.primary_ssrc())
+        } else {
+            None
+        };
+        if !self.fabric_io_authorized(publisher) {
+            return None;
+        }
+        let encoding = ingress.source_encoding()?;
+        let source = self.runtime.install_fabric_source(
+            track,
+            publisher,
+            emission,
+            refresh,
+            Some(encoding),
+        )?;
+        if !self.attach_fabric_ingress(source, publisher, ingress) {
+            self.runtime.retire_fabric_source(source);
+            return None;
+        }
+        Some(source)
+    }
+
+    pub(super) fn install_fabric_source(
+        &mut self,
+        track: crate::keys::TrackHandle,
+        publisher: ParticipantHandle,
+        emission: Emission,
+        refresh_ssrc: Option<std::num::NonZeroU32>,
+    ) -> Option<FabricSourceHandle> {
+        if !self.fabric_io_authorized(publisher) {
+            return None;
+        }
+        self.runtime
+            .install_fabric_source(track, publisher, emission, refresh_ssrc, None)
+    }
+
+    pub(super) fn install_fabric_branch(
+        &mut self,
+        track: crate::keys::TrackHandle,
+        source: FabricSourceHandle,
+        destination: ParticipantHandle,
+        receiver: Emission,
+    ) -> Option<FabricLocalBranch> {
+        if !self.fabric_io_authorized(destination) {
+            return None;
+        }
+        self.runtime.install_fabric_branch(
+            track,
+            source,
+            destination,
+            receiver,
+            self.plans.get(track)?,
+            None,
+        )
+    }
+
+    /// Install an explicitly qualified filtered candidate. The ordinary RTP
+    /// writer cannot drain it before DD output bootstrap is implemented.
+    pub(super) fn install_fabric_filtered_branch(
+        &mut self,
+        track: crate::keys::TrackHandle,
+        source: FabricSourceHandle,
+        destination: ParticipantHandle,
+        receiver: Emission,
+        target: pulsebeam_core::dd::evidence::DecodeTarget,
+        now: Instant,
+    ) -> Option<FabricLocalBranch> {
+        if !self.fabric_io_authorized(destination) {
+            return None;
+        }
+        let branch = self.runtime.install_fabric_branch(
+            track,
+            source,
+            destination,
+            receiver,
+            self.plans.get(track)?,
+            Some(target),
+        )?;
+        self.request_fabric_refresh(destination, branch, now);
+        Some(branch)
+    }
+
+    pub(super) fn attach_fabric_ingress(
+        &mut self,
+        source: FabricSourceHandle,
+        publisher: ParticipantHandle,
+        mut ingress: crate::rtp::fabric_ingress::RtpIngressShadow,
+    ) -> bool {
+        let Some(publication) = self.runtime.local_fabric_publication(source, publisher) else {
+            return false;
+        };
+        let Some(identity) = ingress.take_identity() else {
+            return false;
+        };
+        self.runtime
+            .bind_fabric_media_identity(source, publisher, identity)
+            && self
+                .registry
+                .resolve_mut(publisher)
+                .is_some_and(|owner| owner.attach_fabric_media_source(publication, ingress, source))
+    }
+
+    /// Stage the source and its exact RTC installation together. Callers must
+    /// await the negotiated channel open before acknowledging the publication.
+    pub(super) fn stage_fabric_data_publisher(
+        &mut self,
+        track: crate::keys::TrackHandle,
+        publisher: ParticipantHandle,
+        prepared: crate::participant::data_fabric::PreparedSctp,
+        clock: Option<pulsebeam_proto::data_record::Clock<'_>>,
+    ) -> Option<(FabricSourceHandle, std::num::NonZeroU64)> {
+        use pulsebeam_proto::{data_control::PublisherBinding, data_endpoint::Endpoint};
+
+        let source = self.install_fabric_source(track, publisher, Emission::DATA, None)?;
+        let Some(incarnation) = self.runtime.fabric_incarnation(source) else {
+            self.runtime.retire_fabric_source(source);
+            return None;
+        };
+        let binding = prepared.bind(Endpoint::Publisher(PublisherBinding {
+            source: incarnation,
+        }));
+        if !self.attach_fabric_data_ingress(source, publisher, binding, clock) {
+            self.runtime.retire_fabric_source(source);
+            return None;
+        }
+        Some((source, incarnation))
+    }
+
+    fn observe_fabric_subscriber(
+        &mut self,
+        destination: ParticipantHandle,
+        feedback: crate::participant::event::FabricSubscriberFeedback,
+    ) {
+        use crate::{
+            participant::event::FabricFeedbackKind, route::fabric::local::ReceiptAcceptance,
+        };
+        let branch = feedback.lease.branch;
+        let Some(owner) = self.runtime.fabric_handoff_owner(branch, destination) else {
+            return;
+        };
+        if let crate::shard::router::FabricOwner::Local(publisher) = owner
+            && !self.fabric_publisher_authorized(publisher, branch.source())
+        {
+            return;
+        }
+        let Some(connection) = self.registry.resolve_mut(destination).and_then(|receiver| {
+            (receiver.reliable_subscriber_lease(feedback.lease.owned) == Some(feedback.lease))
+                .then_some(receiver.connection_id)
+        }) else {
+            return;
+        };
+        let now = Instant::now();
+        match feedback.kind {
+            FabricFeedbackKind::Propagation(unit, outcome) => {
+                self.runtime.settle_fabric_data_propagation(
+                    destination,
+                    branch,
+                    unit,
+                    outcome,
+                    now,
+                );
+            }
+            FabricFeedbackKind::Assembled(unit) => {
+                let Some(receipt) = self.runtime.record_fabric_assembly_receipt(
+                    destination,
+                    feedback.lease,
+                    unit,
+                    now,
+                ) else {
+                    return;
+                };
+                if receipt == ReceiptAcceptance::First {
+                    metrics::counter!("fabric_data_assembly_receipts").increment(1);
+                }
+                if let Some(owner) = self.registry.resolve_mut(destination)
+                    && owner.write_fabric_receipt_ack(feedback.lease, unit)
+                {
+                    #[cfg(feature = "sim")]
+                    crate::sim_metrics::record_wan_data_receipt_ack(
+                        feedback.lease.endpoint.source.get(),
+                        unit.unit_seq,
+                    );
+                    self.dirty.mark(destination, owner);
+                }
+            }
+            FabricFeedbackKind::Repair(request) => {
+                use crate::route::fabric::local::RepairAdmission;
+                use pulsebeam_proto::data_control::RepairStatus;
+                let target = branch.repair_target(destination, feedback.lease.endpoint.branch);
+                let admission = if owner == crate::shard::router::FabricOwner::Network {
+                    match self.runtime.request_network_repair(
+                        branch.source(),
+                        target,
+                        connection,
+                        request,
+                        now,
+                    ) {
+                        Ok(interest) => {
+                            self.pipeline.push_network_data_repair(
+                                crate::route::fabric::network_repair::InterestEvent::Request(
+                                    interest,
+                                ),
+                            );
+                            return;
+                        }
+                        Err(admission) => admission,
+                    }
+                } else {
+                    self.runtime
+                        .repair_fanout(branch.source())
+                        .map_or(RepairAdmission::Ineligible, |fanout| {
+                            fanout.request_data_repair(now, target, request)
+                        })
+                };
+                let status = match admission {
+                    RepairAdmission::Ineligible => RepairStatus::Unavailable,
+                    RepairAdmission::Exhausted => RepairStatus::Exhausted,
+                    RepairAdmission::Coalesced => RepairStatus::Unknown,
+                    RepairAdmission::First | RepairAdmission::Replay => return,
+                };
+                self.report_fabric_repair(destination, feedback.lease, request, status);
+            }
+            FabricFeedbackKind::CancelRepair(request) => {
+                let target = branch.repair_target(destination, feedback.lease.endpoint.branch);
+                if owner == crate::shard::router::FabricOwner::Network {
+                    if let Some(interest) = self.runtime.cancel_network_repair(
+                        branch.source(),
+                        target,
+                        Some(connection),
+                        request,
+                        now,
+                    ) {
+                        self.pipeline.push_network_data_repair(
+                            crate::route::fabric::network_repair::InterestEvent::Cancel(interest),
+                        );
+                    }
+                } else if let Some(fanout) = self.runtime.repair_fanout(branch.source()) {
+                    fanout.cancel_data_repair(target, request);
+                }
+            }
+        }
+    }
+
+    fn report_fabric_repair(
+        &mut self,
+        destination: ParticipantHandle,
+        lease: crate::participant::data_fabric::SubscriberLease,
+        request: crate::route::fabric::local::RepairRequest,
+        status: pulsebeam_proto::data_control::RepairStatus,
+    ) {
+        if let Some(receiver) = self.registry.resolve_mut(destination)
+            && receiver.write_fabric_repair_outcome(lease, request, status)
+        {
+            self.dirty.mark(destination, receiver);
+        }
+    }
+
+    fn complete_fabric_receiver_stage(
+        &mut self,
+        receiver: ParticipantHandle,
+        work: crate::control::native::Preparation,
+    ) {
+        use pulsebeam_proto::data_endpoint::Endpoint;
+
+        let prepared = self
+            .registry
+            .resolve_mut(receiver)
+            .and_then(|owner| owner.prepared_native_fabric_receiver(work));
+        let Some(prepared) = prepared else {
+            return;
+        };
+        let Some(track) = self.runtime.track_handle(prepared.source) else {
+            return;
+        };
+        let Some(source) = self.runtime.fabric_source_for_track(track) else {
+            // Imported candidates can bind their SCTP channels before the peer receive route.
+            return;
+        };
+        let branch = (|| {
+            if self.runtime.fabric_incarnation(source) != Some(prepared.endpoint.source) {
+                return None;
+            }
+            let install_branch = if let Some(publisher) = self.runtime.source_origin(track) {
+                if !self.fabric_publisher_authorized(publisher, source) {
+                    return None;
+                }
+                true
+            } else {
+                self.runtime.is_shard_fabric_source(source)
+            };
+            let branch = if install_branch {
+                self.install_fabric_branch(track, source, receiver, Emission::DATA)?
+            } else {
+                self.runtime.remote_fabric_branch(source, receiver)?
+            };
+            let binding = prepared
+                .prepared
+                .bind(Endpoint::Subscriber(prepared.endpoint));
+            if self.attach_fabric_data_egress(branch, receiver, binding, None) {
+                Some(branch)
+            } else {
+                self.runtime.retire_fabric_branch(branch, receiver);
+                None
+            }
+        })();
+        let completed = if let Some(owner) = self.registry.resolve_mut(receiver) {
+            let mut sink =
+                self.pipeline
+                    .participant_sink(crate::shard::events::ParticipantBinding {
+                        participant_id: owner.participant_id,
+                        connection_id: owner.connection_id,
+                        handle: receiver,
+                    });
+            let completed = owner.complete_native_fabric_receiver(work, branch, &mut sink);
+            self.dirty.mark(receiver, owner);
+            completed
+        } else {
+            false
+        };
+        let Some(branch) = branch else {
+            return;
+        };
+        if !completed {
+            self.runtime.retire_fabric_branch(branch, receiver);
+            return;
+        }
+        if let Some(crate::shard::router::FabricOwner::Shard(binding)) =
+            self.runtime.fabric_handoff_owner(branch, receiver)
+            && let Some(owner) = self.registry.resolve_mut(receiver)
+            && let Some(lease) = owner.reliable_subscriber_branch(branch)
+            && lease.endpoint.source == binding.incarnation
+        {
+            self.pipeline
+                .push_shard_event(ShardEvent::ShardDataReceiverReady(
+                    crate::route::fabric::ShardDataReady {
+                        binding,
+                        reference: work.reference,
+                        receiver: crate::route::fabric::ShardDataReceiver {
+                            connection: owner.connection_id,
+                            branch: lease.endpoint.branch,
+                        },
+                    },
+                ));
+        }
+    }
+
+    fn complete_fabric_publisher_stage(
+        &mut self,
+        publisher: ParticipantHandle,
+        work: crate::control::native::Preparation,
+        publication: crate::entity::PublicationKey,
+    ) {
+        let prepared = self
+            .registry
+            .resolve_mut(publisher)
+            .and_then(|owner| owner.prepared_native_fabric_publisher(work, publication));
+        let mut reserved = false;
+        let source = prepared.and_then(|prepared| {
+            if self.runtime.track_handle(publication).is_some() {
+                return None;
+            }
+            let track = self
+                .runtime
+                .install_track(publication, None, Some(publisher), None);
+            reserved = true;
+            self.stage_fabric_data_publisher(track, publisher, prepared, None)
+                .map(|(_, incarnation)| incarnation)
+        });
+        let completed = if let Some(owner) = self.registry.resolve_mut(publisher) {
+            let mut sink =
+                self.pipeline
+                    .participant_sink(crate::shard::events::ParticipantBinding {
+                        participant_id: owner.participant_id,
+                        connection_id: owner.connection_id,
+                        handle: publisher,
+                    });
+            let completed =
+                owner.complete_native_fabric_publisher(work, publication, source, &mut sink);
+            self.dirty.mark(publisher, owner);
+            completed
+        } else {
+            false
+        };
+        if reserved && !completed {
+            self.runtime.retire_track(publication);
+        }
+    }
+
+    fn attach_fabric_data_ingress(
+        &mut self,
+        source: FabricSourceHandle,
+        publisher: ParticipantHandle,
+        binding: crate::participant::data_fabric::InstalledBinding,
+        clock: Option<pulsebeam_proto::data_record::Clock<'_>>,
+    ) -> bool {
+        let pulsebeam_proto::data_endpoint::Endpoint::Publisher(endpoint) = binding.endpoint else {
+            return false;
+        };
+        if !self
+            .runtime
+            .local_fabric_publication(source, publisher)
+            .is_some_and(|publication| publication.kind() == crate::entity::TrackKind::Data)
+            || self.runtime.fabric_incarnation(source) != Some(endpoint.source)
+        {
+            return false;
+        }
+        self.runtime
+            .bind_data_publisher(source, publisher, binding, clock)
+            && self
+                .registry
+                .resolve_mut(publisher)
+                .is_some_and(|owner| owner.attach_fabric_data_source(source, binding))
+    }
+
+    fn resolve_data_original(
+        &mut self,
+        publisher: ParticipantHandle,
+        source: FabricSourceHandle,
+        installation: pulsebeam_rtc::DataChannelInstallation,
+        fragment: crate::route::fabric::local::RepairFragment,
+        now: Instant,
+    ) -> crate::participant::data_fabric::OriginalResolution {
+        use crate::participant::data_fabric::OriginalResolution;
+        let Some(owner) = self.registry.resolve_mut(publisher) else {
+            return OriginalResolution::Revoked;
+        };
+        let Some((owned, endpoint)) = owner.authorize_fabric_original_request(source, installation)
+        else {
+            return OriginalResolution::Revoked;
+        };
+        let Some((data, fanout)) = self
+            .runtime
+            .data_publisher_mut(source, publisher, installation)
+        else {
+            return OriginalResolution::Revoked;
+        };
+        let result = data.request_original(fanout, fragment.unit_seq, fragment.index, now);
+        if let OriginalResolution::Request(request) = result {
+            owner.send_fabric_original_request(owned, endpoint, request);
+            self.dirty.mark(publisher, owner);
+        }
+        result
+    }
+
+    fn fabric_publisher_authorized(
+        &mut self,
+        publisher: ParticipantHandle,
+        source: FabricSourceHandle,
+    ) -> bool {
+        if !self.fabric_io_authorized(publisher) {
+            self.runtime.retire_fabric_participant(publisher);
+            return false;
+        }
+        let data = self
+            .runtime
+            .local_fabric_publication(source, publisher)
+            .is_some_and(|publication| publication.kind() == crate::entity::TrackKind::Data);
+        if !self.registry.resolve_mut(publisher).is_some_and(|owner| {
+            if data {
+                owner.fabric_data_source_authorized(source)
+            } else {
+                owner.fabric_source_authorized(source)
+            }
+        }) {
+            self.runtime.fence_local_fabric_source(source, publisher);
+            return false;
+        }
+        true
+    }
+
+    fn accept_reliable_data_admission(
+        &mut self,
+        source: FabricSourceHandle,
+        publisher: ParticipantHandle,
+        admission: crate::participant::data_fabric::ReliableAdmission,
+        now: Instant,
+    ) -> bool {
+        if now >= admission.expires
+            || !self.fabric_publisher_authorized(publisher, source)
+            || self
+                .registry
+                .resolve_mut(publisher)
+                .and_then(|owner| owner.reliable_publisher_lease(source, admission.installation))
+                .is_none()
+        {
+            return false;
+        }
+        let registry = &mut self.registry;
+        let accepted = self.runtime.accept_local_data_expectation(
+            source,
+            publisher,
+            admission,
+            now,
+            |branch, destination| {
+                registry
+                    .resolve_mut(destination)
+                    .and_then(|owner| owner.reliable_subscriber_branch(branch))
+                    .map(|lease| lease.endpoint.branch)
+            },
+        );
+        if !accepted {
+            return false;
+        }
+        if admission.acknowledge
+            && let Some(owner) = registry.resolve_mut(publisher)
+            && owner.acknowledge_fabric_admission(source, admission)
+        {
+            self.dirty.mark(publisher, owner);
+        }
+        true
+    }
+
+    #[cfg(test)]
+    pub(super) fn offer_fabric(
+        &mut self,
+        source: FabricSourceHandle,
+        publisher: ParticipantHandle,
+        now: Instant,
+        arrival: Instant,
+        sequence: u64,
+        packet: OwnedPacket,
+    ) -> Result<Offers, Rejection> {
+        self.offer_fabric_publication(
+            publisher,
+            now,
+            crate::participant::event::FabricPublication {
+                source,
+                arrival,
+                sequence,
+                packet,
+                reliable: None,
+            },
+        )
+    }
+
+    #[cfg(test)]
+    fn offer_fabric_publication(
+        &mut self,
+        publisher: ParticipantHandle,
+        now: Instant,
+        publication: crate::participant::event::FabricPublication,
+    ) -> Result<Offers, Rejection> {
+        let crate::participant::event::FabricPublication {
+            source,
+            arrival,
+            sequence,
+            packet,
+            reliable,
+        } = publication;
+        if !self.fabric_publisher_authorized(publisher, source) {
+            return Err(Rejection::Binding);
+        }
+        let data = packet.header().profile == pulsebeam_core::fabric::Profile::Data;
+        let report = self
+            .runtime
+            .offer_fabric(source, publisher, now, arrival, sequence, packet)?;
+        if !data {
+            self.drain_fabric_rtp(source, now);
+        }
+        if data {
+            self.drain_after_data_offer(now, source, sequence, reliable, &report);
+        }
+        self.refresh_after_fabric_offer(source, now, &report);
+        Ok(report)
+    }
+
+    fn offer_fabric_data_position(
+        &mut self,
+        publisher: ParticipantHandle,
+        now: Instant,
+        publication: crate::participant::event::FabricDataPosition,
+    ) {
+        let source = publication.source;
+        if !self.fabric_publisher_authorized(publisher, source)
+            || self
+                .registry
+                .resolve_mut(publisher)
+                .and_then(|owner| owner.fabric_data_input_installation(source))
+                != Some(publication.installation)
+            || self
+                .runtime
+                .data_publisher(source, publisher, publication.installation)
+                .is_none_or(|(data, fanout)| {
+                    data.sequence_anchor().is_none()
+                        || fanout.endpoint_data(publication.sequence).is_none()
+                })
+        {
+            return;
+        }
+        if let Some(admission) = publication.reliable
+            && !self.accept_reliable_data_admission(source, publisher, admission, now)
+        {
+            return;
+        }
+        if let Ok(report) = self.runtime.offer_fabric_data(publisher, now, &publication) {
+            self.drain_after_data_offer(
+                now,
+                source,
+                publication.sequence,
+                publication.reliable,
+                &report,
+            );
+        }
+    }
+
+    fn drain_after_data_offer(
+        &mut self,
+        now: Instant,
+        source: FabricSourceHandle,
+        sequence: u64,
+        reliable: Option<crate::participant::data_fabric::ReliableAdmission>,
+        report: &Offers,
+    ) {
+        if report.enqueued != 0 || (reliable.is_some() && report.duplicates != 0) {
+            if let Some(admission) = reliable
+                && let Some(fanout) = self.runtime.repair_fanout(source)
+            {
+                fanout.claim_live_data(
+                    now,
+                    crate::route::fabric::local::RepairFragment {
+                        unit_seq: admission.unit.unit_seq,
+                        index: admission.fragment_index,
+                    },
+                    sequence,
+                );
+            }
+            self.drain_fabric_data(source, now);
+        }
+    }
+
+    fn refresh_after_fabric_offer(
+        &mut self,
+        source: FabricSourceHandle,
+        now: Instant,
+        report: &Offers,
+    ) {
+        if report.awaiting_entry != 0 || report.suspended != 0 {
+            let registry = &mut self.registry;
+            if let Some((branch, destination)) =
+                self.runtime.awaiting_fabric_refresh(source, |destination| {
+                    registry
+                        .resolve_mut(destination)
+                        .is_some_and(|owner| owner.fabric_io_authorized())
+                })
+            {
+                self.request_fabric_refresh(destination, branch, now);
+            }
+        }
+    }
+
+    pub(super) fn attach_fabric_rtp_egress(
+        &mut self,
+        branch: FabricLocalBranch,
+        destination: ParticipantHandle,
+        leg: crate::rtp::fabric_egress::SenderLeg<FabricLocalBranch>,
+        source: crate::rtp::fabric_egress::SourceMetadata,
+    ) -> bool {
+        let Some(crate::shard::router::FabricOwner::Local(publisher)) =
+            self.runtime.fabric_handoff_owner(branch, destination)
+        else {
+            return false;
+        };
+        self.fabric_publisher_authorized(publisher, branch.source())
+            && self
+                .registry
+                .resolve_mut(destination)
+                .is_some_and(|receiver| receiver.attach_fabric_rtp_output(branch, leg, source))
+    }
+
+    fn local_rtp_profile_enabled(profile: pulsebeam_core::fabric::Profile) -> bool {
+        use pulsebeam_core::fabric::Profile;
+        matches!(profile, Profile::Opus | Profile::H264 | Profile::Av1)
+    }
+
+    fn stage_local_rtp_receiver(&mut self, destination: ParticipantHandle, reference: u64) {
+        let Some(receiver) = self.registry.resolve_mut(destination) else {
+            return;
+        };
+        let Some((track, mid, primary, profile)) = receiver.local_rtp_receiver(reference) else {
+            return;
+        };
+        self.bind_ready_fabric_rtp(destination, track, mid, primary, profile);
+    }
+
+    fn bind_ready_fabric_rtp(
+        &mut self,
+        destination: ParticipantHandle,
+        track: crate::keys::TrackHandle,
+        mid: crate::media::Mid,
+        primary: u32,
+        profile: pulsebeam_core::fabric::Profile,
+    ) {
+        if !Self::local_rtp_profile_enabled(profile) {
+            return;
+        }
+        let Some(receiver) = self.registry.resolve_mut(destination) else {
+            return;
+        };
+        let selected = receiver.selected_fabric_video_encoding(mid, track);
+        let mut committed = None;
+        if let Some((bound, active)) = receiver.fabric_rtp_output_branches(mid) {
+            let live = |branch| {
+                self.runtime
+                    .fabric_handoff_owner(branch, destination)
+                    .is_some()
+            };
+            committed = active.filter(|&branch| live(branch));
+            let bound_live = live(bound);
+            if let Some(branch) = active.filter(|branch| Some(*branch) != committed) {
+                self.retire_bound_fabric_rtp(destination, branch);
+            }
+            if bound_live {
+                let Some((bound_track, encoding)) = self.runtime.fabric_dd_source(bound.source())
+                else {
+                    return;
+                };
+                if track == bound_track
+                    && selected.is_some_and(|(selected, target)| {
+                        selected.matches(encoding.primary, encoding.rid)
+                            && self.runtime.fabric_branch_target(bound) == Some(target)
+                    })
+                {
+                    return;
+                }
+                // A new request can replace a staged branch, but it cannot replace
+                // the sender's committed epoch until a qualified packet is accepted.
+                if Some(bound) != committed {
+                    self.retire_bound_fabric_rtp(destination, bound);
+                }
+            }
+            if selected.is_none()
+                && let Some(branch) = committed.take()
+            {
+                self.retire_bound_fabric_rtp(destination, branch);
+            }
+        }
+        let source = if let Some((selected, _)) = selected {
+            self.runtime.fabric_source_for_encoding(track, selected)
+        } else {
+            self.runtime.fabric_source_for_track(track)
+        };
+        let Some(source) = source else { return };
+        let Some(emission) = self
+            .runtime
+            .fabric_emission(source)
+            .filter(|emission| emission.profile() == profile)
+        else {
+            return;
+        };
+        let requires_dd = emission.selects_dd_encoding();
+        if requires_dd && selected.is_none() {
+            return;
+        }
+        let install_branch = self.runtime.source_origin(track).is_some()
+            || self.runtime.is_shard_fabric_source(source);
+        let reuse = committed.filter(|&branch| {
+            branch.source() == source
+                && self.runtime.fabric_branch_target(branch) == selected.map(|(_, target)| target)
+        });
+        let branch = if reuse.is_some() {
+            reuse
+        } else if install_branch && requires_dd {
+            let Some(target) = selected
+                .and_then(|(_, index)| pulsebeam_core::dd::evidence::DecodeTarget::new(index))
+            else {
+                return;
+            };
+            if !self.fabric_io_authorized(destination) {
+                return;
+            }
+            let Some(plan) = self.plans.get(track) else {
+                return;
+            };
+            self.runtime.install_fabric_branch(
+                track,
+                source,
+                destination,
+                emission,
+                plan,
+                Some(target),
+            )
+        } else if install_branch {
+            self.install_fabric_branch(track, source, destination, emission)
+        } else if self.fabric_io_authorized(destination)
+            && self
+                .plans
+                .get(track)
+                .is_some_and(|plan| plan.local.contains(&destination))
+        {
+            self.runtime.remote_fabric_branch(source, destination)
+        } else {
+            None
+        };
+        let Some(branch) = branch else { return };
+        if !self
+            .registry
+            .resolve_mut(destination)
+            .is_some_and(|owner| owner.bind_local_rtp_output(branch, mid, primary, emission))
+        {
+            if install_branch && reuse.is_none() {
+                self.runtime.retire_fabric_branch(branch, destination);
+            }
+        } else if matches!(
+            profile,
+            pulsebeam_core::fabric::Profile::H264 | pulsebeam_core::fabric::Profile::Av1
+        ) {
+            self.pipeline.request_fabric_refresh(destination, branch);
+        }
+    }
+
+    fn retire_bound_fabric_rtp(
+        &mut self,
+        destination: ParticipantHandle,
+        branch: FabricLocalBranch,
+    ) {
+        self.runtime.retire_fabric_branch(branch, destination);
+        if let Some(receiver) = self.registry.resolve_mut(destination) {
+            receiver.retire_fabric_rtp_scope(branch);
+            self.dirty.mark(destination, receiver);
+        }
+    }
+
+    fn drain_fabric_rtp(&mut self, source: FabricSourceHandle, now: Instant) {
+        let branches: [_; crate::route::fabric::local::MAX_BRANCHES] = {
+            let mut iter = self.runtime.fabric_destinations(source);
+            std::array::from_fn(|_| iter.next())
+        };
+        let video_source = self.runtime.fabric_dd_source(source);
+        for (branch, destination) in branches.into_iter().flatten() {
+            if !self
+                .registry
+                .resolve_mut(destination)
+                .is_some_and(|receiver| {
+                    receiver.has_fabric_rtp_output(branch)
+                        && video_source.is_none_or(|(track, encoding)| {
+                            self.runtime
+                                .fabric_branch_target(branch)
+                                .is_some_and(|target| {
+                                    receiver.fabric_video_output_selects(
+                                        branch, track, encoding, target,
+                                    )
+                                })
+                        })
+                })
+            {
+                continue;
+            }
+            match self.admit_fabric(
+                branch,
+                destination,
+                now,
+                |receiver, sequence, packet, evidence| {
+                    receiver
+                        .queue_bound_fabric_rtp(
+                            branch,
+                            (sequence, &packet, evidence),
+                            video_source,
+                            now,
+                        )
+                        .map(|replaced| (packet.header().profile, replaced))
+                },
+            ) {
+                Ok(Some((_profile, replaced))) => {
+                    if let Some(branch) = replaced {
+                        self.retire_bound_fabric_rtp(destination, branch);
+                    }
+                    if let Some(receiver) = self.registry.resolve_mut(destination) {
+                        self.dirty.mark(destination, receiver);
+                        #[cfg(feature = "sim")]
+                        {
+                            crate::sim_metrics::record_routing_counter("fabric_rtp_enqueued");
+                            if receiver.has_whep_output() {
+                                crate::sim_metrics::record_routing_counter(
+                                    "fabric_whep_rtp_enqueued",
+                                );
+                            }
+                            if self.runtime.is_shard_fabric_source(source) {
+                                crate::sim_metrics::record_routing_counter(
+                                    "fabric_rtp_shard_enqueued",
+                                );
+                                use pulsebeam_core::fabric::Profile;
+                                match _profile {
+                                    Profile::Opus => crate::sim_metrics::record_routing_counter(
+                                        "fabric_rtp_opus_shard_enqueued",
+                                    ),
+                                    Profile::H264 => crate::sim_metrics::record_routing_counter(
+                                        "fabric_rtp_h264_shard_enqueued",
+                                    ),
+                                    _ => {}
+                                }
+                            } else if matches!(
+                                self.runtime.fabric_handoff_owner(branch, destination),
+                                Some(crate::shard::router::FabricOwner::Local(_))
+                            ) {
+                                use pulsebeam_core::fabric::Profile;
+                                match _profile {
+                                    Profile::Opus => crate::sim_metrics::record_routing_counter(
+                                        "fabric_rtp_opus_local_enqueued",
+                                    ),
+                                    Profile::H264 => crate::sim_metrics::record_routing_counter(
+                                        "fabric_rtp_h264_local_enqueued",
+                                    ),
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(reason) => {
+                    #[cfg(feature = "sim")]
+                    if reason
+                        == crate::rtp::fabric_egress::AdmissionError::Rtc(
+                            pulsebeam_rtc::WriteError::RtpTooLarge,
+                        )
+                    {
+                        crate::sim_metrics::record_routing_counter("fabric_rtp_egress_too_large");
+                    }
+                    tracing::debug!(?reason, "Could not enqueue local Fabric RTP");
+                }
+            }
+        }
+    }
+
+    pub(super) fn write_fabric_rtp(
+        &mut self,
+        branch: FabricLocalBranch,
+        destination: ParticipantHandle,
+        now: Instant,
+        leg: &mut crate::rtp::fabric_egress::SenderLeg<FabricLocalBranch>,
+        source: crate::rtp::fabric_egress::SourceMetadata,
+    ) -> Result<Option<()>, crate::rtp::fabric_egress::AdmissionError> {
+        let admitted = self.admit_fabric(
+            branch,
+            destination,
+            now,
+            |receiver, sequence, packet, evidence| {
+                receiver.queue_fabric_rtp(leg, branch, source, (sequence, &packet, evidence), now)
+            },
+        )?;
+        if admitted.is_some()
+            && let Some(receiver) = self.registry.resolve_mut(destination)
+        {
+            self.dirty.mark(destination, receiver);
+        }
+        Ok(admitted)
+    }
+
+    pub(super) fn attach_fabric_data_egress(
+        &mut self,
+        branch: FabricLocalBranch,
+        destination: ParticipantHandle,
+        binding: crate::participant::data_fabric::InstalledBinding,
+        clock: Option<pulsebeam_proto::data_record::Clock<'_>>,
+    ) -> bool {
+        let pulsebeam_proto::data_endpoint::Endpoint::Subscriber(endpoint) = binding.endpoint
+        else {
+            return false;
+        };
+        if self.runtime.fabric_incarnation(branch.source()) != Some(endpoint.source)
+            || self
+                .runtime
+                .fabric_handoff_owner(branch, destination)
+                .is_none()
+        {
+            return false;
+        }
+        let Some(output) =
+            crate::participant::data_fabric::Output::from_subscriber(branch, binding, clock)
+        else {
+            return false;
+        };
+        self.registry
+            .resolve_mut(destination)
+            .is_some_and(|owner| owner.attach_fabric_data_output(output))
+    }
+
+    fn drain_fabric_data(&mut self, source: FabricSourceHandle, now: Instant) {
+        let branches: [_; crate::route::fabric::local::MAX_BRANCHES] = {
+            let mut iter = self.runtime.fabric_destinations(source);
+            std::array::from_fn(|_| iter.next())
+        };
+        for (branch, destination) in branches.into_iter().flatten() {
+            self.drain_fabric_data_branch(branch, destination, now);
+        }
+    }
+
+    fn receive_network_repair(
+        &mut self,
+        address: crate::route::NodeRouteAddress,
+        ingress: pulsebeam_link::FabricIngress,
+        now: Instant,
+        image: crate::route::fabric::NetworkPacket,
+    ) {
+        let Some((child, branch, destination)) =
+            self.runtime.network_repair_target(address, ingress, now)
+        else {
+            return;
+        };
+        let Some(packet) = child.accept_image(image) else {
+            return;
+        };
+        if self
+            .registry
+            .resolve_mut(destination)
+            .is_some_and(|receiver| receiver.matches_network_repair(branch, child, &packet))
+            && self.runtime.offer_network_repair(child, now, packet)
+        {
+            self.drain_fabric_data_branch(branch, destination, now);
+        }
+    }
+
+    fn drain_fabric_data_branch(
+        &mut self,
+        branch: FabricLocalBranch,
+        destination: ParticipantHandle,
+        now: Instant,
+    ) {
+        use crate::shard::router::FabricOwner;
+        let Some(owner) = self.runtime.fabric_handoff_owner(branch, destination) else {
+            return;
+        };
+        if let FabricOwner::Local(publisher) = owner
+            && !self.fabric_publisher_authorized(publisher, branch.source())
+        {
+            return;
+        }
+        if !self.fabric_io_authorized(destination) {
+            self.runtime.retire_fabric_participant(destination);
+            return;
+        }
+        let Some(receiver) = self.registry.resolve_mut(destination) else {
+            return;
+        };
+        let current_branch = receiver
+            .reliable_subscriber_branch(branch)
+            .and_then(|lease| {
+                (self.runtime.fabric_incarnation(branch.source()) == Some(lease.endpoint.source))
+                    .then_some(lease.endpoint.branch)
+            });
+        let Some(handoff) = self.runtime.admit_fabric_data(
+            branch,
+            destination,
+            now,
+            current_branch,
+            |_, packet, repair| {
+                #[cfg(feature = "sim")]
+                let stale = matches!(owner, FabricOwner::Shard(_))
+                    && crate::sim_metrics::is_stale_shard_data(
+                        packet.payload(),
+                        receiver.connection_id,
+                    );
+                let written = receiver
+                    .write_fabric_data(branch, packet, repair.map(|repair| repair.fragment))
+                    .is_ok();
+                #[cfg(feature = "sim")]
+                if written && stale {
+                    crate::sim_metrics::record_stale_shard_data_write();
+                }
+                written
+            },
+        ) else {
+            return;
+        };
+        if handoff.written {
+            if let Some(request) = handoff.completed
+                && let Some(lease) = receiver.reliable_subscriber_branch(branch)
+            {
+                receiver.write_fabric_repair_outcome(
+                    lease,
+                    request,
+                    pulsebeam_proto::data_control::RepairStatus::HandedOff,
+                );
+            }
+            self.dirty.mark(destination, receiver);
+        } else {
+            record_routing_drop("packet", "fabric_data", "local");
+        }
+    }
+
+    fn admit_fabric<T, E>(
+        &mut self,
+        handle: FabricLocalBranch,
+        destination: ParticipantHandle,
+        now: Instant,
+        write: impl FnOnce(
+            &mut crate::participant::Connection,
+            u64,
+            PacketView<'_>,
+            crate::route::fabric::local::OutputEvidence,
+        ) -> Result<T, E>,
+    ) -> Result<Option<T>, E> {
+        use crate::shard::router::FabricOwner;
+        let Some(owner) = self.runtime.fabric_handoff_owner(handle, destination) else {
+            return Ok(None);
+        };
+        if let FabricOwner::Local(publisher) = owner
+            && !self.fabric_publisher_authorized(publisher, handle.source())
+        {
+            return Ok(None);
+        }
+        if !self.fabric_io_authorized(destination) {
+            self.runtime.retire_fabric_participant(destination);
+            return Ok(None);
+        }
+        let Some(receiver) = self.registry.resolve_mut(destination) else {
+            return Ok(None);
+        };
+        self.runtime
+            .admit_fabric(handle, destination, now, |sequence, packet, evidence| {
+                write(receiver, sequence, packet, evidence)
+            })
+    }
+
+    fn reset_fabric_output(&mut self, destination: ParticipantHandle, branch: FabricLocalBranch) {
+        if self.runtime.lose_fabric_output_context(branch, destination)
+            && let Some(scope) = branch.scope()
+            && let Some(receiver) = self.registry.resolve_mut(destination)
+            && receiver.discard_pending_fabric_rtp(scope)
+        {
+            self.dirty.mark(destination, receiver);
+        }
+    }
+
+    fn request_fabric_refresh(
+        &mut self,
+        destination: ParticipantHandle,
+        branch: FabricLocalBranch,
+        now: Instant,
+    ) {
+        if !self.fabric_io_authorized(destination) {
+            return;
+        }
+        let registry = &mut self.registry;
+        let dirty = &mut self.dirty;
+        self.runtime
+            .request_fabric_refresh(branch, destination, now, |publisher, ssrc| {
+                let Some(owner) = registry.resolve_mut(publisher) else {
+                    return false;
+                };
+                if !owner.fabric_source_authorized(branch.source())
+                    || !owner.request_fabric_refresh(ssrc)
+                {
+                    return false;
+                }
+                dirty.mark(publisher, owner);
+                true
+            });
+    }
+
+    fn fabric_io_authorized(&mut self, participant: ParticipantHandle) -> bool {
+        self.registry
+            .resolve_mut(participant)
+            .is_some_and(|p| p.fabric_io_authorized())
     }
 
     fn on_media_frame(
@@ -574,20 +2586,76 @@ impl ShardExecution {
         self.dirty.mark(key, participant);
     }
 
-    pub(crate) fn flush_stream_buffers(
-        &mut self,
-        _router: &impl IngressTransport,
-        budget: usize,
-    ) -> usize {
+    pub(crate) fn flush_stream_buffers(&mut self, now: Instant, budget: usize) -> usize {
         debug_assert!(budget > 0);
-        let plans = &self.plans;
+        use crate::shard::events::QueuedPublication;
         let mut processed = 0;
         while processed < budget {
-            let Some((track_handle, packet)) = self.pipeline.pop_packet() else {
+            let Some(queued) = self.pipeline.pop_publication() else {
                 break;
             };
             processed = processed.saturating_add(1);
-            let Some(plan) = plans.get(track_handle) else {
+            let (track_handle, packet) = match queued {
+                QueuedPublication::Legacy(track, packet) => (track, packet),
+                QueuedPublication::FabricMedia {
+                    publisher,
+                    source,
+                    input,
+                } => {
+                    if self.fabric_publisher_authorized(publisher, source) {
+                        match self
+                            .runtime
+                            .offer_fabric_media(source, publisher, now, &input)
+                        {
+                            Ok(report) => {
+                                if let Some(facts) = report.dd_structure
+                                    && let Some((_, encoding)) =
+                                        self.runtime.fabric_dd_source(source)
+                                    && let Some(owner) = self.registry.resolve_mut(publisher)
+                                {
+                                    owner.measure_fabric_structure(source, encoding, facts);
+                                }
+                                self.drain_fabric_rtp(source, now);
+                                self.refresh_after_fabric_offer(source, now, &report);
+                            }
+                            Err(Rejection::Conflict) => {
+                                if let Some(owner) = self.registry.resolve_mut(publisher) {
+                                    owner.fence_fabric_media(source);
+                                }
+                                self.runtime.fence_local_fabric_source(source, publisher);
+                            }
+                            Err(_) => (),
+                        }
+                    }
+                    continue;
+                }
+                QueuedPublication::FabricData {
+                    publisher,
+                    publication,
+                } => {
+                    self.offer_fabric_data_position(publisher, now, publication);
+                    continue;
+                }
+                #[cfg(test)]
+                QueuedPublication::Fabric {
+                    publisher,
+                    publication,
+                } => {
+                    if let Some(admission) = publication.reliable
+                        && !self.accept_reliable_data_admission(
+                            publication.source,
+                            publisher,
+                            admission,
+                            now,
+                        )
+                    {
+                        continue;
+                    }
+                    let _ = self.offer_fabric_publication(publisher, now, publication);
+                    continue;
+                }
+            };
+            let Some(plan) = self.plans.get(track_handle) else {
                 record_routing_drop("packet", "plan", "local");
                 continue;
             };
@@ -609,8 +2677,17 @@ impl ShardExecution {
 
     pub(crate) fn flush_participant_events(
         &mut self,
-        _router: &impl IngressTransport,
+        router: &impl IngressTransport,
         budget: usize,
+    ) -> usize {
+        self.flush_participant_events_with_clock(router, budget, Instant::now)
+    }
+
+    fn flush_participant_events_with_clock(
+        &mut self,
+        router: &impl IngressTransport,
+        budget: usize,
+        now: impl Fn() -> Instant,
     ) -> usize {
         debug_assert!(budget > 0);
         let mut processed = 0;
@@ -676,6 +2753,57 @@ impl ShardExecution {
                     self.pipeline.push_shard_event(ev);
                 }
                 ParticipantEvent::Internal(ev) => match ev {
+                    crate::shard::events::ShardInternalEvent::FabricSubscriberFeedback {
+                        destination,
+                        feedback,
+                    } => {
+                        self.observe_fabric_subscriber(destination, feedback);
+                    }
+                    crate::shard::events::ShardInternalEvent::StageLocalRtpReceiver {
+                        receiver,
+                        reference,
+                    } => {
+                        self.stage_local_rtp_receiver(receiver, reference);
+                    }
+                    crate::shard::events::ShardInternalEvent::StageFabricReceiver {
+                        receiver,
+                        work,
+                    } => {
+                        self.complete_fabric_receiver_stage(receiver, work);
+                    }
+                    crate::shard::events::ShardInternalEvent::StageFabricPublisher {
+                        publisher,
+                        work,
+                        publication,
+                    } => {
+                        self.complete_fabric_publisher_stage(publisher, work, publication);
+                    }
+                    crate::shard::events::ShardInternalEvent::FenceFabricSource {
+                        publisher,
+                        source,
+                    } => {
+                        self.runtime.fence_local_fabric_source(source, publisher);
+                    }
+                    crate::shard::events::ShardInternalEvent::FabricRefresh {
+                        destination,
+                        branch,
+                    } => {
+                        if self.fabric_io_authorized(destination) {
+                            self.reset_fabric_output(destination, branch);
+                            match self.runtime.fabric_handoff_owner(branch, destination) {
+                                Some(crate::shard::router::FabricOwner::Shard(binding)) => {
+                                    router.send_frame(
+                                        binding.origin,
+                                        ShardFrame::FabricRefresh(binding),
+                                    );
+                                }
+                                Some(crate::shard::router::FabricOwner::Local(_)) => {
+                                    self.request_fabric_refresh(destination, branch, now());
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                     crate::shard::events::ShardInternalEvent::ReverseRequested {
                         stream,
                         packet,
@@ -794,6 +2922,21 @@ impl ShardExecution {
         router: &impl IngressTransport,
     ) {
         for frame in frames {
+            #[cfg(feature = "sim")]
+            {
+                if crate::sim_metrics::delay_shard_data_frame(&frame) {
+                    continue;
+                }
+                if let Some(held) = crate::sim_metrics::take_released_shard_data(&frame, now) {
+                    for delayed in held {
+                        self.on_shard_frame(delayed, now, router);
+                    }
+                }
+                if let Some(late) = crate::sim_metrics::take_expired_shard_data_receipt(&frame, now)
+                {
+                    self.on_shard_frame(late, now, router);
+                }
+            }
             self.on_shard_frame(frame, now, router);
         }
     }
@@ -825,7 +2968,172 @@ impl ShardExecution {
             ShardFrame::Media { delivery, payload } => {
                 self.on_media_frame(delivery, payload, now, router);
             }
+            ShardFrame::Fabric(offer) => {
+                let binding = offer.binding;
+                let data = offer.packet.header().profile == pulsebeam_core::fabric::Profile::Data;
+                if let Ok(report) = self.runtime.offer_shard_fabric(now, offer)
+                    && let Some(source) = self.runtime.shard_fabric_source(binding)
+                {
+                    if !data {
+                        self.drain_fabric_rtp(source, now);
+                    } else if report.enqueued != 0 {
+                        self.drain_fabric_data(source, now);
+                    }
+                }
+            }
+            ShardFrame::FabricDataExpectation(notice) => {
+                let registry = &mut self.registry;
+                self.runtime
+                    .accept_shard_data_expectation(&notice, now, |branch, destination| {
+                        let owner = registry.resolve_mut(destination)?;
+                        let lease = owner.reliable_subscriber_branch(branch)?;
+                        (lease.endpoint.source == notice.binding.incarnation).then_some(
+                            crate::route::fabric::ShardDataReceiver {
+                                connection: owner.connection_id,
+                                branch: lease.endpoint.branch,
+                            },
+                        )
+                    });
+            }
+            ShardFrame::FabricDataRepair(repair) => self.on_shard_data_repair(repair, now),
+            ShardFrame::FabricDataRepairImage(image) => self.on_shard_data_repair_image(image, now),
+            ShardFrame::FabricDataReceipt(receipt) => {
+                if let Some((source, publisher)) = self.runtime.shard_receipt_publisher(receipt)
+                    && self.fabric_publisher_authorized(publisher, source)
+                {
+                    let _accepted = self.runtime.record_shard_data_receipt(source, now, receipt);
+                    #[cfg(feature = "sim")]
+                    match _accepted {
+                        Some(crate::route::fabric::local::ReceiptAcceptance::First) => {
+                            crate::sim_metrics::record_shard_data_receipt(receipt, now);
+                        }
+                        None => {
+                            crate::sim_metrics::record_rejected_shard_data_receipt(receipt, now);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            ShardFrame::FabricRefresh(binding) => {
+                let registry = &mut self.registry;
+                let dirty = &mut self.dirty;
+                self.runtime.request_shard_fabric_refresh(
+                    binding,
+                    now,
+                    |source, publisher, ssrc| {
+                        let Some(owner) = registry.resolve_mut(publisher) else {
+                            return false;
+                        };
+                        if !owner.fabric_source_authorized(source)
+                            || !owner.request_fabric_refresh(ssrc)
+                        {
+                            return false;
+                        }
+                        dirty.mark(publisher, owner);
+                        #[cfg(feature = "sim")]
+                        crate::sim_metrics::record_routing_counter("fabric_rtp_shard_refresh");
+                        true
+                    },
+                );
+            }
+            ShardFrame::FabricImage(_) | ShardFrame::FabricWanImage { .. } => {}
             ShardFrame::Reverse { address, packet } => self.on_reverse_frame(address, packet, now),
+        }
+    }
+
+    fn on_shard_data_repair(
+        &mut self,
+        repair: crate::route::fabric::ShardDataRepair,
+        now: Instant,
+    ) {
+        use crate::{
+            participant::data_fabric::OriginalResolution, route::fabric::ShardDataRepairImage,
+        };
+        let Some((source, publisher, installation, route, count)) =
+            self.runtime.resolve_shard_data_repair(now, repair)
+        else {
+            return;
+        };
+        let route = route.clone();
+        if !self.fabric_publisher_authorized(publisher, source) {
+            return;
+        }
+        let fragment = repair.request.fragment;
+        let OriginalResolution::Cached { sequence, expires } =
+            self.resolve_data_original(publisher, source, installation, fragment, now)
+        else {
+            return;
+        };
+        let Some((data, fanout)) = self.runtime.data_publisher(source, publisher, installation)
+        else {
+            return;
+        };
+        let Some((position, packet, deadline)) =
+            data.cached_original(fanout, fragment.unit_seq, fragment.index, now)
+        else {
+            return;
+        };
+        if position != sequence
+            || now >= expires.min(deadline)
+            || !pulsebeam_proto::data_record::wire_identity(packet.payload())
+                .is_ok_and(|identity| identity.count == count)
+        {
+            return;
+        }
+        crate::shard::worker::send_link_frame(
+            &route.tx,
+            route.clock_origin,
+            ShardFrame::FabricDataRepairImage(ShardDataRepairImage {
+                repair,
+                sequence,
+                packet: packet.clone(),
+            }),
+        );
+    }
+
+    fn on_shard_data_repair_image(
+        &mut self,
+        image: crate::route::fabric::ShardDataRepairImage,
+        now: Instant,
+    ) {
+        use crate::route::fabric::local::RepairQueue;
+        let repair = image.repair;
+        let Some(source) = self.runtime.shard_fabric_source(repair.binding) else {
+            return;
+        };
+        let Some(receiver) = self.registry.resolve_connection(repair.receiver.connection) else {
+            return;
+        };
+        let Some(branch) = self.runtime.remote_fabric_branch(source, receiver) else {
+            return;
+        };
+        let Some(lease) = self
+            .registry
+            .resolve_mut(receiver)
+            .and_then(|owner| owner.reliable_subscriber_branch(branch))
+        else {
+            return;
+        };
+        if lease.endpoint.source != repair.binding.incarnation
+            || lease.endpoint.branch != repair.receiver.branch
+        {
+            return;
+        }
+        let target = branch.repair_target(receiver, lease.endpoint.branch);
+        let Some(fanout) = self.runtime.repair_fanout(source) else {
+            return;
+        };
+        #[cfg(feature = "sim")]
+        let identity = pulsebeam_proto::data_record::wire_identity(image.packet.payload());
+        let outcome = fanout.enqueue_shard_repair(now, target, image);
+        #[cfg(feature = "sim")]
+        if outcome == RepairQueue::Queued
+            && let Ok(identity) = identity
+        {
+            crate::sim_metrics::record_shard_data_repair(identity);
+        }
+        if matches!(outcome, RepairQueue::Queued | RepairQueue::Backpressured) {
+            self.drain_fabric_data_branch(branch, receiver, now);
         }
     }
 
@@ -869,6 +3177,7 @@ impl ShardExecution {
             .and_then(|endpoint| self.registry.resolve_endpoint(endpoint))
         {
             self.timers.cancel(previous);
+            self.runtime.retire_fabric_participant(previous);
         }
         let key = self.registry.insert(cfg, transport);
         if let Some(participant) = self.registry.resolve_mut(key) {
@@ -882,10 +3191,365 @@ impl ShardExecution {
     }
 
     pub(crate) fn next_timer_deadline(&mut self) -> Option<Instant> {
-        self.timers.next_deadline()
+        self.timers
+            .next_deadline()
+            .into_iter()
+            .chain(self.runtime.next_endpoint_data_expiry())
+            .chain(
+                self.runtime
+                    .next_fabric_data_propagation()
+                    .map(|(deadline, _, _)| deadline),
+            )
+            .chain(
+                self.runtime
+                    .next_shard_data_notice()
+                    .map(|(deadline, _, _)| deadline),
+            )
+            .chain(
+                self.runtime
+                    .next_fabric_delivery_report()
+                    .map(|(deadline, _, _)| deadline),
+            )
+            .chain(
+                self.runtime
+                    .next_fabric_data_repair()
+                    .map(|(_, _, work)| work.due),
+            )
+            .chain(
+                self.runtime
+                    .next_network_repair_expiry()
+                    .map(|(expires, ..)| expires),
+            )
+            .chain(
+                self.pending_publisher_lookups
+                    .iter()
+                    .map(|lookup| lookup.due)
+                    .min(),
+            )
+            .chain(
+                self.runtime
+                    .next_publisher_data_expectation()
+                    .map(|(deadline, _)| deadline),
+            )
+            .chain(
+                self.runtime
+                    .next_relay_data_expectation()
+                    .map(|(deadline, _)| deadline),
+            )
+            .min()
     }
 
-    pub(crate) fn fire_timers(&mut self, now: Instant) {
+    fn expire_network_repairs(&mut self, now: Instant) {
+        for _ in 0..FABRIC_CONTROL_TURN_BUDGET {
+            let Some((_, source, target, request)) = self
+                .runtime
+                .next_network_repair_expiry()
+                .filter(|(expires, ..)| now >= *expires)
+            else {
+                break;
+            };
+            self.runtime
+                .cancel_network_repair(source, target, None, request, now);
+            let branch = FabricLocalBranch::for_repair(source, target);
+            if let Some(lease) = self
+                .registry
+                .resolve_mut(target.destination)
+                .and_then(|receiver| receiver.reliable_subscriber_branch(branch))
+                .filter(|lease| lease.endpoint.branch == target.incarnation)
+            {
+                self.report_fabric_repair(
+                    target.destination,
+                    lease,
+                    request,
+                    pulsebeam_proto::data_control::RepairStatus::Expired,
+                );
+            }
+        }
+    }
+
+    fn advance_fabric_repairs(&mut self, now: Instant, send: &impl Fn(ShardId, ShardFrame)) {
+        use crate::{
+            participant::data_fabric::OriginalResolution, route::fabric::local::RepairQueue,
+        };
+        use pulsebeam_proto::data_control::RepairStatus;
+
+        for _ in 0..FABRIC_CONTROL_TURN_BUDGET {
+            let Some((source, owner, work)) = self
+                .runtime
+                .next_fabric_data_repair()
+                .filter(|(_, _, work)| work.due <= now)
+            else {
+                break;
+            };
+            let target = work.target;
+            let request = work.request;
+            let branch = FabricLocalBranch::for_repair(source, target);
+            let lease = self
+                .registry
+                .resolve_mut(target.destination)
+                .and_then(|receiver| {
+                    let lease = receiver.reliable_subscriber_branch(branch)?;
+                    (lease.endpoint.branch == target.incarnation)
+                        .then_some((receiver.connection_id, lease))
+                });
+            let Some((connection, lease)) = lease else {
+                if let Some(fanout) = self.runtime.repair_fanout(source) {
+                    fanout.cancel_data_repair(target, request);
+                }
+                continue;
+            };
+            let Some(fanout) = self.runtime.repair_fanout(source) else {
+                break;
+            };
+            let status = if now >= work.expires {
+                Some(RepairStatus::Expired)
+            } else if fanout.repair_until(now, target, request).is_none() {
+                Some(RepairStatus::Revoked)
+            } else {
+                fanout.defer_data_repair(now, work);
+                if work.queued {
+                    self.drain_fabric_data_branch(branch, target.destination, now);
+                    continue;
+                }
+                let (publisher, installation) = match owner {
+                    crate::shard::router::FabricRepairSource::Publisher(
+                        publisher,
+                        installation,
+                    ) => (publisher, installation),
+                    crate::shard::router::FabricRepairSource::Shard(binding) => {
+                        if self.runtime.shard_fabric_source(binding) == Some(source)
+                            && lease.endpoint.source == binding.incarnation
+                        {
+                            send(
+                                binding.origin,
+                                ShardFrame::FabricDataRepair(
+                                    crate::route::fabric::ShardDataRepair {
+                                        binding,
+                                        receiver: crate::route::fabric::ShardDataReceiver {
+                                            connection,
+                                            branch: lease.endpoint.branch,
+                                        },
+                                        request,
+                                    },
+                                ),
+                            );
+                        }
+                        continue;
+                    }
+                };
+                let resolution = if self.fabric_publisher_authorized(publisher, source) {
+                    self.resolve_data_original(
+                        publisher,
+                        source,
+                        installation,
+                        request.fragment,
+                        now,
+                    )
+                } else {
+                    OriginalResolution::Revoked
+                };
+                match resolution {
+                    OriginalResolution::Cached { sequence, expires } if now < expires => {
+                        let Some(fanout) = self.runtime.repair_fanout(source) else {
+                            continue;
+                        };
+                        match fanout.enqueue_data_repair(now, target, request, sequence) {
+                            RepairQueue::Queued | RepairQueue::Backpressured => {
+                                self.drain_fabric_data_branch(branch, target.destination, now);
+                                None
+                            }
+                            RepairQueue::Unavailable => Some(RepairStatus::Unavailable),
+                        }
+                    }
+                    OriginalResolution::Cached { .. } => Some(RepairStatus::Expired),
+                    OriginalResolution::Unavailable => Some(RepairStatus::Unavailable),
+                    OriginalResolution::Exhausted => Some(RepairStatus::Exhausted),
+                    OriginalResolution::Revoked => Some(RepairStatus::Revoked),
+                    OriginalResolution::Request(_) | OriginalResolution::Pending => None,
+                }
+            };
+            if let Some(status) = status
+                && let Some(fanout) = self.runtime.repair_fanout(source)
+                && fanout.cancel_data_repair(target, request)
+            {
+                self.report_fabric_repair(target.destination, lease, request, status);
+            }
+        }
+    }
+
+    fn advance_relay_data_expectations(&mut self, now: Instant) {
+        use crate::route::fabric::relay::RelayExpectationStep;
+        for _ in 0..FABRIC_CONTROL_TURN_BUDGET {
+            let Some((deadline, source)) = self.runtime.next_relay_data_expectation() else {
+                break;
+            };
+            if now < deadline {
+                break;
+            }
+            match self.runtime.tick_relay_data_expectation(source, now) {
+                Some(RelayExpectationStep::Send(expectation)) => {
+                    self.pipeline.push_relay_data_expectation(expectation);
+                }
+                Some(RelayExpectationStep::Settled(outcome)) => {
+                    self.record_relay_data_outcome(outcome);
+                }
+                None => break,
+            }
+        }
+    }
+
+    fn advance_publisher_data_expectations(&mut self, now: Instant) {
+        use crate::route::fabric::PublisherExpectationStep;
+        for _ in 0..FABRIC_CONTROL_TURN_BUDGET {
+            let Some((_, source)) = self
+                .runtime
+                .next_publisher_data_expectation()
+                .filter(|(deadline, _)| now >= *deadline)
+            else {
+                break;
+            };
+            match self.runtime.tick_publisher_data_expectation(source, now) {
+                Some(PublisherExpectationStep::Send(expectation)) => {
+                    if let Some((publisher, current)) = expectation
+                        .route
+                        .publisher
+                        .data_publisher()
+                        .and_then(|publisher| self.data_publisher_source(publisher))
+                        && source == current
+                        && self.fabric_publisher_authorized(publisher, current)
+                    {
+                        self.pipeline.push_publisher_data_expectation(expectation);
+                    }
+                }
+                Some(PublisherExpectationStep::Settled(outcome)) => {
+                    self.record_relay_data_outcome(outcome);
+                }
+                None => break,
+            }
+        }
+    }
+
+    fn advance_fabric_control(&mut self, now: Instant, send: impl Fn(ShardId, ShardFrame)) {
+        self.advance_publisher_data_expectations(now);
+        for _ in 0..FABRIC_CONTROL_TURN_BUDGET {
+            let Some((deadline, source, publisher)) = self.runtime.next_shard_data_notice() else {
+                break;
+            };
+            if now < deadline {
+                break;
+            }
+            if self.fabric_publisher_authorized(publisher, source) {
+                self.runtime.tick_shard_data_notice(source, now);
+            }
+        }
+        self.retry_publisher_lookups(now);
+        self.expire_network_repairs(now);
+        self.advance_fabric_repairs(now, &send);
+        self.advance_relay_data_expectations(now);
+        use crate::{
+            route::fabric::local::{ExpectationWrite, PropagationOutcome, PropagationStep},
+            shard::router::{FabricDeliveryTarget, FabricOwner},
+        };
+
+        for _ in 0..FABRIC_CONTROL_TURN_BUDGET {
+            let propagation = self.runtime.next_fabric_data_propagation();
+            if let Some((deadline, source, target)) = self.runtime.next_fabric_delivery_report()
+                && now >= deadline
+                && propagation.is_none_or(|(next, _, _)| deadline <= next)
+            {
+                match target {
+                    FabricDeliveryTarget::ShardShadow(binding) => {
+                        let live = self.runtime.shard_fabric_source(binding) == Some(source);
+                        self.runtime
+                            .tick_fabric_delivery_report(source, now, |report| {
+                                if !live
+                                    || report.outcome
+                                        != crate::route::fabric::local::DeliveryOutcome::Confirmed
+                                {
+                                    return ExpectationWrite::Revoked;
+                                }
+                                let receipt = crate::route::fabric::ShardDataReceipt {
+                                    binding,
+                                    unit: report.unit,
+                                    branch: report.branch_incarnation,
+                                };
+                                #[cfg(feature = "sim")]
+                                if crate::sim_metrics::drop_shard_data_receipt(receipt, now) {
+                                    return ExpectationWrite::Backpressured;
+                                }
+                                send(binding.origin, ShardFrame::FabricDataReceipt(receipt));
+                                // Mailbox acceptance does not confirm origin processing.
+                                ExpectationWrite::Backpressured
+                            });
+                    }
+                    FabricDeliveryTarget::Publisher(publisher, installation) => {
+                        let authorized = self.fabric_publisher_authorized(publisher, source);
+                        let (registry, dirty) = (&mut self.registry, &mut self.dirty);
+                        self.runtime
+                            .tick_fabric_delivery_report(source, now, |report| {
+                                let Some(owner) =
+                                    registry.resolve_mut(publisher).filter(|_| authorized)
+                                else {
+                                    return ExpectationWrite::Revoked;
+                                };
+                                let written = owner.write_fabric_delivery_report(
+                                    source,
+                                    installation,
+                                    report,
+                                );
+                                if written == ExpectationWrite::Queued {
+                                    dirty.mark(publisher, owner);
+                                }
+                                written
+                            });
+                    }
+                }
+                continue;
+            }
+            let Some((deadline, source, owner)) = propagation else {
+                break;
+            };
+            if now < deadline {
+                break;
+            }
+            let authorized = match owner {
+                FabricOwner::Local(publisher) => {
+                    self.fabric_publisher_authorized(publisher, source)
+                }
+                FabricOwner::Network => self.runtime.has_live_network_ingress(source),
+                FabricOwner::Shard(binding) => {
+                    self.runtime.shard_fabric_source(binding) == Some(source)
+                }
+            };
+            let (registry, dirty) = (&mut self.registry, &mut self.dirty);
+            let step = self.runtime.tick_fabric_data_propagation(
+                source,
+                now,
+                |branch, destination, unit, incarnation| {
+                    let Some(receiver) = registry.resolve_mut(destination).filter(|_| authorized)
+                    else {
+                        return ExpectationWrite::Revoked;
+                    };
+                    let written = receiver.write_fabric_expectation(branch, unit, incarnation);
+                    if written == ExpectationWrite::Queued {
+                        dirty.mark(destination, receiver);
+                    }
+                    written
+                },
+            );
+            if let Some(PropagationStep::Settled { outcome, .. }) = step {
+                let outcome = match outcome {
+                    PropagationOutcome::Confirmed => "confirmed",
+                    PropagationOutcome::Failed => "failed",
+                    PropagationOutcome::Unknown => "unknown",
+                };
+                metrics::counter!("fabric_data_expectation_outcome", "outcome" => outcome)
+                    .increment(1);
+            }
+        }
+    }
+
+    pub(crate) fn fire_timers(&mut self, now: Instant, send: impl Fn(ShardId, ShardFrame)) {
         let registry = &mut self.registry;
         let dirty = &mut self.dirty;
         self.timers.drain_expired(now, |key| {
@@ -894,18 +3558,23 @@ impl ShardExecution {
                 dirty.mark(key, participant);
             }
         });
+        self.runtime.expire_endpoint_data(now);
+        self.advance_fabric_control(now, send);
     }
 
     pub(crate) fn poll_and_flush_dirty(
         &mut self,
         udp_socket: &mut pulsebeam_udp::UdpSocket,
         budget: usize,
+        router: &impl IngressTransport,
     ) -> usize {
         // Commands and update retirements can create transports after the
         // worker sampled its turn start. Advance the wheel and RTC from one
         // fresh wall-time sample at the poll boundary.
         let now = Instant::now();
-        self.fire_timers(now);
+        self.fire_timers(now, |destination, frame| {
+            router.send_frame(destination, frame);
+        });
         debug_assert!(budget > 0);
         debug_assert!(self.udp_send_batch.is_empty());
         self.dirty.begin_phase();
@@ -923,9 +3592,8 @@ impl ShardExecution {
                 participant_id: participant.participant_id,
                 connection_id: participant.connection_id,
                 handle: key,
-                joined_room: participant.scope.joined_room(),
             };
-            let mut sink = self.pipeline.participant_sink(who);
+            let mut sink = self.pipeline.polling_sink(who, &mut self.runtime);
             if let Some(deadline) = participant.poll(now, &mut sink) {
                 self.timers.schedule(key, deadline);
             }
@@ -936,10 +3604,17 @@ impl ShardExecution {
         } else {
             self.dirty.finish_phase();
         }
-        self.udp_send_batch.flush(udp_socket);
+        self.flush_udp(udp_socket);
         processed
     }
 }
+
+#[cfg(test)]
+mod fabric_tests;
+#[cfg(test)]
+pub(crate) use fabric_tests::FabricRtpFixture;
+#[cfg(all(test, feature = "sim"))]
+pub(crate) use fabric_tests::LiveNetworkFixture;
 
 #[cfg(test)]
 mod wrong_owner_tests {
@@ -1145,8 +3820,6 @@ mod wrong_owner_tests {
                             participant_id,
                             connection_id,
                             profile: crate::control::controller::SignalingProtocol::State,
-                            allow_topic_channels: false,
-                            topic_publications: Default::default(),
                             authorization_expiry: None,
                             rtc: crate::control::application_only_test_connection(),
                             resources,
@@ -1196,7 +3869,6 @@ mod wrong_owner_tests {
                     participant_id,
                     connection_id,
                     handle,
-                    joined_room: Some(crate::entity::ProjectRoomKey::fixture(room_id)),
                 })
                 .connected(source, destination, ingress);
             assert_eq!(core.flush_participant_events(&router, 1), 1);
@@ -1264,8 +3936,6 @@ mod wrong_owner_tests {
                     participant_id: participant,
                     connection_id,
                     profile: crate::control::controller::SignalingProtocol::State,
-                    allow_topic_channels: false,
-                    topic_publications: Default::default(),
                     authorization_expiry: None,
                     rtc: crate::control::application_only_test_connection(),
                     resources,
@@ -1431,7 +4101,7 @@ mod wrong_owner_tests {
             .unwrap();
             let wall_now = Instant::now();
             assert!(wall_now > turn_started + pulsebeam_runtime::SHARD_TIMER_QUANTUM);
-            assert_eq!(core.poll_and_flush_dirty(&mut udp, 256), 2);
+            assert_eq!(core.poll_and_flush_dirty(&mut udp, 256, &router), 2);
             let deadline = core.next_timer_deadline().unwrap();
             assert!(deadline >= wall_now);
             assert!(deadline <= wall_now + Duration::from_millis(101));
@@ -1490,7 +4160,7 @@ mod wrong_owner_tests {
     }
 
     #[pulsebeam_runtime::test(start_paused = true, crate = "pulsebeam_runtime::__harness")]
-    async fn compiled_network_branches_are_installed_and_counted_separately_from_local_routes() {
+    async fn compiled_network_reverse_overrides_the_local_reverse_route() {
         let shard = ShardId::new(0);
         let (_, update_rx) = crate::shard_update::new_shard_update(shard);
         let origin = Instant::now();
@@ -1528,14 +4198,12 @@ mod wrong_owner_tests {
             }
         };
         let local = compiled(1);
-        let network = compiled(2);
-        let reverse = compiled(3);
+        let reverse = compiled(2);
         let plan = crate::shard_update::TrackPlan {
             remote: vec![local.address],
             reverse_route: Some(local.address),
             compiled_remote: vec![local.clone()],
             compiled_reverse: Some(local.clone()),
-            compiled_network: vec![network.clone()],
             compiled_network_reverse: Some(reverse.clone()),
             ..Default::default()
         };
@@ -1545,10 +4213,10 @@ mod wrong_owner_tests {
                     publication_id,
                     plan: Some(plan)
                 }),
-            3
+            2
         );
         let installed = core.execution.plans.get(handle).unwrap();
-        assert_eq!(installed.remote, vec![local, network]);
+        assert_eq!(installed.remote, vec![local]);
         assert_eq!(installed.reverse_route, Some(reverse));
     }
 

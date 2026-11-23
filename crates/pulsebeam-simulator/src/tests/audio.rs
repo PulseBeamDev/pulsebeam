@@ -57,6 +57,7 @@ fn audio_reaches_the_room_test() {
 #[test]
 fn each_listener_must_count_only_decoded_opus_as_heard_test() {
     LocalNodeSim::new()
+        .with_shards(2)
         .with_room(
             Room::new("decoded-audio-boundary")
                 .with_participant(
@@ -105,6 +106,8 @@ fn each_listener_must_count_only_decoded_opus_as_heard_test() {
                 max_silence: None,
             },
         ]);
+    assert!(pulsebeam::sim_metrics::routing_counter("fabric_rtp_enqueued") > 0);
+    assert!(pulsebeam::sim_metrics::routing_counter("fabric_rtp_shard_enqueued") > 0);
 }
 
 #[test]

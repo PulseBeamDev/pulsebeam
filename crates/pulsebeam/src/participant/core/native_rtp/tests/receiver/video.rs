@@ -28,6 +28,7 @@ fn receiver_spec(
             kind: wire::TrackKind::Video as i32,
             source_room: room.into(),
             binding: Some(wire::TrackBinding { transport: Some(wire::track_binding::Transport::Rtp(wire::RtpParameters {
+                extmap_allow_mixed: None,
                 mid: mid.into(),
                 codec: Some(wire::RtpCodecParameters { payload_type: Some(96), format: Some(format), feedback: vec![wire::RtcpFeedback::TransportCc.as_str().into()], ..Default::default() }),
                 encodings: vec![wire::RtpEncodingParameters { ssrc: Some(ssrc), ..Default::default() }],
@@ -79,7 +80,7 @@ fn feed(
         let processed = tx.process(Some(&rid), raw, None);
         for packet in processed.first.into_iter().chain(processed.remaining) {
             assert!(cache.push(packet.clone()).is_none());
-            participant.on_track_packet(handle, TrackPacketRef::Rtp(&packet), Some(cache));
+            participant.on_track_packet(handle, &packet, Some(cache));
         }
     }
     tx.poll_stats(last_arrival);

@@ -106,7 +106,7 @@ pub fn unspecified_addr(ip: IpAddr, port: u16) -> SocketAddr {
     }
 }
 
-/// Start an SFU node in the simulation.
+/// Configure an SFU node for the simulation.
 ///
 /// `shards` above one also sets `room_partition_size(1)` and `round_robin_rooms()`.
 /// Both halves matter: extra shards make `hash(peer_addr)` and `hash(room_id)`
@@ -114,41 +114,6 @@ pub fn unspecified_addr(ip: IpAddr, port: u16) -> SocketAddr {
 /// room's *participants* on different shards. Without it a room of fewer than
 /// sixteen is co-located and its media never leaves a core, so none of the
 /// route, envelope or reverse-lane machinery is reached.
-///
-/// `tcp_only` suppresses UDP candidates so clients must take the TCP path. It
-/// is independent of `shards`: cross-shard forwarding has to hold on the
-/// transport that carries almost all real traffic, not only on the fallback.
-pub async fn start_sfu_node_with(
-    ip: IpAddr,
-    rng: pulsebeam_runtime::rand::Rng,
-    shards: usize,
-    tcp_only: bool,
-) -> anyhow::Result<()> {
-    start_sfu_node_with_transport(ip, rng, shards, tcp_only, false, None).await
-}
-
-pub async fn start_sfu_node_with_transport(
-    ip: IpAddr,
-    rng: pulsebeam_runtime::rand::Rng,
-    shards: usize,
-    tcp_only: bool,
-    udp_only: bool,
-    startup_notification: Option<tokio::sync::mpsc::Sender<()>>,
-) -> anyhow::Result<()> {
-    let mut builder = sfu_node_builder(ip, rng, shards);
-    if let Some(notification) = startup_notification {
-        builder = builder.with_sim_startup_notification(notification);
-    }
-    if tcp_only {
-        builder = builder.tcp_only();
-    } else if udp_only {
-        builder = builder.udp_only();
-    }
-    builder
-        .run(tokio_util::sync::CancellationToken::new())
-        .await
-}
-
 pub fn sfu_node_builder(
     ip: IpAddr,
     rng: pulsebeam_runtime::rand::Rng,

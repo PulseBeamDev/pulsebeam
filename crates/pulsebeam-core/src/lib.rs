@@ -15,6 +15,7 @@
 
 pub mod auth;
 pub mod dd;
+pub mod fabric;
 pub mod framing;
 pub mod h264;
 pub mod identity;

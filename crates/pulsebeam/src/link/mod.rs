@@ -2,11 +2,14 @@
 
 mod codec;
 mod control;
+pub(crate) mod fabric_codec;
+pub(crate) mod fabric_tx;
 pub use control::Control;
 pub(crate) mod host;
 #[cfg(test)]
 mod tests;
-pub(crate) use codec::ShardCodec;
+pub(crate) mod wan_host;
+pub(crate) use codec::ReverseCodec;
 
 use pulsebeam_link::DeliveryTag;
 
@@ -37,19 +40,6 @@ pub struct BindReceive {
     pub destinations: Vec<NodeRouteAddress>,
     pub reply:
         pulsebeam_runtime::sync::oneshot::Sender<Result<ReceiveRoute, pulsebeam_link::BindError>>,
-}
-
-/// Explicit trusted publication branch. The controller resolves the source
-/// shard from the existing materialized publication, never from packet bytes.
-#[derive(Debug)]
-pub struct BindSend {
-    pub room: crate::entity::ProjectRoomKey,
-    pub track: crate::entity::PublicationKey,
-    pub peer: pulsebeam_link::NetworkId,
-    pub address: pulsebeam_link::NodeRouteKey,
-    pub reply: pulsebeam_runtime::sync::oneshot::Sender<
-        Result<pulsebeam_link::BindingId, pulsebeam_link::BindError>,
-    >,
 }
 
 /// Select one explicit reverse next hop for an existing non-origin runtime.

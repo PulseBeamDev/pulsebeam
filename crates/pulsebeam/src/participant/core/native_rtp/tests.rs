@@ -50,6 +50,9 @@ fn capabilities() -> wire::RtpCapabilities {
             wire::RtpHeaderExtensionType::RtpHeaderExtensionDependencyDescriptor
                 .as_str()
                 .into(),
+            wire::RtpHeaderExtensionType::RtpHeaderExtensionAudioLevel
+                .as_str()
+                .into(),
         ],
         rtcp_modes: vec![wire::RtcpMode::Compound.as_str().into()],
     }
@@ -62,6 +65,7 @@ fn spec(enabled: bool) -> wire::ResourceSpec {
             track_id: "microphone".into(),
             kind: Some(wire::publication_spec::Kind::Audio(wire::AudioPublication {
                 binding: Some(wire::TrackBinding { transport: Some(wire::track_binding::Transport::Rtp(wire::RtpParameters {
+                    extmap_allow_mixed: None,
                     mid: "mic".into(),
                     codec: Some(wire::RtpCodecParameters { payload_type: Some(111), rtx_payload_type: None, feedback: vec![wire::RtcpFeedback::TransportCc.as_str().into()], format: Some(opus()) }),
                     header_extensions: vec![wire::RtpHeaderExtensionParameters { id: 1, uri: wire::RtpHeaderExtensionType::RtpHeaderExtensionMid.as_str().into() }, wire::RtpHeaderExtensionParameters { id: 2, uri: wire::RtpHeaderExtensionType::RtpHeaderExtensionTransportCcDraft01.as_str().into() }],
@@ -123,6 +127,7 @@ fn video_spec(
                         binding: Some(wire::TrackBinding {
                             transport: Some(wire::track_binding::Transport::Rtp(
                                 wire::RtpParameters {
+                                    extmap_allow_mixed: None,
                                     mid: mid.into(),
                                     codec: Some(wire::RtpCodecParameters {
                                         payload_type: Some(96),
@@ -172,6 +177,129 @@ fn last_live_for(
         panic!("accepted owned source/receiver, got {value:?}")
     };
     (value.clone(), live.as_ref().clone())
+}
+
+#[test]
+fn whole_opus_ingress_uses_the_committed_owner_and_fanout_before_first_packet() {
+    let mut participant =
+        participant_with_capabilities(native_data::unix_now() + 60, Some(capabilities()));
+    let mut sink = MockParticipantSink::new();
+    let mut declaration = spec(true);
+    let Some(resource_spec::Declaration::Publication(publication)) =
+        declaration.declaration.as_mut()
+    else {
+        panic!("publication");
+    };
+    let Some(wire::publication_spec::Kind::Audio(audio)) = publication.kind.as_mut() else {
+        panic!("audio");
+    };
+    let Some(wire::track_binding::Transport::Rtp(rtp)) =
+        audio.binding.as_mut().unwrap().transport.as_mut()
+    else {
+        panic!("RTP");
+    };
+    rtp.encodings[0].ssrc = Some(1234);
+    rtp.header_extensions
+        .push(wire::RtpHeaderExtensionParameters {
+            id: 3,
+            uri: wire::RtpHeaderExtensionType::RtpHeaderExtensionAudioLevel
+                .as_str()
+                .into(),
+        });
+    participant.handle_native_signaling(
+        &frame(
+            1,
+            wire::desired_state::Value::Present(Box::new(declaration)),
+        ),
+        &mut sink,
+    );
+    let published = sink.publish_track_calls[0];
+    let mut handles = slotmap::SlotMap::<TrackHandle, ()>::with_key();
+    let fanout = handles.insert(());
+    let stale = handles.insert(());
+    assert!(
+        participant
+            .prepare_local_rtp_ingress(published, fanout)
+            .is_none()
+    );
+    participant.apply(
+        ParticipantEffect::TrackPublished {
+            publication_id: published,
+        },
+        Some(fanout),
+    );
+    let (_, ingress) = participant
+        .prepare_local_rtp_ingress(published, fanout)
+        .unwrap();
+    assert_eq!(ingress.primary_ssrc(), 1234);
+    assert_eq!(
+        ingress.emission(),
+        crate::route::fabric::local::Emission::new(
+            pulsebeam_core::fabric::Profile::Opus,
+            &[pulsebeam_core::fabric::ExtensionKind::AudioLevel],
+        ),
+    );
+    assert!(
+        participant
+            .prepare_local_rtp_ingress(published, stale)
+            .is_none()
+    );
+}
+
+#[test]
+fn simulcast_fabric_preparation_uses_all_exact_committed_encodings() {
+    let mut participant =
+        participant_with_capabilities(native_data::unix_now() + 60, Some(capabilities()));
+    let mut sink = MockParticipantSink::new();
+    participant.handle_native_signaling(
+        &frame(
+            1,
+            wire::desired_state::Value::Present(Box::new(video_spec(
+                "camera",
+                1234,
+                wire::RtpScalabilityMode::L1t1,
+                true,
+            ))),
+        ),
+        &mut sink,
+    );
+    let published = sink.publish_track_calls[0];
+    let mut handles = slotmap::SlotMap::<TrackHandle, ()>::with_key();
+    let fanout = handles.insert(());
+    let stale = handles.insert(());
+    assert!(
+        participant
+            .prepare_dd_fabric_ingress(published, fanout)
+            .is_none()
+    );
+    participant.apply(
+        ParticipantEffect::TrackPublished {
+            publication_id: published,
+        },
+        Some(fanout),
+    );
+    assert!(
+        participant
+            .prepare_dd_fabric_ingress(published, stale)
+            .is_none()
+    );
+    assert!(
+        participant
+            .prepare_local_rtp_ingress(published, fanout)
+            .is_none()
+    );
+    let (_, encodings) = participant
+        .prepare_dd_fabric_ingress(published, fanout)
+        .unwrap();
+    let dd = pulsebeam_core::fabric::ExtensionKind::DependencyDescriptor;
+    assert_eq!(encodings.len(), 3);
+    for (ingress, primary) in encodings.iter().zip([1234_u32, 1236, 1238]) {
+        let encoding = ingress.source_encoding().unwrap();
+        assert_eq!(encoding.primary, primary.into());
+        assert_eq!(encoding.payload_type, 96_u8.into());
+        assert!(encoding.rid.is_none());
+        assert!(ingress.emission().unwrap().includes(dd));
+    }
 }
 
 #[test]
@@ -511,7 +639,7 @@ fn admitted_source_keeps_birth_identity_demand_and_cutoff_independent_of_desire(
         participant.native_rtp.publications[&7].slot
     );
     assert_eq!(route.encoding, track::SourceEncoding::Ssrc(77.into()));
-    let mut cache = crate::rtp::cache::TrackStreamCache::with_encodings(&encodings);
+    let video_slot = participant.native_rtp.publications[&7].slot;
     let now = Instant::now();
     for ssrc in [81, 77, 79] {
         // The RTC emits this notice before its first authenticated packet. Use
@@ -540,7 +668,6 @@ fn admitted_source_keeps_birth_identity_demand_and_cutoff_independent_of_desire(
         );
         for packet in builder.keyframe(2) {
             assert!(packet.ext_vals.rid.is_none());
-            assert_eq!(cache.source(&packet), Some(encoding));
             let incoming = pulsebeam_rtc::RtpPacket {
                 arrival: packet.arrival_ts.into(),
                 header: pulsebeam_rtc::RtpHeader {
@@ -554,31 +681,19 @@ fn admitted_source_keeps_birth_identity_demand_and_cutoff_independent_of_desire(
                 extensions: Vec::new(),
             };
             participant.handle_incoming_rtp(incoming, Mid::from("camera"), None, &mut sink);
-            cache.push_encoding(encoding, packet);
         }
-        assert!(
-            sink.publish_track_packet_calls.len() > published_before,
-            "source {ssrc} must publish real processed packets"
+        assert_eq!(
+            participant.native_rtp.fabric_measurement_slot(ssrc),
+            Some(video_slot)
+        );
+        assert_eq!(
+            sink.publish_track_packet_calls.len(),
+            published_before,
+            "source {ssrc} cannot fall back to legacy forwarding without authenticated DD"
         );
         participant.enqueue_remote_keyframe((video_id, encoding), KeyframeRequestKind::Pli);
     }
-    let video_slot = participant.native_rtp.publications[&7].slot;
-    let source = participant.upstream.track_mut(video_slot).unwrap();
-    source.poll_stats(now + std::time::Duration::from_millis(50));
-    let states = source.monitor.layer_states();
-    assert_eq!(states.len(), 3);
     for encoding in &encodings {
-        assert!(
-            !states
-                .iter()
-                .find(|(key, _)| key == encoding)
-                .unwrap()
-                .1
-                .is_inactive()
-        );
-        let packet = cache.encoding(*encoding).unwrap().get(1000.into()).unwrap();
-        assert!(encoding.matches(packet.ssrc, packet.ext_vals.rid));
-        assert!(packet.ext_vals.rid.is_none());
         assert!(
             participant
                 .pending_keyframe_requests
@@ -586,7 +701,6 @@ fn admitted_source_keeps_birth_identity_demand_and_cutoff_independent_of_desire(
         );
     }
     assert_eq!(participant.pending_keyframe_requests.len(), 3);
-    assert!(cache.source(&crate::rtp::RtpPacket::default()).is_none());
     assert_eq!(
         participant
             .native_rtp
@@ -599,12 +713,7 @@ fn admitted_source_keeps_birth_identity_demand_and_cutoff_independent_of_desire(
             .keyframe_mid(video_id, track::SourceEncoding::Rid(None)),
         None
     );
-    assert!(
-        sink.publish_track_packet_calls
-            .iter()
-            .all(|handle| *handle == fanout)
-    );
-    assert!(!sink.publish_track_packet_calls.is_empty());
+    assert!(sink.publish_track_packet_calls.is_empty());
     let video_binding = participant.native_rtp.publications[&7]
         .binding
         .description()
@@ -644,6 +753,14 @@ fn admitted_source_keeps_birth_identity_demand_and_cutoff_independent_of_desire(
         &mut sink,
     );
     assert!(participant.upstream.owns_managed_track(video_id));
+    for ssrc in [77, 79, 81] {
+        assert!(
+            participant
+                .native_rtp
+                .fabric_measurement_slot(ssrc)
+                .is_none()
+        );
+    }
     assert!(participant.pending_keyframe_requests.is_empty());
     participant.enqueue_remote_keyframe((video_id, encodings[0]), KeyframeRequestKind::Pli);
     assert!(participant.pending_keyframe_requests.is_empty());

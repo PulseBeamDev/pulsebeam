@@ -121,17 +121,6 @@ impl ControllerCore {
             participant_id: state.participant_id,
             connection_id: state.connection_id,
             profile: state.profile,
-            allow_topic_channels: state.profile != super::controller::SignalingProtocol::State,
-            topic_publications: if state.profile == super::controller::SignalingProtocol::State {
-                crate::participant::policy::TopicPublications::Denied
-            } else {
-                state
-                    .authorization
-                    .as_ref()
-                    .map_or_else(Default::default, |lease| {
-                        lease.permissions().topic_publications()
-                    })
-            },
             authorization_expiry: state
                 .authorization
                 .as_ref()

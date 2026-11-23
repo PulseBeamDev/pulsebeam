@@ -23,6 +23,8 @@ use std::collections::VecDeque;
 use crate::clock::{NtpExpander, NtpTime};
 use crate::id::ShardId;
 
+pub mod fabric;
+
 /// How long a retired slot waits before it can be handed out again.
 ///
 /// `epoch` is the primary guard against a delayed datagram landing on a
@@ -600,6 +602,9 @@ impl RouteRuntime {
     }
 
     pub fn entry(&self, address: NodeRouteAddress) -> Option<&RouteRuntimeEntry> {
+        if address.shard() != self.shard_id {
+            return None;
+        }
         match self.slots.get(address.route.index()) {
             Some(Some(entry)) if entry.epoch == address.epoch => Some(entry),
             _ => None,
@@ -853,12 +858,16 @@ mod tests {
                 target: crate::keys::TrackHandle::default(),
             },
         );
-        let packet = crate::participant::reverse::ReversePacket::reliable_control(vec![4, 5]);
+        let packet = crate::participant::reverse::ReversePacket::keyframe(
+            None,
+            crate::media::KeyframeRequestKind::Pli,
+        );
         let now = Instant::now();
 
         assert!(runtime.accept_reverse(route, packet.dedup(), now));
         assert!(!runtime.accept_reverse(route, packet.dedup(), now));
-        pulsebeam_runtime::time::advance(Duration::from_millis(101)).await;
+        pulsebeam_runtime::time::advance(crate::track::KEYFRAME_DEBOUNCE + Duration::from_nanos(1))
+            .await;
         assert!(runtime.accept_reverse(route, packet.dedup(), Instant::now()));
     }
 
@@ -870,7 +879,10 @@ mod tests {
         let action = RouteAction::Reverse {
             target: crate::keys::TrackHandle::default(),
         };
-        let packet = crate::participant::reverse::ReversePacket::reliable_control(vec![4, 5]);
+        let packet = crate::participant::reverse::ReversePacket::keyframe(
+            None,
+            crate::media::KeyframeRequestKind::Pli,
+        );
         let now = Instant::now();
 
         assert!(!runtime.accept_reverse(old, packet.dedup(), now));
@@ -896,7 +908,10 @@ mod tests {
                 target: crate::keys::TrackHandle::default(),
             },
         );
-        let packet = crate::participant::reverse::ReversePacket::reliable_control(vec![4, 5]);
+        let packet = crate::participant::reverse::ReversePacket::keyframe(
+            None,
+            crate::media::KeyframeRequestKind::Pli,
+        );
         runtime.accept_reverse(route, packet.dedup(), Instant::now());
     }
 

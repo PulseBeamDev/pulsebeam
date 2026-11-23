@@ -13,13 +13,15 @@ use bytes::Bytes;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    AcceptError, CloseReason, ConnectionConfig, ConnectionEntropy, ConnectionState,
-    ConnectionStats, ConnectionWarning, DataChannelConfig, DataChannelId, DataMessage, Event,
-    MediaPayloadBitrate, NetworkInput, Output, PacketFeedbackKind, ReceiveError, RejectedData,
-    RejectedRtp, RtpWrite, SdpAnswer, SdpOffer, SessionInfo, StatsSnapshot, Transmit, WriteError,
-    egress::{MediaEgress, PrepareResult},
+    AcceptError, AuthenticatedRtp, CloseReason, ConnectionConfig, ConnectionEntropy,
+    ConnectionState, ConnectionStats, ConnectionWarning, DataChannelConfig, DataChannelId,
+    DataMessage, Event, MediaPayloadBitrate, NetworkInput, Output, PacketFeedbackKind,
+    ReceiveError, RejectedData, RejectedRtp, RtpWrite, SdpAnswer, SdpOffer, SessionInfo,
+    StatsSnapshot, Transmit, WriteError,
+    egress::{MediaEgress, MediaLayout, PrepareResult},
     ingress::IngressOwner,
     negotiation,
+    rtp::RtpObserver,
     scheduler::{ServiceArbiter, UserLane},
     sctp::Association,
     sent_history::{HistoryError, MAX_EXPIRATIONS_PER_POLL, SentHistory},
@@ -29,6 +31,13 @@ use crate::{
         TransportError, TransportEvent, TransportState,
     },
 };
+
+#[derive(Clone, Copy)]
+struct AnswerFidBudget {
+    pair: [u32; 2],
+    // An optional plaintext bound for an unknown source primary layout.
+    source_primary_plaintext_bytes: Option<usize>,
+}
 
 pub struct RtcConnection {
     feedback: Option<PacketFeedbackKind>,
@@ -44,6 +53,8 @@ pub struct RtcConnection {
     sctp: Option<Association>,
     service: ServiceArbiter,
     commit: CommitCoordinator,
+    next_handoff_id: u64,
+    handoff: Option<MediaHandoff>,
     lifecycle: Lifecycle,
     _not_sync: PhantomData<Cell<()>>,
 }
@@ -63,6 +74,12 @@ pub(crate) struct TransmitCommitContext {
     pub(crate) wire_len: usize,
     pub(crate) path_epoch: Option<PathEpoch>,
     pub(crate) rtp: Option<PreparedRtpIdentity>,
+}
+
+struct MediaHandoff {
+    id: u64,
+    at: Instant,
+    prepared: PreparedTransmit,
 }
 
 struct CommitCoordinator {
@@ -94,9 +111,19 @@ impl CommitCoordinator {
     fn commit_transport(
         &mut self,
         at: Instant,
-        prepared: PreparedTransmit,
+        mut prepared: PreparedTransmit,
         egress: Option<&mut MediaEgress>,
     ) -> Result<Transmit, HistoryError> {
+        self.record_transport(at, &prepared, egress)?;
+        Ok(take_transmit(&mut prepared))
+    }
+
+    fn record_transport(
+        &mut self,
+        at: Instant,
+        prepared: &PreparedTransmit,
+        egress: Option<&mut MediaEgress>,
+    ) -> Result<(), HistoryError> {
         let context = TransmitCommitContext {
             at,
             kind: prepared.kind,
@@ -107,7 +134,7 @@ impl CommitCoordinator {
         self.history.preflight_commit(context)?;
         if egress
             .as_deref()
-            .is_some_and(|egress| !egress.preflight_commit(&prepared))
+            .is_some_and(|egress| !egress.preflight_commit(prepared))
         {
             return Err(HistoryError::InvalidCommit);
         }
@@ -115,7 +142,7 @@ impl CommitCoordinator {
         if let Some(egress) = egress {
             egress.commit(
                 at,
-                &prepared,
+                prepared,
                 self.history.controller_inputs().bytes_in_flight,
             );
         }
@@ -141,17 +168,15 @@ impl CommitCoordinator {
                 self.counters.protocol_bytes = self.counters.protocol_bytes.saturating_add(bytes);
             }
         }
-        let PreparedTransmit {
-            target,
-            bytes,
-            classification,
-            ..
-        } = prepared;
-        Ok(Transmit {
-            kind: classification,
-            target,
-            payload: Bytes::from(bytes),
-        })
+        Ok(())
+    }
+}
+
+fn take_transmit(prepared: &mut PreparedTransmit) -> Transmit {
+    Transmit {
+        kind: prepared.classification,
+        target: prepared.target.clone(),
+        payload: Bytes::from(std::mem::take(&mut prepared.bytes)),
     }
 }
 
@@ -376,6 +401,62 @@ impl RtcConnection {
         self.rtp_configuration.snapshot()
     }
 
+    /// The committed receive metadata for a typed inbound primary SSRC.
+    /// Metadata remains available while the encoding is paused, but not after
+    /// retirement. A bootstrap-only or outbound identity has no typed binding.
+    pub fn rtp_receive_binding(&self, primary: u32) -> Option<crate::RtpReceiveBinding<'_>> {
+        if !self.rtp_configuration.is_typed_inbound_primary(primary) {
+            return None;
+        }
+        self.ingress.typed_receive_binding(primary)
+    }
+
+    /// Receive metadata for an authenticated, discovered SDP primary in a
+    /// single-primary section. This describes transport state, not publication
+    /// authorization, and never substitutes for an uncommitted typed binding.
+    pub fn sdp_receive_binding(&self, primary: u32) -> Option<crate::RtpReceiveBinding<'_>> {
+        self.ingress.sdp_receive_binding(primary)
+    }
+
+    /// Wire form used by the active sender. Without a primary SSRC the MID
+    /// must resolve to exactly one active encoding, as with `write_rtp`.
+    pub fn rtp_egress_extension_form(
+        &self,
+        mid: &str,
+        primary: Option<u32>,
+    ) -> Option<crate::RtpExtensionForm> {
+        self.egress.extension_form(mid, primary)
+    }
+
+    /// Exact video FID declared in the bootstrap answer, including paused
+    /// senders. This does not prove that the peer applied the receive description.
+    pub fn rtp_egress_answer_fid(&self, mid: &str, primary: u32) -> Option<[u32; 2]> {
+        if self.feedback != Some(PacketFeedbackKind::Rfc8888) {
+            return None;
+        }
+        self.egress.declared_answer_fid(mid, Some(primary))
+    }
+
+    /// Highest committed primary index and extended Sender Report timestamp
+    /// for the active sender. Queued and cancelled transmissions do not count.
+    pub fn rtp_egress_progress(
+        &self,
+        mid: &str,
+        primary: Option<u32>,
+    ) -> Option<(Option<u64>, Option<u64>)> {
+        self.egress.progress(mid, primary)
+    }
+
+    /// The active output ID for a caller-supplied semantic media extension.
+    pub fn rtp_egress_extension_id(
+        &self,
+        mid: &str,
+        primary: Option<u32>,
+        uri: &str,
+    ) -> Option<u8> {
+        self.egress.extension_id(mid, primary, uri)
+    }
+
     #[allow(
         clippy::result_large_err,
         reason = "return the original packet on rejection"
@@ -427,6 +508,210 @@ impl RtcConnection {
             .map_err(|(reason, packet)| RejectedRtp { reason, packet })
     }
 
+    /// Admit only when both primary and negotiated RTX fit the current leg.
+    /// The byte budget is at the selected UDP or ICE-TCP handoff, after SRTP
+    /// and any RFC 4571 framing. Rejection leaves the RTP index unconsumed.
+    /// When supplied, the output clock anchor replaces the packet's individual
+    /// RTP timestamp and wallclock for Sender Report correlation only.
+    #[allow(
+        clippy::result_large_err,
+        reason = "return the original packet on rejection"
+    )]
+    pub fn write_rtp_bounded(
+        &mut self,
+        at: Instant,
+        mid: &str,
+        primary: Option<u32>,
+        packet: RtpWrite,
+        policy: crate::BoundedRtp,
+    ) -> Result<(), RejectedRtp> {
+        self.write_rtp_bounded_with_fid(at, mid, primary, packet, policy, None)
+    }
+
+    /// Admit an opaque packet for a qualified, answer-installed FID pair on direct UDP.
+    ///
+    /// Uses the minimum authenticated primary layout (base header and codec bytes),
+    /// even for RTX-first input. The caller must supply unchanged codec bytes from
+    /// the qualified source and confirm that the receiver applied the answer.
+    #[allow(
+        clippy::result_large_err,
+        reason = "return the original packet on rejection"
+    )]
+    pub fn write_rtp_bounded_answer_fid(
+        &mut self,
+        at: Instant,
+        mid: &str,
+        primary: Option<u32>,
+        packet: RtpWrite,
+        policy: crate::BoundedRtp,
+        pair: [u32; 2],
+    ) -> Result<(), RejectedRtp> {
+        const BASE_RTP_HEADER: usize = 12;
+        const GCM_TAG: usize = 16;
+        if policy.scope.is_none()
+            || self.feedback != Some(PacketFeedbackKind::Rfc8888)
+            || self.transport.rtp_wire_bytes(BASE_RTP_HEADER).ok()
+                != Some(BASE_RTP_HEADER + GCM_TAG)
+        {
+            return Err(RejectedRtp {
+                reason: WriteError::InvalidState,
+                packet,
+            });
+        }
+        if !packet.extensions.is_empty() {
+            return Err(RejectedRtp {
+                reason: WriteError::InvalidRtp,
+                packet,
+            });
+        }
+        let Some(source_primary_plaintext_bytes) =
+            BASE_RTP_HEADER.checked_add(packet.payload.len())
+        else {
+            return Err(RejectedRtp {
+                reason: WriteError::RtpTooLarge,
+                packet,
+            });
+        };
+        self.write_rtp_bounded_with_fid(
+            at,
+            mid,
+            primary,
+            packet,
+            policy,
+            Some(AnswerFidBudget {
+                pair,
+                source_primary_plaintext_bytes: Some(source_primary_plaintext_bytes),
+            }),
+        )
+    }
+
+    /// Preserve negotiated extensions while allowing MID omission for an exact
+    /// FID already known to the receiver on direct UDP. The caller must supply
+    /// the matched protected primary size and the pair from the receive binding.
+    #[allow(
+        clippy::result_large_err,
+        reason = "return the original packet on rejection"
+    )]
+    pub fn write_rtp_bounded_matched_primary(
+        &mut self,
+        at: Instant,
+        mid: &str,
+        primary: Option<u32>,
+        packet: RtpWrite,
+        policy: crate::BoundedRtp,
+        pair: [u32; 2],
+    ) -> Result<(), RejectedRtp> {
+        if policy.scope.is_none() || policy.max_primary_wire_bytes.is_none() {
+            return Err(RejectedRtp {
+                reason: WriteError::InvalidState,
+                packet,
+            });
+        }
+        self.write_rtp_bounded_with_fid(
+            at,
+            mid,
+            primary,
+            packet,
+            policy,
+            Some(AnswerFidBudget {
+                pair,
+                source_primary_plaintext_bytes: None,
+            }),
+        )
+    }
+
+    #[allow(
+        clippy::result_large_err,
+        reason = "return the original packet on rejection"
+    )]
+    fn write_rtp_bounded_with_fid(
+        &mut self,
+        at: Instant,
+        mid: &str,
+        primary: Option<u32>,
+        packet: RtpWrite,
+        policy: crate::BoundedRtp,
+        answer_budget: Option<AnswerFidBudget>,
+    ) -> Result<(), RejectedRtp> {
+        let at = self.time.observe(at);
+        let check_size = |emit_mid| {
+            let (original, repair) = self
+                .egress
+                .plaintext_rtp_sizes(mid, primary, &packet, emit_mid)?;
+            if answer_budget
+                .and_then(|budget| budget.source_primary_plaintext_bytes)
+                .is_some_and(|limit| original > limit)
+            {
+                return Err(WriteError::RtpTooLarge);
+            }
+            for (bytes, primary_limit) in std::iter::once((original, policy.max_primary_wire_bytes))
+                .chain(repair.map(|repair| (repair, None)))
+            {
+                let protected =
+                    self.transport
+                        .rtp_wire_bytes(bytes)
+                        .map_err(|error| match error {
+                            pulsebeam_transport::dtls_srtp::SrtpError::OutputTooLarge => {
+                                WriteError::RtpTooLarge
+                            }
+                            _ => WriteError::InvalidState,
+                        })?;
+                if protected > policy.max_wire_bytes
+                    || primary_limit.is_some_and(|limit| protected > limit)
+                {
+                    return Err(WriteError::RtpTooLarge);
+                }
+            }
+            Ok(())
+        };
+        let layout = (|| {
+            self.check_writable()?;
+            if self.transport.state() != TransportState::Connected {
+                return Err(WriteError::InvalidState);
+            }
+            let path = if let Some(budget) = answer_budget {
+                if self.egress.fid(
+                    mid,
+                    primary,
+                    budget.source_primary_plaintext_bytes.is_some(),
+                ) != Some(budget.pair)
+                    || self.egress.progress(mid, primary).is_none()
+                {
+                    return Err(WriteError::InvalidState);
+                }
+                Some(
+                    self.transport
+                        .direct_udp_rtp_epoch()
+                        .ok_or(WriteError::InvalidState)?,
+                )
+            } else if policy.scope.is_some() {
+                Some(
+                    self.transport
+                        .authenticated_rtp_epoch()
+                        .ok_or(WriteError::InvalidState)?,
+                )
+            } else {
+                None
+            };
+            let emit_mid = match check_size(true) {
+                Ok(()) => true,
+                Err(WriteError::RtpTooLarge) if answer_budget.is_some() => {
+                    check_size(false)?;
+                    false
+                }
+                Err(reason) => return Err(reason),
+            };
+            Ok(MediaLayout { emit_mid, path })
+        })();
+        let layout = match layout {
+            Ok(layout) => layout,
+            Err(reason) => return Err(RejectedRtp { reason, packet }),
+        };
+        self.egress
+            .admit_with_policy(at, mid, primary, packet, policy, layout)
+            .map_err(|(reason, packet)| RejectedRtp { reason, packet })
+    }
+
     fn check_writable(&self) -> Result<(), WriteError> {
         match self.lifecycle {
             Lifecycle::Open => Ok(()),
@@ -445,6 +730,45 @@ impl RtcConnection {
     pub fn discard_pending_rtp(&mut self, mid: &str) -> Result<(), WriteError> {
         self.check_writable()?;
         self.egress.discard_pending(mid)
+    }
+
+    /// Drop unsent primary media for this scope, including a protected
+    /// datagram not yet accepted by the adapter. Committed repair is retained.
+    pub fn discard_pending_rtp_scope(
+        &mut self,
+        scope: crate::MediaScope,
+    ) -> Result<(), WriteError> {
+        self.check_writable()?;
+        if self
+            .egress
+            .pending_primary_scope()
+            .is_some_and(|pending| scope.includes(pending))
+        {
+            let id = self.handoff.as_ref().ok_or(WriteError::InvalidState)?.id;
+            if !self.resolve_handoff(id, false) {
+                return Err(WriteError::InvalidState);
+            }
+        }
+        self.egress.discard_pending_scope(scope);
+        Ok(())
+    }
+
+    /// Cancel a retired branch's unsent media and stop generating sender reports
+    /// and padding for it. The next committed primary can establish a new scope.
+    pub fn retire_rtp_scope(&mut self, scope: crate::MediaScope) -> Result<(), WriteError> {
+        self.check_writable()?;
+        if self
+            .egress
+            .pending_scope()
+            .is_some_and(|pending| scope.includes(pending))
+        {
+            let id = self.handoff.as_ref().ok_or(WriteError::InvalidState)?.id;
+            if !self.resolve_handoff(id, false) {
+                return Err(WriteError::InvalidState);
+            }
+        }
+        self.egress.retire_scope(scope);
+        Ok(())
     }
 
     pub fn request_keyframe(&mut self, ssrc: u32) -> Result<(), WriteError> {
@@ -526,6 +850,25 @@ impl RtcConnection {
         sctp.install(at, config)
     }
 
+    /// Install an unordered, zero-retransmit binary channel with a whole-message
+    /// size limit and a receive-side partial payload budget on this exact stream.
+    /// Stream zero is reserved for existing signaling.
+    pub fn install_bounded_data_channel(
+        &mut self,
+        at: Instant,
+        config: DataChannelConfig,
+        receive_budget: std::num::NonZeroUsize,
+    ) -> Result<crate::DataChannelInstallation, (WriteError, DataChannelConfig)> {
+        let at = self.time.observe(at);
+        if let Err(reason) = self.check_writable() {
+            return Err((reason, config));
+        }
+        let Some(sctp) = self.sctp.as_mut() else {
+            return Err((WriteError::InvalidState, config));
+        };
+        sctp.install_with_receive_budget(at, config, Some(receive_budget))
+    }
+
     /// Read the actual state of this installation lifetime, not the current SID
     /// occupant. Existing channel events wake the caller; query this token before
     /// attaching a completion. None means canceled, failed, retired or unavailable.
@@ -534,6 +877,18 @@ impl RtcConnection {
         installation: crate::DataChannelInstallation,
     ) -> Option<crate::DataChannelInstallationState> {
         self.sctp.as_ref()?.installation_state(installation)
+    }
+
+    /// Check that this open installation uses the requested complete-message
+    /// and partial-reassembly bound on an unordered, zero-retransmit channel.
+    pub fn supports_unordered_data(
+        &self,
+        installation: crate::DataChannelInstallation,
+        message_bytes: usize,
+    ) -> bool {
+        self.sctp
+            .as_ref()
+            .is_some_and(|sctp| sctp.supports_unordered_data(installation, message_bytes))
     }
 
     /// Cancel only this installation. Before physical admission no reset is
@@ -557,6 +912,27 @@ impl RtcConnection {
         channel: DataChannelId,
         message: DataMessage,
     ) -> Result<(), RejectedData> {
+        self.send_data_on(at, channel, None, message)
+    }
+
+    /// Accept one message only on this open installation lifetime. Success is
+    /// SCTP send admission, not delivery to the peer.
+    pub fn send_installed_data(
+        &mut self,
+        at: Instant,
+        installation: crate::DataChannelInstallation,
+        message: DataMessage,
+    ) -> Result<(), RejectedData> {
+        self.send_data_on(at, installation.channel(), Some(installation), message)
+    }
+
+    fn send_data_on(
+        &mut self,
+        at: Instant,
+        channel: DataChannelId,
+        installation: Option<crate::DataChannelInstallation>,
+        message: DataMessage,
+    ) -> Result<(), RejectedData> {
         let at = self.time.observe(at);
         if let Err(reason) = self.check_writable() {
             return Err(RejectedData { reason, message });
@@ -567,8 +943,11 @@ impl RtcConnection {
                 message,
             });
         };
-        sctp.send(at, channel, message)
-            .map_err(|(reason, message)| RejectedData { reason, message })
+        let result = match installation {
+            Some(installation) => sctp.send_installed(at, installation, message),
+            None => sctp.send(at, channel, message),
+        };
+        result.map_err(|(reason, message)| RejectedData { reason, message })
     }
 
     pub fn close_data_channel(
@@ -591,6 +970,7 @@ impl RtcConnection {
         }
         self.check_writable()?;
         self.lifecycle = Lifecycle::Closing { deadline };
+        self.handoff = None;
         self.egress.begin_shutdown();
         if let Some(sctp) = self.sctp.as_mut() {
             sctp.begin_shutdown(at, deadline);
@@ -628,6 +1008,70 @@ impl RtcConnection {
     /// requesting more finalized work. Budget exhaustion needs an immediate
     /// continuation; an `Idle` wakeup due now also denotes runnable work.
     pub fn poll(&mut self, at: Instant) -> Output {
+        self.poll_inner(at, None, false)
+    }
+
+    /// Performs the same bounded service turn as `poll`, with a synchronous
+    /// observation of any resolved authenticated RTP attempt before primary
+    /// deduplication or RTX normalization. Does not change RTC delivery.
+    pub fn poll_with_rtp_observer(
+        &mut self,
+        at: Instant,
+        observer: &mut impl for<'packet> FnMut(AuthenticatedRtp<'packet>),
+    ) -> Output {
+        self.poll_inner(at, Some(observer), false)
+    }
+
+    /// Poll with an explicit adapter handoff for protected media and Sender
+    /// Reports. Resolve `Output::Handoff` before polling this connection again.
+    /// Protocol and SCTP outputs keep the `Output::Transmit` contract.
+    pub fn poll_for_handoff(
+        &mut self,
+        at: Instant,
+        observer: Option<&mut dyn for<'packet> FnMut(AuthenticatedRtp<'packet>)>,
+    ) -> Output {
+        self.poll_inner(at, observer, true)
+    }
+
+    /// Test that the offered datagram still belongs to the selected path. The
+    /// adapter must also check its own socket and forwarding authorization.
+    pub fn handoff_pending(&self, id: u64) -> bool {
+        self.handoff.as_ref().is_some_and(|handoff| {
+            handoff.id == id && self.transport.prepared_path_is_current(&handoff.prepared)
+        })
+    }
+
+    /// Resolve one protected send from the final adapter acceptance result.
+    /// An unknown or already resolved ID does not mutate send state. A pending
+    /// datagram from a retired path is discarded without committing it.
+    pub fn resolve_handoff(&mut self, id: u64, accepted: bool) -> bool {
+        let Some(handoff) = self.handoff.take_if(|handoff| handoff.id == id) else {
+            return false;
+        };
+        if !accepted || !self.transport.prepared_path_is_current(&handoff.prepared) {
+            self.egress.reject_protected(handoff.at);
+        } else if self
+            .commit
+            .record_transport(handoff.at, &handoff.prepared, Some(&mut self.egress))
+            .is_err()
+        {
+            self.abort();
+            return false;
+        }
+        true
+    }
+
+    fn poll_inner(
+        &mut self,
+        at: Instant,
+        observer: Option<&mut RtpObserver<'_>>,
+        defer_media: bool,
+    ) -> Output {
+        if self.handoff.is_some() {
+            return Output::Idle {
+                next_wakeup: Some(at),
+            };
+        }
         let at = self.time.observe(at);
 
         match self.lifecycle {
@@ -659,7 +1103,7 @@ impl RtcConnection {
         }
 
         if let Some(event) = self.transport.poll_event()
-            && let Some(output) = self.handle_transport_event(at, event)
+            && let Some(output) = self.handle_transport_event(at, event, observer)
         {
             return output;
         }
@@ -689,7 +1133,7 @@ impl RtcConnection {
         }
         if let Some(repair) = self.ingress.poll_repair() {
             self.egress
-                .request_repair(repair.media_ssrc, repair.sequence);
+                .request_repair(at, repair.media_ssrc, repair.sequence);
         }
 
         let inputs = self.commit.history.controller_inputs();
@@ -820,10 +1264,38 @@ impl RtcConnection {
                 &mut admission,
             ) {
                 PrepareResult::Prepared => {
-                    let Some(prepared) = self.transport.poll_prepared() else {
+                    let Some(mut prepared) = self.transport.poll_prepared() else {
                         self.lifecycle = Lifecycle::Closed(CloseReason::TransportFailure);
                         return Output::Closed(CloseReason::TransportFailure);
                     };
+                    let scope = self.egress.pending_scope();
+                    if defer_media || scope.is_some() {
+                        let context = TransmitCommitContext {
+                            at,
+                            kind: prepared.kind,
+                            wire_len: prepared.wire_len,
+                            path_epoch: prepared.path_epoch,
+                            rtp: prepared.rtp,
+                        };
+                        if self.commit.history.preflight_commit(context).is_err()
+                            || !self.egress.preflight_commit(&prepared)
+                        {
+                            self.abort();
+                            return Output::Closed(CloseReason::TransportFailure);
+                        }
+                        let Some(id) = self.next_handoff_id.checked_add(1) else {
+                            self.abort();
+                            return Output::Closed(CloseReason::TransportFailure);
+                        };
+                        self.next_handoff_id = id;
+                        let transmit = take_transmit(&mut prepared);
+                        self.handoff = Some(MediaHandoff { id, at, prepared });
+                        return Output::Handoff {
+                            id,
+                            scope,
+                            transmit,
+                        };
+                    }
                     return match self
                         .commit
                         .commit_transport(at, prepared, Some(&mut self.egress))
@@ -895,7 +1367,12 @@ impl RtcConnection {
         }
     }
 
-    fn handle_transport_event(&mut self, at: Instant, event: TransportEvent) -> Option<Output> {
+    fn handle_transport_event(
+        &mut self,
+        at: Instant,
+        event: TransportEvent,
+        observer: Option<&mut RtpObserver<'_>>,
+    ) -> Option<Output> {
         match event {
             TransportEvent::AuthenticatedPath(path) => {
                 Some(Output::Event(Event::AuthenticatedPath(path)))
@@ -917,12 +1394,19 @@ impl RtcConnection {
             }
             TransportEvent::Rtp {
                 arrival,
-                path_epoch: _,
+                path_epoch,
                 bytes,
+                protected_bytes,
                 metadata: _,
                 ecn,
             } => {
-                self.ingress.accept_rtp(arrival, bytes, ecn);
+                let protection = crate::rtp::RtpProtection {
+                    bytes: protected_bytes,
+                    direct_full_tag: self.transport.direct_udp_rtp_epoch() == Some(path_epoch)
+                        && protected_bytes.checked_sub(bytes.len()) == Some(16),
+                };
+                self.ingress
+                    .accept_rtp_observed(arrival, bytes, ecn, Some(protection), observer);
                 self.ingress.poll_event().map(Output::Event)
             }
             TransportEvent::Rtcp {
@@ -1042,6 +1526,7 @@ impl RtcConnection {
         ) {
             return;
         }
+        self.handoff = None;
         self.transport.abort();
         self.ingress.abort();
         self.egress.abort();
@@ -1112,6 +1597,8 @@ impl RtcConnection {
             controller_feedback: Vec::new(),
             sctp,
             service: ServiceArbiter::default(),
+            next_handoff_id: 0,
+            handoff: None,
             commit: CommitCoordinator::new(feedback, config.limits.max_sent_history_bytes, at)
                 .map_err(|_| AcceptError::SessionLimitExceeded)?,
             lifecycle: Lifecycle::Open,
@@ -1185,8 +1672,356 @@ mod feedback_trace;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{NetworkPolicy, PeerFixture, assert_native_rtp_pacing, sample};
+    use crate::test_support::{
+        NetworkPolicy, PeerFixture, assert_native_rtp_pacing, rtp_write, sample,
+    };
     use std::time::Duration;
+
+    #[test]
+    fn native_answer_fid_startup_and_repair_fit_and_are_fenced_on_path_change() {
+        let mut fixture = PeerFixture::connected_video_with_rfc8888();
+        let mid = fixture.sender_mid.clone();
+        let fid = fixture.installed_answer_fid(&mid);
+        let budget = AnswerFidBudget {
+            pair: fid,
+            source_primary_plaintext_bytes: Some(1_198),
+        };
+        let packets = fixture.send_fragmented_video_source(None);
+        assert!(fixture.take_video_wire_packets().is_empty());
+        let scope = crate::MediaScope::new(std::num::NonZeroU128::MIN);
+        fixture.lose_next_handoff(1_001);
+        fixture.record_transmits();
+        let policy = crate::BoundedRtp {
+            max_wire_bytes: 1_216,
+            max_primary_wire_bytes: None,
+            clock: None,
+            scope: Some(scope),
+            replace_queued: false,
+        };
+        let mut startup = rtp_write(packets[1].clone(), 1_001);
+        startup.extensions.clear();
+        let mut payload = startup.payload.to_vec();
+        assert!(payload.len() <= 1_186);
+        payload.resize(1_186, 0x55);
+        startup.payload = payload.into();
+        let (primary, repair) = fixture
+            .connection
+            .egress
+            .plaintext_rtp_sizes(&mid, None, &startup, true)
+            .unwrap();
+        assert!(
+            fixture
+                .connection
+                .transport
+                .rtp_wire_bytes(primary)
+                .unwrap()
+                > 1_216
+        );
+        assert!(
+            fixture
+                .connection
+                .transport
+                .rtp_wire_bytes(repair.unwrap())
+                .unwrap()
+                > 1_216
+        );
+        let rejected = fixture
+            .connection
+            .write_rtp_bounded(fixture.at(), &mid, None, startup, policy)
+            .expect_err(
+                "production startup MID must not turn a full fragment into an oversize write",
+            );
+        assert_eq!(rejected.reason, crate::WriteError::RtpTooLarge);
+        let wrong = fixture
+            .connection
+            .write_rtp_bounded_with_fid(
+                fixture.at(),
+                &mid,
+                None,
+                rejected.packet,
+                policy,
+                Some(AnswerFidBudget {
+                    pair: [fid[1], fid[0]],
+                    ..budget
+                }),
+            )
+            .expect_err("the exact installed FID is required for the alternate layout");
+        assert_eq!(wrong.reason, crate::WriteError::InvalidState);
+        assert_eq!(fixture.connection.stats().connection.queued_media_bytes, 0);
+
+        for (offset, packet) in packets.into_iter().enumerate() {
+            let mut write = rtp_write(packet, 1_000 + u64::try_from(offset).unwrap());
+            write.extensions.clear();
+            if offset == 1 {
+                // The synthetic encoded frame exercises the repair size boundary.
+                let mut payload = write.payload.to_vec();
+                assert!(payload.len() <= 1_186);
+                payload.resize(1_187, 0x55);
+                write.payload = payload.into();
+                assert_eq!(
+                    fixture
+                        .connection
+                        .egress
+                        .plaintext_rtp_sizes(&mid, None, &write, false),
+                    Ok((1_199, Some(1_201)))
+                );
+                assert_eq!(
+                    fixture.connection.transport.rtp_wire_bytes(1_201),
+                    Ok(1_217)
+                );
+                let oversized = fixture
+                    .connection
+                    .write_rtp_bounded_with_fid(
+                        fixture.at(),
+                        &mid,
+                        None,
+                        write,
+                        policy,
+                        Some(AnswerFidBudget {
+                            source_primary_plaintext_bytes: Some(1_199),
+                            ..budget
+                        }),
+                    )
+                    .expect_err("1,217-byte RTX must reject the write even when the primary fits");
+                assert_eq!(oversized.reason, crate::WriteError::RtpTooLarge);
+                write = oversized.packet;
+                write.payload.truncate(1_186);
+            }
+            fixture
+                .connection
+                .write_rtp_bounded_matched_primary(
+                    fixture.at(),
+                    &mid,
+                    None,
+                    write,
+                    crate::BoundedRtp {
+                        max_primary_wire_bytes: Some(1_214),
+                        ..policy
+                    },
+                    fid,
+                )
+                .expect("bounded primary and negotiated repair with a separate ceiling");
+        }
+        let frame = fixture.receive_video_frame();
+        assert!(frame.data.len() >= 3_500);
+        assert!(fixture.handoff_losses_consumed());
+        let headers = fixture.take_video_wire_packets();
+        assert!(!headers.is_empty());
+        assert!(headers.iter().all(|header| {
+            header.ext_vals.dependency_descriptor.is_none()
+                && header.ext_vals.transport_cc.is_none()
+                && header.wire_bytes <= 1_216
+        }));
+        let repair = fixture
+            .take_transmit_observations()
+            .into_iter()
+            .find_map(|(_, kind)| match kind {
+                crate::TransmitKind::Repair { ssrc } => Some(ssrc),
+                _ => None,
+            })
+            .expect("RTC transmitted a repair");
+        assert!(headers.iter().any(|header| header.ssrc == repair
+            && header.wire_bytes == 1_216
+            && header.ext_vals.mid.is_none()));
+        let primary = headers
+            .iter()
+            .find(|header| header.ssrc != repair)
+            .expect("native received primary RTP")
+            .ssrc;
+        assert_eq!([primary, repair], fid);
+        assert!(
+            headers
+                .iter()
+                .any(|header| header.ssrc == primary && header.ext_vals.mid.is_some())
+        );
+
+        fixture.drive_for(Duration::from_millis(20));
+        let mut next = wrong.packet;
+        next.sequence = 2_000;
+        fixture
+            .connection
+            .write_rtp_bounded_with_fid(
+                fixture.at(),
+                &mid,
+                None,
+                next.clone(),
+                policy,
+                Some(budget),
+            )
+            .expect("queue an original on the old path");
+        let mut standard = next.clone();
+        standard.sequence = 2_001;
+        standard.payload = vec![0x55; 64].into();
+        fixture
+            .connection
+            .write_rtp_bounded(fixture.at(), &mid, None, standard, policy)
+            .expect("queue a scoped standard-layout original on the old path");
+        assert!(fixture.connection.stats().connection.queued_media_bytes > 0);
+        let at = fixture.at();
+        fixture.connection.egress.request_repair(at, primary, 1_001);
+        assert_eq!(
+            fixture
+                .connection
+                .egress
+                .test_retained_repair_pending(primary, 1_001),
+            Some(true)
+        );
+        let sealed_repair = (0..200)
+            .find_map(|_| {
+                let output = fixture.connection.poll(fixture.at());
+                if let Output::Handoff { id, transmit, .. } = output {
+                    assert_eq!(transmit.kind, crate::TransmitKind::Repair { ssrc: repair });
+                    assert_eq!(transmit.payload.len(), 1_216);
+                    return Some(id);
+                }
+                fixture.advance_clock_without_poll(Duration::from_millis(1));
+                None
+            })
+            .expect("repair sealed on the old path, but not yet submitted");
+        assert!(fixture.connection.handoff_pending(sealed_repair));
+        let old = fixture.connection.transport.direct_udp_rtp_epoch().unwrap();
+        fixture
+            .connection
+            .transport
+            .reselect_path_for_test()
+            .unwrap();
+        assert_ne!(
+            fixture.connection.transport.direct_udp_rtp_epoch(),
+            Some(old)
+        );
+
+        assert!(!fixture.connection.handoff_pending(sealed_repair));
+        let committed = fixture.connection.commit.counters.rtp_bytes;
+        assert!(fixture.connection.resolve_handoff(sealed_repair, true));
+        assert_eq!(fixture.connection.commit.counters.rtp_bytes, committed);
+        assert!(!fixture.connection.resolve_handoff(sealed_repair, false));
+        let at = fixture.at();
+        fixture.connection.egress.request_repair(at, primary, 1_001);
+        assert_eq!(
+            fixture
+                .connection
+                .egress
+                .test_retained_repair_pending(primary, 1_001),
+            Some(true),
+            "a repeated request must still encounter the retired layout fence"
+        );
+        fixture.record_transmits();
+        fixture.drive_for(Duration::from_millis(250));
+        assert_eq!(fixture.connection.stats().connection.queued_media_bytes, 0);
+        assert_eq!(
+            fixture
+                .connection
+                .egress
+                .test_retained_repair_pending(primary, 1_001),
+            None
+        );
+        assert!(
+            !fixture
+                .take_transmit_observations()
+                .iter()
+                .any(|(_, kind)| {
+                    matches!(
+                        kind,
+                        crate::TransmitKind::Original { .. } | crate::TransmitKind::Repair { .. }
+                    )
+                })
+        );
+
+        fixture
+            .connection
+            .write_rtp_bounded_with_fid(fixture.at(), &mid, None, next, policy, Some(budget))
+            .expect("fresh admission on the replacement path");
+        let fresh = fixture.receive_video_wire_packet();
+        assert_eq!((fresh.ssrc, fresh.sequence_number), (primary, 2_000));
+        assert!(fresh.ext_vals.mid.is_none() && fresh.wire_bytes <= 1_216);
+    }
+
+    #[test]
+    fn answer_fid_primary_does_not_expand_stock_source_datagrams() {
+        const CAP: usize = 1_216;
+        const GCM_TAG: usize = 16;
+        const FIRST: u64 = 1_000;
+        let mut fixture = PeerFixture::connected_video_with_rfc8888();
+        let mid = fixture.sender_mid.clone();
+        assert!(matches!(
+            fixture.native_media_srtp_profile(&mid),
+            Some(0x0007 | 0x0008)
+        ));
+        let pair = fixture.installed_answer_fid(&mid);
+        let source = fixture.send_stock_h264_keyframe_with_sizes();
+        let policy = crate::BoundedRtp {
+            max_wire_bytes: CAP,
+            max_primary_wire_bytes: None,
+            clock: None,
+            scope: Some(crate::MediaScope::new(std::num::NonZeroU128::MIN)),
+            replace_queued: false,
+        };
+
+        for (i, (packet, source_udp_bytes)) in source.iter().enumerate() {
+            let mut write = rtp_write(packet.clone(), FIRST + u64::try_from(i).unwrap());
+            write.extensions.clear();
+            let observed = source_udp_bytes.checked_sub(GCM_TAG).unwrap();
+            let mut budget = AnswerFidBudget {
+                pair,
+                source_primary_plaintext_bytes: Some(observed),
+            };
+            if i == 0 {
+                // Model the guaranteed bound when none of the incoming header
+                // extensions can be counted toward the output.
+                let (bare, repair) = fixture
+                    .connection
+                    .egress
+                    .plaintext_rtp_sizes(&mid, None, &write, false)
+                    .unwrap();
+                let (with_mid, with_mid_repair) = fixture
+                    .connection
+                    .egress
+                    .plaintext_rtp_sizes(&mid, None, &write, true)
+                    .unwrap();
+                assert!(bare <= observed && with_mid > bare);
+                assert!(with_mid + GCM_TAG <= CAP && with_mid_repair.unwrap() + GCM_TAG <= CAP);
+                assert_eq!(repair, Some(bare + 2));
+                budget.source_primary_plaintext_bytes = Some(bare - 1);
+                let rejected = fixture
+                    .connection
+                    .write_rtp_bounded_with_fid(
+                        fixture.at(),
+                        &mid,
+                        None,
+                        write,
+                        policy,
+                        Some(budget),
+                    )
+                    .expect_err("even below the path ceiling, primary growth is forbidden");
+                assert_eq!(rejected.reason, WriteError::RtpTooLarge);
+                assert_eq!(fixture.connection.stats().connection.queued_media_bytes, 0);
+                write = rejected.packet;
+                budget.source_primary_plaintext_bytes = Some(bare);
+            }
+            fixture
+                .connection
+                .write_rtp_bounded_with_fid(fixture.at(), &mid, None, write, policy, Some(budget))
+                .expect("bounded whole-source remap");
+        }
+        for (i, (_, source_udp_bytes)) in source.iter().enumerate() {
+            let received = fixture.receive_video_wire_packet();
+            assert_eq!(
+                received.sequence_number,
+                u16::try_from(FIRST).unwrap() + u16::try_from(i).unwrap()
+            );
+            assert_eq!(received.ssrc, pair[0]);
+            assert!(received.wire_bytes <= *source_udp_bytes && received.wire_bytes <= CAP);
+            if i == 0 {
+                assert!(received.ext_vals.mid.is_none());
+                assert_eq!(
+                    received.wire_bytes,
+                    12 + source[0].0.payload.len() + GCM_TAG
+                );
+            }
+        }
+        assert!(fixture.receive_video_frame().key_frame);
+    }
+
     #[test]
     fn retired_sender_cleanup_progresses_without_transport_send_readiness() {
         let now = Instant::now();
@@ -1380,7 +2215,8 @@ mod tests {
             .find(|sender| sender.mid.as_ref() == mid.as_str())
             .expect("video sender")
             .ssrc;
-        fixture.connection.egress.request_repair(ssrc, 42);
+        let at = fixture.at();
+        fixture.connection.egress.request_repair(at, ssrc, 42);
         fixture.drive_for(Duration::from_millis(100));
         assert_eq!(
             fixture

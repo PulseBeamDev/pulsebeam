@@ -138,11 +138,10 @@ The existing simulator replay owner also includes distinct focused scenarios:
   one pooled HTTP connection with exactly one POST admission and capacity-one
   receive backpressure through FIN retransmission. SYN and final socket teardown
   retain the simulator's existing semantics; this is not general TCP qualification.
-- `tests::video::marker_only_simulcast_reaches_native_decoded_video_test`:
-  marker-only three-rung ingress to a DD-capable receiver, requiring at least 150
-  fresh changing 720p native I420 frames in a ten-second world and native decoder
-  progress. The added witness executed in 8.99 seconds excluding build time; it is
-  not a throughput benchmark. The separate raw encoded-frame oracle is unchanged.
+- `tests::video::whole_source_fabric_h264_reaches_native_decoder` and its
+  same-shard counterpart check decoded 720p H.264 from a single encoding without
+  a dependency descriptor. Native State rejects simulcast publications that do
+  not negotiate the dependency descriptor.
 
 ## Acceptance and distribution limits
 

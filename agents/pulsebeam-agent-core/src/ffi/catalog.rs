@@ -47,7 +47,6 @@ pub struct CatalogPublicationInfo {
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct CatalogParticipantInfo {
     pub id: String,
-    pub data_recipient_id: Option<String>,
     pub publications: Vec<CatalogPublicationInfo>,
 }
 

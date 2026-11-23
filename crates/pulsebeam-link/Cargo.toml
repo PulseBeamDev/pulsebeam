@@ -14,7 +14,7 @@ workspace = true
 
 [dependencies]
 pulsebeam-queue = { path = "../pulsebeam-queue" }
-pulsebeam-transport = { path = "../pulsebeam-transport" }
+pulsebeam-transport = { path = "../pulsebeam-transport", features = ["dtls-srtp"] }
 
 futures-lite.workspace = true
 

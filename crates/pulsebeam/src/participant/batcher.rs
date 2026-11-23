@@ -24,9 +24,23 @@ pub trait NetworkEgress {
     fn flush(&mut self) -> bool;
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Handoff {
+    pub participant: crate::keys::ParticipantHandle,
+    pub branch: crate::shard::router::FabricLocalBranch,
+    pub ingress: Option<std::num::NonZeroU64>,
+    pub id: u64,
+}
+
+pub(crate) struct Submission {
+    pub accepted: usize,
+    pub handoffs: ArrayVec<(Handoff, bool), { net::BATCH_SIZE }>,
+}
+
 struct OwnedPacket {
     dst: SocketAddr,
     contents: Vec<u8>,
+    handoff: Option<Handoff>,
 }
 
 impl OwnedPacketQueue {
@@ -39,6 +53,15 @@ impl OwnedPacketQueue {
     }
 
     pub fn push_back(&mut self, dst: SocketAddr, contents: Vec<u8>) -> bool {
+        self.push_with_handoff(dst, contents, None)
+    }
+
+    pub(crate) fn push_with_handoff(
+        &mut self,
+        dst: SocketAddr,
+        contents: Vec<u8>,
+        handoff: Option<Handoff>,
+    ) -> bool {
         if self.is_full() {
             return false;
         }
@@ -47,7 +70,11 @@ impl OwnedPacketQueue {
             contents.len() <= net::MAX_UDP_GSO_PAYLOAD_SIZE,
             "Packet exceeds the maximum framed payload"
         );
-        self.packets.push_back(OwnedPacket { dst, contents });
+        self.packets.push_back(OwnedPacket {
+            dst,
+            contents,
+            handoff,
+        });
         true
     }
 
@@ -62,6 +89,13 @@ impl OwnedPacketQueue {
     pub fn is_empty(&self) -> bool {
         self.packets.is_empty()
     }
+
+    #[cfg(test)]
+    pub(crate) fn pop_packet(&mut self) -> Option<(SocketAddr, Vec<u8>)> {
+        self.packets
+            .pop_front()
+            .map(|packet| (packet.dst, packet.contents))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -70,6 +104,7 @@ struct GsoPacketMeta {
     segment_size: usize,
     start: usize,
     end: usize,
+    handoff: Option<Handoff>,
 }
 
 #[derive(Default)]
@@ -115,6 +150,7 @@ impl GsoSendBatch {
         }
 
         let dst = first.dst;
+        let handoff = first.handoff;
         let segment_size = first.contents.len();
         let start = self.arena.len();
         let mut segment_count = 0;
@@ -128,7 +164,10 @@ impl GsoSendBatch {
             debug_assert!(segment_count <= queue.max_segments);
             debug_assert!(self.arena.len().saturating_sub(start) <= net::MAX_UDP_GSO_PAYLOAD_SIZE);
 
+            // A revocable datagram cannot share a GSO submission with
+            // datagrams whose authority and outcomes are independent.
             if packet.dst != dst
+                || (segment_count != 0 && (handoff.is_some() || packet.handoff.is_some()))
                 || segment_count >= queue.max_segments
                 || self
                     .arena
@@ -159,17 +198,41 @@ impl GsoSendBatch {
             segment_size,
             start,
             end,
+            handoff,
         });
         true
     }
 
-    pub fn flush(&mut self, socket: &mut pulsebeam_udp::UdpSocket) -> bool {
-        if self.packets.is_empty() {
-            return false;
-        }
-        debug_assert!(self.packets.len() <= net::BATCH_SIZE);
+    pub(crate) fn flush_checked(
+        &mut self,
+        socket: &mut pulsebeam_udp::UdpSocket,
+        authorized: impl FnMut(Handoff) -> bool,
+    ) -> Submission {
+        self.submit(authorized, |packets| {
+            let report = socket.try_send_batch(packets);
+            if report.accepted < packets.len() {
+                tracing::trace!(
+                    accepted = report.accepted,
+                    offered = packets.len(),
+                    stop = ?report.stop,
+                    "UDP egress suffix discarded"
+                );
+            }
+            report.accepted
+        })
+    }
+
+    pub(crate) fn submit(
+        &mut self,
+        mut authorized: impl FnMut(Handoff) -> bool,
+        send: impl FnOnce(&[pulsebeam_udp::SendDatagram<'_>]) -> usize,
+    ) -> Submission {
         let mut packets = ArrayVec::<pulsebeam_udp::SendDatagram<'_>, { net::BATCH_SIZE }>::new();
-        for packet in &self.packets {
+        let mut submitted = ArrayVec::<usize, { net::BATCH_SIZE }>::new();
+        for (index, packet) in self.packets.iter().enumerate() {
+            if packet.handoff.is_some_and(|handoff| !authorized(handoff)) {
+                continue;
+            }
             debug_assert!(packet.start < packet.end);
             debug_assert!(packet.end <= self.arena.len());
             debug_assert_ne!(packet.segment_size, 0);
@@ -177,6 +240,7 @@ impl GsoSendBatch {
                 debug_assert!(false, "queued packet escapes the arena");
                 continue;
             };
+            submitted.push(index);
             packets.push(pulsebeam_udp::SendDatagram {
                 destination: packet.dst,
                 payload: buf,
@@ -189,33 +253,32 @@ impl GsoSendBatch {
                     .flatten(),
             });
         }
-        let report = socket.try_send_batch(&packets);
+        let accepted = if packets.is_empty() {
+            0
+        } else {
+            send(&packets).min(packets.len())
+        };
         drop(packets);
-        self.account_submission(report.accepted);
-        if report.accepted < self.packets.len() {
-            tracing::trace!(
-                accepted = report.accepted,
-                offered = self.packets.len(),
-                stop = ?report.stop,
-                "UDP egress suffix discarded"
-            );
-        }
-        // RTC output is irrevocable. The host discards the unsubmitted suffix
-        // as local loss, never credits it as submitted and never replays it.
-        self.packets.clear();
-        self.arena.clear();
-        report.accepted != 0
-    }
-
-    fn account_submission(&mut self, accepted: usize) {
-        debug_assert!(accepted <= self.packets.len());
+        let mut submission = Submission {
+            accepted,
+            handoffs: ArrayVec::new(),
+        };
+        let mut accepted_indexes = submitted.iter().take(accepted).copied().peekable();
         for (index, packet) in self.packets.iter().enumerate() {
+            let accepted = accepted_indexes.next_if_eq(&index).is_some();
+            if let Some(handoff) = packet.handoff {
+                submission.handoffs.push((handoff, accepted));
+                #[cfg(feature = "sim")]
+                if accepted {
+                    crate::sim_metrics::record_fabric_udp_submission(packet.segment_size);
+                }
+            }
             let bytes = packet.end.saturating_sub(packet.start) as u64;
             let datagrams = packet
                 .end
                 .saturating_sub(packet.start)
                 .div_ceil(packet.segment_size) as u64;
-            if index < accepted {
+            if accepted {
                 self.counters.submitted_bytes = self.counters.submitted_bytes.saturating_add(bytes);
                 self.counters.submitted_datagrams =
                     self.counters.submitted_datagrams.saturating_add(datagrams);
@@ -225,6 +288,9 @@ impl GsoSendBatch {
                     self.counters.discarded_datagrams.saturating_add(datagrams);
             }
         }
+        self.packets.clear();
+        self.arena.clear();
+        submission
     }
 }
 
@@ -244,11 +310,61 @@ mod tests {
         let mut batch = GsoSendBatch::preallocated();
         assert!(batch.append_from(&mut queue));
         assert!(batch.append_from(&mut queue));
-        batch.account_submission(1);
+        let result = batch.submit(
+            |_| unreachable!(),
+            |offered| {
+                assert_eq!(offered.len(), 2);
+                1
+            },
+        );
+        assert_eq!(result.accepted, 1);
         assert_eq!(batch.counters.submitted_datagrams, 2);
         assert_eq!(batch.counters.submitted_bytes, 1037);
         assert_eq!(batch.counters.discarded_datagrams, 1);
         assert_eq!(batch.counters.discarded_bytes, 400);
+    }
+
+    #[test]
+    fn revocation_and_a_short_udp_prefix_resolve_exact_handoffs() {
+        let participant = slotmap::SlotMap::with_key().insert(());
+        let branch = crate::shard::router::FabricLocalBranch::for_test();
+        let ticket = |id| Handoff {
+            participant,
+            branch,
+            ingress: None,
+            id,
+        };
+        let addr = create_test_addr();
+        let mut queue = OwnedPacketQueue::with_capacity(4);
+        for id in 1..=3 {
+            assert!(queue.push_with_handoff(
+                addr,
+                vec![u8::try_from(id).unwrap(); 400],
+                Some(ticket(id))
+            ));
+        }
+        assert!(queue.push_back(addr, vec![4; 400]));
+        assert!(queue.push_back(addr, vec![5; 400]));
+        let mut batch = GsoSendBatch::preallocated();
+        while batch.append_from(&mut queue) {}
+        let result = batch.submit(
+            |handoff| handoff.id != 1,
+            |offered| {
+                assert_eq!(offered.len(), 3);
+                assert_eq!(offered[0].payload, [2; 400]);
+                assert_eq!(offered[1].payload, [3; 400]);
+                assert_eq!(offered[2].gso_segment_size.unwrap().get(), 400);
+                1
+            },
+        );
+        assert_eq!(result.accepted, 1);
+        assert_eq!(
+            result.handoffs.as_slice(),
+            &[(ticket(1), false), (ticket(2), true), (ticket(3), false)]
+        );
+        assert_eq!(batch.counters.submitted_datagrams, 1);
+        assert_eq!(batch.counters.discarded_datagrams, 4);
+        assert!(batch.is_empty());
     }
 
     fn create_test_addr() -> SocketAddr {

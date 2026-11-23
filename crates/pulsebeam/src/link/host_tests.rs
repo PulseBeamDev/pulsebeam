@@ -17,9 +17,7 @@ fn retained_input_cannot_cross_an_endpoint_replacement() {
         class: NetworkClass::Lan,
     };
     let mut control = LinkControl::new(|| LinkTime::from_nanos(0)).unwrap();
-    let codec = || crate::link::ShardCodec {
-        origin: Instant::now(),
-    };
+    let codec = || crate::link::ReverseCodec;
     let old = control.open_network(peer(), codec()).unwrap();
     control.close_network(old);
     let replacement = control.open_network(peer(), codec()).unwrap();
@@ -95,7 +93,7 @@ fn busy_quic_input_does_not_block_another_peers_real_dtls_handshake() {
                 class: NetworkClass::Lan,
                 tuning: QuicTuning::default(),
             },
-            crate::link::ShardCodec { origin },
+            crate::link::ReverseCodec,
         )
         .unwrap();
     let ready = control
@@ -107,7 +105,7 @@ fn busy_quic_input_does_not_block_another_peers_real_dtls_handshake() {
                 role: PeerRole::Responder,
                 class: NetworkClass::Lan,
             },
-            crate::link::ShardCodec { origin },
+            crate::link::ReverseCodec,
         )
         .unwrap();
     let mut blocked_driver = control.take_network_driver(blocked).unwrap();
@@ -140,7 +138,7 @@ fn busy_quic_input_does_not_block_another_peers_real_dtls_handshake() {
                 role: PeerRole::Initiator,
                 class: NetworkClass::Lan,
             },
-            crate::link::ShardCodec { origin },
+            crate::link::ReverseCodec,
         )
         .unwrap();
     let mut client = client_control.take_network_driver(client).unwrap();

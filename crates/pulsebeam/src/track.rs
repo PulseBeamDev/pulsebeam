@@ -329,6 +329,11 @@ impl UpstreamTrackLayer {
     }
 
     fn process_normalized(&mut self, pkt: &RtpPacket, facts: StreamFacts) {
+        self.apply_stream_facts(facts);
+        self.monitor.process_packet(pkt);
+    }
+
+    fn apply_stream_facts(&mut self, facts: StreamFacts) {
         if let Some(count) = facts.decode_targets {
             self.monitor.set_decode_target_count(count);
         }
@@ -338,7 +343,6 @@ impl UpstreamTrackLayer {
         if let Some(temporal_only) = facts.temporal_only {
             self.monitor.set_temporal_only(temporal_only);
         }
-        self.monitor.process_packet(pkt);
     }
 
     #[cfg(test)]
@@ -584,6 +588,48 @@ impl TrackMonitor {
         }
     }
 
+    pub(crate) fn measure_fabric_structure(
+        &mut self,
+        ssrc: Ssrc,
+        rid: Option<Rid>,
+        facts: StreamFacts,
+    ) {
+        if let Some(encoding) = self
+            .encodings
+            .iter_mut()
+            .find(|encoding| encoding.encoding.matches(ssrc, rid))
+        {
+            encoding.apply_stream_facts(facts);
+        }
+    }
+
+    /// Measure the authenticated primary stream for allocation. Fabric owns
+    /// dependency qualification and delivery independently of these samples.
+    /// Returns whether this live encoding still needs a geometry declaration.
+    pub(crate) fn measure_fabric(&mut self, rid: Option<Rid>, packet: &RtpPacket) -> bool {
+        let Some(index) = self
+            .encodings
+            .iter()
+            .position(|encoding| encoding.encoding.matches(packet.ssrc, rid))
+        else {
+            return false;
+        };
+        if let Some(vla) = packet.ext_vals.video_layers_allocation().cloned() {
+            if let Some(encoding) = self.encodings.get_mut(index) {
+                encoding.normalizer.learn_vla_index(packet);
+            }
+            for encoding in &mut self.encodings {
+                encoding.apply_vla(&vla);
+            }
+        }
+        let Some(encoding) = self.encodings.get_mut(index) else {
+            return false;
+        };
+        encoding.monitor.process_packet(packet);
+        let stats = encoding.monitor.stats();
+        !stats.is_inactive() && stats.observed_height == 0 && stats.decode_target_heights[0] == 0
+    }
+
     fn process_normalized(
         &mut self,
         index: usize,
@@ -686,6 +732,7 @@ pub struct VideoTrack {
 #[derive(Debug, Clone)]
 pub struct DataTrack {
     pub meta: TrackMeta,
+    pub(crate) fabric_source: Option<std::num::NonZeroU64>,
     pub topic: Option<crate::track::Topic>,
     pub lane: crate::track::DataLane,
     pub reverse: Option<crate::route::NodeRouteAddress>,
@@ -786,18 +833,35 @@ impl Track {
         Self::Data(DataTrack {
             meta,
             topic: Some(topic),
+            fabric_source: None,
             lane,
             reverse,
         })
     }
 
     pub(crate) fn data_publication(meta: TrackMeta, lane: DataLane) -> Self {
+        Self::native_data_publication(meta, lane, None)
+    }
+
+    pub(crate) fn native_data_publication(
+        meta: TrackMeta,
+        lane: DataLane,
+        fabric_source: Option<std::num::NonZeroU64>,
+    ) -> Self {
         Self::Data(DataTrack {
             meta,
             topic: None,
+            fabric_source,
             lane,
             reverse: None,
         })
+    }
+
+    pub(crate) fn fabric_data_source(&self) -> Option<std::num::NonZeroU64> {
+        match self {
+            Self::Data(track) => track.fabric_source,
+            _ => None,
+        }
     }
 
     pub fn meta(&self) -> &TrackMeta {
@@ -851,14 +915,7 @@ impl Track {
     }
 
     pub fn requires_reverse_route(&self) -> bool {
-        matches!(
-            self,
-            Self::Video(_)
-                | Self::Data(DataTrack {
-                    lane: DataLane::Ordered,
-                    ..
-                })
-        )
+        matches!(self, Self::Video(_))
     }
 
     pub fn layers(&self) -> &[TrackLayer] {
@@ -1149,59 +1206,10 @@ pub mod test_utils {
 mod data_track {
     use std::fmt::Display;
 
-    use crate::media::{ChannelConfig, Reliability};
-    use pulsebeam_rtc::{DataChannelId, DataChannelPriority};
-
-    const MAX_DATA_TRACK_NAMESPACE_LEN: usize = 104;
-
-    pub const MAX_DATA_TOPIC_CHANNELS: usize = 64;
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-    pub enum DataTrackDirection {
-        Publish,
-        Subscribe,
-    }
-
-    impl Display for DataTrackDirection {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self {
-                DataTrackDirection::Publish => f.write_str("pub"),
-                DataTrackDirection::Subscribe => f.write_str("sub"),
-            }
-        }
-    }
-
     #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-    /// A data-channel topic name.
-    ///
-    /// An owned `String`, deliberately. `Arc<str>` would make the two clones
-    /// per cross-shard data frame refcount bumps instead of allocations, but a
-    /// topic travels between shards on the control plane, so those bumps would
-    /// land on a count another core holds — trading a core-local malloc for
-    /// cross-core traffic, which is the wrong direction.
-    ///
-    /// The clones are not inherent: they exist only to build lookup keys, and a
-    /// dense key in `RouteAction::Unreliable` removes them the way `TrackHandle`
-    /// did for video. Fix the cause, not the symptom.
     pub struct Topic(String);
 
     impl Topic {
-        pub(crate) fn parse(value: &str) -> Result<Self, DataTrackIntentError> {
-            if value.is_empty() {
-                return Err(DataTrackIntentError::MissingLabel);
-            }
-            if value.len() > 85 {
-                return Err(DataTrackIntentError::LabelTooLong);
-            }
-            if !value
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-            {
-                return Err(DataTrackIntentError::IllegalCharacters);
-            }
-            Ok(Self(value.to_string()))
-        }
-
         #[cfg(test)]
         pub fn for_test(topic: &str) -> Self {
             Self(topic.to_string())
@@ -1260,346 +1268,6 @@ mod data_track {
     /// contain a separator, so (mode, topic) has an unambiguous routing label.
     pub fn publication_label(lane: DataLane, topic: &crate::track::Topic) -> String {
         format!("v2/{}/{}", lane.as_str(), topic)
-    }
-
-    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-    pub struct DataTopicChannel {
-        pub direction: DataTrackDirection,
-        pub topic: crate::track::Topic,
-        pub lane: DataLane,
-    }
-
-    impl Display for DataTopicChannel {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(
-                f,
-                "v2/{}/{}/{}",
-                self.lane.as_str(),
-                self.direction,
-                self.topic
-            )
-        }
-    }
-
-    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-    pub enum DataTrackIntent {
-        InternalSignaling,
-        UserTopic(DataTopicChannel),
-    }
-
-    #[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
-    pub enum DataTrackIntentError {
-        #[error("The input string exceeds the maximum permitted security boundary size")]
-        LabelTooLong,
-
-        #[error("Invalid API version (expected v1 system signaling or v2 topic channels)")]
-        InvalidVersion,
-
-        #[error("Invalid topic mode (expected latest, lossy, or ordered)")]
-        InvalidLane,
-
-        #[error("Invalid routing direction parameter (expected 'pub' or 'sub')")]
-        InvalidDirection,
-
-        #[error("The target user asset label component is missing or empty")]
-        MissingLabel,
-
-        #[error(
-            "Unsupported data channel configuration for label '{label}': delivery does not match mode, got ordered={ordered}, reliability={reliability:?}"
-        )]
-        UnsupportedDataChannelConfig {
-            label: String,
-            ordered: bool,
-            reliability: Reliability,
-        },
-
-        #[error(
-            "The label contains illegal characters (only alphanumeric, dashes, and underscores allowed)"
-        )]
-        IllegalCharacters,
-
-        #[error("Topic channels cannot carry a publisher scope segment")]
-        ScopeNotAllowed,
-    }
-
-    impl DataTrackIntent {
-        pub(crate) fn native_signaling_config() -> ChannelConfig {
-            ChannelConfig {
-                id: Some(DataChannelId::from_value(0)),
-                label: "v1/sys/signaling".into(),
-                protocol: "".into(),
-                ordered: true,
-                reliability: Reliability::Reliable,
-                priority: DataChannelPriority::LOW,
-                negotiated: true,
-            }
-        }
-    }
-
-    impl TryFrom<&ChannelConfig> for DataTrackIntent {
-        type Error = DataTrackIntentError;
-
-        fn try_from(cfg: &ChannelConfig) -> Result<Self, Self::Error> {
-            let s = &cfg.label;
-            if s.len() > MAX_DATA_TRACK_NAMESPACE_LEN {
-                return Err(DataTrackIntentError::LabelTooLong);
-            }
-
-            let mut parts = s.splitn(5, '/');
-
-            let version = parts.next();
-            if !matches!(version, Some("v1" | "v2")) {
-                return Err(DataTrackIntentError::InvalidVersion);
-            }
-
-            match parts.next() {
-                Some("sys") if version == Some("v1") => {
-                    if parts.next() == Some("signaling") && parts.next().is_none() {
-                        Ok(Self::InternalSignaling)
-                    } else {
-                        Err(DataTrackIntentError::InvalidDirection)
-                    }
-                }
-                lane_str @ (Some("latest") | Some("lossy") | Some("ordered"))
-                    if version == Some("v2") =>
-                {
-                    let lane = match lane_str {
-                        Some("ordered") => DataLane::Ordered,
-                        Some("lossy") => DataLane::Lossy,
-                        _ => DataLane::Latest,
-                    };
-
-                    let supported_delivery_guarantee =
-                        matches!(cfg.reliability, Reliability::MaxRetransmits(0)) && !cfg.ordered;
-                    if !supported_delivery_guarantee {
-                        return Err(DataTrackIntentError::UnsupportedDataChannelConfig {
-                            label: s.to_string(),
-                            ordered: cfg.ordered,
-                            reliability: cfg.reliability,
-                        });
-                    }
-
-                    let direction = match parts.next() {
-                        Some("pub") => DataTrackDirection::Publish,
-                        Some("sub") => DataTrackDirection::Subscribe,
-                        _ => return Err(DataTrackIntentError::InvalidDirection),
-                    };
-
-                    let topic_slice = parts.next().ok_or(DataTrackIntentError::MissingLabel)?;
-                    let topic = Topic::parse(topic_slice)?;
-
-                    if parts.next().is_some() {
-                        return Err(DataTrackIntentError::ScopeNotAllowed);
-                    }
-
-                    let topic = DataTopicChannel {
-                        direction,
-                        topic,
-                        lane,
-                    };
-                    Ok(Self::UserTopic(topic))
-                }
-                _ => Err(DataTrackIntentError::InvalidLane),
-            }
-        }
-    }
-
-    #[cfg(test)]
-    mod test {
-        // Convenience only: a test is not a shard, so nothing here is
-        // cross-core, and a fixture may read the host clock. Allowed at the
-        // module, never the file, so it cannot drift over production code
-        // sharing it. See crates/pulsebeam/docs/thread-per-core.md.
-        use std::ops::Deref;
-
-        use super::*;
-
-        fn cfg(label: &str) -> ChannelConfig {
-            ChannelConfig {
-                label: label.into(),
-                ordered: false,
-                reliability: Reliability::MaxRetransmits(0),
-                negotiated: false,
-                id: None,
-                priority: pulsebeam_rtc::DataChannelPriority::MEDIUM,
-                protocol: "".into(),
-            }
-        }
-
-        fn reliable_cfg(label: &str) -> ChannelConfig {
-            ChannelConfig {
-                label: label.into(),
-                ordered: true,
-                reliability: Reliability::Reliable,
-                negotiated: false,
-                id: None,
-                priority: pulsebeam_rtc::DataChannelPriority::MEDIUM,
-                protocol: "".into(),
-            }
-        }
-
-        #[test]
-        fn test_modern_system_routing() {
-            let res = DataTrackIntent::try_from(&cfg("v1/sys/signaling")).unwrap();
-            assert!(matches!(res, DataTrackIntent::InternalSignaling));
-        }
-
-        #[test]
-        fn test_invalid_system_channels() {
-            // Unknown system channel
-            let err = DataTrackIntent::try_from(&cfg("v1/sys/metrics")).unwrap_err();
-            assert_eq!(err, DataTrackIntentError::InvalidDirection);
-
-            // Malformed layout trailing after signaling
-            let err = DataTrackIntent::try_from(&cfg("v1/sys/signaling/extra")).unwrap_err();
-            assert_eq!(err, DataTrackIntentError::InvalidDirection);
-        }
-
-        #[test]
-        fn test_valid_user_topics() {
-            let res = DataTrackIntent::try_from(&cfg("v2/latest/pub/game-sync")).unwrap();
-            if let DataTrackIntent::UserTopic(e) = res {
-                assert_eq!(e.direction, DataTrackDirection::Publish);
-                assert_eq!(e.topic.deref(), "game-sync");
-                assert_eq!(e.lane, DataLane::Latest);
-            } else {
-                panic!("Expected UserTopic variant");
-            }
-
-            let res = DataTrackIntent::try_from(&cfg("v2/latest/sub/audio_stream_12")).unwrap();
-            if let DataTrackIntent::UserTopic(e) = res {
-                assert_eq!(e.direction, DataTrackDirection::Subscribe);
-                assert_eq!(e.topic.deref(), "audio_stream_12");
-                assert_eq!(e.lane, DataLane::Latest);
-            } else {
-                panic!("Expected UserTopic variant");
-            }
-        }
-
-        #[test]
-        fn test_ordered_publish() {
-            let res = DataTrackIntent::try_from(&cfg("v2/ordered/pub/chat")).unwrap();
-            if let DataTrackIntent::UserTopic(e) = res {
-                assert_eq!(e.direction, DataTrackDirection::Publish);
-                assert_eq!(e.topic.deref(), "chat");
-                assert_eq!(e.lane, DataLane::Ordered);
-            } else {
-                panic!("Expected UserTopic variant");
-            }
-        }
-
-        #[test]
-        fn test_ordered_subscribe_is_topic_wide() {
-            let res = DataTrackIntent::try_from(&cfg("v2/ordered/sub/chat")).unwrap();
-            let DataTrackIntent::UserTopic(channel) = res else {
-                panic!("Expected UserTopic variant");
-            };
-            assert_eq!(channel.direction, DataTrackDirection::Subscribe);
-            assert_eq!(channel.topic.deref(), "chat");
-            assert_eq!(channel.lane, DataLane::Ordered);
-        }
-
-        #[test]
-        fn all_topic_modes_reject_transport_recovery_and_ordering() {
-            for mode in ["latest", "lossy", "ordered"] {
-                for direction in ["pub", "sub"] {
-                    let label = format!("v2/{mode}/{direction}/chat");
-                    let mut ordered = cfg(&label);
-                    ordered.ordered = true;
-                    let mut retransmitting = cfg(&label);
-                    retransmitting.reliability = Reliability::MaxRetransmits(1);
-                    for config in [reliable_cfg(&label), ordered, retransmitting] {
-                        assert!(matches!(
-                            DataTrackIntent::try_from(&config),
-                            Err(DataTrackIntentError::UnsupportedDataChannelConfig { .. })
-                        ));
-                    }
-                }
-            }
-        }
-
-        #[test]
-        fn test_ordered_display() {
-            let pub_ch = DataTopicChannel {
-                direction: DataTrackDirection::Publish,
-                topic: Topic("chat".to_string()),
-                lane: DataLane::Ordered,
-            };
-            assert_eq!(pub_ch.to_string(), "v2/ordered/pub/chat");
-
-            let sub_ch = DataTopicChannel {
-                direction: DataTrackDirection::Subscribe,
-                topic: Topic("chat".to_string()),
-                lane: DataLane::Ordered,
-            };
-            assert_eq!(sub_ch.to_string(), "v2/ordered/sub/chat");
-        }
-
-        #[test]
-        fn topic_channels_reject_all_publisher_scope_segments() {
-            for mode in ["latest", "lossy", "ordered"] {
-                for direction in ["pub", "sub"] {
-                    for scope in ["", "publisher", "publisher/trailing"] {
-                        let label = format!("v2/{mode}/{direction}/game-sync/{scope}");
-                        let config = cfg(&label);
-                        assert_eq!(
-                            DataTrackIntent::try_from(&config),
-                            Err(DataTrackIntentError::ScopeNotAllowed)
-                        );
-                    }
-                }
-            }
-        }
-
-        #[test]
-        fn test_invalid_version_and_lane() {
-            // Bad version prefix
-            let err = DataTrackIntent::try_from(&cfg("v0/latest/pub/topic")).unwrap_err();
-            assert_eq!(err, DataTrackIntentError::InvalidVersion);
-
-            // Unknown lane
-            let err = DataTrackIntent::try_from(&cfg("v1/data/pub/topic")).unwrap_err();
-            assert_eq!(err, DataTrackIntentError::InvalidLane);
-        }
-
-        #[test]
-        fn test_invalid_direction() {
-            let err = DataTrackIntent::try_from(&cfg("v2/latest/broadcast/topic")).unwrap_err();
-            assert_eq!(err, DataTrackIntentError::InvalidDirection);
-        }
-
-        #[test]
-        fn test_missing_or_empty_label() {
-            let err = DataTrackIntent::try_from(&cfg("v2/latest/pub/")).unwrap_err();
-            assert_eq!(err, DataTrackIntentError::MissingLabel);
-
-            let err = DataTrackIntent::try_from(&cfg("v2/latest/pub")).unwrap_err();
-            assert_eq!(err, DataTrackIntentError::MissingLabel);
-        }
-
-        #[test]
-        fn test_illegal_characters() {
-            let err = DataTrackIntent::try_from(&cfg("v2/latest/pub/game/engine")).unwrap_err();
-            assert_eq!(err, DataTrackIntentError::ScopeNotAllowed);
-
-            // Spaces and symbols
-            let err = DataTrackIntent::try_from(&cfg("v2/latest/pub/my topic")).unwrap_err();
-            assert_eq!(err, DataTrackIntentError::IllegalCharacters);
-
-            let err = DataTrackIntent::try_from(&cfg("v2/latest/pub/topic$")).unwrap_err();
-            assert_eq!(err, DataTrackIntentError::IllegalCharacters);
-        }
-
-        #[test]
-        fn test_max_length_boundary() {
-            let exact_valid = format!("v2/latest/pub/{}", "a".repeat(85));
-            assert!(DataTrackIntent::try_from(&cfg(&exact_valid)).is_ok());
-
-            // 1 byte over limit
-            let one_byte_over = format!("v2/latest/pub/{}", "a".repeat(86));
-            let err = DataTrackIntent::try_from(&cfg(&one_byte_over)).unwrap_err();
-            assert_eq!(err, DataTrackIntentError::LabelTooLong);
-        }
     }
 }
 

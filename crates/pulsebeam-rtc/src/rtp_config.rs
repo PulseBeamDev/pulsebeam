@@ -54,6 +54,8 @@ pub struct RtcpParameters {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RtpBinding {
+    /// Actual negotiated form. Omission inherits existing SDP facts where present.
+    pub extmap_allow_mixed: Option<bool>,
     pub mid: String,
     pub kind: MediaKind,
     pub codec: RtpCodec,
@@ -285,14 +287,35 @@ impl PhysicalBinding {
         let binding = &self.binding;
         let codec = &binding.codec;
         let encoding = self.encoding();
+        let name = codec.parameters.name.to_ascii_lowercase().into_boxed_str();
+        let profile = match name.as_ref() {
+            "opus" => Some(crate::CodecProfile::Opus),
+            "h264" => Some(crate::CodecProfile::H264 {
+                profile_level_id: codec
+                    .parameters
+                    .fmtp
+                    .get("profile-level-id")
+                    .and_then(|value| u32::from_str_radix(value, 16).ok()),
+                packetization_mode: 1,
+                level_asymmetry_allowed: codec
+                    .parameters
+                    .fmtp
+                    .get("level-asymmetry-allowed")
+                    .is_some_and(|value| value == "1"),
+            }),
+            "av1" => av1_profile(&codec.parameters.fmtp),
+            _ => None,
+        };
         crate::negotiation::IngressMediaFacts {
             kind: binding.kind,
             rtcp: Some(binding.rtcp.clone()),
             mid: binding.mid.clone().into_boxed_str(),
-            payloads: vec![crate::RtpPayloadInfo {
+            payloads: vec![crate::RtpReceiveCodec {
                 payload_type: codec.payload_type,
-                name: codec.parameters.name.to_ascii_lowercase().into_boxed_str(),
+                name,
                 clock_rate: codec.parameters.clock_rate,
+                channels: codec.parameters.channels,
+                profile,
             }]
             .into_boxed_slice(),
             feedback_payloads: vec![codec.payload_type].into_boxed_slice(),
@@ -320,8 +343,9 @@ impl PhysicalBinding {
             extensions: binding
                 .extensions
                 .iter()
-                .map(|e| (e.id, e.uri.clone().into_boxed_str()))
+                .map(|e| crate::RtpReceiveExtension::without_attributes(e.id, e.uri.as_str()))
                 .collect(),
+            allow_mixed_extensions: binding.extmap_allow_mixed.unwrap_or(false),
         }
     }
     pub(crate) fn egress_facts(
@@ -346,6 +370,7 @@ impl PhysicalBinding {
             dependency_extension_id: crate::negotiation::DEPENDENCY_URIS
                 .iter()
                 .find_map(|uri| self.extension_id(uri)),
+            allow_mixed_extensions: self.binding.extmap_allow_mixed.unwrap_or(false),
             forwarded_extensions: self
                 .binding
                 .extensions
@@ -422,13 +447,17 @@ pub(crate) struct RtpActivityUpdate {
 }
 
 impl RtpCapabilities {
+    /// Check whether a single-encoding stock video offer opts into this RFC 8888
+    /// profile. This is a capability selection check, not full SDP admission.
+    pub fn matches_single_video_rfc8888_offer(&self, offer: &crate::SdpOffer) -> bool {
+        self.feedback == PacketFeedbackKind::Rfc8888
+            && crate::negotiation::matches_single_video_rfc8888_offer(offer, self)
+    }
+
     pub(crate) fn validate(&self) -> Result<usize, RtpConfigurationError> {
         let bytes = storage::capability_bytes(self)
             .filter(|bytes| *bytes <= self.limits.max_live_metadata_bytes)
             .ok_or(RtpConfigurationError::Capacity)?;
-        if self.feedback != PacketFeedbackKind::TransportWide {
-            return Err(RtpConfigurationError::Unsupported);
-        }
         for codec in &self.codecs {
             validate_codec(&codec.parameters)?;
         }
@@ -787,6 +816,7 @@ impl RtpConfigurationState {
                 let mut identity = encoding.clone();
                 identity.active = true;
                 let physical = RtpBinding {
+                    extmap_allow_mixed: record.binding.extmap_allow_mixed,
                     mid: record.binding.mid.clone(),
                     kind: record.binding.kind,
                     codec: record.binding.codec.clone(),
@@ -860,6 +890,7 @@ impl RtpConfigurationState {
             && binding.kind == physical.binding.kind
             && binding.codec == physical.binding.codec
             && binding.rtcp == physical.binding.rtcp
+            && binding.extmap_allow_mixed == physical.binding.extmap_allow_mixed
             && encoding.primary == incoming.primary
             && encoding.repair == incoming.repair
             && encoding.rid == incoming.rid
@@ -1016,6 +1047,13 @@ impl RtpConfigurationState {
         self.initialized = true;
     }
 
+    pub(crate) fn is_typed_inbound_primary(&self, primary: u32) -> bool {
+        self.live
+            .get(&primary)
+            .and_then(|location| self.records.get(&location.record))
+            .is_some_and(|record| !record.outbound)
+    }
+
     pub(crate) fn snapshot(&self) -> Option<RtpConfiguration> {
         if !self.initialized {
             return None;
@@ -1110,12 +1148,17 @@ fn validate_binding(
             return Err(Error::Unsupported);
         }
     }
-    if !uris.contains(MID_EXTENSION)
-        || !crate::negotiation::TWCC_URIS
-            .iter()
-            .any(|uri| uris.contains(uri))
-        || !binding.codec.parameters.feedback.contains("transport-cc")
-    {
+    let has_twcc = crate::negotiation::TWCC_URIS
+        .iter()
+        .any(|uri| uris.contains(uri));
+    let feedback = &binding.codec.parameters.feedback;
+    let matches_feedback = match caps.feedback {
+        PacketFeedbackKind::TransportWide => has_twcc && feedback.contains("transport-cc"),
+        PacketFeedbackKind::Rfc8888 => {
+            !has_twcc && !feedback.contains("transport-cc") && feedback.contains("ack ccfb")
+        }
+    };
+    if !uris.contains(MID_EXTENSION) || !matches_feedback {
         return Err(Error::Unsupported);
     }
     let mut rids = BTreeSet::new();
@@ -1148,6 +1191,34 @@ fn identifier(value: &str) -> bool {
 fn attribute_value(value: &str) -> bool {
     !value.is_empty() && value.len() <= 1024 && !value.chars().any(char::is_whitespace)
 }
+pub(crate) fn av1_profile(fmtp: &BTreeMap<String, String>) -> Option<crate::CodecProfile> {
+    fn field(value: &str) -> Option<u8> {
+        value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit())
+            .then(|| value.parse().ok())
+            .flatten()
+    }
+
+    // AOMedia RTP v1.0.0 §7.2 defaults and AV1 Annex A.3 level indices.
+    let mut profile = 0;
+    let mut level_idx = 5;
+    let mut tier = 0;
+    for (key, value) in fmtp {
+        match key.as_str() {
+            "profile" => profile = field(value).filter(|value| *value <= 2)?,
+            "level-idx" => level_idx = field(value).filter(|value| matches!(value, 0..=23 | 31))?,
+            "tier" => tier = field(value).filter(|value| *value <= 1)?,
+            _ => return None,
+        }
+    }
+    Some(crate::CodecProfile::Av1 {
+        profile,
+        level_idx,
+        tier,
+    })
+}
+
 fn validate_codec(codec: &RtpCodecParameters) -> Result<(), RtpConfigurationError> {
     let name = codec.name.to_ascii_lowercase();
     if codec.fmtp.len() > 64
@@ -1156,10 +1227,12 @@ fn validate_codec(codec: &RtpCodecParameters) -> Result<(), RtpConfigurationErro
             .fmtp
             .iter()
             .any(|(k, v)| !identifier(k) || v.len() > 1024 || v.contains(['\r', '\n', ';', '\0']))
-        || codec
-            .feedback
-            .iter()
-            .any(|f| !matches!(f.as_str(), "transport-cc" | "nack" | "nack pli" | "ccm fir"))
+        || codec.feedback.iter().any(|f| {
+            !matches!(
+                f.as_str(),
+                "transport-cc" | "ack ccfb" | "nack" | "nack pli" | "ccm fir"
+            )
+        })
     {
         return Err(RtpConfigurationError::Invalid);
     }
@@ -1174,6 +1247,11 @@ fn validate_codec(codec: &RtpCodecParameters) -> Result<(), RtpConfigurationErro
                     .fmtp
                     .get("profile-id")
                     .is_none_or(|v| matches!(v.as_str(), "0" | "2"))
+        }
+        "av1" => {
+            codec.clock_rate == 90000
+                && codec.channels.is_none()
+                && av1_profile(&codec.fmtp).is_some()
         }
         "h264" => {
             codec.clock_rate == 90000

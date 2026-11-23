@@ -15,6 +15,7 @@ struct RtpPublication {
     track: Track,
     slot: UpstreamSlotKey,
     binding: CompiledRtpBinding,
+    fabric_dd_video: bool,
     enabled: bool,
     demanded: bool,
     retiring: bool,
@@ -37,6 +38,27 @@ impl NativeRtp {
 
     pub(super) fn owns_encoding(&self, ssrc: u32) -> bool {
         self.ssrcs.contains_key(&ssrc)
+    }
+
+    fn publication_for_ssrc(&self, ssrc: u32) -> Option<&RtpPublication> {
+        self.publications.get(self.ssrcs.get(&ssrc)?)
+    }
+
+    pub(super) fn requires_dd_fabric(&self, ssrc: u32) -> bool {
+        self.publication_for_ssrc(ssrc)
+            .is_some_and(|publication| publication.fabric_dd_video)
+    }
+
+    pub(super) fn fabric_measurement_slot(&self, ssrc: u32) -> Option<UpstreamSlotKey> {
+        let source = self.publication_for_ssrc(ssrc)?;
+        (source.fabric_dd_video && source.enabled && source.demanded && !source.retiring)
+            .then_some(source.slot)
+    }
+
+    pub(super) fn requires_fabric(&self, ssrc: u32) -> bool {
+        self.publication_for_ssrc(ssrc).is_some_and(|publication| {
+            publication.fabric_dd_video || publication.whole_source_fabric_profile().is_some()
+        })
     }
 
     pub(super) fn ingress_route(
@@ -158,7 +180,108 @@ fn execution_bytes(spec_bytes: usize, encodings: usize) -> usize {
         .saturating_add(Connection::native_execution_metadata_bytes())
 }
 
+impl RtpPublication {
+    fn whole_source_fabric_profile(&self) -> Option<pulsebeam_core::fabric::Profile> {
+        use pulsebeam_core::fabric::Profile;
+        let description = self.binding.description();
+        let [_] = description.encodings.as_slice() else {
+            return None;
+        };
+        match description.codec.parameters.name.as_str() {
+            "opus" => Some(Profile::Opus),
+            "av1" if crate::control::rtp::is_stock_av1(&description.codec.parameters) => {
+                Some(Profile::Av1)
+            }
+            "h264"
+                if !description
+                    .extensions
+                    .iter()
+                    .any(|extension| extension.uri == pulsebeam_core::dd::URI) =>
+            {
+                Some(Profile::H264)
+            }
+            _ => None,
+        }
+    }
+}
+
 impl Connection {
+    pub(crate) fn prepare_local_rtp_ingress(
+        &self,
+        publication: PublicationKey,
+        fanout: TrackHandle,
+    ) -> Option<(crate::track::TrackMeta, RtpIngressShadow)> {
+        let source = self.fabric_publication(publication, fanout)?;
+        let profile = source.whole_source_fabric_profile()?;
+        let [encoding] = source.binding.description().encodings.as_slice() else {
+            return None;
+        };
+        let binding = self.fabric_encoding_binding(source, encoding)?;
+        let ingress = RtpIngressShadow::bind_local_endpoint(profile, binding)?;
+        Some((source.track.meta().clone(), ingress))
+    }
+
+    pub(crate) fn prepare_dd_fabric_ingress(
+        &self,
+        publication: PublicationKey,
+        fanout: TrackHandle,
+    ) -> Option<(
+        crate::track::TrackMeta,
+        arrayvec::ArrayVec<RtpIngressShadow, { crate::track::MAX_SIMULCAST_LAYERS }>,
+    )> {
+        let source = self.fabric_publication(publication, fanout)?;
+        let description = source.binding.description();
+        if !source.fabric_dd_video {
+            return None;
+        }
+        let mut ingresses = arrayvec::ArrayVec::new();
+        for encoding in &description.encodings {
+            let binding = self.fabric_encoding_binding(source, encoding)?;
+            ingresses
+                .try_push(RtpIngressShadow::bind_dd_encoding(binding)?)
+                .ok()?;
+        }
+        Some((source.track.meta().clone(), ingresses))
+    }
+
+    fn fabric_publication(
+        &self,
+        publication: PublicationKey,
+        fanout: TrackHandle,
+    ) -> Option<&RtpPublication> {
+        if self.authorization_expiry.is_none()
+            || !self.fabric_io_authorized()
+            || self.upstream.track_fanout(publication) != Some(fanout)
+        {
+            return None;
+        }
+        let source = self
+            .native_rtp
+            .publications
+            .get(self.native_rtp.tracks.get(publication.as_bytes())?)?;
+        (!source.retiring && source.track.id() == publication && source.fanout == Some(fanout))
+            .then_some(source)
+    }
+
+    fn fabric_encoding_binding<'a>(
+        &'a self,
+        source: &RtpPublication,
+        encoding: &pulsebeam_rtc::RtpEncoding,
+    ) -> Option<pulsebeam_rtc::RtpReceiveBinding<'a>> {
+        if self.media_ingress.contains_key(&encoding.primary) {
+            return None;
+        }
+        let description = source.binding.description();
+        let binding = self.transport.rtp_receive_binding(encoding.primary)?;
+        (binding.mid == description.mid
+            && binding.rid == encoding.rid.as_deref()
+            && binding.primary_ssrc == encoding.primary
+            && binding.primary_codec.payload_type == description.codec.payload_type
+            && binding.repair_payload_type == description.codec.repair_payload_type
+            && binding.declared_repair_ssrc == encoding.repair)
+            .then_some(binding)
+    }
+
     pub(crate) fn native_rtp_execution_bytes(spec_bytes: usize, encodings: usize) -> usize {
         execution_bytes(spec_bytes, encodings)
     }
@@ -181,6 +304,7 @@ impl Connection {
             kind,
             mut binding,
             format,
+            fabric_dd_video,
             enabled,
         } = plan;
         tracing::debug!(
@@ -209,6 +333,7 @@ impl Connection {
                 return;
             }
             let execution = PublicationExecution {
+                data_v1_source: None,
                 track,
                 enabled,
                 active,
@@ -369,6 +494,7 @@ impl Connection {
                 track: track.clone(),
                 slot,
                 binding,
+                fabric_dd_video,
                 enabled,
                 demanded: false,
                 retiring: false,
@@ -385,6 +511,7 @@ impl Connection {
         self.record_native_publication(
             work,
             PublicationExecution {
+                data_v1_source: None,
                 track,
                 enabled,
                 active: false,

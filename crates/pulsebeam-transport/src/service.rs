@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use crate::backend::{Engine, Output};
+use crate::fabric_negotiation::Negotiation;
 use crate::wire;
 use crate::{PeerConfig, ReceiveTime, Time};
 use pulsebeam_feedback as feedback;
@@ -33,6 +34,7 @@ pub enum Error {
     SequenceWindow,
     FeedbackUnavailable,
     UnsupportedProfile,
+    PathIncapable,
     Timeout,
 }
 
@@ -43,7 +45,8 @@ pub enum SendOutcome {
 }
 
 pub struct Application<'a> {
-    pub context: [u8; 4],
+    /// A legacy context or the reserved control context. Fabric images have no context.
+    pub context: Option<[u8; 4]>,
     pub payload: &'a [u8],
     pub observed: ReceiveTime,
 }
@@ -51,6 +54,14 @@ pub struct Application<'a> {
 pub struct Datagram<'a> {
     pub destination: SocketAddr,
     pub payload: &'a [u8],
+    fabric_application: bool,
+}
+
+impl Datagram<'_> {
+    /// Protected Fabric data is cancellable by the owning route until socket handoff.
+    pub fn is_fabric_application(&self) -> bool {
+        self.fabric_application
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -82,9 +93,21 @@ pub struct Staging {
     pub oldest_age: Option<Duration>,
 }
 
+#[derive(Clone, Copy)]
+enum Submission {
+    Legacy([u8; 4]),
+    Fabric,
+    FabricControl,
+}
+
 enum Protected {
-    Data { attempt: u64, expires_at: Time },
+    Data {
+        attempt: u64,
+        expires_at: Time,
+        fabric_application: bool,
+    },
     Feedback(Option<feedback::ReportWindow>),
+    FabricCapability(wire::Capability),
 }
 
 struct SocketOutput {
@@ -94,6 +117,7 @@ struct SocketOutput {
 
 pub struct Transport {
     peer: PeerConfig,
+    negotiation: Option<Negotiation>,
     closed: bool,
     association: Option<Engine>,
     origin: Option<(Time, Instant)>,
@@ -165,8 +189,13 @@ impl Transport {
             .map_err(|_| Error::Capacity)?;
         let controller = pulsebeam_cc::Controller::new(pulsebeam_cc::Config::default())
             .map_err(|_| Error::Capacity)?;
+        let negotiation = match &peer {
+            PeerConfig::Fabric(peer) => Some(Negotiation::new(peer.dtls.role)),
+            _ => None,
+        };
         Ok(Self {
             peer,
+            negotiation,
             closed: false,
             association: None,
             origin: None,
@@ -214,6 +243,7 @@ impl Transport {
             match self.protected {
                 Some(Protected::Data { .. }) => "data",
                 Some(Protected::Feedback(_)) => "feedback",
+                Some(Protected::FabricCapability(_)) => "fabric-capability",
                 None => "none",
             },
             self.demand,
@@ -341,7 +371,7 @@ impl Transport {
         let origin = self.origin?.0;
         let now = Duration::from_nanos(self.now.0.saturating_sub(origin.0));
         let staging_available = self.protected.is_none();
-        let candidate = (self.demand && staging_available)
+        let candidate = (self.health.ready && self.demand && staging_available)
             .then_some((self.sender.observations().bytes_in_flight, wire::UDP_BUDGET));
         let relative = [
             self.sender.next_deadline(now),
@@ -360,10 +390,15 @@ impl Transport {
                     .saturating_add(u64::try_from(at.as_nanos()).unwrap_or(u64::MAX)),
             )
         });
-        [self.protocol_deadline, relative, self.feedback_deadline()]
-            .into_iter()
-            .flatten()
-            .min()
+        [
+            self.protocol_deadline,
+            relative,
+            self.feedback_deadline(),
+            self.negotiation.as_ref().and_then(Negotiation::deadline),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     /// Input is accepted only at a fully drained protocol boundary. On Busy,
@@ -378,7 +413,7 @@ impl Transport {
         if !self.input_ready() {
             return Err(Error::Busy);
         }
-        if source != self.peer.endpoint() || datagram.len() > wire::UDP_BUDGET {
+        if source != self.peer.endpoint() || datagram.len() > self.datagram_limit() {
             self.health.invalid = self.health.invalid.saturating_add(1);
             return Ok(());
         }
@@ -449,6 +484,13 @@ impl Transport {
         if self.feedback_deadline().is_some_and(|at| at <= now) {
             return Err(Error::FeedbackUnavailable);
         }
+        if self
+            .negotiation
+            .as_ref()
+            .is_some_and(|negotiation| negotiation.timed_out(now))
+        {
+            return Err(Error::UnsupportedProfile);
+        }
         self.sender.expire(elapsed, 256);
         self.update_controller(elapsed)?;
         if self.drained {
@@ -516,9 +558,11 @@ impl Transport {
                     self.on_application(bytes, elapsed, receive)?;
                 }
                 Output::Connected => {
-                    self.health.ready = true;
-                    self.sender.set_availability(EPOCH, true);
-                    self.update_controller(elapsed)?;
+                    if let Some(negotiation) = &mut self.negotiation {
+                        negotiation.connected(now);
+                    } else {
+                        self.mark_ready(elapsed)?;
+                    }
                 }
                 Output::Timeout(deadline) => {
                     self.drained = true;
@@ -540,6 +584,9 @@ impl Transport {
                         }
                         break;
                     }
+                    if self.prepare_fabric_capability()? {
+                        continue;
+                    }
                     if !self.health.ready || !self.prepare_feedback(elapsed)? {
                         break;
                     }
@@ -553,6 +600,31 @@ impl Transport {
         Ok(work)
     }
 
+    fn mark_ready(&mut self, elapsed: Duration) -> Result<(), Error> {
+        self.health.ready = true;
+        self.sender.set_availability(EPOCH, true);
+        self.update_controller(elapsed)
+    }
+
+    fn prepare_fabric_capability(&mut self) -> Result<bool, Error> {
+        let Some(capability) = self
+            .negotiation
+            .as_mut()
+            .and_then(|negotiation| negotiation.next(self.now))
+        else {
+            return Ok(false);
+        };
+        let frame = capability.encode();
+        self.association
+            .as_mut()
+            .ok_or(Error::NotStarted)?
+            .send_application_data(&frame)?;
+        self.protected = Some(Protected::FabricCapability(capability));
+        self.staged = Some((self.now, frame.len()));
+        self.drained = false;
+        Ok(true)
+    }
+
     fn submit_output(
         &mut self,
         bytes: &[u8],
@@ -563,6 +635,15 @@ impl Transport {
         if matches!(protected, Some(Protected::Data { expires_at, .. }) if *expires_at <= self.now)
         {
             self.health.expired = self.health.expired.saturating_add(1);
+            return Ok(true);
+        }
+        if matches!(protected, Some(Protected::Data { .. }))
+            && self
+                .peer
+                .fabric_path()
+                .is_some_and(|path| !path.qualifies())
+        {
+            self.health.send_failed = self.health.send_failed.saturating_add(1);
             return Ok(true);
         }
         let commit = match protected {
@@ -589,7 +670,12 @@ impl Transport {
             }
             _ => None,
         };
-        let accepted = matches!(send(Datagram { destination: self.peer.endpoint(), payload: bytes }), SendOutcome::Accepted { bytes: submitted } if submitted == bytes.len());
+        let accepted = bytes.len() <= self.datagram_limit()
+            && matches!(send(Datagram {
+                destination: self.peer.endpoint(),
+                payload: bytes,
+                fabric_application: matches!(protected, Some(Protected::Data { fabric_application: true, .. })),
+            }), SendOutcome::Accepted { bytes: submitted } if submitted == bytes.len());
         if accepted {
             if let Some((context, next_attempt)) = commit {
                 self.sender
@@ -606,6 +692,14 @@ impl Transport {
                 if self.peer.is_quic() {
                     self.feedback_wait.get_or_insert(self.now);
                 }
+            }
+            if let Some(Protected::FabricCapability(capability)) = protected
+                && self
+                    .negotiation
+                    .as_mut()
+                    .is_some_and(|negotiation| negotiation.accepted_by_socket(*capability))
+            {
+                self.mark_ready(elapsed)?;
             }
             if let Some(Protected::Feedback(Some(report))) = protected {
                 self.receiver
@@ -694,7 +788,46 @@ impl Transport {
         payload: &[u8],
         expires_at: Time,
     ) -> Result<(), Error> {
-        let result = self.submit_inner(context, payload, expires_at);
+        self.submit(Submission::Legacy(context), payload, expires_at)
+    }
+
+    /// Submit an opaque canonical image without a legacy context field.
+    pub fn try_submit_fabric(&mut self, image: &[u8], expires_at: Time) -> Result<(), Error> {
+        self.submit(Submission::Fabric, image, expires_at)
+    }
+
+    /// Send one bounded control frame on the same authenticated Fabric association as data.
+    pub fn try_submit_fabric_control(
+        &mut self,
+        frame: &[u8],
+        expires_at: Time,
+    ) -> Result<(), Error> {
+        self.submit(Submission::FabricControl, frame, expires_at)
+    }
+
+    /// Replace the current path bound. An incapable path suspends Fabric
+    /// admission and fences staged data before socket submission.
+    pub fn set_fabric_path(&mut self, path: crate::FabricPath) -> Result<(), Error> {
+        let PeerConfig::Fabric(peer) = &mut self.peer else {
+            return Err(Error::UnsupportedProfile);
+        };
+        peer.path = path;
+        Ok(())
+    }
+
+    fn datagram_limit(&self) -> usize {
+        self.peer
+            .fabric_path()
+            .map_or(wire::UDP_BUDGET, crate::FabricPath::datagram_limit)
+    }
+
+    fn submit(
+        &mut self,
+        submission: Submission,
+        payload: &[u8],
+        expires_at: Time,
+    ) -> Result<(), Error> {
+        let result = self.submit_inner(submission, payload, expires_at);
         if let Err(
             error @ (Error::Security
             | Error::Capacity
@@ -710,7 +843,7 @@ impl Transport {
 
     fn submit_inner(
         &mut self,
-        context: [u8; 4],
+        submission: Submission,
         payload: &[u8],
         expires_at: Time,
     ) -> Result<(), Error> {
@@ -718,7 +851,20 @@ impl Transport {
         if expires_at <= self.now {
             return Err(Error::Expired);
         }
-        if payload.len() > self.payload_capacity() {
+        let fabric = self.peer.fabric_path();
+        if fabric.is_some() == matches!(submission, Submission::Legacy(_)) {
+            return Err(Error::UnsupportedProfile);
+        }
+        if fabric.is_some_and(|path| !path.qualifies()) {
+            return Err(Error::PathIncapable);
+        }
+        let fabric_application = matches!(submission, Submission::Fabric);
+        let limit = if matches!(submission, Submission::FabricControl) {
+            wire::CONTROL_FRAME_BYTES
+        } else {
+            self.payload_capacity()
+        };
+        if payload.len() > limit || (fabric_application && payload.is_empty()) {
             return Err(Error::Oversize);
         }
         self.admission()?;
@@ -732,10 +878,20 @@ impl Transport {
         let attempt = self.attempt;
         let wire_attempt =
             u32::try_from(attempt & u64::from(u32::MAX)).map_err(|_| Error::SequenceWindow)?;
-        wire::data_header(&mut plain, context, wire_attempt).map_err(|_| Error::Codec)?;
-        let length = payload.len().saturating_add(wire::DATA_HEADER);
+        let header = match submission {
+            Submission::Legacy(context) => {
+                wire::data_header(&mut plain, context, wire_attempt).map_err(|_| Error::Codec)?;
+                wire::DATA_HEADER
+            }
+            Submission::Fabric | Submission::FabricControl => {
+                wire::fabric_header(&mut plain, wire_attempt, !fabric_application)
+                    .map_err(|_| Error::Codec)?;
+                wire::FABRIC_HEADER
+            }
+        };
+        let length = payload.len().saturating_add(header);
         plain
-            .get_mut(wire::DATA_HEADER..length)
+            .get_mut(header..length)
             .ok_or(Error::Capacity)?
             .copy_from_slice(payload);
         self.association
@@ -745,6 +901,7 @@ impl Transport {
         self.protected = Some(Protected::Data {
             attempt,
             expires_at,
+            fabric_application,
         });
         self.staged = Some((self.now, length));
         self.drained = false;
@@ -754,6 +911,13 @@ impl Transport {
     /// Non-reserving readiness, useful before expensive application encoding.
     pub fn admission(&mut self) -> Result<(), Error> {
         self.ensure_live()?;
+        if self
+            .peer
+            .fabric_path()
+            .is_some_and(|path| !path.qualifies())
+        {
+            return Err(Error::PathIncapable);
+        }
         if !self.health.ready {
             return Err(Error::NotReady);
         }
@@ -780,6 +944,13 @@ impl Transport {
     }
 
     pub fn payload_capacity(&self) -> usize {
+        if let Some(path) = self.peer.fabric_path() {
+            return if path.qualifies() {
+                wire::FABRIC_IMAGE
+            } else {
+                0
+            };
+        }
         self.association.as_ref().map_or_else(
             || {
                 if self.peer.is_quic() {
@@ -798,11 +969,24 @@ impl Transport {
         now: Duration,
         receive: &mut impl FnMut(Application<'_>),
     ) -> Result<(), Error> {
-        let Ok(frame) = wire::decode(bytes) else {
+        let Ok(frame) = wire::decode_for(bytes, self.peer.fabric_path().is_some()) else {
             self.health.invalid = self.health.invalid.saturating_add(1);
             return Ok(());
         };
+        if !self.health.ready && !matches!(&frame, wire::Frame::Capability(_)) {
+            self.health.invalid = self.health.invalid.saturating_add(1);
+            return Ok(());
+        }
         match frame {
+            wire::Frame::Capability(capability) => {
+                if self
+                    .negotiation
+                    .as_mut()
+                    .is_some_and(|negotiation| negotiation.receive(capability))
+                {
+                    self.mark_ready(now)?;
+                }
+            }
             wire::Frame::Feedback {
                 base,
                 generation,
@@ -868,6 +1052,13 @@ impl Transport {
                     return Ok(());
                 }
                 self.health.received = self.health.received.saturating_add(1);
+                if self
+                    .peer
+                    .fabric_path()
+                    .is_some_and(|path| !path.qualifies())
+                {
+                    return Ok(());
+                }
                 receive(Application {
                     context,
                     payload,

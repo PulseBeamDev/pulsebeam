@@ -19,13 +19,15 @@ use std::{
 use bytes::Bytes;
 
 use crate::{
-    EcnCodepoint, EncodingInfo, EncodingRetireReason, EncodingStats, Event, PacketFeedbackKind,
-    RtpHeader, RtpPacket as ReceivedRtp, SenderReport,
+    AuthenticatedRtp, EcnCodepoint, EncodingInfo, EncodingRetireReason, EncodingStats, Event,
+    PacketFeedbackKind, RtpHeader, RtpPacket as ReceivedRtp, RtpReceiveCodec, RtpReceiveExtension,
+    SenderReport,
     negotiation::IngressMediaFacts,
     packet::RtpPacket,
     receive_feedback::ReceiveFeedback,
     receive_stream::ReceiveStream,
     rtcp::{self, FeedbackBatch, LifecycleFact, RepairRequest},
+    rtp::RtpObserver,
     transport::PathEpoch,
 };
 
@@ -238,12 +240,38 @@ impl IngressOwner {
             if owners.len() > 1 {
                 return Err(Error::Collision);
             }
-            let facts = physical.ingress_facts();
+            let mut facts = physical.ingress_facts();
             let bootstrap: BTreeSet<_> = self
                 .media_by_mid
                 .range((facts.mid.clone(), 0)..=(facts.mid.clone(), u64::MAX))
                 .filter_map(|((_, key), bootstrap)| bootstrap.then_some(*key))
                 .collect();
+            // Typed adoption can narrow a bootstrap extmap but cannot signal a
+            // different extension form or replace established SDP attributes.
+            if let Some(previous) = owners
+                .first()
+                .or_else(|| bootstrap.first())
+                .and_then(|key| self.media.get(key))
+                .filter(|previous| previous.mid == facts.mid && previous.kind == facts.kind)
+            {
+                if physical
+                    .binding
+                    .extmap_allow_mixed
+                    .is_some_and(|mixed| mixed != previous.allow_mixed_extensions)
+                {
+                    return Err(Error::Collision);
+                }
+                facts.allow_mixed_extensions = previous.allow_mixed_extensions;
+                for extension in &mut facts.extensions {
+                    if let Some(known) = previous
+                        .extensions
+                        .iter()
+                        .find(|known| known.id == extension.id && known.uri == extension.uri)
+                    {
+                        extension.attributes.clone_from(&known.attributes);
+                    }
+                }
+            }
             if let Some(&owner) = owners.first() {
                 let old = self.media.get(&owner).ok_or(Error::ConnectionState)?;
                 let known_repair = self
@@ -548,7 +576,7 @@ impl IngressOwner {
             && let Some(id) = facts
                 .extensions
                 .iter()
-                .find_map(|(id, uri)| (uri.as_ref() == crate::MID_EXTENSION).then_some(*id))
+                .find_map(|ext| (ext.uri.as_ref() == crate::MID_EXTENSION).then_some(ext.id))
         {
             self.mid_candidates.insert(key, id);
         }
@@ -572,6 +600,58 @@ impl IngressOwner {
         }
     }
 
+    pub(crate) fn typed_receive_binding(
+        &self,
+        primary: u32,
+    ) -> Option<crate::RtpReceiveBinding<'_>> {
+        self.single_receive_binding(primary, *self.declared_primary.get(&primary)?)
+    }
+
+    pub(crate) fn sdp_receive_binding(&self, primary: u32) -> Option<crate::RtpReceiveBinding<'_>> {
+        let encoding = self.encodings.get(&primary)?;
+        let facts = self.media.get(&encoding.media)?;
+        let bootstrap = self
+            .media_by_mid
+            .get(&(facts.mid.clone(), encoding.media))
+            .copied()?;
+        if !bootstrap || encoding.retired || encoding.ssrc != Some(primary) {
+            return None;
+        }
+        self.single_receive_binding(primary, encoding.media)
+    }
+
+    fn single_receive_binding(
+        &self,
+        primary: u32,
+        media: u64,
+    ) -> Option<crate::RtpReceiveBinding<'_>> {
+        let facts = self.media.get(&media)?;
+        let [codec] = facts.payloads.as_ref() else {
+            return None;
+        };
+        let rid = match facts.rids.as_ref() {
+            [] => None,
+            [rid] => Some(rid.as_ref()),
+            _ => return None,
+        };
+        if facts.ssrcs.as_ref() != [primary] || self.terminal_ssrcs.contains(&primary) {
+            return None;
+        }
+        Some(crate::RtpReceiveBinding {
+            mid: &facts.mid,
+            rid,
+            primary_ssrc: primary,
+            primary_codec: codec,
+            repair_payload_type: facts
+                .repairs
+                .iter()
+                .find_map(|&(repair, target)| (target == codec.payload_type).then_some(repair)),
+            declared_repair_ssrc: facts.declared_repair_ssrc(primary),
+            receive_extensions: &facts.extensions,
+            allow_mixed_extensions: facts.allow_mixed_extensions,
+        })
+    }
+
     pub(crate) const fn control_ssrc(&self) -> u32 {
         self.receiver_ssrc
     }
@@ -582,13 +662,25 @@ impl IngressOwner {
         self.media_by_ssrc.contains_key(&ssrc) || self.terminal_ssrcs.contains(&ssrc)
     }
 
+    #[cfg(test)]
     pub(crate) fn accept_rtp(
         &mut self,
         arrival: Instant,
         bytes: Vec<u8>,
         ecn: Option<EcnCodepoint>,
     ) {
-        self.accept_packet(arrival, bytes, None, ecn);
+        self.accept_rtp_observed(arrival, bytes, ecn, None, None);
+    }
+
+    pub(crate) fn accept_rtp_observed(
+        &mut self,
+        arrival: Instant,
+        bytes: Vec<u8>,
+        ecn: Option<EcnCodepoint>,
+        protection: Option<crate::rtp::RtpProtection>,
+        observer: Option<&mut RtpObserver<'_>>,
+    ) {
+        self.accept_packet(arrival, bytes, None, ecn, protection, observer);
     }
 
     fn accept_packet(
@@ -597,6 +689,8 @@ impl IngressOwner {
         bytes: Vec<u8>,
         repair: Option<RepairIdentity>,
         ecn: Option<EcnCodepoint>,
+        protection: Option<crate::rtp::RtpProtection>,
+        observer: Option<&mut RtpObserver<'_>>,
     ) {
         let backing_capacity = bytes.capacity();
         let bytes = Bytes::from(bytes);
@@ -604,7 +698,7 @@ impl IngressOwner {
             self.drop();
             return;
         };
-        let Some((media, clock_rate, rid)) = self.resolve(&packet) else {
+        let Some((media, codec_index, rid)) = self.resolve(&packet) else {
             self.drop();
             return;
         };
@@ -613,6 +707,7 @@ impl IngressOwner {
             return;
         }
         let facts = &self.media[&media];
+        let primary_codec = &facts.payloads[codec_index];
         // Typed facts bind one primary SSRC to its RID. SDP RID lists do not.
         let rid = rid.or_else(
             || match (self.strict, facts.ssrcs.as_ref(), facts.rids.as_ref()) {
@@ -620,17 +715,14 @@ impl IngressOwner {
                 _ => None,
             },
         );
-        let primary_type = facts
-            .repairs
-            .iter()
-            .find(|(pt, _)| *pt == packet.payload_type())
-            .map_or_else(|| packet.payload_type(), |(_, primary)| *primary);
+        let primary_type = primary_codec.payload_type;
+        let clock_rate = primary_codec.clock_rate;
         if repair.is_none() && facts.feedback_payloads.contains(&primary_type) {
             let twcc = facts
                 .extensions
                 .iter()
-                .find(|(_, uri)| crate::negotiation::TWCC_URIS.contains(&uri.as_ref()))
-                .and_then(|(id, _)| packet.extensions().ok()?.find(|value| value.id() == *id))
+                .find(|ext| crate::negotiation::TWCC_URIS.contains(&ext.uri.as_ref()))
+                .and_then(|ext| packet.extensions().ok()?.find(|value| value.id() == ext.id))
                 .and_then(|value| <[u8; 2]>::try_from(value.value()).ok())
                 .map(u16::from_be_bytes);
             self.receive_feedback
@@ -640,11 +732,7 @@ impl IngressOwner {
             self.drop();
             return;
         }
-        if let Some((_, primary_type)) = self.media[&media]
-            .repairs
-            .iter()
-            .find(|(pt, _)| *pt == packet.payload_type())
-        {
+        if packet.payload_type() != primary_type {
             let primary_ssrc = self.media[&media]
                 .ssrc_repairs
                 .iter()
@@ -672,14 +760,43 @@ impl IngressOwner {
                 self.drop();
                 return;
             }
+            if repair.is_some()
+                || self.terminal_ssrcs.contains(&primary_ssrc)
+                || self
+                    .media_by_ssrc
+                    .get(&primary_ssrc)
+                    .is_some_and(|owner| *owner != media)
+                || self.encodings.get(&primary_ssrc).is_some_and(|encoding| {
+                    encoding.retired
+                        || encoding.media != media
+                        || encoding
+                            .repair_ssrc
+                            .is_some_and(|known| known != packet.ssrc())
+                })
+            {
+                self.drop();
+                return;
+            }
+            if let Some(observe) = observer {
+                observe(AuthenticatedRtp {
+                    arrival,
+                    mid: &facts.mid,
+                    rid,
+                    primary_ssrc,
+                    primary_codec,
+                    repair_payload_type: Some(packet.payload_type()),
+                    declared_repair_ssrc: facts.declared_repair_ssrc(primary_ssrc),
+                    is_repair: true,
+                    receive_extensions: &facts.extensions,
+                    allow_mixed_extensions: facts.allow_mixed_extensions,
+                    wire: &packet,
+                    protection,
+                });
+            }
             let Some(sequence) = packet.payload().get(..2) else {
                 self.drop();
                 return;
             };
-            if repair.is_some() {
-                self.drop();
-                return;
-            }
             let mut normalized = bytes[..packet.payload_range().start].to_vec();
             normalized[0] &= !0x20;
             normalized[1] = (normalized[1] & 0x80) | primary_type;
@@ -696,15 +813,6 @@ impl IngressOwner {
                 self.drop();
                 return;
             }
-            if let Some(encoding) = self.encodings.get(&primary_ssrc)
-                && (encoding.retired
-                    || encoding
-                        .repair_ssrc
-                        .is_some_and(|known| known != packet.ssrc()))
-            {
-                self.drop();
-                return;
-            }
             self.accept_packet(
                 arrival,
                 normalized,
@@ -712,6 +820,8 @@ impl IngressOwner {
                     ssrc: packet.ssrc(),
                     media,
                 }),
+                None,
+                None,
                 None,
             );
             return;
@@ -726,20 +836,6 @@ impl IngressOwner {
             self.drop();
             return;
         }
-        let retained_bytes = queued_backing_bytes(
-            &packet,
-            &self.media[&media],
-            backing_capacity,
-            packet.payload().len(),
-        );
-        let Some(queued_total) = self
-            .queued_media_bytes
-            .checked_add(retained_bytes)
-            .filter(|bytes| *bytes <= self.max_bytes)
-        else {
-            self.drop();
-            return;
-        };
         let encoding = self.find_encoding(media, packet.ssrc(), rid);
         let discovery = encoding.is_none();
         let index = encoding.unwrap_or_else(|| packet.ssrc());
@@ -763,6 +859,35 @@ impl IngressOwner {
             return;
         }
         let event_rid = state.and_then(|state| state.rid.as_deref()).or(rid);
+        if let Some(observe) = observer {
+            observe(AuthenticatedRtp {
+                arrival,
+                mid: &facts.mid,
+                rid: event_rid,
+                primary_ssrc: packet.ssrc(),
+                primary_codec,
+                repair_payload_type: facts
+                    .repairs
+                    .iter()
+                    .find_map(|&(repair, primary)| (primary == primary_type).then_some(repair)),
+                declared_repair_ssrc: facts.declared_repair_ssrc(packet.ssrc()),
+                is_repair: false,
+                receive_extensions: &facts.extensions,
+                allow_mixed_extensions: facts.allow_mixed_extensions,
+                wire: &packet,
+                protection,
+            });
+        }
+        let retained_bytes =
+            queued_backing_bytes(&packet, facts, backing_capacity, packet.payload().len());
+        let Some(queued_total) = self
+            .queued_media_bytes
+            .checked_add(retained_bytes)
+            .filter(|bytes| *bytes <= self.max_bytes)
+        else {
+            self.drop();
+            return;
+        };
         let strings = self.media[&media]
             .mid
             .len()
@@ -811,7 +936,11 @@ impl IngressOwner {
                     ssrc: packet.ssrc(),
                     kind: self.media[&media].kind,
                     rid: rid.map(Arc::from),
-                    payloads: self.media[&media].payloads.clone(),
+                    payloads: facts
+                        .payloads
+                        .iter()
+                        .map(RtpReceiveCodec::discovery_info)
+                        .collect(),
                 }),
                 0,
             ) else {
@@ -1281,7 +1410,7 @@ impl IngressOwner {
         self.dropped
     }
 
-    fn resolve<'a>(&self, packet: &'a RtpPacket<'a>) -> Option<(u64, u32, Option<&'a str>)> {
+    fn resolve<'a>(&self, packet: &'a RtpPacket<'a>) -> Option<(u64, usize, Option<&'a str>)> {
         if self.terminal_ssrcs.contains(&packet.ssrc()) {
             return None;
         }
@@ -1307,18 +1436,18 @@ impl IngressOwner {
             {
                 return None;
             }
+            let primary_type = media
+                .repairs
+                .iter()
+                .find(|(repair, _)| *repair == packet.payload_type())
+                .map_or_else(|| packet.payload_type(), |(_, primary)| *primary);
             media
                 .payloads
                 .iter()
-                .find(|payload| {
-                    payload.payload_type == packet.payload_type()
-                        || media.repairs.iter().any(|(repair, primary)| {
-                            *repair == packet.payload_type() && *primary == payload.payload_type
-                        })
-                })
-                .map(|payload| (index, payload.clock_rate))
+                .position(|payload| payload.payload_type == primary_type)
+                .map(|codec_index| (index, codec_index))
         };
-        let (index, clock_rate) = if let Some(index) = by_ssrc {
+        let (index, codec_index) = if let Some(index) = by_ssrc {
             resolve(index)?
         } else {
             // Bootstrap alone permits discovery without an explicit SSRC.
@@ -1348,7 +1477,7 @@ impl IngressOwner {
         {
             return None;
         }
-        Some((index, clock_rate, rid))
+        Some((index, codec_index, rid))
     }
 
     fn find_encoding(&self, media: u64, ssrc: u32, rid: Option<&str>) -> Option<u32> {
@@ -1405,20 +1534,17 @@ fn queued_backing_bytes(
 ) -> usize {
     let retained = payload_len != 0
         || packet.extensions().ok().into_iter().flatten().any(|value| {
-            !value.value().is_empty() && facts.extensions.iter().any(|(id, _)| *id == value.id())
+            !value.value().is_empty() && facts.extensions.iter().any(|ext| ext.id == value.id())
         });
     if retained { capacity } else { 0 }
 }
 
 fn extension_value<'a>(
     packet: &'a RtpPacket<'a>,
-    extensions: &[(u8, Box<str>)],
+    extensions: &[RtpReceiveExtension],
     uri: &str,
 ) -> Option<&'a str> {
-    let id = extensions
-        .iter()
-        .find(|(_, candidate)| candidate.as_ref() == uri)?
-        .0;
+    let id = extensions.iter().find(|ext| ext.uri.as_ref() == uri)?.id;
     let value = packet
         .extensions()
         .ok()?
@@ -1440,10 +1566,16 @@ mod tests {
                 kind: crate::MediaKind::Video,
                 rtcp: None,
                 mid: "v".into(),
-                payloads: Box::new([crate::RtpPayloadInfo {
+                payloads: Box::new([RtpReceiveCodec {
                     payload_type: 96,
                     name: "h264".into(),
                     clock_rate: 90_000,
+                    channels: None,
+                    profile: Some(crate::CodecProfile::H264 {
+                        profile_level_id: None,
+                        packetization_mode: 1,
+                        level_asymmetry_allowed: false,
+                    }),
                 }]),
                 feedback_payloads: Box::new([96]),
                 repairs: Box::new([(97, 96)]),
@@ -1452,10 +1584,11 @@ mod tests {
                 ssrcs: Box::new([]),
                 rids: Box::new(["q".into(), "h".into()]),
                 extensions: Box::new([
-                    (1, "urn:ietf:params:rtp-hdrext:sdes:mid".into()),
-                    (2, "urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id".into()),
-                    (3, crate::REPAIRED_RID_EXTENSION.into()),
+                    RtpReceiveExtension::without_attributes(1, crate::MID_EXTENSION),
+                    RtpReceiveExtension::without_attributes(2, crate::RID_EXTENSION),
+                    RtpReceiveExtension::without_attributes(3, crate::REPAIRED_RID_EXTENSION),
                 ]),
+                allow_mixed_extensions: false,
             }]),
             4096,
             crate::ConnectionLimits::DEFAULT_MAX_RECEIVE_RUNTIME_BYTES,
@@ -1496,8 +1629,8 @@ mod tests {
                 ingress.media[&media]
                     .extensions
                     .iter()
-                    .find(|(id, _)| *id == value.id())
-                    .map(|(_, uri)| uri.as_ref())
+                    .find(|ext| ext.id == value.id())
+                    .map(|ext| ext.uri.as_ref())
             })
             .collect();
         let mut native = Vec::<crate::RtpExtension>::new();
@@ -1517,6 +1650,72 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn resolved_wire_observer_sees_padding_and_primary_after_rtx_first() {
+        let now = Instant::now();
+        let mut ingress = rid_ingress(now);
+        ingress.media.values_mut().next().unwrap().ssrc_repairs = Box::new([(33, 11)]);
+        let mut padding = repair_packet(33, 49, 77, b'q');
+        padding[0] |= 0x20;
+        padding.truncate(20);
+        padding.extend_from_slice(&[0, 2]);
+        let mut attempts = Vec::new();
+        for bytes in [
+            padding,
+            repair_packet(33, 50, 77, b'q'),
+            rid_packet(11, 77, Some(b'q')),
+        ] {
+            ingress.accept_rtp_observed(
+                now,
+                bytes,
+                None,
+                None,
+                Some(&mut |rtp: AuthenticatedRtp<'_>| {
+                    assert_eq!((rtp.mid, rtp.rid), ("v", Some("q")));
+                    assert_eq!((rtp.primary_ssrc, rtp.primary_payload_type()), (11, 96));
+                    assert_eq!(rtp.repair_payload_type, Some(97));
+                    assert_eq!(rtp.declared_repair_ssrc, Some(33));
+                    assert_eq!(rtp.primary_codec.clock_rate, 90_000);
+                    assert!(matches!(
+                        rtp.primary_codec.profile,
+                        Some(crate::CodecProfile::H264 {
+                            packetization_mode: 1,
+                            ..
+                        })
+                    ));
+                    assert_eq!(rtp.extension_profile(), Some(0xbede));
+                    let header = rtp.wire_header();
+                    attempts.push((
+                        rtp.is_repair,
+                        header.ssrc,
+                        header.sequence,
+                        rtp.padding_len(),
+                        rtp.wire_payload().to_vec(),
+                    ));
+                }),
+            );
+        }
+        assert_eq!(
+            attempts,
+            [
+                (true, 33, 49, 2, vec![]),
+                (true, 33, 50, 0, vec![0, 77, 0x65]),
+                (false, 11, 77, 0, vec![0x65]),
+            ]
+        );
+        let sequences: Vec<_> = std::iter::from_fn(|| ingress.poll_event())
+            .filter_map(|event| match event {
+                Event::Rtp { packet, .. } => Some(packet.header.sequence),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            sequences,
+            [77],
+            "legacy primary delivery still deduplicates"
+        );
     }
 
     #[test]
@@ -2355,10 +2554,16 @@ mod tests {
             kind: crate::MediaKind::Video,
             rtcp: None,
             mid: "video".into(),
-            payloads: Box::new([crate::RtpPayloadInfo {
+            payloads: Box::new([RtpReceiveCodec {
                 payload_type: 96,
                 name: "h264".into(),
                 clock_rate: 90_000,
+                channels: None,
+                profile: Some(crate::CodecProfile::H264 {
+                    profile_level_id: None,
+                    packetization_mode: 1,
+                    level_asymmetry_allowed: false,
+                }),
             }]),
             feedback_payloads: Box::new([96]),
             repairs: Box::new([(97, 96)]),
@@ -2367,6 +2572,7 @@ mod tests {
             ssrcs: Box::new([11, 12]),
             rids: Box::new([]),
             extensions: Box::new([]),
+            allow_mixed_extensions: false,
         };
         let now = Instant::now();
         let mut feedback = ReceiveFeedback::new(Some(PacketFeedbackKind::Rfc8888), now);

@@ -21,7 +21,7 @@ fn data_framing_preserves_opaque_payload_and_rejects_truncated_headers() {
     assert!(matches!(
         decode(&bytes),
         Ok(Frame::Data {
-            context: [1, 2, 3, 4],
+            context: Some([1, 2, 3, 4]),
             attempt: u32::MAX,
             payload: [9, 8, 7]
         })
@@ -34,6 +34,38 @@ fn data_framing_preserves_opaque_payload_and_rejects_truncated_headers() {
     let mut oversize = vec![0u8; DATA_HEADER + PAYLOAD_BUDGET + 1];
     data_header(&mut oversize, [0, 0, 0, 1], 1).unwrap();
     assert!(decode(&oversize).is_err());
+}
+
+#[test]
+fn fabric_attempt_frame_carries_one_unchanged_image_without_legacy_context() {
+    let image = [0x90, 0xe0, 0x01, 0x02, 0x03];
+    let mut bytes = [0; FABRIC_HEADER + 5];
+    fabric_header(&mut bytes, 0x0123_4567, false).unwrap();
+    bytes[FABRIC_HEADER..].copy_from_slice(&image);
+    assert_eq!(&bytes[..FABRIC_HEADER], &[2, 0, 1, 0x23, 0x45, 0x67]);
+    assert!(
+        matches!(decode_for(&bytes, true), Ok(Frame::Data { context: None, attempt: 0x0123_4567, payload }) if payload == image)
+    );
+    assert!(decode(&bytes).is_err());
+    for length in 0..=FABRIC_HEADER {
+        assert!(decode_for(&bytes[..length], true).is_err());
+    }
+    let mut legacy = [0; DATA_HEADER + 1];
+    data_header(&mut legacy, [0; 4], 1).unwrap();
+    assert!(decode_for(&legacy, true).is_err());
+}
+
+#[test]
+fn fabric_control_is_a_distinct_bounded_frame_on_the_negotiated_profile() {
+    let mut bytes = [0; FABRIC_HEADER + CONTROL_FRAME_BYTES + 1];
+    fabric_header(&mut bytes, 7, true).unwrap();
+    assert_eq!(&bytes[..FABRIC_HEADER], &[2, 2, 0, 0, 0, 7]);
+    let bounded = &bytes[..FABRIC_HEADER + CONTROL_FRAME_BYTES];
+    assert!(
+        matches!(decode_for(bounded, true), Ok(Frame::Data { context: Some(CONTROL_CONTEXT), attempt: 7, payload }) if payload.len() == CONTROL_FRAME_BYTES)
+    );
+    assert!(decode_for(&bytes, true).is_err());
+    assert!(decode(bounded).is_err());
 }
 
 #[test]

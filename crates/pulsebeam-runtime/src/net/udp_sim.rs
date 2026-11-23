@@ -181,6 +181,7 @@ impl Io for HostIo {
             len,
             stride,
             received_at,
+            ecn: None,
         })
     }
     fn submit(&mut self, entry: &SendDatagram<'_>) -> io::Result<()> {

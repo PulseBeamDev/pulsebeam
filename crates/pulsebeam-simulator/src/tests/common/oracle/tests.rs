@@ -1,14 +1,16 @@
 use super::*;
 use pulsebeam::entity::ParticipantId;
 use pulsebeam_agent_native::agent_core::{
-    Participant, Snapshot, TopicMode, TopicPublisher, TopicPublisherStatus, TopicSubscriber,
-    TopicSubscriberStatus,
+    Participant, Snapshot, TopicMode, TopicPublisher, TopicSubscriber,
+    ffi::{
+        DataPublicationState, DataSubscriptionState, PublicationAdmissionStatus,
+        PublicationExecution, SubscriptionSourceStatus, TrackSelector,
+    },
 };
 
 type Mutation<T> = (&'static str, fn(&mut T));
 
 fn fixture() -> (ApplicationStateOracle, ClientObservation) {
-    let room = RoomId::new("room").unwrap();
     let publisher = ParticipantId::new("publisher").unwrap();
     let viewer = ParticipantId::new("viewer").unwrap();
     let source_connection = ConnectionId::new();
@@ -382,69 +384,85 @@ fn client_oracle_rejects_wrong_missing_duplicate_and_stale_assignments() {
 #[test]
 fn subscriber_bindings_follow_declared_room_topic_and_mode() {
     let (mut model, mut client) = fixture();
+    let publisher = TopicPublisher {
+        topic: "updates".into(),
+        mode: TopicMode::Lossy,
+    };
     model.participants[0]
         .topics
         .publishers
-        .push(TopicPublisher {
-            topic: "updates".into(),
-            mode: TopicMode::Ordered,
-        });
+        .push(publisher.clone());
     let registration = TopicSubscriber {
         room: model.participants[0].room.to_owned(),
         participant_id: model.participants[0].external_id.clone(),
-        topic: "updates".into(),
-        mode: TopicMode::Ordered,
+        topic: publisher.topic.clone(),
+        mode: publisher.mode,
     };
     model.participants[1]
         .topics
         .subscribers
         .push(registration.clone());
+    client.data_catalog.insert(
+        (registration.participant_id.clone(), publisher),
+        "catalog-id".into(),
+    );
+    let bound = DataSubscriptionState {
+        observation_revision: 1,
+        intent_revision: 1,
+        evaluated_revision: 1,
+        accepted_revision: Some(1),
+        rejected_revision: None,
+        selector: TrackSelector {
+            room: registration.room.clone(),
+            participant_id: registration.participant_id.clone(),
+            track_id: registration.topic.clone(),
+        },
+        delivery: registration.mode.into(),
+        local_enabled: true,
+        closed: false,
+        source_status: SubscriptionSourceStatus::Available,
+        source_track_id: Some("catalog-id".into()),
+        admission: PublicationAdmissionStatus::Admitted,
+        admission_pending: false,
+        error: None,
+        execution: PublicationExecution::Installed,
+        execution_error: None,
+        terminal_error: None,
+    };
     client
-        .snapshot
-        .topics
-        .subscribers
-        .push(TopicSubscriberStatus {
-            registration,
-            channel: None,
-            publishers: 1,
-            buffered_messages: 0,
-        });
+        .data_subscribers
+        .insert(registration.clone(), bound.clone());
     let requested = [model.participants[0].id.as_str().to_owned()];
-    model
-        .check_client(&model.participants[1], &client, &requested)
-        .unwrap();
-    client.snapshot.topics.subscribers[0].publishers = 0;
-    assert!(
-        model
-            .check_client(&model.participants[1], &client, &requested)
-            .is_err()
-    );
+    let check = |model: &ApplicationStateOracle, client: &ClientObservation| {
+        model.check_client(&model.participants[1], client, &requested)
+    };
+    check(&model, &client).unwrap();
+    let mut wrong_id = bound.clone();
+    wrong_id.source_track_id = Some("not-the-catalog-id".into());
+    client
+        .data_subscribers
+        .insert(registration.clone(), wrong_id);
+    assert!(check(&model, &client).is_err());
+    let mut unbound = bound.clone();
+    unbound.source_track_id = None;
+    unbound.execution = PublicationExecution::Unavailable;
+    client
+        .data_subscribers
+        .insert(registration.clone(), unbound.clone());
+    assert!(check(&model, &client).is_err());
     model.participants[0].required = false;
-    model
-        .check_client(&model.participants[1], &client, &requested)
-        .unwrap();
-    client.snapshot.topics.subscribers[0].publishers = 2;
-    assert!(
-        model
-            .check_client(&model.participants[1], &client, &requested)
-            .is_err()
+    check(&model, &client).unwrap();
+    client.data_subscribers.insert(registration.clone(), bound);
+    let peer = &mut model.participants[0];
+    peer.topics.publishers[0].mode = TopicMode::Latest;
+    assert!(check(&model, &client).is_err());
+    model.participants[0].topics.publishers[0].mode = TopicMode::Lossy;
+    let prior_id = std::mem::replace(
+        &mut model.participants[0].external_id,
+        "other-publisher".into(),
     );
-    client.snapshot.topics.subscribers[0].publishers = 1;
-    let external = model.participants[0].external_id.clone();
-    model.participants[0].external_id = "other-publisher".into();
-    assert!(
-        model
-            .check_client(&model.participants[1], &client, &requested)
-            .is_err()
-    );
-    model.participants[0].external_id = external;
-    model.participants[0].topics.publishers[0].mode = TopicMode::Latest;
-    assert!(
-        model
-            .check_client(&model.participants[1], &client, &requested)
-            .is_err()
-    );
-    model.participants[0].topics.publishers[0].mode = TopicMode::Ordered;
+    assert!(check(&model, &client).is_err());
+    model.participants[0].external_id = prior_id;
     model.participants[0].room = "other-room";
     client.snapshot.participants.clear();
     client.snapshot.publications.clear();
@@ -454,64 +472,55 @@ fn subscriber_bindings_follow_declared_room_topic_and_mode() {
             .check_client(&model.participants[1], &client, &[])
             .is_err()
     );
-    client.snapshot.topics.subscribers[0].publishers = 0;
+    client.data_subscribers.insert(registration, unbound);
     model
         .check_client(&model.participants[1], &client, &[])
         .unwrap();
 }
 
 #[test]
-fn publishers_expose_distinct_public_bindings_for_declared_registrations() {
+fn publishers_must_install_each_declared_data_track() {
     let (mut model, mut client) = fixture();
-    for (mode, id) in [
-        (TopicMode::Latest, "latest-id"),
-        (TopicMode::Ordered, "ordered-id"),
-    ] {
+    for (topic, mode) in [("state", TopicMode::Latest), ("events", TopicMode::Lossy)] {
         let registration = TopicPublisher {
-            topic: "updates".into(),
+            topic: topic.into(),
             mode,
         };
         model.participants[1]
             .topics
             .publishers
             .push(registration.clone());
-        client
-            .snapshot
-            .topics
-            .publishers
-            .push(TopicPublisherStatus {
-                registration,
-                channel: None,
-                publication_id: Some(id.into()),
-                next_sequence: 0,
-                accepted_history: 0,
-                queued_messages: 0,
-                send_pending: false,
-            });
+        client.data_publishers.insert(
+            registration,
+            DataPublicationState {
+                observation_revision: 1,
+                intent_revision: 1,
+                evaluated_revision: 1,
+                accepted_revision: Some(1),
+                rejected_revision: None,
+                track_id: topic.into(),
+                delivery: mode.into(),
+                local_enabled: true,
+                closed: false,
+                admission: PublicationAdmissionStatus::Admitted,
+                admission_pending: false,
+                error: None,
+                execution: PublicationExecution::Installed,
+                execution_error: None,
+            },
+        );
     }
     let requested = [model.participants[0].id.as_str().to_owned()];
-    model
-        .check_client(&model.participants[1], &client, &requested)
-        .unwrap();
-    client.snapshot.topics.publishers[0].publication_id = None;
-    assert!(
-        model
-            .check_client(&model.participants[1], &client, &requested)
-            .is_err()
-    );
-    client.snapshot.topics.publishers[0].publication_id = Some("ordered-id".into());
-    assert!(
-        model
-            .check_client(&model.participants[1], &client, &requested)
-            .is_err()
-    );
-    client.snapshot.topics.publishers[0].publication_id = Some("latest-id".into());
-    client.snapshot.topics.publishers[0].registration.mode = TopicMode::Lossy;
-    assert!(
-        model
-            .check_client(&model.participants[1], &client, &requested)
-            .is_err()
-    );
+    let check =
+        |client: &ClientObservation| model.check_client(&model.participants[1], client, &requested);
+    check(&client).unwrap();
+    let state = client.data_publishers.values_mut().next().unwrap();
+    state.execution = PublicationExecution::Unavailable;
+    assert!(check(&client).is_err());
+    let state = client.data_publishers.values_mut().next().unwrap();
+    state.execution = PublicationExecution::Installed;
+    state.track_id = "not-declared".into();
+    assert!(check(&client).is_err());
 }
 
 #[test]

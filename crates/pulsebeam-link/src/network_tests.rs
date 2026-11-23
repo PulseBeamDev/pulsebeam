@@ -43,6 +43,55 @@ impl WireCodec<Packet> for Codec {
     }
 }
 
+struct FabricImageCodec;
+
+impl FabricCodec<Packet> for FabricImageCodec {
+    fn encoded_len(&self, packet: &Packet) -> Result<usize, CodecError> {
+        Codec.encoded_len(packet)
+    }
+
+    fn encode(
+        &self,
+        packet: &Packet,
+        key: NodeRouteKey,
+        dst: &mut [u8],
+    ) -> Result<usize, CodecError> {
+        let len = Codec.encode(packet, dst)?;
+        dst.get_mut(..len)
+            .and_then(|image| image.get_mut(8..12))
+            .ok_or(CodecError::Malformed)?
+            .copy_from_slice(&key.to_bytes());
+        Ok(len)
+    }
+
+    fn encode_positioned(
+        &self,
+        packet: &Packet,
+        key: NodeRouteKey,
+        position: Option<u64>,
+        dst: &mut [u8],
+    ) -> Result<usize, CodecError> {
+        let len = self.encode(packet, key, dst)?;
+        if let Some(position) = position {
+            dst[..8].copy_from_slice(&position.to_be_bytes());
+        }
+        Ok(len)
+    }
+
+    fn route_key(&self, image: &[u8]) -> Result<NodeRouteKey, CodecError> {
+        let bytes = image
+            .get(8..12)
+            .ok_or(CodecError::Malformed)?
+            .try_into()
+            .map_err(|_| CodecError::Malformed)?;
+        Ok(NodeRouteKey::from_bytes(bytes))
+    }
+
+    fn decode(&self, image: &[u8]) -> Result<Packet, CodecError> {
+        Codec.decode(image)
+    }
+}
+
 struct Pair {
     a: LinkControl<Packet>,
     b: LinkControl<Packet>,
@@ -59,6 +108,7 @@ struct Pair {
     b_peer: PeerConfig,
     control: Option<[PeerControl; 2]>,
     a_epochs: [bool; 4],
+    a_full_image_epochs: [bool; 4],
     reject_a: bool,
     short_a: bool,
     drop_b: bool,
@@ -79,6 +129,15 @@ impl Pair {
     }
 
     fn configured(key_limit: Option<u64>, quic: bool, control: bool) -> Self {
+        Self::configured_profile(key_limit, quic, control, None)
+    }
+
+    fn configured_profile(
+        key_limit: Option<u64>,
+        quic: bool,
+        control: bool,
+        fabric: Option<FabricPath>,
+    ) -> Self {
         let ticks = Arc::new(AtomicU64::new(0));
         let clock = ticks.clone();
         let mut a = LinkControl::new(move || LinkTime(clock.load(Ordering::Relaxed))).unwrap();
@@ -112,36 +171,59 @@ impl Pair {
         } else {
             let ca = SecretCredential::generate().unwrap();
             let cb = SecretCredential::generate().unwrap();
+            let profile = |peer| -> PeerConfig {
+                match fabric {
+                    Some(path) => NetworkPeer::with_fabric_path(peer, path).into(),
+                    None => peer.into(),
+                }
+            };
             (
-                NetworkPeer {
+                profile(NetworkPeer {
                     endpoint: ba,
                     credential: ca.clone(),
                     expected_peer: cb.fingerprint(),
                     role: PeerRole::Initiator,
                     class: NetworkClass::Lan,
-                }
-                .into(),
-                NetworkPeer {
+                }),
+                profile(NetworkPeer {
                     endpoint: aa,
                     credential: cb,
                     expected_peer: ca.fingerprint(),
                     role: PeerRole::Responder,
                     class: NetworkClass::Wan,
+                }),
+            )
+        };
+        let (aid, bid, control) =
+            if let (PeerConfig::Fabric(left), PeerConfig::Fabric(right)) = (&a_peer, &b_peer) {
+                if control {
+                    let (aid, left) = a
+                        .open_fabric_network_with_control(left.clone(), FabricImageCodec)
+                        .unwrap();
+                    let (bid, right) = b
+                        .open_fabric_network_with_control(right.clone(), FabricImageCodec)
+                        .unwrap();
+                    (aid, bid, Some([left, right]))
+                } else {
+                    (
+                        a.open_fabric_network(left.clone(), FabricImageCodec)
+                            .unwrap(),
+                        b.open_fabric_network(right.clone(), FabricImageCodec)
+                            .unwrap(),
+                        None,
+                    )
                 }
-                .into(),
-            )
-        };
-        let (aid, bid, control) = if control {
-            let (aid, left) = a.open_network_with_control(a_peer.clone(), Codec).unwrap();
-            let (bid, right) = b.open_network_with_control(b_peer.clone(), Codec).unwrap();
-            (aid, bid, Some([left, right]))
-        } else {
-            (
-                a.open_network(a_peer.clone(), Codec).unwrap(),
-                b.open_network(b_peer.clone(), Codec).unwrap(),
-                None,
-            )
-        };
+            } else if control {
+                let (aid, left) = a.open_network_with_control(a_peer.clone(), Codec).unwrap();
+                let (bid, right) = b.open_network_with_control(b_peer.clone(), Codec).unwrap();
+                (aid, bid, Some([left, right]))
+            } else {
+                (
+                    a.open_network(a_peer.clone(), Codec).unwrap(),
+                    b.open_network(b_peer.clone(), Codec).unwrap(),
+                    None,
+                )
+            };
         let mut ad = a.take_network_driver(aid).unwrap();
         let mut bd = b.take_network_driver(bid).unwrap();
         if let Some(limit) = key_limit {
@@ -167,6 +249,7 @@ impl Pair {
             b_peer,
             control,
             a_epochs: [false; 4],
+            a_full_image_epochs: [false; 4],
             reject_a: false,
             short_a: false,
             drop_b: false,
@@ -179,8 +262,17 @@ impl Pair {
         self.b.close_network(self.bid);
         self.aout.clear();
         self.bout.clear();
-        self.aid = self.a.open_network(self.a_peer.clone(), Codec).unwrap();
-        self.bid = self.b.open_network(self.b_peer.clone(), Codec).unwrap();
+        let open = |link: &mut LinkControl<Packet>, peer: &PeerConfig| {
+            match peer {
+                PeerConfig::Fabric(peer) => {
+                    link.open_fabric_network(peer.clone(), FabricImageCodec)
+                }
+                _ => link.open_network(peer.clone(), Codec),
+            }
+            .unwrap()
+        };
+        self.aid = open(&mut self.a, &self.a_peer);
+        self.bid = open(&mut self.b, &self.b_peer);
         self.ad = self.a.take_network_driver(self.aid).unwrap();
         self.bd = self.b.take_network_driver(self.bid).unwrap();
         let now = LinkTime(self.ticks.load(Ordering::Relaxed));
@@ -207,7 +299,11 @@ impl Pair {
                 if let Some(header) = datagram.payload.first()
                     && header & 0xe0 == 0x20
                 {
-                    self.a_epochs[usize::from(header & 3)] = true;
+                    let epoch = usize::from(header & 3);
+                    self.a_epochs[epoch] = true;
+                    if datagram.payload.len() == 1180 {
+                        self.a_full_image_epochs[epoch] = true;
+                    }
                 }
                 self.aout.push_back(datagram.payload.to_vec());
                 io::SendOutcome::Accepted {
@@ -291,6 +387,203 @@ impl Pair {
             })
             .unwrap()
     }
+}
+
+#[test]
+fn negotiated_fabric_link_preserves_full_images_through_rekey_and_path_shrink() {
+    let path = FabricPath {
+        udp_payload_limit: 1200,
+        additional_overhead: 20,
+    };
+    let mut pair = Pair::configured_profile(Some(8), false, false, Some(path));
+    let (port, mut rx) = pair.b.create_port().unwrap();
+    assert_eq!(
+        pair.b
+            .stage_fabric_receive(pair.bid, 3, &[(port, DeliveryTag(91))], |_| true),
+        Err(BindError::UnsupportedProfile)
+    );
+    assert_eq!(
+        pair.a
+            .bind_fabric_send(pair.aid, NodeRouteKey::from_bytes([1, 3, 0, 0]))
+            .unwrap_err(),
+        BindError::UnsupportedProfile
+    );
+    pair.connect();
+    assert_eq!(
+        pair.a
+            .bind_fabric_send(pair.aid, NodeRouteKey::from_bytes([0; 4]))
+            .unwrap_err(),
+        BindError::Closed
+    );
+    let (binding, key) = pair
+        .b
+        .stage_fabric_receive(pair.bid, 3, &[(port, DeliveryTag(91))], |_| true)
+        .unwrap();
+    pair.b.activate_fabric_receive(binding).unwrap();
+    let (_, tx) = pair.a.bind_fabric_send(pair.aid, key).unwrap();
+    let mut image = vec![0x65; wire::FABRIC_IMAGE];
+    image[..24].copy_from_slice(&[
+        0x90, 0xe0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0xbe, 0xde, 0, 2, 0x16, 0, 0, 0, 1, 0, 0, 0xc0,
+    ]);
+    for seq in 1_u16..=20 {
+        image[2..4].copy_from_slice(&seq.to_be_bytes());
+        let positioned = seq == 1;
+        let position = (1_u64 << 32) | u64::from(seq);
+        if positioned {
+            tx.try_send_fabric(
+                Packet::Wire(image.clone().into()),
+                position,
+                LinkTime(u64::MAX),
+            )
+            .unwrap();
+        } else {
+            tx.try_send(Packet::Wire(image.clone().into()), LinkTime(u64::MAX))
+                .unwrap();
+        }
+        for _ in 0..20 {
+            pair.step();
+        }
+        let mut out = Vec::new();
+        assert_eq!(rx.try_recv_batch(&mut out, 2), 1);
+        assert_eq!(out[0].tag, DeliveryTag(91));
+        assert_eq!(
+            out[0].fabric,
+            Some(FabricIngress {
+                association: pair.bid,
+                key,
+                purpose: FabricPurpose::Live,
+            })
+        );
+        let Packet::Wire(ref actual) = out[0].packet else {
+            panic!("expected the protected Fabric image")
+        };
+        let mut expected = image.clone();
+        expected[8..12].copy_from_slice(&key.to_bytes());
+        if positioned {
+            expected[..8].copy_from_slice(&position.to_be_bytes());
+        }
+        assert_eq!(actual.as_ref(), expected);
+    }
+    assert!(
+        pair.a_full_image_epochs
+            .into_iter()
+            .filter(|seen| *seen)
+            .count()
+            > 1
+    );
+    assert_eq!(pair.ad.health().sent, 20);
+    assert_eq!(pair.ad.health().bytes_in_flight, 0);
+
+    tx.try_send(Packet::Wire(image.clone().into()), LinkTime(u64::MAX))
+        .unwrap();
+    pair.ad
+        .set_fabric_path(FabricPath {
+            udp_payload_limit: 1199,
+            ..path
+        })
+        .unwrap();
+    assert_eq!(
+        tx.try_send(Packet::Wire(image.into()), LinkTime(u64::MAX))
+            .unwrap_err()
+            .kind,
+        SendErrorKind::NotReady
+    );
+    pair.step();
+    assert_eq!(pair.ad.health().sent, 20);
+    assert_eq!(pair.ad.health().send_failed, 1);
+    assert_eq!(rx.try_recv_batch(&mut Vec::new(), 1), 0);
+}
+
+#[test]
+fn fabric_route_cutoff_fences_all_queued_members_and_reuse_changes_generation() {
+    let path = FabricPath {
+        udp_payload_limit: 1200,
+        additional_overhead: 0,
+    };
+    let mut pair = Pair::configured_profile(None, false, false, Some(path));
+    pair.connect();
+    let (left, mut left_rx) = pair.b.create_port().unwrap();
+    let (right, mut right_rx) = pair.b.create_port().unwrap();
+    let (original, key) = pair
+        .b
+        .stage_fabric_receive(
+            pair.bid,
+            9,
+            &[(left, DeliveryTag(1)), (right, DeliveryTag(2))],
+            |packet| matches!(packet, Packet::Wire(image) if image.len() == 24),
+        )
+        .unwrap();
+    assert_eq!(key.to_bytes(), [1, 9, 0, 0]);
+    let (_, tx) = pair
+        .a
+        .bind_send(Destination::Network {
+            peer: pair.aid,
+            address: key,
+        })
+        .unwrap();
+    let image = || Packet::Wire(vec![0; 24].into());
+    tx.try_send(image(), LinkTime(u64::MAX)).unwrap();
+    for _ in 0..30 {
+        pair.step();
+    }
+    assert_eq!(pair.bd.health().received, 1);
+    assert_eq!(pair.bd.health().stale, 1);
+    assert_eq!(left_rx.try_recv_batch(&mut Vec::new(), 1), 0);
+    assert_eq!(right_rx.try_recv_batch(&mut Vec::new(), 1), 0);
+    pair.b.activate_fabric_receive(original).unwrap();
+
+    tx.try_send(Packet::Wire(vec![0; 25].into()), LinkTime(u64::MAX))
+        .unwrap();
+    for _ in 0..30 {
+        pair.step();
+    }
+    assert_eq!(pair.bd.health().received, 2);
+    assert_eq!(pair.bd.health().invalid, 1);
+    assert_eq!(left_rx.try_recv_batch(&mut Vec::new(), 1), 0);
+    assert_eq!(right_rx.try_recv_batch(&mut Vec::new(), 1), 0);
+
+    tx.try_send(image(), LinkTime(u64::MAX)).unwrap();
+    for _ in 0..30 {
+        pair.step();
+    }
+    assert_eq!(pair.bd.health().received, 3);
+    pair.b.receive_port_cutoff(original, left).unwrap().fence();
+    assert_eq!(
+        pair.b.activate_fabric_receive(original),
+        Err(BindError::Closed)
+    );
+    assert_eq!(left_rx.try_recv_batch(&mut Vec::new(), 1), 0);
+    assert_eq!(right_rx.try_recv_batch(&mut Vec::new(), 1), 0);
+    pair.b.unbind(original);
+
+    let (_, other) = pair
+        .b
+        .stage_fabric_receive(pair.bid, 9, &[(right, DeliveryTag(3))], |_| true)
+        .unwrap();
+    assert_eq!(other.to_bytes(), [1, 9, 0, 1]);
+    pair.ticks.fetch_add(2_000_000_000, Ordering::Relaxed);
+    let (successor, replacement) = pair
+        .b
+        .stage_fabric_receive(pair.bid, 9, &[(right, DeliveryTag(4))], |_| true)
+        .unwrap();
+    pair.b.activate_fabric_receive(successor).unwrap();
+    assert_eq!(replacement.to_bytes(), [2, 9, 0, 0]);
+    let (_, fresh) = pair
+        .a
+        .bind_send(Destination::Network {
+            peer: pair.aid,
+            address: replacement,
+        })
+        .unwrap();
+    tx.try_send(image(), LinkTime(u64::MAX)).unwrap();
+    fresh.try_send(image(), LinkTime(u64::MAX)).unwrap();
+    for _ in 0..100 {
+        pair.step();
+    }
+    let mut received = Vec::new();
+    assert_eq!(right_rx.try_recv_batch(&mut received, 2), 1);
+    assert_eq!(received[0].tag, DeliveryTag(4));
+    assert!(pair.bd.health().stale > 0);
 }
 
 #[test]
@@ -501,14 +794,25 @@ fn receive_retirement_fences_queued_payloads_without_withholding_transport_feedb
 
 #[test]
 fn provisioned_control_shares_an_authenticated_link_without_entering_media_routes() {
-    let mut pair = Pair::configured(None, false, true);
+    for profile in [
+        None,
+        Some(FabricPath {
+            udp_payload_limit: 1200,
+            additional_overhead: 0,
+        }),
+    ] {
+        control_lane_case(profile);
+    }
+}
+
+fn control_lane_case(profile: Option<FabricPath>) {
+    let mut pair = Pair::configured_profile(None, false, true, profile);
     let [left, mut right] = pair.control.take().unwrap();
     assert_eq!(
         left.try_send(Box::new([1]), LinkTime(u64::MAX)),
         Err(SendErrorKind::NotReady)
     );
     let (port, mut rx) = pair.b.create_port().unwrap();
-    let (_, media) = pair.route(&[(port, DeliveryTag(7))]);
     assert!(
         pair.a
             .bind_send(Destination::Network {
@@ -519,6 +823,24 @@ fn provisioned_control_shares_an_authenticated_link_without_entering_media_route
     );
     pair.connect();
     assert!(left.is_ready() && right.is_ready());
+    let (media, packet) = if profile.is_some() {
+        let (binding, key) = pair
+            .b
+            .stage_fabric_receive(pair.bid, 3, &[(port, DeliveryTag(7))], |_| true)
+            .unwrap();
+        pair.b.activate_fabric_receive(binding).unwrap();
+        let mut packet = [0; 24];
+        packet[23] = 3;
+        (
+            pair.a.bind_fabric_send(pair.aid, key).unwrap().1,
+            Packet::Wire(Arc::from(packet)),
+        )
+    } else {
+        (
+            pair.route(&[(port, DeliveryTag(7))]).1,
+            Packet::Wire(Arc::from([3])),
+        )
+    };
     assert_eq!(
         left.try_send(
             vec![0; CONTROL_FRAME_BYTES + 1].into_boxed_slice(),
@@ -527,9 +849,7 @@ fn provisioned_control_shares_an_authenticated_link_without_entering_media_route
         Err(SendErrorKind::TooLarge)
     );
     left.try_send(Box::new([2]), LinkTime(u64::MAX)).unwrap();
-    media
-        .try_send(Packet::Wire(Arc::from([3])), LinkTime(u64::MAX))
-        .unwrap();
+    media.try_send(packet, LinkTime(u64::MAX)).unwrap();
     for _ in 0..20 {
         pair.step();
     }
@@ -538,7 +858,8 @@ fn provisioned_control_shares_an_authenticated_link_without_entering_media_route
     let mut batch = Vec::new();
     assert_eq!(rx.try_recv_batch(&mut batch, 10), 1);
     assert_eq!(batch[0].tag, DeliveryTag(7));
-    assert!(matches!(&batch[0].packet, Packet::Wire(bytes) if bytes.as_ref() == [3]));
+    assert!(matches!(&batch[0].packet, Packet::Wire(bytes) if bytes.last() == Some(&3)));
+    assert!(right.try_recv().is_none());
     pair.b.close_network(pair.bid);
     assert!(right.is_closed());
     assert!(futures_lite::future::block_on(right.recv()).is_none());
@@ -588,6 +909,11 @@ fn association_replacement_reuses_pinned_identities_but_not_bindings_or_queued_p
 ) {
     let mut pair = Pair::with_backend(quic);
     let (port, mut rx) = pair.b.create_port().unwrap();
+    assert_eq!(
+        pair.b
+            .stage_fabric_receive(pair.bid, 3, &[(port, DeliveryTag(1))], |_| true),
+        Err(BindError::UnsupportedProfile)
+    );
     let (_, key) = pair
         .b
         .bind_receive(pair.bid, &[(port, DeliveryTag(1))])
@@ -600,6 +926,12 @@ fn association_replacement_reuses_pinned_identities_but_not_bindings_or_queued_p
         })
         .unwrap();
     pair.connect();
+    assert_eq!(
+        pair.a
+            .bind_fabric_send(pair.aid, NodeRouteKey::from_bytes([1, 3, 0, 0]))
+            .unwrap_err(),
+        BindError::UnsupportedProfile
+    );
     old.try_send(Packet::Wire(Arc::from([1u8])), LinkTime(u64::MAX))
         .unwrap();
     for _ in 0..20 {
@@ -644,6 +976,190 @@ fn association_replacement_reuses_pinned_identities_but_not_bindings_or_queued_p
     assert_eq!(pair.ad.health().sent, 1);
     assert_eq!(pair.bd.health().received, 1);
     assert_eq!(pair.ad.health().bytes_in_flight, 0);
+}
+
+#[test]
+fn fabric_restart_reuses_route_label_but_never_admits_old_association_work() {
+    let path = FabricPath {
+        udp_payload_limit: 1200,
+        additional_overhead: 0,
+    };
+    let mut pair = Pair::configured_profile(None, false, false, Some(path));
+    let (port, mut rx) = pair.b.create_port().unwrap();
+    let install = |pair: &mut Pair, tag| {
+        pair.connect();
+        let (binding, key) = pair
+            .b
+            .stage_fabric_receive(pair.bid, 3, &[(port, tag)], |_| true)
+            .unwrap();
+        pair.b.activate_fabric_receive(binding).unwrap();
+        let (_, tx) = pair
+            .a
+            .bind_send(Destination::Network {
+                peer: pair.aid,
+                address: key,
+            })
+            .unwrap();
+        (key, tx)
+    };
+    let image = || Packet::Wire(Arc::from([0; 24]));
+    let (label, old) = install(&mut pair, DeliveryTag(1));
+    let previous = pair.bid;
+    old.try_send(image(), LinkTime(u64::MAX)).unwrap();
+    for _ in 0..20 {
+        pair.step();
+    }
+    assert_eq!(pair.bd.health().received, 1);
+    old.try_send(image(), LinkTime(u64::MAX)).unwrap();
+    pair.reset();
+    let (label_after_restart, fresh) = install(&mut pair, DeliveryTag(2));
+    assert_ne!(previous, pair.bid);
+    assert_eq!(label, label_after_restart);
+    assert_eq!(
+        old.try_send(image(), LinkTime(u64::MAX)).unwrap_err().kind,
+        SendErrorKind::Stale
+    );
+    fresh.try_send(image(), LinkTime(u64::MAX)).unwrap();
+    for _ in 0..20 {
+        pair.step();
+    }
+    let mut delivered = Vec::new();
+    assert_eq!(rx.try_recv_batch(&mut delivered, 2), 1);
+    assert_eq!(rx.drop_counts().stale, 1);
+    assert_eq!(delivered[0].tag, DeliveryTag(2));
+    assert_eq!(
+        delivered[0].fabric,
+        Some(FabricIngress {
+            association: pair.bid,
+            key: label,
+            purpose: FabricPurpose::Live,
+        })
+    );
+    assert_eq!(pair.bd.health().received, 1);
+}
+
+#[test]
+fn protected_repair_label_has_one_destination_and_cannot_compile_as_live() {
+    let path = FabricPath {
+        udp_payload_limit: 1200,
+        additional_overhead: 0,
+    };
+    let mut pair = Pair::configured_profile(None, false, false, Some(path));
+    pair.connect();
+    let (live_port, mut live) = pair.b.create_port().unwrap();
+    let (repair_port, mut repair) = pair.b.create_port().unwrap();
+    let (live_binding, _) = pair
+        .b
+        .stage_fabric_receive(pair.bid, 3, &[(live_port, DeliveryTag(1))], |_| true)
+        .unwrap();
+    let (repair_binding, key) = pair
+        .b
+        .stage_fabric_repair_receive(
+            pair.bid,
+            3,
+            (repair_port, DeliveryTag(2)),
+            |packet| matches!(packet, Packet::Wire(bytes) if bytes.get(1) == Some(&0xe3)),
+        )
+        .unwrap();
+    pair.b.activate_fabric_receive(live_binding).unwrap();
+    pair.b.activate_fabric_receive(repair_binding).unwrap();
+    assert_eq!(
+        pair.b
+            .bind_fabric_relay(repair_binding, pair.bid, key)
+            .unwrap_err(),
+        BindError::UnsupportedProfile
+    );
+    assert_eq!(
+        pair.b
+            .bind_fabric_repair_relay(live_binding, pair.bid, key)
+            .unwrap_err(),
+        BindError::UnsupportedProfile
+    );
+    assert!(
+        pair.b
+            .bind_fabric_repair_relay(repair_binding, pair.bid, key)
+            .is_ok()
+    );
+
+    let (_, tx) = pair.a.bind_fabric_send(pair.aid, key).unwrap();
+    let mut image = vec![0; 64];
+    image[0] = 0x80;
+    image[1] = 0xe3;
+    tx.try_send(Packet::Wire(image.into()), LinkTime(u64::MAX))
+        .unwrap();
+    for _ in 0..20 {
+        pair.step();
+    }
+    let mut out = Vec::new();
+    assert_eq!(live.try_recv_batch(&mut out, 2), 0);
+    assert_eq!(repair.try_recv_batch(&mut out, 2), 1);
+    assert_eq!(out[0].tag, DeliveryTag(2));
+    assert_eq!(
+        out[0].fabric,
+        Some(FabricIngress {
+            association: pair.bid,
+            key,
+            purpose: FabricPurpose::RepairOnly
+        })
+    );
+}
+
+#[test]
+fn relay_cutoff_cancels_protected_output_at_either_binding() {
+    for cut_input in [true, false] {
+        let path = FabricPath {
+            udp_payload_limit: 1200,
+            additional_overhead: 0,
+        };
+        let mut pair = Pair::configured_profile(None, false, false, Some(path));
+        pair.connect();
+        let (input_port, _input) = pair.a.create_port().unwrap();
+        let (output_port, mut output) = pair.b.create_port().unwrap();
+        let (input, _) = pair
+            .a
+            .stage_fabric_receive(pair.aid, 0, &[(input_port, DeliveryTag(1))], |_| true)
+            .unwrap();
+        let (output_binding, key) = pair
+            .b
+            .stage_fabric_receive(pair.bid, 1, &[(output_port, DeliveryTag(2))], |_| true)
+            .unwrap();
+        pair.b.activate_fabric_receive(output_binding).unwrap();
+        assert_eq!(
+            pair.a.bind_fabric_relay(input, pair.aid, key).unwrap_err(),
+            BindError::Closed
+        );
+        pair.a.activate_fabric_receive(input).unwrap();
+        let (relay, tx) = pair.a.bind_fabric_relay(input, pair.aid, key).unwrap();
+        let image = || Packet::Wire(Arc::from([0; 24]));
+        tx.try_send(image(), LinkTime(u64::MAX)).unwrap();
+        for _ in 0..40 {
+            pair.step();
+        }
+        assert_eq!(output.try_recv_batch(&mut Vec::new(), 1), 1);
+        assert_eq!(pair.ad.health().sent, 1);
+
+        tx.try_send(image(), LinkTime(u64::MAX)).unwrap();
+        assert!(pair.ad.stage_test_outbound().unwrap());
+        assert_eq!(pair.ad.health().sent, 1);
+        if cut_input {
+            pair.a
+                .receive_port_cutoff(input, input_port)
+                .unwrap()
+                .fence();
+        } else {
+            pair.a.unbind(relay);
+        }
+        assert_eq!(
+            tx.try_send(image(), LinkTime(u64::MAX)).unwrap_err().kind,
+            SendErrorKind::Stale
+        );
+        for _ in 0..40 {
+            pair.step();
+        }
+        assert_eq!(output.try_recv_batch(&mut Vec::new(), 1), 0);
+        assert_eq!(pair.ad.health().sent, 1);
+        assert_eq!(pair.ad.health().send_failed, 1);
+    }
 }
 
 #[test]

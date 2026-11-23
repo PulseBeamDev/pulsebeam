@@ -6,13 +6,15 @@ use std::collections::HashMap;
 use std::num::NonZeroUsize;
 
 mod control;
+mod fabric_keys;
 pub mod io;
 mod network;
+pub mod wan;
 mod wire;
 pub use control::{CONTROL_FRAME_BYTES, PeerControl};
 pub use network::{
-    CodecError, LinkError, NetworkClass, NetworkId, NetworkPeer, NodeRouteKey, PeerFingerprint,
-    PeerRole, SecretCredential, WireCodec,
+    CodecError, FabricCodec, FabricPath, FabricPeer, LinkError, NetworkClass, NetworkId,
+    NetworkPeer, NodeRouteKey, PeerFingerprint, PeerRole, SecretCredential, WireCodec,
 };
 pub use pulsebeam_transport::{
     PeerConfig, QuicCredential, QuicPeer, QuicTuning, ReceiveTime, Time as LinkTime,
@@ -78,6 +80,7 @@ pub enum Destination {
 pub enum BindError {
     Closed,
     Capacity,
+    UnsupportedProfile,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,15 +99,30 @@ pub struct SendError<P> {
     pub packet: P,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FabricPurpose {
+    Live,
+    RepairOnly,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FabricIngress {
+    pub association: NetworkId,
+    pub key: NodeRouteKey,
+    pub purpose: FabricPurpose,
+}
+
 #[derive(Debug)]
 pub struct Received<P> {
     pub tag: DeliveryTag,
     pub packet: P,
     pub received_at: ReceiveTime,
+    pub fabric: Option<FabricIngress>,
 }
 
 struct Pending<P> {
     binding: BindingId,
+    parent: Option<BindingId>,
     expires_at: LinkTime,
     received: Received<P>,
 }
@@ -159,6 +177,7 @@ impl Table {
 
 /// A generation-specific fence that a shard can apply at its lifecycle cutoff.
 /// LinkControl still owns the binding record and its cleanup.
+#[derive(Clone)]
 pub struct BindingCutoff {
     table: Shared<Table>,
     binding: BindingId,
@@ -173,7 +192,15 @@ impl std::fmt::Debug for BindingCutoff {
 }
 
 impl BindingCutoff {
-    pub fn fence(self) {
+    pub fn id(&self) -> BindingId {
+        self.binding
+    }
+
+    pub fn is_live(&self) -> bool {
+        self.table.binding_live(self.binding)
+    }
+
+    pub fn fence(&self) {
         Table::retire(
             &self.table.bindings,
             self.binding.slot,
@@ -271,6 +298,7 @@ impl<P> LinkControl<P> {
             binding,
             LinkTx {
                 binding,
+                parent: None,
                 destination,
                 table: self.table.clone(),
                 clock: self.clock.clone(),
@@ -291,15 +319,31 @@ impl<P> LinkControl<P> {
     pub fn unbind(&mut self, binding: BindingId) {
         if let Some(target) = self.bindings.remove(&binding) {
             target.retire(&self.table, binding);
+            if let BindingTarget::NetworkReceive {
+                peer,
+                fabric: Some(route),
+                ..
+            } = target
+                && let Some(entry) = self.networks.get_mut(&peer)
+            {
+                entry.retire_fabric_key((self.clock)(), route.key);
+            }
         }
     }
 
     pub fn close_port(&mut self, port: PortId) {
         if port.owner == self.owner && self.table.port_live(port) {
             Table::retire(&self.table.ports, port.slot, port.generation);
+            let networks = &mut self.networks;
+            let now = (self.clock)();
             self.bindings.retain(|binding, target| {
                 let keep = match target {
                     BindingTarget::Local(target) => *target != port,
+                    BindingTarget::NetworkReceive {
+                        destinations,
+                        fabric: Some(_),
+                        ..
+                    } => !destinations.iter().any(|&(target, _)| target == port),
                     BindingTarget::NetworkReceive { destinations, .. } => {
                         retire_receive_port(&self.table, destinations, port);
                         !destinations.is_empty()
@@ -308,6 +352,15 @@ impl<P> LinkControl<P> {
                 };
                 if !keep {
                     target.retire(&self.table, *binding);
+                    if let BindingTarget::NetworkReceive {
+                        peer,
+                        fabric: Some(route),
+                        ..
+                    } = target
+                        && let Some(entry) = networks.get_mut(peer)
+                    {
+                        entry.retire_fabric_key(now, route.key);
+                    }
                 }
                 keep
             });
@@ -341,6 +394,7 @@ enum BindingTarget {
     NetworkReceive {
         peer: NetworkId,
         destinations: Vec<(PortId, BindingId)>,
+        fabric: Option<network::StagedFabricRoute>,
     },
 }
 
@@ -373,6 +427,7 @@ enum TxDestination<P> {
 
 pub struct LinkTx<P> {
     binding: BindingId,
+    parent: Option<BindingId>,
     table: Shared<Table>,
     clock: Shared<dyn Fn() -> LinkTime + Send + Sync>,
     destination: TxDestination<P>,
@@ -397,6 +452,7 @@ impl<P> Clone for LinkTx<P> {
     fn clone(&self) -> Self {
         Self {
             binding: self.binding,
+            parent: self.parent,
             table: self.table.clone(),
             clock: self.clock.clone(),
             destination: match &self.destination {
@@ -412,6 +468,30 @@ impl<P> Clone for LinkTx<P> {
 }
 
 impl<P> LinkTx<P> {
+    pub fn is_live(&self) -> bool {
+        self.table.binding_live(self.binding)
+            && self
+                .parent
+                .is_none_or(|parent| self.table.binding_live(parent))
+    }
+
+    pub fn local_cutoff(&self) -> Option<BindingCutoff> {
+        if self.local_delivery_tag().is_none() || !self.is_live() {
+            return None;
+        }
+        Some(BindingCutoff {
+            table: self.table.clone(),
+            binding: self.binding,
+        })
+    }
+
+    pub fn local_delivery_tag(&self) -> Option<DeliveryTag> {
+        match &self.destination {
+            TxDestination::Local { tag, .. } => Some(*tag),
+            TxDestination::Network(_) => None,
+        }
+    }
+
     pub fn try_send(&self, packet: P, expires_at: LinkTime) -> Result<(), SendError<P>> {
         self.try_send_received(
             packet,
@@ -423,6 +503,45 @@ impl<P> LinkTx<P> {
         )
     }
 
+    /// Preserve the full logical position to the Fabric network codec. The
+    /// historical wire still carries only its existing sequence fields.
+    pub fn try_send_fabric(
+        &self,
+        packet: P,
+        source_position: u64,
+        expires_at: LinkTime,
+    ) -> Result<(), SendError<P>> {
+        let TxDestination::Network(tx) = &self.destination else {
+            return Err(SendError {
+                kind: SendErrorKind::Unsupported,
+                packet,
+            });
+        };
+        self.try_send_network(tx, packet, Some(source_position), expires_at)
+    }
+
+    fn try_send_network(
+        &self,
+        tx: &network::NetworkTx<P>,
+        packet: P,
+        source_position: Option<u64>,
+        expires_at: LinkTime,
+    ) -> Result<(), SendError<P>> {
+        if !self.is_live() {
+            return Err(SendError {
+                kind: SendErrorKind::Stale,
+                packet,
+            });
+        }
+        tx.try_send(
+            self.binding,
+            self.parent,
+            packet,
+            source_position,
+            expires_at,
+        )
+    }
+
     /// Retain the original host observation through a local ownership handoff.
     pub fn try_send_received(
         &self,
@@ -430,45 +549,46 @@ impl<P> LinkTx<P> {
         received_at: ReceiveTime,
         expires_at: LinkTime,
     ) -> Result<(), SendError<P>> {
-        if let TxDestination::Local { port, .. } = &self.destination
-            && !self.table.port_live(*port)
-        {
+        let (port, tag, sender) = match &self.destination {
+            TxDestination::Network(tx) => {
+                return self.try_send_network(tx, packet, None, expires_at);
+            }
+            TxDestination::Local { port, tag, sender } => (*port, *tag, sender),
+        };
+        if !self.table.port_live(port) {
             return Err(SendError {
                 kind: SendErrorKind::Closed,
                 packet,
             });
         }
-        if !self.table.binding_live(self.binding) {
+        if !self.is_live() {
             return Err(SendError {
                 kind: SendErrorKind::Stale,
                 packet,
             });
         }
-        match &self.destination {
-            TxDestination::Network(tx) => tx.try_send(self.binding, packet, expires_at),
-            TxDestination::Local { tag, sender, .. } => sender
-                .try_send(Pending {
-                    binding: self.binding,
-                    expires_at,
-                    received: Received {
-                        tag: *tag,
-                        packet,
-                        received_at,
-                    },
-                })
-                .map_err(|error| {
-                    let (kind, pending) = match error {
-                        pulsebeam_queue::TrySendError::Full(value) => (SendErrorKind::Full, value),
-                        pulsebeam_queue::TrySendError::Closed(value) => {
-                            (SendErrorKind::Closed, value)
-                        }
-                    };
-                    SendError {
-                        kind,
-                        packet: pending.received.packet,
-                    }
-                }),
-        }
+        sender
+            .try_send(Pending {
+                binding: self.binding,
+                parent: None,
+                expires_at,
+                received: Received {
+                    tag,
+                    packet,
+                    received_at,
+                    fabric: None,
+                },
+            })
+            .map_err(|error| {
+                let (kind, pending) = match error {
+                    pulsebeam_queue::TrySendError::Full(value) => (SendErrorKind::Full, value),
+                    pulsebeam_queue::TrySendError::Closed(value) => (SendErrorKind::Closed, value),
+                };
+                SendError {
+                    kind,
+                    packet: pending.received.packet,
+                }
+            })
     }
 }
 
@@ -499,7 +619,11 @@ impl<P> LinkRx<P> {
             };
             if !self.table.port_live(self.port) {
                 self.drops.closed = self.drops.closed.saturating_add(1);
-            } else if !self.table.binding_live(pending.binding) {
+            } else if !self.table.binding_live(pending.binding)
+                || pending
+                    .parent
+                    .is_some_and(|parent| !self.table.binding_live(parent))
+            {
                 self.drops.stale = self.drops.stale.saturating_add(1);
             } else if pending.expires_at <= now {
                 self.drops.expired = self.drops.expired.saturating_add(1);

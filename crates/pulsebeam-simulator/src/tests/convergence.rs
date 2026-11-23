@@ -17,10 +17,10 @@ fn crashed_publications_retire_from_every_public_catalog() {
             topic: "latest",
         });
         plan.push(Step::DeclareSubscribeTopic {
-            mode: TopicMode::Ordered,
-            description: "receive ordered data",
+            mode: TopicMode::Lossy,
+            description: "receive lossy data",
             participant,
-            topic: "ordered",
+            topic: "lossy",
         });
     }
     plan.extend([
@@ -31,10 +31,10 @@ fn crashed_publications_retire_from_every_public_catalog() {
             topic: "latest",
         },
         Step::DeclarePublishTopic {
-            mode: TopicMode::Ordered,
-            description: "publish ordered data",
+            mode: TopicMode::Lossy,
+            description: "publish lossy data",
             participant: "publisher",
-            topic: "ordered",
+            topic: "lossy",
         },
         Step::Run {
             description: "settle channel registration",
@@ -48,11 +48,11 @@ fn crashed_publications_retire_from_every_public_catalog() {
             data: b"latest-origin",
         },
         Step::PublishData {
-            mode: TopicMode::Ordered,
+            mode: TopicMode::Lossy,
             description: "send reliable payload",
             participant: "publisher",
-            topic: "ordered",
-            data: b"ordered-origin",
+            topic: "lossy",
+            data: b"lossy-origin",
         },
         Step::Run {
             description: "deliver all lanes across destination shards",
@@ -86,15 +86,15 @@ fn crashed_publications_retire_from_every_public_catalog() {
                 expected: b"latest-origin",
             },
             Step::CheckDataReceived {
-                description: "every intended ordered recipient received the payload",
+                description: "every intended lossy recipient received the payload",
                 participant,
-                topic: "ordered",
-                expected: b"ordered-origin",
+                topic: "lossy",
+                expected: b"lossy-origin",
             },
             Step::CheckDataCount {
-                description: "ordered delivery is exactly once",
+                description: "lossy delivery is exactly once",
                 participant,
-                topic: "ordered",
+                topic: "lossy",
                 expected: 1,
             },
         ]);
@@ -122,10 +122,10 @@ fn crashed_publications_retire_from_every_public_catalog() {
                 excluded: b"latest-origin",
             },
             Step::CheckDataNotReceived {
-                description: "intentional bystanders received no ordered payload",
+                description: "intentional bystanders received no lossy payload",
                 participant,
-                topic: "ordered",
-                excluded: b"ordered-origin",
+                topic: "lossy",
+                excluded: b"lossy-origin",
             },
         ]);
     }

@@ -252,8 +252,6 @@ mod tests {
                     participant_id: participant,
                     connection_id,
                     profile: SignalingProtocol::State,
-                    allow_topic_channels: false,
-                    topic_publications: Default::default(),
                     authorization_expiry: None,
                     rtc: crate::control::application_only_test_connection(),
                     resources: NegotiatedResources::empty_for_test(),

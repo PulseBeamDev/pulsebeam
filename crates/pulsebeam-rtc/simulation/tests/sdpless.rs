@@ -115,6 +115,7 @@ fn binding(value: &client::Binding) -> RtpBinding {
         "incomplete runtime sender facts are not RTC admission"
     );
     RtpBinding {
+        extmap_allow_mixed: Some(value.extmap_allow_mixed),
         mid: value.mid.clone(),
         kind: match value.kind {
             client::Kind::Audio => pulsebeam_rtc::MediaKind::Audio,

@@ -79,14 +79,23 @@ pub(crate) struct IngressMediaFacts {
     pub(crate) kind: crate::MediaKind,
     pub(crate) rtcp: Option<crate::RtcpParameters>,
     pub(crate) mid: Box<str>,
-    pub(crate) payloads: Box<[crate::RtpPayloadInfo]>,
+    pub(crate) payloads: Box<[crate::RtpReceiveCodec]>,
     pub(crate) feedback_payloads: Box<[u8]>,
     pub(crate) repairs: Box<[(u8, u8)]>,
     pub(crate) nack_payloads: Box<[u8]>,
     pub(crate) ssrc_repairs: Box<[(u32, u32)]>,
     pub(crate) ssrcs: Box<[u32]>,
     pub(crate) rids: Box<[Box<str>]>,
-    pub(crate) extensions: Box<[(u8, Box<str>)]>,
+    pub(crate) extensions: Box<[crate::RtpReceiveExtension]>,
+    pub(crate) allow_mixed_extensions: bool,
+}
+
+impl IngressMediaFacts {
+    pub(crate) fn declared_repair_ssrc(&self, ssrc: u32) -> Option<u32> {
+        self.ssrc_repairs
+            .iter()
+            .find_map(|&(repair, primary)| (primary == ssrc).then_some(repair))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -102,6 +111,7 @@ pub(crate) struct EgressSenderFacts {
     pub(crate) twcc_extension_id: Option<u8>,
     pub(crate) playout_extension_id: Option<u8>,
     pub(crate) dependency_extension_id: Option<u8>,
+    pub(crate) allow_mixed_extensions: bool,
     pub(crate) forwarded_extensions: Box<[(u8, Box<str>)]>,
 }
 
@@ -150,14 +160,17 @@ impl NegotiatedSessionFacts {
                     payloads: section
                         .codecs
                         .iter()
-                        .map(|codec| crate::RtpPayloadInfo {
+                        .map(|codec| crate::RtpReceiveCodec {
                             payload_type: codec.payload_type,
                             name: match codec.profile {
                                 crate::CodecProfile::Opus => "opus",
                                 crate::CodecProfile::H264 { .. } => "h264",
+                                crate::CodecProfile::Av1 { .. } => "av1",
                             }
                             .into(),
                             clock_rate: codec.clock_rate,
+                            channels: codec.channels.map(u16::from),
+                            profile: Some(codec.profile),
                         })
                         .collect(),
                     feedback_payloads: section
@@ -202,8 +215,13 @@ impl NegotiatedSessionFacts {
                         .extensions
                         .iter()
                         .filter(|extension| extension.direction.allows_receive())
-                        .map(|extension| (extension.id, extension.uri.clone().into_boxed_str()))
+                        .map(|extension| crate::RtpReceiveExtension {
+                            id: extension.id,
+                            uri: extension.uri.clone().into_boxed_str(),
+                            attributes: extension.attributes.as_deref().map(Box::from),
+                        })
                         .collect(),
+                    allow_mixed_extensions: section.allow_mixed_extensions,
                 })
             })
             .collect()
@@ -249,6 +267,7 @@ impl NegotiatedSessionFacts {
                     dependency_extension_id: DEPENDENCY_URIS
                         .iter()
                         .find_map(|uri| extension_id(uri)),
+                    allow_mixed_extensions: section.allow_mixed_extensions,
                     forwarded_extensions: section
                         .extensions
                         .iter()
@@ -359,6 +378,7 @@ struct NegotiatedMediaSection {
     direction: Direction,
     codecs: Box<[crate::CodecInfo]>,
     extensions: Box<[HeaderExtensionFacts]>,
+    allow_mixed_extensions: bool,
     rids: Box<[String]>,
     inbound_rids: Box<[String]>,
     ssrcs: Box<[u32]>,
@@ -408,12 +428,7 @@ pub(crate) fn negotiate(
     negotiate_inner(config, offer, at, entropy).map_err(Into::into)
 }
 
-fn negotiate_inner(
-    config: &ConnectionConfig,
-    offer: &SdpOffer,
-    at: Instant,
-    entropy: &mut EntropyConsumer,
-) -> Result<NegotiationResult, NegotiationError> {
+fn parse_offer(offer: &SdpOffer) -> Result<(Sdp, RawSdp), NegotiationError> {
     if offer.as_str().len() > MAX_SDP_BYTES {
         return Err(NegotiationError::limit());
     }
@@ -435,6 +450,64 @@ fn negotiate_inner(
         return Err(NegotiationError::limit());
     }
 
+    Ok((parsed, raw))
+}
+
+pub(crate) fn matches_single_video_rfc8888_offer(
+    offer: &SdpOffer,
+    capabilities: &crate::RtpCapabilities,
+) -> bool {
+    let Ok((parsed, raw)) = parse_offer(offer) else {
+        return false;
+    };
+    let mut media = parsed
+        .media_lines
+        .iter()
+        .zip(&raw.sections)
+        .filter(|(line, raw)| {
+            line.typ != MediaType::Application
+                && (!line.disabled || raw.iter().any(|line| line == "a=bundle-only"))
+        });
+    let Some((line, raw)) = media.next() else {
+        return false;
+    };
+    if media.next().is_some() || line.typ != MediaType::Video {
+        return false;
+    }
+    let Ok(section) = parse_section(line, raw, "", 0, true, Some(capabilities)) else {
+        return false;
+    };
+    let facts = &section.facts;
+    let [codec] = facts.codecs.as_ref() else {
+        return false;
+    };
+    matches!(
+        facts.direction,
+        Direction::ReceiveOnly | Direction::SendOnly
+    ) && facts.rids.is_empty()
+        && facts.inbound_rids.is_empty()
+        && codec.rfc8888
+        && codec.nack
+        && codec.pli
+        && codec.retransmission_payload_type.is_some()
+        && !(codec_feedback(raw, codec.payload_type, "transport-cc")
+            && facts.extensions.iter().any(|extension| {
+                TWCC_URIS.contains(&extension.uri.as_str())
+                    && if facts.direction.allows_send() {
+                        extension.direction.allows_send()
+                    } else {
+                        extension.direction.allows_receive()
+                    }
+            }))
+}
+
+fn negotiate_inner(
+    config: &ConnectionConfig,
+    offer: &SdpOffer,
+    at: Instant,
+    entropy: &mut EntropyConsumer,
+) -> Result<NegotiationResult, NegotiationError> {
+    let (parsed, raw) = parse_offer(offer)?;
     let mids = validate_bundle(&parsed)?;
     if parsed.session.ice_lite() || raw.session.iter().any(|line| line == "a=ice-lite") {
         return Err(NegotiationError::unsupported());
@@ -532,6 +605,15 @@ fn negotiate_inner(
                 .ok_or(NegotiationError(AcceptError::MissingPacketFeedback))?,
         )
     };
+    if config
+        .rtp_capabilities
+        .as_ref()
+        .is_some_and(|caps| caps.feedback == PacketFeedbackKind::Rfc8888)
+        && ((!inbound.is_empty() && inbound_feedback != Some(PacketFeedbackKind::Rfc8888))
+            || (!outbound.is_empty() && feedback != Some(PacketFeedbackKind::Rfc8888)))
+    {
+        return Err(NegotiationError(AcceptError::MissingPacketFeedback));
+    }
     for section in &mut builds {
         section.facts.extensions = std::mem::take(&mut section.facts.extensions)
             .into_vec()
@@ -961,6 +1043,7 @@ fn parse_section(
             direction,
             codecs: codecs.into_boxed_slice(),
             extensions: extensions.into_boxed_slice(),
+            allow_mixed_extensions: allow_mixed,
             rids: rids.into_boxed_slice(),
             inbound_rids: inbound_rids(raw)?.into_boxed_slice(),
             ssrcs: ssrcs.into_boxed_slice(),
@@ -994,27 +1077,21 @@ fn parse_codecs(
     let mut repairable = BTreeSet::new();
     for parameter in &params {
         let clock_rate = u32::from(std::num::NonZeroU32::from(parameter.spec.clock_rate));
-        let supported = match kind {
-            SectionKind::Audio => {
-                parameter.spec.codec == str0m::format::Codec::Opus
-                    && clock_rate == 48_000
-                    && parameter.spec.channels == Some(2)
-            }
-            SectionKind::Video => {
-                parameter.spec.codec == str0m::format::Codec::H264
-                    && clock_rate == 90_000
-                    && parameter.spec.channels.is_none()
-            }
-            SectionKind::Application => false,
+        use str0m::format::Codec;
+        let name = match (
+            kind,
+            parameter.spec.codec,
+            clock_rate,
+            parameter.spec.channels,
+        ) {
+            (SectionKind::Audio, Codec::Opus, 48_000, Some(2)) => Some("opus"),
+            (SectionKind::Video, Codec::H264, 90_000, None) => Some("h264"),
+            (SectionKind::Video, Codec::Av1, 90_000, None) if capabilities.is_some() => Some("av1"),
+            _ => None,
         };
-        if supported {
+        if let Some(name) = name {
             let capability = if let Some(capabilities) = capabilities {
                 let fmtp = codec_fmtp(raw, *parameter.pt)?;
-                let name = if kind == SectionKind::Audio {
-                    "opus"
-                } else {
-                    "h264"
-                };
                 let Some(capability) = capabilities.codecs.iter().find(|capability| {
                     let parameters = &capability.parameters;
                     parameters.name.eq_ignore_ascii_case(name)
@@ -1034,7 +1111,12 @@ fn parse_codecs(
             if capability.is_none_or(|capability| capability.repair) {
                 repairable.insert(*parameter.pt);
             }
-            let profile = parse_codec_profile(raw, *parameter.pt, kind)?;
+            let profile = if parameter.spec.codec == Codec::Av1 {
+                crate::rtp_config::av1_profile(&codec_fmtp(raw, *parameter.pt)?)
+                    .ok_or_else(NegotiationError::unsupported)?
+            } else {
+                parse_codec_profile(raw, *parameter.pt, kind)?
+            };
             payloads.push(*parameter.pt);
             codecs.push(crate::CodecInfo {
                 payload_type: *parameter.pt,
@@ -1841,6 +1923,14 @@ fn format_answer_section(
         }
     }
     if section.explicit_capabilities && !disabled {
+        if section.rfc8888
+            && ((section.facts.direction.allows_send()
+                && feedback[0] == Some(PacketFeedbackKind::Rfc8888))
+                || (section.facts.direction.allows_receive()
+                    && feedback[1] == Some(PacketFeedbackKind::Rfc8888)))
+        {
+            output.push_str("a=rtcp-fb:* ack ccfb\r\n");
+        }
         for codec in &section.facts.codecs {
             let selected = |kind| feedback.contains(&Some(kind));
             for (allowed, name) in [
@@ -1850,10 +1940,6 @@ fn format_answer_section(
                 (
                     codec.twcc && selected(PacketFeedbackKind::TransportWide),
                     "transport-cc",
-                ),
-                (
-                    codec.rfc8888 && selected(PacketFeedbackKind::Rfc8888),
-                    "ack ccfb",
                 ),
             ] {
                 if allowed {
@@ -2123,10 +2209,17 @@ mod tests {
 
     #[test]
     fn extension_policy_keeps_media_values_and_regenerates_transport_values() {
+        const AUDIO_LEVEL: &str = "urn:ietf:params:rtp-hdrext:ssrc-audio-level";
+        const ENCRYPT: &str = "urn:ietf:params:rtp-hdrext:encrypt";
         let offer = SdpOffer::new(
             fixture("chrome")
                 .as_str()
                 .replace("a=sendonly", "a=sendrecv")
+                .replace("m=audio", "a=extmap-allow-mixed\nm=audio")
+                .replace(
+                    &format!("a=extmap:1 {AUDIO_LEVEL}"),
+                    &format!("a=extmap:1 {AUDIO_LEVEL} vad=off"),
+                )
                 .replace(
                     "a=mid:audio",
                     concat!(
@@ -2134,7 +2227,9 @@ mod tests {
                         "a=extmap:10 urn:example:opaque\n",
                         "a=extmap:11 urn:3gpp:video-orientation\n",
                         "a=extmap:12 http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time\n",
-                        "a=extmap:13/sendonly urn:example:receive-only",
+                        "a=extmap:13/sendonly urn:example:receive-only\n",
+                        "a=extmap:14/recvonly urn:example:send-only\n",
+                        "a=extmap:16/sendonly urn:ietf:params:rtp-hdrext:encrypt urn:example:encrypted",
                     ),
                 ),
         );
@@ -2157,6 +2252,28 @@ mod tests {
                     .answer
                     .as_str()
                     .contains("urn:3gpp:video-orientation")
+            );
+            let receiving = result.facts.ingress_media();
+            let audio_rx = receiving
+                .iter()
+                .find(|media| media.kind == crate::MediaKind::Audio)
+                .expect("audio ingress");
+            let rx_ext = |uri: &str| {
+                audio_rx
+                    .extensions
+                    .iter()
+                    .find(|ext| ext.uri.as_ref() == uri)
+            };
+            assert!(audio_rx.allow_mixed_extensions);
+            assert_eq!(
+                rx_ext(AUDIO_LEVEL).and_then(|ext| ext.attributes.as_deref()),
+                Some("vad=off")
+            );
+            assert_eq!(rx_ext("urn:example:receive-only").is_some(), opaque);
+            assert!(rx_ext("urn:example:send-only").is_none());
+            assert_eq!(
+                rx_ext(ENCRYPT).map(|ext| (ext.id, ext.is_encrypted(), ext.attributes.as_deref())),
+                opaque.then_some((16, true, Some("urn:example:encrypted")))
             );
             let senders = result.facts.egress_senders();
             let audio = senders
@@ -2225,15 +2342,7 @@ mod tests {
                         .contains(&format!("a=ssrc:{ssrc} cname:{}\r\n", rtcp.cname))
                 );
             }
-            let inbound = result.facts.ingress_media();
-            assert!(inbound.iter().all(|media| media.rtcp.is_none()));
-            assert_eq!(
-                inbound
-                    .iter()
-                    .flat_map(|media| media.extensions.iter())
-                    .any(|(_, uri)| &**uri == "urn:example:receive-only"),
-                opaque
-            );
+            assert!(receiving.iter().all(|media| media.rtcp.is_none()));
         }
     }
 

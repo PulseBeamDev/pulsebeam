@@ -5,12 +5,14 @@ use crate::bitrate::{BitrateController, BitrateControllerConfig};
 use crate::media::{KeyframeRequest, Mid, Pt, Rid, Ssrc};
 use crate::participant::downstream::SlotConfig;
 use crate::participant::event::ParticipantSink;
+use crate::route::fabric::RtpSourceEncoding;
 use crate::rtp;
 #[cfg(test)]
 use crate::rtp::RtpPacket;
 use crate::rtp::cache::TrackStreamCache;
 use crate::rtp::frame_selector::DecodeTargetSelection;
 use crate::rtp::switcher::{LayerStates, Switcher};
+use crate::shard::router::FabricLocalBranch;
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use pulsebeam_runtime::time::Instant;
 use slotmap::{SecondaryMap, SlotMap};
@@ -442,8 +444,13 @@ impl VideoAllocator {
                     priority: s.priority,
                     track,
                     current_quality,
-                    current_stream: s.switcher.active_stream(),
-                    current_decode_target: s.switcher.decode_target(),
+                    current_stream: s
+                        .fabric_active
+                        .map(|active| active.stream)
+                        .or_else(|| s.switcher.active_stream()),
+                    current_decode_target: s
+                        .fabric_active
+                        .map_or_else(|| s.switcher.decode_target(), |active| active.target),
                     forwarding: !s.paused,
                 })
             })
@@ -508,6 +515,7 @@ impl VideoAllocator {
                         priority = view.priority,
                         forwarding = view.forwarding,
                         current_quality = ?view.current_quality,
+                        current_stream = ?view.current_stream,
                         current_decode_target = ?view.current_decode_target,
                         available_bps = available_bandwidth.as_f64(),
                         desired_raw_bps = desired_raw.as_f64(),
@@ -536,7 +544,11 @@ impl VideoAllocator {
 
         let mut changed = false;
         let _keyframe_requests: Vec<KeyframeRequest> = Vec::new();
-        for (key, decision) in &decisions {
+        for view in &views {
+            let Some(decision) = decisions.get(view.key) else {
+                continue;
+            };
+            let key = view.key;
             let Some(slot) = self.slots.get_mut(key) else {
                 plog_warn!(self.ctx, "no slot found from decision");
                 continue;
@@ -544,6 +556,19 @@ impl VideoAllocator {
 
             if let Some(gate) = resume_gates.get(key) {
                 slot.resume_gate = *gate;
+            }
+            slot.fabric_gate =
+                if slot.fabric_active.is_some() && engine.can_bridge_fabric(view, decision) {
+                    FabricGate::Bridge
+                } else {
+                    FabricGate::Selected
+                };
+            if let Some(index) = engine
+                .forwarded_target_index(decision)
+                .and_then(|index| u8::try_from(index).ok())
+            {
+                changed |= slot.fabric_target != index;
+                slot.fabric_target = index;
             }
             match decision {
                 AllocationDecision::Forward(layer, _) => {
@@ -616,6 +641,101 @@ impl VideoAllocator {
             return false;
         };
         slot.on_rtp(publication_id, arrival_ts, cache, writer)
+    }
+
+    pub(crate) fn selected_encoding(
+        &self,
+        mid: Mid,
+        track: TrackHandle,
+    ) -> Option<(crate::track::SourceEncoding, u8)> {
+        let slot = self
+            .slots
+            .values()
+            .find(|slot| slot.mid == mid && !slot.paused)?;
+        let selected = slot.target()?;
+        (self.track_handles.get(&selected.meta.id) == Some(&track))
+            .then_some((selected.encoding, slot.fabric_target))
+    }
+
+    pub(crate) fn allows_fabric_encoding(
+        &self,
+        mid: Mid,
+        branch: FabricLocalBranch,
+        (track, encoding, target): (TrackHandle, RtpSourceEncoding, u8),
+        staged: bool,
+    ) -> bool {
+        let Some((_, slot)) = self
+            .slots
+            .iter()
+            .find(|(_, slot)| slot.mid == mid && !slot.paused)
+        else {
+            return false;
+        };
+        if slot.fabric_gate == FabricGate::AwaitAllocation {
+            return false;
+        }
+        let matches = |(publication, source): StreamId| {
+            self.track_handles.get(&publication) == Some(&track)
+                && source.matches(encoding.primary, encoding.rid)
+        };
+        (staged
+            && target == slot.fabric_target
+            && slot
+                .target()
+                .is_some_and(|layer| matches(layer.stream_id())))
+            || (slot.fabric_gate == FabricGate::Bridge
+                && slot
+                    .fabric_active
+                    .is_some_and(|active| active.branch == branch && matches(active.stream)))
+    }
+
+    pub(crate) fn note_fabric_admission(
+        &mut self,
+        mid: Mid,
+        branch: FabricLocalBranch,
+        (track, encoding): (TrackHandle, RtpSourceEncoding),
+        target: u8,
+    ) {
+        let Some((_, slot)) = self
+            .slots
+            .iter_mut()
+            .find(|(_, slot)| slot.mid == mid && !slot.paused)
+        else {
+            return;
+        };
+        let Some(layer) = slot.target().filter(|layer| {
+            self.track_handles.get(&layer.meta.id) == Some(&track)
+                && layer.encoding.matches(encoding.primary, encoding.rid)
+        }) else {
+            return;
+        };
+        if target != slot.fabric_target {
+            return;
+        }
+        let active = FabricSelection {
+            branch,
+            stream: layer.stream_id(),
+            target: DecodeTargetSelection::Target(usize::from(target)),
+        };
+        if slot.fabric_active != Some(active) {
+            slot.fabric_active = Some(active);
+            slot.fabric_gate = FabricGate::Selected;
+            slot.pli_reset();
+        }
+    }
+
+    pub(crate) fn retire_fabric_selection(&mut self, branch: FabricLocalBranch) {
+        for (_, slot) in &mut self.slots {
+            if slot
+                .fabric_active
+                .is_some_and(|active| active.branch == branch)
+            {
+                slot.fabric_active = None;
+                if slot.fabric_gate == FabricGate::Bridge {
+                    slot.fabric_gate = FabricGate::Selected;
+                }
+            }
+        }
     }
 
     pub(crate) fn poll_slow(
@@ -862,6 +982,21 @@ impl ResumeGate {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FabricSelection {
+    branch: FabricLocalBranch,
+    stream: StreamId,
+    target: DecodeTargetSelection,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum FabricGate {
+    #[default]
+    Selected,
+    AwaitAllocation,
+    Bridge,
+}
+
 struct Slot {
     ctx: LogCtx,
     ssrc: Ssrc,
@@ -869,13 +1004,15 @@ struct Slot {
 
     /// The layer this slot is assigned to serve — the most recent BWE choice.
     /// This is policy: it carries the quality/height the allocator reasons about.
-    /// What is *actually* being forwarded (active / staging / draining streams)
-    /// and every step of moving between them is owned by `switcher`.
+    /// Actual forwarding comes from the legacy switcher or an admitted Fabric branch.
     desired: Option<TrackLayer>,
     /// Logical receiver assignment, independent of whether forwarding has a layer.
     assignment: Option<PublicationKey>,
 
     switcher: Switcher,
+    fabric_active: Option<FabricSelection>,
+    fabric_target: u8,
+    fabric_gate: FabricGate,
 
     mid: Mid,
     media_index: Option<u32>,
@@ -926,6 +1063,9 @@ impl Slot {
             assignment: None,
 
             switcher: Switcher::new(rtp::VIDEO_FREQUENCY),
+            fabric_active: None,
+            fabric_target: 0,
+            fabric_gate: FabricGate::Selected,
             // With no signaling, we assume users are viewing with 720p playback
             max_height: 720,
             height_ceiling: None,
@@ -988,6 +1128,15 @@ impl Slot {
         let Some(staging) = self.desired.as_ref() else {
             return;
         };
+        if self.recovery_requested_at.is_none()
+            && self.fabric_active.is_some_and(|active| {
+                active.stream == staging.stream_id()
+                    && active.target
+                        == DecodeTargetSelection::Target(usize::from(self.fabric_target))
+            })
+        {
+            return;
+        }
         // The fanout key is what addresses the request to the publisher's shard,
         // and it arrives asynchronously: the control plane publishes it in the
         // view delta that installs this subscription, some time after the
@@ -1058,9 +1207,15 @@ impl Slot {
 
         // A forced track change hard-resets the switcher so no stale stream state
         // from the previous track leaks across.
-        if force && is_track_change && self.switcher.active_stream().is_some() {
-            self.switcher.stop();
-            changed = true;
+        if is_track_change {
+            changed |= self.fabric_active.take().is_some();
+            self.fabric_gate = FabricGate::Selected;
+        }
+        if force && is_track_change {
+            if self.switcher.active_stream().is_some() {
+                self.switcher.stop();
+                changed = true;
+            }
         }
 
         if self.desired.as_ref() != Some(new_layer) {
@@ -1108,6 +1263,8 @@ impl Slot {
     fn stop(&mut self) {
         plog_debug!(self.ctx, media_index=?self.media_index, "slot stopped");
         self.desired = None;
+        self.fabric_active = None;
+        self.fabric_gate = FabricGate::Selected;
         self.paused = true;
         self.resume_gate = ResumeGate::default();
         self.switcher.stop();
@@ -1135,6 +1292,8 @@ impl Slot {
         }
 
         if !self.paused {
+            self.fabric_active = None;
+            self.fabric_gate = FabricGate::Selected;
             self.pli_reset();
             self.resume_gate = ResumeGate { required: true };
             self.paused = true;
@@ -1477,6 +1636,7 @@ type QualityRank = (u32, u32, LayerQuality, usize);
 struct AllocationChoice<'a> {
     layer: &'a TrackLayer,
     target: DecodeTargetSelection,
+    decode_target_index: usize,
     height: u32,
     fps: u32,
     cost: f64,
@@ -1518,7 +1678,7 @@ impl AllocationChoice<'_> {
     fn retained_by(&self, slot: &SlotView<'_>) -> bool {
         slot.forwarding
             && slot.current_stream == Some(self.layer.stream_id())
-            && Self::target_rank(self.target) <= Self::target_rank(slot.current_decode_target)
+            && self.decode_target_index <= Self::target_rank(slot.current_decode_target)
     }
 }
 
@@ -1813,6 +1973,55 @@ impl AllocationEngine {
         Bitrate::from(crate::bitrate::saturating_bps(total))
     }
 
+    fn forwarded_target_index(&self, decision: &AllocationDecision<'_>) -> Option<usize> {
+        match decision {
+            AllocationDecision::Forward(layer, _)
+            | AllocationDecision::ForwardTarget(layer, DecodeTargetSelection::Full, _) => Some(
+                usize::from(self.decode_target_count(layer).saturating_sub(1)),
+            ),
+            AllocationDecision::ForwardTarget(_, DecodeTargetSelection::Target(target), _) => {
+                Some(*target)
+            }
+            AllocationDecision::Pause(..) => None,
+        }
+    }
+
+    fn can_bridge_fabric(&self, slot: &SlotView<'_>, decision: &AllocationDecision<'_>) -> bool {
+        let (layer, target) = match decision {
+            AllocationDecision::Forward(layer, _) => (*layer, DecodeTargetSelection::Full),
+            AllocationDecision::ForwardTarget(layer, target, _) => (*layer, *target),
+            AllocationDecision::Pause(..) => return false,
+        };
+        let Some(current) = slot.current_stream else {
+            return false;
+        };
+        if current == layer.stream_id()
+            && self.forwarded_target_index(decision).is_some_and(|next| {
+                next <= AllocationChoice::target_rank(slot.current_decode_target)
+            })
+        {
+            return false;
+        }
+        // The old encoding may run only while it still fits the charged
+        // allocation and is legal under the current height policy.
+        let choices = self.choices(slot);
+        let Some(next) = choices
+            .iter()
+            .find(|choice| choice.identity() == (layer.stream_id(), target))
+        else {
+            return false;
+        };
+        choices.iter().any(|active| {
+            active.retained_by(slot)
+                && match slot.current_decode_target {
+                    DecodeTargetSelection::Full => active.target == DecodeTargetSelection::Full,
+                    DecodeTargetSelection::Target(idx) => active.decode_target_index == idx,
+                }
+                && active.cost <= next.cost
+                && active.rank(slot) < next.rank(slot)
+        })
+    }
+
     fn choices<'a>(&self, slot: &SlotView<'a>) -> Vec<AllocationChoice<'a>> {
         let fallback = self.nothing_healthy(slot);
         let lowest = self.lowest_ladder(slot);
@@ -1869,6 +2078,7 @@ impl AllocationEngine {
                     } else {
                         DecodeTargetSelection::Target(dt)
                     },
+                    decode_target_index: dt,
                     height,
                     fps: self.decode_target_fps(layer, dt),
                     cost: stable_cost,
@@ -2281,6 +2491,7 @@ mod assignment_tests {
         let mut choice = AllocationChoice {
             layer: &same_quality,
             target: DecodeTargetSelection::Full,
+            decode_target_index: 2,
             height: 360,
             fps: 30,
             cost: 1.0,
@@ -2294,7 +2505,21 @@ mod assignment_tests {
         active.current_decode_target = DecodeTargetSelection::Target(0);
         assert!(!choice.retained_by(&active));
         choice.target = DecodeTargetSelection::Target(0);
+        choice.decode_target_index = 0;
         assert!(choice.retained_by(&active));
+        let plain_active = SlotView {
+            current_stream: Some(plain.stream_id()),
+            ..active
+        };
+        let plain_full = AllocationChoice {
+            layer: plain,
+            target: DecodeTargetSelection::Full,
+            ..choice
+        };
+        assert!(
+            plain_full.retained_by(&plain_active),
+            "target 0 holds the only rung of a single-target encoding"
+        );
     }
 
     #[test]

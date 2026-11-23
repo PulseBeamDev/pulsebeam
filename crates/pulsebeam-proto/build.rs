@@ -58,7 +58,10 @@ fn main() {
         .boxed(".pulsebeam.media.v1.ConfirmedState.value.source_lookup")
         .boxed(".pulsebeam.media.v1.ConfirmedState.value.logical_subscription")
         .skip_debug([".pulsebeam.media.v1.SuccessorReceipt"])
-        .compile_protos(&["proto/state.proto", "proto/topic.proto"], &["proto"])
+        .compile_protos(
+            &["proto/state.proto", "proto/data_control.proto"],
+            &["proto"],
+        )
         .expect("Failed to compile .proto files");
 
     let descriptor_bytes = std::fs::read(out_dir.join("state-descriptors.bin"))

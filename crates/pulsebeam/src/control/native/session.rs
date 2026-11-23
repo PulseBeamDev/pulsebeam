@@ -77,7 +77,7 @@ pub(crate) struct LookupInterestChange {
     pub(crate) active: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Preparation {
     pub(crate) reference: u64,
     pub(crate) revision: u64,
@@ -96,7 +96,7 @@ impl Preparation {
         }
     }
 
-    fn owned(self) -> u64 {
+    pub(crate) fn owned(self) -> u64 {
         self.logical_owner
             .map_or(self.reference, std::num::NonZeroU64::get)
     }
@@ -201,8 +201,23 @@ const STATE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PUBLICATIONS: usize = 64;
 const SELECT_WORK: usize = 32;
 
+/// One local controller namespace for DATA branch incarnations. The publisher
+/// observes branches across subscriber sessions, so session-local counters alias.
+#[derive(Default)]
+pub(crate) struct DataBranchIds(std::cell::Cell<u64>);
+
+impl DataBranchIds {
+    fn allocate(&self) -> Result<u64, OutputError> {
+        let next = self.0.get().checked_add(1).ok_or(OutputError::Capacity)?;
+        self.0.set(next);
+        Ok(next)
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct NativeSession {
+    data_v1_enabled: bool,
+    reliable_data_enabled: bool,
     pub(crate) cid: Option<ChannelId>,
     incident_context: Option<(ProjectId, ConnectionId)>,
     pub(crate) catalog: catalog::CatalogSession,
@@ -242,6 +257,12 @@ pub(crate) struct NativeSession {
     retained_bytes: usize,
     unavailable: usize,
     initial_deadline: Option<pulsebeam_runtime::time::Instant>,
+}
+
+fn is_reliable_data(parameters: &wire::SctpDataV1Parameters) -> bool {
+    parameters.format().is_some_and(|format| {
+        format.delivery() == pulsebeam_proto::data_endpoint::Delivery::Reliable
+    })
 }
 
 impl NativeSession {
@@ -1134,7 +1155,7 @@ impl NativeSession {
                 };
                 if !is_enabled {
                     self.request_logical_retirement(reference);
-                    set_logical_source(&mut next, None).map_err(|_| InputError::Capacity)?;
+                    set_logical_source(&mut next, None, None).map_err(|_| InputError::Capacity)?;
                 }
                 next.spec = Some(spec);
                 Value::LogicalSubscription(Box::new(next))
@@ -1243,6 +1264,21 @@ impl NativeSession {
         Ok(ExecutionCommand(ExecutionAction::Retire(
             self.execution_scope(reference)?,
         )))
+    }
+
+    pub(crate) fn configure_data_profile(&mut self, profile: super::DataProfile) {
+        self.data_v1_enabled = profile != super::DataProfile::Legacy;
+        self.reliable_data_enabled = profile == super::DataProfile::FabricReliable;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn enable_data_v1(&mut self) {
+        self.configure_data_profile(super::DataProfile::FabricLive);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn enable_reliable_data_fixture(&mut self) {
+        self.configure_data_profile(super::DataProfile::FabricReliable);
     }
 
     pub(crate) fn preparation_pending(&self, unix_now: u64) -> bool {
@@ -1357,6 +1393,7 @@ impl NativeSession {
         &mut self,
         budget: usize,
         unix_now: u64,
+        branches: &DataBranchIds,
         mut source: impl FnMut(&wire::LogicalSourceAddress) -> Option<super::ResolvedSource<'a>>,
     ) -> Result<(), OutputError> {
         for _ in 0..budget {
@@ -1391,9 +1428,26 @@ impl NativeSession {
                 && self.permissions.permits_intent(spec)
             {
                 let address = observed_address(spec).ok_or(OutputError::InvalidObservation)?;
-                source(address)
-                    .and_then(|source| track_descriptor(source.track))
-                    .filter(|track| validation::matches_source_address(track, address))
+                source(address).and_then(|source| {
+                    let fabric_source = source.track.fabric_data_source();
+                    let track = track_descriptor(source.track)?;
+                    if let Some(wire::resource_spec::Declaration::LogicalSubscription(logical)) =
+                        &spec.declaration
+                    {
+                        let requested = logical.data_version.is_some();
+                        let reliable = matches!(&track.kind, Some(wire::track::Kind::Data(data))
+                            if data.delivery == wire::DataDelivery::Ordered as i32);
+                        if requested != fabric_source.is_some()
+                            || (requested
+                                && (!self.data_v1_enabled
+                                    || (reliable && !self.reliable_data_enabled)))
+                        {
+                            return None;
+                        }
+                    }
+                    validation::matches_source_address(&track, address)
+                        .then_some((track, fabric_source))
+                })
             } else {
                 None
             };
@@ -1401,6 +1455,7 @@ impl NativeSession {
             let mut value = row.value.clone();
             match &mut value.value {
                 Some(Value::SourceLookup(lookup)) => {
+                    let resolved = resolved.map(|(track, _)| track);
                     lookup.participant = resolved.as_ref().map(|track| wire::Participant {
                         participant_id: track.participant_id.clone(),
                         room_id: track.room_id.clone(),
@@ -1408,7 +1463,7 @@ impl NativeSession {
                     lookup.track = resolved;
                 }
                 Some(Value::LogicalSubscription(subscription)) => {
-                    self.reconcile_logical_source(reference, subscription, resolved)?;
+                    self.reconcile_logical_source(reference, subscription, resolved, branches)?;
                 }
                 _ => return Err(OutputError::InvalidObservation),
             }
@@ -1572,6 +1627,13 @@ impl NativeSession {
         else {
             return Ok(None);
         };
+        if let crate::control::native::Publication::Data(data) = &plan {
+            let enabled = self.data_v1_enabled
+                && (self.reliable_data_enabled || !is_reliable_data(&data.parameters));
+            if !enabled {
+                return Err(failure(wire::FailureCode::Unsupported));
+            }
+        }
         let reserved = self
             .rows
             .get(&Key::Owned(work.owned()))
@@ -1646,13 +1708,34 @@ impl NativeSession {
         {
             return Err(failure(wire::FailureCode::PermissionDenied));
         }
-        let (transport, policy) =
-            crate::control::native::receiver(spec, source.track, &track, capabilities).map_err(
-                |code| wire::Failure {
-                    diagnostic: "native receiver transport preparation failed".to_owned(),
-                    ..failure(code)
-                },
-            )?;
+        let data_v1_endpoint = work
+            .logical_owner
+            .filter(|_| self.data_v1_enabled)
+            .and_then(|owner| self.rows.get(&Key::Owned(owner.get())))
+            .and_then(|row| row.owned.as_ref()?.logical_binding.as_ref())
+            .filter(|binding| binding.id == work.reference && !binding.retiring)
+            .and_then(|binding| binding.data_v1_endpoint);
+        let (transport, policy) = crate::control::native::receiver(
+            spec,
+            source.track,
+            &track,
+            capabilities,
+            data_v1_endpoint,
+        )
+        .map_err(|code| wire::Failure {
+            diagnostic: "native receiver transport preparation failed".to_owned(),
+            ..failure(code)
+        })?;
+        let enabled = match &transport {
+            ReceiveTransport::FabricData(fabric) => {
+                self.data_v1_enabled
+                    && (self.reliable_data_enabled || !is_reliable_data(&fabric.parameters))
+            }
+            ReceiveTransport::Rtp(_) => true,
+        };
+        if !enabled {
+            return Err(failure(wire::FailureCode::Unsupported));
+        }
         let plan = Receiver {
             source_room: source.track.meta().room,
             source: source.track.clone(),
@@ -1665,7 +1748,7 @@ impl NativeSession {
             &plan.source_id,
             match &plan.transport {
                 ReceiveTransport::Rtp(rtp) => Some(rtp.kind),
-                ReceiveTransport::Sctp { .. } => None,
+                ReceiveTransport::FabricData(_) => None,
             },
         );
         self.reserve_receiver_source(work, bytes, participant, track)
@@ -1941,6 +2024,7 @@ impl NativeSession {
         track: wire::Track,
     ) -> Result<(), OutputError> {
         let preview = wire::LiveResource {
+            data_v1_source: None,
             spec: Some(
                 self.preparation_spec(work)
                     .ok_or(OutputError::InvalidObservation)?
@@ -2020,6 +2104,7 @@ impl NativeSession {
             return Err(failure(wire::FailureCode::InvalidConfiguration));
         }
         let live = wire::LiveResource {
+            data_v1_source: execution.data_v1_source.map(std::num::NonZeroU64::get),
             spec: Some(spec.clone()),
             participant: Some(wire::Participant {
                 participant_id: execution.track.meta().origin.as_str().to_owned(),
@@ -2071,6 +2156,7 @@ impl NativeSession {
             .receiver_result(work.owned(), execution)
             .map_err(|_| failure(wire::FailureCode::InternalFailure))?;
         let live = wire::LiveResource {
+            data_v1_source: None,
             spec: Some(
                 self.preparation_spec(work)
                     .ok_or_else(|| failure(wire::FailureCode::ResourceGone))?
@@ -2558,6 +2644,7 @@ fn live_fits(spec: &wire::ResourceSpec) -> bool {
             rejection: Some(failure.clone()),
             value: Some(wire::confirmed_state::Value::Owned(Box::new(
                 wire::LiveResource {
+                    data_v1_source: None,
                     spec: Some(spec.clone()),
                     participant: Some(participant),
                     track: Some(track),
@@ -2698,12 +2785,14 @@ fn enabled(spec: &wire::ResourceSpec) -> bool {
 fn set_logical_source(
     subscription: &mut wire::LogicalSubscriptionState,
     source: Option<wire::Track>,
+    data_v1: Option<wire::DataV1ReceiverOffer>,
 ) -> Result<(), OutputError> {
     if subscription
         .source
         .as_ref()
         .map(|track| &track.publication_id)
         != source.as_ref().map(|track| &track.publication_id)
+        || subscription.data_v1 != data_v1
     {
         subscription.source_revision = subscription
             .source_revision
@@ -2712,6 +2801,7 @@ fn set_logical_source(
         subscription.execution = None;
     }
     subscription.source = source;
+    subscription.data_v1 = data_v1;
     Ok(())
 }
 

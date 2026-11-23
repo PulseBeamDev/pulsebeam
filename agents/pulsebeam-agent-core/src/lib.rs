@@ -12,6 +12,7 @@ extern crate alloc;
 
 mod agent;
 mod catalog;
+pub mod data_v1;
 mod effect;
 mod event;
 mod http;

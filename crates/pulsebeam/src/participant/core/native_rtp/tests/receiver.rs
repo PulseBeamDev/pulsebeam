@@ -192,7 +192,7 @@ pub(super) fn check(source: &Track) {
         ..Default::default()
     };
     assert!(packet.ext_vals.audio_level.is_none());
-    participant.on_track_packet(handle, TrackPacketRef::Rtp(&packet), None);
+    participant.on_track_packet(handle, &packet, None);
     let mut outputs = Vec::new();
     while let Some(write) = participant.stream_writer.pop() {
         let StreamWrite::Audio {
@@ -257,7 +257,7 @@ pub(super) fn check(source: &Track) {
     video::check(&mut participant, &mut sink, &mut handles, source);
     packet.seq_no = 2u64.into();
     packet.rtp_ts = MediaTime::new(1920, AUDIO_FREQUENCY);
-    participant.on_track_packet(handle, TrackPacketRef::Rtp(&packet), None);
+    participant.on_track_packet(handle, &packet, None);
     desire(
         &mut participant,
         &mut sink,

@@ -323,6 +323,7 @@ impl ControllerActor {
             .and_then(|()| {
                 native.service(
                     unix_now,
+                    &self.data_branches,
                     |track| {
                         let track = self.lifecycle.source_for_connection(
                             room?,

@@ -39,6 +39,11 @@ pub struct BindOptions {
     pub recv_buffer_bytes: usize,
     pub send_buffer_bytes: usize,
     pub max_datagram_bytes: usize,
+    /// Request IP ECN receive metadata on backends that support it.
+    pub receive_ecn: bool,
+    /// Require nonfragmenting sends and cap each transmitted UDP payload.
+    /// Binding fails on backends that cannot enforce the policy.
+    pub nonfragmenting_max_datagram_bytes: Option<NonZeroU16>,
 }
 
 impl BindOptions {
@@ -50,12 +55,17 @@ impl BindOptions {
             recv_buffer_bytes: 4 * 1024 * 1024,
             send_buffer_bytes: 2 * 1024 * 1024,
             max_datagram_bytes: 1500,
+            receive_ecn: false,
+            nonfragmenting_max_datagram_bytes: None,
         }
     }
 
     fn validate(&self) -> io::Result<()> {
         if self.max_datagram_bytes == 0
             || self.max_datagram_bytes > MAX_DATAGRAM_BYTES
+            || self
+                .nonfragmenting_max_datagram_bytes
+                .is_some_and(|cap| usize::from(cap.get()) > MAX_DATAGRAM_BYTES)
             || self.recv_buffer_bytes == 0
             || self.send_buffer_bytes == 0
             || self.recv_buffer_bytes > i32::MAX as usize
@@ -89,12 +99,34 @@ impl ReceiveTime {
     }
 }
 
+/// IP ECN codepoint, without the DSCP bits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ecn {
+    NotEct,
+    Ect1,
+    Ect0,
+    Ce,
+}
+
+impl Ecn {
+    #[cfg(all(target_os = "linux", not(feature = "sim")))]
+    fn from_traffic_class(value: u8) -> Self {
+        match value & 3 {
+            1 => Self::Ect1,
+            2 => Self::Ect0,
+            3 => Self::Ce,
+            _ => Self::NotEct,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct ReceivedDatagram<'a> {
     pub source: SocketAddr,
     pub destination: SocketAddr,
     pub payload: &'a [u8],
     pub received_at: ReceiveTime,
+    pub ecn: Option<Ecn>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -104,6 +136,7 @@ struct Received {
     len: usize,
     stride: usize,
     received_at: ReceiveTime,
+    ecn: Option<Ecn>,
 }
 
 struct ReceiveArena {
@@ -150,6 +183,7 @@ impl RecvBatch<'_> {
                         destination: entry.destination,
                         payload: bytes.get(start..end).unwrap_or_default(),
                         received_at: entry.received_at,
+                        ecn: entry.ecn,
                     }
                 })
             })
@@ -167,6 +201,17 @@ pub struct SendDatagram<'a> {
 pub enum SendStop {
     Blocked,
     Error(io::Error),
+}
+
+impl SendStop {
+    /// The kernel refused this datagram at the current path MTU.
+    pub fn is_path_mtu_error(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        if let Self::Error(error) = self {
+            return error.raw_os_error() == Some(nix::errno::Errno::EMSGSIZE as i32);
+        }
+        false
+    }
 }
 
 #[derive(Debug)]
@@ -210,6 +255,7 @@ impl BoundUdpSocket {
         Ok(UdpSocket {
             arena: ReceiveArena::new(self.options.max_datagram_bytes, capabilities.gro),
             max_datagram_bytes: self.options.max_datagram_bytes,
+            nonfragmenting_max_datagram_bytes: self.options.nonfragmenting_max_datagram_bytes,
             inner,
             counters: Counters::default(),
         })
@@ -229,6 +275,7 @@ pub struct DetachedUdpSocket {
     inner: backend::Detached,
     arena: ReceiveArena,
     max_datagram_bytes: usize,
+    nonfragmenting_max_datagram_bytes: Option<NonZeroU16>,
     counters: Counters,
 }
 
@@ -248,6 +295,7 @@ impl DetachedUdpSocket {
             inner,
             arena,
             max_datagram_bytes,
+            nonfragmenting_max_datagram_bytes,
             counters,
         } = self;
         match inner.activate() {
@@ -255,6 +303,7 @@ impl DetachedUdpSocket {
                 inner,
                 arena,
                 max_datagram_bytes,
+                nonfragmenting_max_datagram_bytes,
                 counters,
             }),
             Err((inner, error)) => Err((
@@ -262,6 +311,7 @@ impl DetachedUdpSocket {
                     inner: *inner,
                     arena,
                     max_datagram_bytes,
+                    nonfragmenting_max_datagram_bytes,
                     counters,
                 }),
                 error,
@@ -274,6 +324,7 @@ pub struct UdpSocket {
     inner: backend::Socket,
     arena: ReceiveArena,
     max_datagram_bytes: usize,
+    nonfragmenting_max_datagram_bytes: Option<NonZeroU16>,
     counters: Counters,
 }
 
@@ -285,6 +336,7 @@ impl UdpSocket {
             inner: self.inner.detach(),
             arena: self.arena,
             max_datagram_bytes: self.max_datagram_bytes,
+            nonfragmenting_max_datagram_bytes: self.nonfragmenting_max_datagram_bytes,
             counters: self.counters,
         }
     }
@@ -294,6 +346,10 @@ impl UdpSocket {
     }
     pub fn capabilities(&self) -> Capabilities {
         self.inner.capabilities()
+    }
+
+    pub const fn nonfragmenting_max_datagram_bytes(&self) -> Option<NonZeroU16> {
+        self.nonfragmenting_max_datagram_bytes
     }
     pub fn counters(&self) -> Counters {
         self.counters
@@ -335,7 +391,49 @@ impl UdpSocket {
 
     /// Validate the entire input first, then submit a bounded contiguous prefix.
     pub fn try_send_batch(&mut self, datagrams: &[SendDatagram<'_>]) -> SendReport {
-        let report = match validate_send(datagrams, self.capabilities()) {
+        self.try_send(datagrams, false)
+    }
+
+    pub const fn supports_ect0(&self) -> bool {
+        cfg!(all(target_os = "linux", not(feature = "sim")))
+    }
+
+    /// Submit exactly one ECT(0) datagram using per-packet IP metadata.
+    pub fn try_send_ect0(&mut self, destination: SocketAddr, payload: &[u8]) -> SendReport {
+        self.try_send(
+            &[SendDatagram {
+                destination,
+                payload,
+                gso_segment_size: None,
+            }],
+            true,
+        )
+    }
+
+    fn try_send(&mut self, datagrams: &[SendDatagram<'_>], ect0: bool) -> SendReport {
+        let max_datagram = self
+            .nonfragmenting_max_datagram_bytes
+            .map_or(MAX_DATAGRAM_BYTES, |cap| usize::from(cap.get()));
+        let report = match validate_send(datagrams, self.capabilities(), max_datagram) {
+            Ok(()) if ect0 => {
+                #[cfg(all(target_os = "linux", not(feature = "sim")))]
+                {
+                    match datagrams {
+                        [datagram] => self.inner.send_ect0(datagram),
+                        _ => SendReport {
+                            accepted: 0,
+                            stop: Some(SendStop::Error(io::ErrorKind::InvalidInput.into())),
+                        },
+                    }
+                }
+                #[cfg(any(not(target_os = "linux"), feature = "sim"))]
+                {
+                    SendReport {
+                        accepted: 0,
+                        stop: Some(SendStop::Error(io::ErrorKind::Unsupported.into())),
+                    }
+                }
+            }
             Ok(()) => self.inner.send(datagrams),
             Err(error) => SendReport {
                 accepted: 0,
@@ -373,7 +471,11 @@ fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
-fn validate_send(datagrams: &[SendDatagram<'_>], caps: Capabilities) -> io::Result<()> {
+fn validate_send(
+    datagrams: &[SendDatagram<'_>],
+    caps: Capabilities,
+    max_datagram: usize,
+) -> io::Result<()> {
     if datagrams.len() > BATCH_SIZE {
         return Err(invalid("UDP send batch exceeds the entry budget"));
     }
@@ -389,12 +491,12 @@ fn validate_send(datagrams: &[SendDatagram<'_>], caps: Capabilities) -> io::Resu
             if entry.payload.len() <= size
                 || entry.payload.len() > MAX_AGGREGATE_BYTES
                 || entry.payload.len().div_ceil(size) > caps.max_gso_segments
-                || size > MAX_DATAGRAM_BYTES
+                || size > max_datagram
             {
                 return Err(invalid("invalid UDP GSO aggregate"));
             }
-        } else if entry.payload.len() > MAX_DATAGRAM_BYTES {
-            return Err(invalid("UDP datagram exceeds legal payload size"));
+        } else if entry.payload.len() > max_datagram {
+            return Err(invalid("UDP datagram exceeds its payload limit"));
         }
     }
     Ok(())

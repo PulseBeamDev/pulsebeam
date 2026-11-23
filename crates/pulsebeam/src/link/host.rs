@@ -184,8 +184,12 @@ impl Host {
         )
     }
 
-    fn poll(&mut self) -> std::io::Result<()> {
-        let instant = Instant::now();
+    #[cfg(test)]
+    pub(in crate::link) fn test_socket(&self) -> &pulsebeam_udp::UdpSocket {
+        &self.socket
+    }
+
+    pub(in crate::link) fn poll_at(&mut self, instant: Instant) -> std::io::Result<()> {
         let now = self.ticks(instant);
         let socket = &mut self.socket;
         let closed = &mut self.closed;
@@ -387,7 +391,7 @@ impl Host {
             if shutdown.is_cancelled() {
                 return Ok(());
             }
-            self.poll()?;
+            self.poll_at(Instant::now())?;
             pulsebeam_runtime::select! {
                 _ = shutdown.cancelled() => return Ok(()),
                 result = self.ready() => if let Err(error) = result {

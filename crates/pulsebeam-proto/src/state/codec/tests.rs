@@ -46,6 +46,208 @@ fn publication(revision: u64) -> ClientStateBatch {
     }
 }
 
+#[test]
+fn native_data_control_is_an_explicit_bounded_message_family() {
+    use crate::data_control::{
+        self, PublisherBinding, PublisherObservation, SourceUnit, publisher_observation,
+    };
+    use core::num::NonZeroU64;
+
+    let binding = PublisherBinding {
+        source: NonZeroU64::MIN,
+    };
+    let admission = PublisherObservation {
+        record: Some(publisher_observation::Record::Admission(SourceUnit {
+            source_incarnation: 1,
+            unit_seq: Some(0),
+        })),
+    };
+    let carrier = NativeDataControl {
+        endpoint: Some(native_data_control::Endpoint::Publisher(OwnedDataControl {
+            owned: 7,
+            record: data_control::encode(binding, &admission).unwrap(),
+        })),
+    };
+    let bytes = encode_data_control(&carrier).unwrap();
+    assert_eq!(&bytes[..6], &[0x22, 24, 0x08, 7, 0x12, 20]);
+    assert_eq!(decode_server(&bytes), Err(DecodeError::Structure));
+    let NativeFrame::Data(decoded) = decode_server_frame(&bytes).unwrap() else {
+        panic!("explicit DATA control carrier")
+    };
+    assert_eq!(decoded, carrier);
+    let Some(native_data_control::Endpoint::Publisher(owned)) = decoded.endpoint else {
+        panic!("publisher envelope")
+    };
+    assert_eq!(data_control::decode(binding, &owned.record), Ok(admission));
+    assert_eq!(
+        data_control::decode::<PublisherObservation>(
+            PublisherBinding {
+                source: NonZeroU64::MAX
+            },
+            &owned.record
+        ),
+        Err(data_control::Error::Binding)
+    );
+
+    let state = publication(1);
+    let state_bytes = encode_client(&state).unwrap();
+    assert_eq!(
+        decode_client_frame(&state_bytes),
+        Ok(NativeFrame::State(state))
+    );
+    for invalid in [
+        [bytes.as_slice(), bytes.as_slice()].concat(),
+        [bytes.as_slice(), state_bytes.as_slice()].concat(),
+        [state_bytes.as_slice(), bytes.as_slice()].concat(),
+        [[0xa2, 0].as_slice(), &bytes[1..]].concat(),
+    ] {
+        assert_eq!(decode_client_frame(&invalid), Err(DecodeError::Structure));
+    }
+    let frame = |owned, len| NativeDataControl {
+        endpoint: Some(native_data_control::Endpoint::Subscriber(
+            OwnedDataControl {
+                owned,
+                record: vec![7; len],
+            },
+        )),
+    };
+    let max = frame(u64::MAX, MAX_DATA_CONTROL);
+    let maximal_bytes = encode_data_control(&max).unwrap();
+    assert_eq!(maximal_bytes.first(), Some(&0x2a));
+    assert_eq!(maximal_bytes.len(), MAX_DATA_CONTROL_FRAME);
+    assert_eq!(decode_client(&maximal_bytes), Err(DecodeError::Structure));
+    assert_eq!(
+        decode_client_frame(&maximal_bytes),
+        Ok(NativeFrame::Data(max))
+    );
+    for bad in [frame(0, 1), frame(1, 0), frame(1, MAX_DATA_CONTROL + 1)] {
+        assert_eq!(
+            encode_data_control(&bad),
+            Err(EncodeError::Validation(ValidationError::Batch))
+        );
+    }
+    assert_eq!(
+        decode_client_frame(&frame(u64::MAX, MAX_DATA_CONTROL + 1).encode_to_vec()),
+        Err(DecodeError::FrameSize)
+    );
+}
+
+#[test]
+fn data_v1_requires_its_exact_negotiated_transport_variant() {
+    fn batch(parameters: SctpDataV1Parameters, delivery: DataDelivery) -> ClientStateBatch {
+        let mut batch = publication(1);
+        let Some(desired_state::Value::Present(spec)) = desired(&mut batch).value.as_mut() else {
+            panic!("publication fixture")
+        };
+        let Some(resource_spec::Declaration::Publication(publication)) = spec.declaration.as_mut()
+        else {
+            panic!("publication fixture")
+        };
+        let Some(publication_spec::Kind::Data(data)) = publication.kind.as_mut() else {
+            panic!("DATA fixture")
+        };
+        data.delivery = delivery as i32;
+        data.binding = Some(TrackBinding {
+            transport: Some(track_binding::Transport::SctpDataV1(parameters)),
+        });
+        batch
+    }
+    fn validate(mut batch: ClientStateBatch) -> Result<(), ValidationError> {
+        let Some(desired_state::Value::Present(spec)) = desired(&mut batch).value.as_ref() else {
+            panic!("publication fixture")
+        };
+        validation::validate_spec(spec)
+    }
+    let fmt = SctpDataV1Parameters {
+        stream_id: Some(7),
+        version: u32::from(crate::data_endpoint::DATA_V1),
+        channel_incarnation: u64::MAX,
+        delivery: DataV1Delivery::Unreliable as i32,
+    };
+    let requested = batch(fmt, DataDelivery::Lossy);
+    assert_eq!(validate(requested.clone()), Ok(()));
+    let bytes = encode_client(&requested).unwrap();
+    assert_eq!(decode_client(&bytes), Ok(requested));
+    assert_ne!(bytes, encode_client(&publication(1)).unwrap());
+    for rejected in [
+        SctpDataV1Parameters { version: 0, ..fmt },
+        SctpDataV1Parameters { version: 2, ..fmt },
+        SctpDataV1Parameters {
+            channel_incarnation: 0,
+            ..fmt
+        },
+        SctpDataV1Parameters {
+            stream_id: Some(0),
+            ..fmt
+        },
+        SctpDataV1Parameters {
+            delivery: DataV1Delivery::Unspecified as i32,
+            ..fmt
+        },
+        SctpDataV1Parameters {
+            delivery: DataV1Delivery::Latest as i32,
+            ..fmt
+        },
+    ] {
+        assert_eq!(
+            validate(batch(rejected, DataDelivery::Lossy)),
+            Err(ValidationError::Binding)
+        );
+    }
+    assert_eq!(
+        validate(batch(fmt, DataDelivery::Ordered)),
+        Err(ValidationError::Binding)
+    );
+}
+
+#[test]
+fn installed_data_v1_publication_requires_the_authenticated_source_incarnation() {
+    let mut desired_batch = publication(1);
+    let Some(desired_state::Value::Present(spec)) = desired(&mut desired_batch).value.as_mut()
+    else {
+        panic!("publication fixture");
+    };
+    spec.settings.as_mut().unwrap().enabled = Some(true);
+    let source = lookup_state(true, true);
+    let mut live = LiveResource {
+        spec: Some(spec.as_ref().clone()),
+        participant: source.participant,
+        track: source.track,
+        execution: ExecutionStatus::Installed as i32,
+        ..Default::default()
+    };
+    assert_eq!(validation::validate_live(&live), Ok(()));
+    live.data_v1_source = Some(u64::MAX);
+    assert_eq!(
+        validation::validate_live(&live),
+        Err(ValidationError::Binding)
+    );
+    let Some(resource_spec::Declaration::Publication(publication)) =
+        &mut live.spec.as_mut().unwrap().declaration
+    else {
+        panic!("publication fixture");
+    };
+    let Some(publication_spec::Kind::Data(data)) = &mut publication.kind else {
+        panic!("DATA fixture");
+    };
+    data.binding = Some(TrackBinding {
+        transport: Some(track_binding::Transport::SctpDataV1(SctpDataV1Parameters {
+            stream_id: Some(1),
+            version: u32::from(crate::data_endpoint::DATA_V1),
+            channel_incarnation: u64::MAX,
+            delivery: DataV1Delivery::Unreliable as i32,
+        })),
+    });
+    assert_eq!(validation::validate_live(&live), Ok(()));
+    for source in [None, Some(0)] {
+        live.data_v1_source = source;
+        assert_eq!(
+            validation::validate_live(&live),
+            Err(ValidationError::Binding)
+        );
+    }
+}
+
 fn desired(batch: &mut ClientStateBatch) -> &mut DesiredState {
     batch.records[0].desired.as_mut().unwrap()
 }
@@ -96,10 +298,12 @@ fn logical_subscription_accepts_only_an_enabled_exact_source_offer() {
     };
     spec.declaration = Some(resource_spec::Declaration::LogicalSubscription(
         LogicalSubscriptionSpec {
+            data_version: None,
             source: lookup_spec.source,
         },
     ));
     let mut subscription = LogicalSubscriptionState {
+        data_v1: None,
         spec: Some(spec),
         source_revision: 0,
         source: None,
@@ -158,6 +362,66 @@ fn logical_subscription_accepts_only_an_enabled_exact_source_offer() {
         ..Default::default()
     };
     assert_eq!(decode_server(&encode_server(&server).unwrap()), Ok(server));
+
+    let opt_in = |subscription: &mut LogicalSubscriptionState| {
+        let Some(resource_spec::Declaration::LogicalSubscription(spec)) =
+            &mut subscription.spec.as_mut().unwrap().declaration
+        else {
+            panic!("logical spec");
+        };
+        spec.data_version = Some(u32::from(crate::data_endpoint::DATA_V1));
+    };
+    for (delivery, expected) in [
+        (DataV1Delivery::Unreliable, Ok(())),
+        (DataV1Delivery::Latest, Err(ValidationError::Binding)),
+    ] {
+        let mut data_v1 = subscription.clone();
+        data_v1.execution = Some(logical_subscription_state::Execution::Installed(
+            TrackBinding {
+                transport: Some(track_binding::Transport::SctpDataV1(SctpDataV1Parameters {
+                    stream_id: Some(5),
+                    version: u32::from(crate::data_endpoint::DATA_V1),
+                    channel_incarnation: 9,
+                    delivery: delivery as i32,
+                })),
+            },
+        ));
+        assert_eq!(
+            validation::validate_logical_subscription(&data_v1),
+            Err(ValidationError::Binding)
+        );
+        data_v1.data_v1 = Some(DataV1ReceiverOffer {
+            source: u64::MAX,
+            branch: (1 << 53) + 1,
+            capture_clock: Some(DataV1CaptureClock {
+                id: String::from("sender-clock"),
+                epoch: 19,
+            }),
+        });
+        assert_eq!(
+            validation::validate_logical_subscription(&data_v1),
+            Err(ValidationError::Binding)
+        );
+        opt_in(&mut data_v1);
+        assert_eq!(
+            validation::validate_logical_subscription(&data_v1),
+            expected
+        );
+        let mut legacy = subscription.clone();
+        opt_in(&mut legacy);
+        legacy.data_v1 = data_v1.data_v1.take();
+        assert_eq!(
+            validation::validate_logical_subscription(&legacy),
+            Err(ValidationError::Binding)
+        );
+        legacy.execution = None;
+        assert_eq!(validation::validate_logical_subscription(&legacy), Ok(()));
+        legacy.data_v1.as_mut().unwrap().branch = 0;
+        assert_eq!(
+            validation::validate_logical_subscription(&legacy),
+            Err(ValidationError::Binding)
+        );
+    }
 
     let mut missing_source = subscription.clone();
     missing_source.source = None;
@@ -573,6 +837,7 @@ fn structural_preflight_bounds_repeated_empty_messages_groups_and_bad_varints() 
 
 fn rtp() -> RtpParameters {
     RtpParameters {
+        extmap_allow_mixed: Some(true),
         mid: String::from("0"),
         codec: Some(RtpCodecParameters {
             payload_type: Some(0),
@@ -787,6 +1052,7 @@ fn owned_confirmation_is_self_contained_and_execution_failure_is_not_rejection()
         panic!("present")
     };
     let live = LiveResource {
+        data_v1_source: None,
         spec: Some(*spec),
         participant: Some(Participant {
             participant_id: String::from("participant"),

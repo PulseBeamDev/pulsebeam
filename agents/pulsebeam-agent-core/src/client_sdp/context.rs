@@ -285,6 +285,7 @@ impl Context {
                     group: owner.group.clone(),
                     mid: mid.clone(),
                     kind: remote.section.kind,
+                    extmap_allow_mixed: local.extmap_allow_mixed && remote.extmap_allow_mixed,
                     codec: codec.clone(),
                     extensions,
                     encodings,
@@ -765,6 +766,7 @@ impl Context {
                     }
                 }
                 bindings.publications.push(Binding {
+                    extmap_allow_mixed: media.extmap_allow_mixed,
                     key: owner.key,
                     group: owner.group,
                     mid: mid.clone(),
@@ -803,6 +805,7 @@ impl Context {
                         .unwrap_or_default();
                 }
                 bindings.receptions.push(Binding {
+                    extmap_allow_mixed: media.extmap_allow_mixed,
                     key: owner.key,
                     group: owner.group,
                     mid: mid.clone(),

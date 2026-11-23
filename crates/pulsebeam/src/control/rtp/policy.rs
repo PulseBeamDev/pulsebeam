@@ -1,4 +1,6 @@
-use super::{failure_code, publication_binding, receiving_binding, transport_capabilities};
+use super::{
+    failure_code, is_stock_av1, publication_binding, receiving_binding, transport_capabilities,
+};
 use crate::entity::TrackId;
 use crate::media::{Mid, Rid};
 use crate::participant::policy::{ReceiverRtpConfiguration, VideoPolicy};
@@ -38,13 +40,14 @@ pub(crate) fn publication(
         publication_declaration(spec).ok_or(wire::FailureCode::Unsupported)?;
     let track_id = TrackId::new(label).map_err(|_| wire::FailureCode::InvalidConfiguration)?;
     let binding = publication_binding(parameters, kind, capabilities)?;
-    // Only the existing production processors qualify a declaration. Temporal
-    // H.264 requires its declared dependency descriptor, not inferred layers.
+    // Neither simulcast nor temporal H.264 may infer dependencies from RTP markers.
     let dependency_descriptor = parameters.header_extensions.iter().any(|extension| {
         extension.uri
             == wire::RtpHeaderExtensionType::RtpHeaderExtensionDependencyDescriptor.as_str()
     });
-    if !matches!(binding.codec.parameters.name.as_str(), "opus" | "h264")
+    let av1_whole_source = is_stock_av1(&binding.codec.parameters) && binding.encodings.len() == 1;
+    if !(av1_whole_source || matches!(binding.codec.parameters.name.as_str(), "opus" | "h264"))
+        || kind == wire::TrackKind::Video && binding.encodings.len() > 1 && !dependency_descriptor
         || kind == wire::TrackKind::Audio
             && (binding.encodings.len() != 1
                 || binding
@@ -123,6 +126,17 @@ pub(crate) fn receiver(
         .iter()
         .any(|extension| extension.uri == PLAYOUT_DELAY);
     let video = receiver_settings(binding.kind, supports_playout_delay, spec)?;
+    if binding.codec.parameters.name == "av1"
+        && (!is_stock_av1(&binding.codec.parameters)
+            || video.as_ref().is_some_and(|options| {
+                options.height_ceiling.is_some()
+                    || options.minimum_height != 0
+                    || options.minimum_fps != 0
+                    || options.playout_delay.is_some()
+            }))
+    {
+        return Err(wire::FailureCode::Unsupported);
+    }
     let mid = Mid::new(&binding.mid).map_err(|_| wire::FailureCode::Unsupported)?;
     let payload_type = binding.codec.payload_type.into();
     let kind = binding.kind;
@@ -177,4 +191,76 @@ pub(crate) fn receiver_settings(
             .playout_delay
             .map(|delay| (rounded(delay.min_ms), rounded(delay.max_ms))),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wire::RtpHeaderExtensionType as Extension;
+
+    #[test]
+    fn h264_requires_dd_only_when_multiple_encodings_need_selection() {
+        let capabilities = super::super::capabilities();
+        let publish = |encodings: usize, dd: bool| {
+            let mut extensions = vec![
+                Extension::RtpHeaderExtensionMid,
+                Extension::RtpHeaderExtensionTransportCcDraft01,
+                Extension::RtpHeaderExtensionRid,
+            ];
+            if dd {
+                extensions.push(Extension::RtpHeaderExtensionDependencyDescriptor);
+            }
+            let rtp = wire::RtpParameters {
+                mid: "camera".into(),
+                extmap_allow_mixed: None,
+                codec: Some(wire::RtpCodecParameters {
+                    payload_type: Some(96),
+                    rtx_payload_type: None,
+                    format: capabilities.codecs[1].format.clone(),
+                    feedback: vec![wire::RtcpFeedback::TransportCc.into()],
+                }),
+                header_extensions: extensions
+                    .into_iter()
+                    .zip(1..)
+                    .map(|(extension, id)| wire::RtpHeaderExtensionParameters {
+                        id,
+                        uri: extension.into(),
+                    })
+                    .collect(),
+                encodings: (1..=u32::try_from(encodings).unwrap())
+                    .map(|ssrc| wire::RtpEncodingParameters {
+                        ssrc: Some(ssrc),
+                        rid: format!("v{ssrc}"),
+                        ..Default::default()
+                    })
+                    .collect(),
+                rtcp: Some(wire::RtcpParameters {
+                    cname: "camera".into(),
+                    reduced_size: true,
+                }),
+            };
+            let spec = wire::ResourceSpec {
+                settings: None,
+                declaration: Some(resource_spec::Declaration::Publication(
+                    wire::PublicationSpec {
+                        track_id: "camera".into(),
+                        kind: Some(wire::publication_spec::Kind::Video(
+                            wire::VideoPublication {
+                                binding: Some(wire::TrackBinding {
+                                    transport: Some(wire::track_binding::Transport::Rtp(rtp)),
+                                }),
+                            },
+                        )),
+                    },
+                )),
+            };
+            publication(&spec, &capabilities).map(|(_, _, binding)| binding)
+        };
+        assert_eq!(publish(1, false).unwrap().description().encodings.len(), 1);
+        assert_eq!(
+            publish(2, false).unwrap_err(),
+            wire::FailureCode::Unsupported
+        );
+        assert_eq!(publish(2, true).unwrap().description().encodings.len(), 2);
+    }
 }

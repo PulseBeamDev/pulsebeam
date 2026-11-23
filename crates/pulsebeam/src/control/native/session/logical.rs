@@ -6,6 +6,7 @@ use wire::logical_subscription_state::Execution;
 pub(super) struct Binding {
     pub(super) id: u64,
     pub(super) exact: wire::ResourceSpec,
+    pub(super) data_v1_endpoint: Option<pulsebeam_proto::data_control::SubscriberBinding>,
     pub(super) wanted_revision: u64,
     evaluated_revision: u64,
     pub(super) retiring: bool,
@@ -62,7 +63,26 @@ impl NativeSession {
         match report.outcome {
             Some(Outcome::Failure(error)) => self.fail_logical_binding(reference, error),
             Some(Outcome::Prepared(transport)) if owned.logical_binding.is_none() => {
+                let data_v1_requested = matches!(
+                    &spec.declaration,
+                    Some(wire::resource_spec::Declaration::LogicalSubscription(spec)) if spec.data_version.is_some()
+                );
+                if matches!(
+                    transport.transport,
+                    Some(wire::track_binding::Transport::SctpDataV1(_))
+                ) != data_v1_requested
+                    || data_v1_requested != state.data_v1.is_some()
+                {
+                    return self.fail_logical_binding(
+                        reference,
+                        failure(wire::FailureCode::InvalidConfiguration),
+                    );
+                }
                 let address = observed_address(spec).ok_or(OutputError::InvalidObservation)?;
+                let data_v1_endpoint = state
+                    .data_v1
+                    .as_ref()
+                    .and_then(wire::DataV1ReceiverOffer::endpoint);
                 let exact = wire::ResourceSpec {
                     settings: spec.settings.clone(),
                     declaration: Some(wire::resource_spec::Declaration::Subscription(
@@ -98,6 +118,7 @@ impl NativeSession {
                 owned.logical_binding = Some(Box::new(Binding {
                     id: revision,
                     exact,
+                    data_v1_endpoint,
                     wanted_revision: revision,
                     evaluated_revision: 0,
                     retiring: false,
@@ -129,16 +150,35 @@ impl NativeSession {
         &mut self,
         reference: u64,
         state: &mut wire::LogicalSubscriptionState,
-        resolved: Option<wire::Track>,
+        resolved: Option<(wire::Track, Option<std::num::NonZeroU64>)>,
+        branches: &DataBranchIds,
     ) -> Result<(), OutputError> {
         let changed = state.source.as_ref().map(|track| &track.publication_id)
-            != resolved.as_ref().map(|track| &track.publication_id);
-        let resolved = if changed && self.request_logical_retirement(reference) {
-            None
-        } else {
-            resolved
+            != resolved.as_ref().map(|(track, _)| &track.publication_id)
+            || state.data_v1.as_ref().map(|offer| offer.source)
+                != resolved
+                    .as_ref()
+                    .and_then(|(_, source)| source.map(std::num::NonZeroU64::get));
+        if changed && self.request_logical_retirement(reference) {
+            return set_logical_source(state, None, None);
+        }
+        let Some((track, fabric_source)) = resolved else {
+            return set_logical_source(state, None, None);
         };
-        set_logical_source(state, resolved)
+        let offer = if changed {
+            if let Some(source) = fabric_source {
+                Some(wire::DataV1ReceiverOffer {
+                    source: source.get(),
+                    branch: branches.allocate()?,
+                    capture_clock: None,
+                })
+            } else {
+                None
+            }
+        } else {
+            state.data_v1.clone()
+        };
+        set_logical_source(state, Some(track), offer)
     }
 
     pub(crate) fn take_logical_retirement(
@@ -164,7 +204,7 @@ impl NativeSession {
         else {
             return Err(OutputError::InvalidObservation);
         };
-        set_logical_source(state, None)?;
+        set_logical_source(state, None, None)?;
         self.put(key, value)
     }
 

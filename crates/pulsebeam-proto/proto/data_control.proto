@@ -1,0 +1,107 @@
+// PRODUCTION WIRE CONTRACT — EDIT WITH EXTREME CARE. Changes can break deployed clients, mixed-version nodes, and production traffic. Require compatibility review and wire-vector tests.
+// Reliable control for RFC #275 §5.4, not the DATA_V1 binary fragment format.
+// Select this contract explicitly on an authenticated control association.
+syntax = "proto3";
+package pulsebeam.data.v1;
+
+// IDs are meaningful only on the installed authenticated binding. Neither a
+// channel number nor an identifier carried here grants access to a resource.
+message SourceUnit {
+  fixed64 source_incarnation = 1;
+  optional fixed64 unit_seq = 2; // Required; zero is a valid identity.
+}
+
+message BranchUnit {
+  SourceUnit source = 1;
+  fixed64 branch_incarnation = 2;
+}
+
+message Expectation {
+  BranchUnit unit = 1;
+  uint32 fragment_count = 2; // 1..64
+}
+
+// These outcomes apply to propagation, not to successful SDK assembly.
+message ExpectationOutcome {
+  Expectation expectation = 1;
+  ControlOutcome outcome = 2;
+}
+
+enum ControlOutcome {
+  CONTROL_OUTCOME_UNSPECIFIED = 0;
+  CONTROL_OUTCOME_CONFIRMED = 1;
+  CONTROL_OUTCOME_FAILED = 2;
+  CONTROL_OUTCOME_UNKNOWN = 3;
+}
+
+message RepairDemand {
+  BranchUnit unit = 1;
+  optional uint32 fragment_index = 2; // Required; 0..63 and below the expectation's count.
+  fixed64 request_id = 3; // Nonzero; monotonic within this branch incarnation.
+}
+
+message RepairOutcome {
+  RepairDemand demand = 1;
+  RepairStatus status = 2;
+}
+
+enum RepairStatus {
+  REPAIR_STATUS_UNSPECIFIED = 0;
+  REPAIR_STATUS_HANDED_OFF = 1; // Not a delivery receipt.
+  REPAIR_STATUS_UNAVAILABLE = 2;
+  REPAIR_STATUS_EXPIRED = 3;
+  REPAIR_STATUS_REVOKED = 4;
+  REPAIR_STATUS_EXHAUSTED = 5;
+  REPAIR_STATUS_UNKNOWN = 6;
+}
+
+// The source requests a missing original from the publisher. A reply with the
+// original uses the installed DATA channel, never a blob in control.
+message OriginalDemand {
+  SourceUnit unit = 1;
+  optional uint32 fragment_index = 2;
+  fixed64 request_id = 3;
+}
+
+message OriginalUnavailable {
+  OriginalDemand demand = 1;
+}
+
+// Positive end-to-end evidence comes only from AssemblyReceipt. This record
+// carries the result for one branch to the publication owner, not authority to
+// target that branch. A receipt may race a terminal timeout.
+message DeliveryOutcome {
+  Expectation expectation = 1;
+  ControlOutcome outcome = 2;
+}
+
+message PublisherControl {
+  oneof record {
+    OriginalUnavailable unavailable = 1;
+  }
+}
+
+message PublisherObservation {
+  oneof record {
+    SourceUnit admission = 1; // Confirms only first-fragment source admission.
+    OriginalDemand request_original = 2;
+    DeliveryOutcome delivery = 3;
+  }
+}
+
+message SubscriberControl {
+  oneof record {
+    ExpectationOutcome expectation_outcome = 1;
+    Expectation assembly_receipt = 2; // Only after complete validated SDK assembly.
+    RepairDemand request_repair = 3;
+    RepairDemand cancel_repair = 4;
+  }
+}
+
+message SubscriberObservation {
+  oneof record {
+    Expectation expectation = 1;
+    Expectation receipt_ack = 2;
+    RepairOutcome repair = 3;
+  }
+}

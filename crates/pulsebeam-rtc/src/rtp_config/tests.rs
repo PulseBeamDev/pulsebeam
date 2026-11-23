@@ -32,6 +32,7 @@ fn capabilities() -> RtpCapabilities {
 }
 fn binding(mid: &str, primary: u32) -> RtpBinding {
     RtpBinding {
+        extmap_allow_mixed: None,
         mid: mid.into(),
         kind: MediaKind::Video,
         rtcp: RtcpParameters {
@@ -105,6 +106,102 @@ fn connection_with_limits(limits: crate::ConnectionLimits) -> RtcConnection {
     )
     .unwrap()
     .connection
+}
+
+#[test]
+fn typed_rfc8888_bindings_require_ccfb_without_twcc() {
+    let mut capabilities = capabilities();
+    capabilities.feedback = PacketFeedbackKind::Rfc8888;
+    let feedback = &mut capabilities.codecs[0].parameters.feedback;
+    feedback.remove("transport-cc");
+    feedback.insert("ack ccfb".into());
+    let compiler = RtpBindingCompiler::new(capabilities.clone()).unwrap();
+    let ccfb_binding = |mid, primary| {
+        let mut binding = binding(mid, primary);
+        binding.codec.parameters = capabilities.codecs[0].parameters.clone();
+        binding.extensions.retain(|ext| ext.uri != TWCC_EXTENSION);
+        binding
+    };
+    let mut inbound = ccfb_binding("in", 100);
+    inbound.extensions.push(RtpExtensionMapping {
+        id: 2,
+        uri: TWCC_EXTENSION.into(),
+    });
+    assert!(matches!(
+        compiler.compile(inbound),
+        Err(RtpConfigurationError::Unsupported)
+    ));
+    let mut inbound = ccfb_binding("in", 100);
+    inbound.codec.parameters.feedback.remove("ack ccfb");
+    assert!(matches!(
+        compiler.compile(inbound),
+        Err(RtpConfigurationError::Unsupported)
+    ));
+
+    let mut connection = connection();
+    connection
+        .set_rtp_capabilities(capabilities.clone())
+        .unwrap();
+    connection
+        .configure_compiled_rtp(
+            compiler
+                .compile_configuration(RtpConfiguration {
+                    inbound: vec![ccfb_binding("in", 100)],
+                    outbound: vec![ccfb_binding("out", 200)],
+                })
+                .unwrap(),
+        )
+        .unwrap();
+    let receive = connection.rtp_receive_binding(100).unwrap();
+    assert_eq!(receive.declared_repair_ssrc, Some(101));
+    assert!(
+        !receive
+            .receive_extensions
+            .iter()
+            .any(|ext| ext.uri.as_ref() == TWCC_EXTENSION)
+    );
+    assert_eq!(
+        connection.rtp_egress_extension_id("out", Some(200), TWCC_EXTENSION),
+        None
+    );
+}
+
+#[test]
+fn typed_receive_binding_is_available_before_ingress_and_fenced_on_retirement() {
+    let mut connection = connection();
+    assert!(connection.rtp_receive_binding(100).is_none());
+    connection.set_rtp_capabilities(capabilities()).unwrap();
+    let mut inbound = binding("in", 100);
+    inbound.encodings[0].active = false;
+    connection
+        .configure_rtp(RtpConfiguration {
+            inbound: vec![inbound],
+            outbound: vec![binding("out", 200)],
+        })
+        .unwrap();
+    let receive = connection.rtp_receive_binding(100).unwrap();
+    assert_eq!(receive.mid, "in");
+    assert_eq!(receive.primary_ssrc, 100);
+    assert_eq!(receive.primary_codec.payload_type, 96);
+    assert_eq!(receive.repair_payload_type, Some(97));
+    assert_eq!(receive.declared_repair_ssrc, Some(101));
+    assert!(
+        receive
+            .receive_extensions
+            .iter()
+            .any(|extension| { extension.id == 1 && extension.uri.as_ref() == MID_EXTENSION })
+    );
+    assert!(connection.rtp_receive_binding(101).is_none());
+    assert!(connection.rtp_receive_binding(200).is_none());
+    connection.set_rtp_encoding_active(100, true).unwrap();
+    assert!(connection.rtp_receive_binding(100).is_some());
+    connection
+        .update_rtp(RtpConfigurationPatch {
+            remove_encodings: [100].into_iter().collect(),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(connection.rtp_receive_binding(100).is_none());
 }
 
 #[test]
@@ -1071,6 +1168,8 @@ fn configured_ingress_admits_only_exact_primary_repair_mid_payload_and_rid() {
         };
         // Bootstrap narrowing keeps the real receiver, not a second physical lifetime.
         let mut bootstrap_facts = physical.ingress_facts();
+        bootstrap_facts.allow_mixed_extensions = true;
+        bootstrap_facts.extensions[0].attributes = Some("bootstrap-attributes".into());
         let mut extra = bootstrap_facts.payloads[0].clone();
         extra.payload_type = 98;
         let extra_payload_bytes = std::mem::size_of_val(&extra) + extra.name.len();
@@ -1236,7 +1335,22 @@ fn configured_ingress_admits_only_exact_primary_repair_mid_payload_and_rid() {
         assert!(bootstrap.poll_event().is_none());
         assert_eq!(bootstrap.stats().len(), 1);
         assert_eq!(bootstrap.stats()[0].received_packets, 3);
-        bootstrap.accept_rtp(now, wire(primary, 96, 4, "v", None, b"continuing"), None);
+        let mut observed = false;
+        bootstrap.accept_rtp_observed(
+            now,
+            wire(primary, 96, 4, "v", None, b"continuing"),
+            None,
+            None,
+            Some(&mut |rtp: crate::AuthenticatedRtp<'_>| {
+                assert!(rtp.allow_mixed_extensions);
+                assert_eq!(
+                    rtp.receive_extensions[0].attributes.as_deref(),
+                    Some("bootstrap-attributes")
+                );
+                observed = true;
+            }),
+        );
+        assert!(observed);
         assert!(
             matches!(bootstrap.poll_event(), Some(crate::Event::Rtp { packet, .. }) if packet.payload.as_ref() == b"continuing")
         );
@@ -1667,6 +1781,10 @@ fn pause_preserves_egress_but_terminal_omission_requires_a_fresh_identity() {
         crate::time::ProtocolClock::new(now, std::time::UNIX_EPOCH),
     )
     .unwrap();
+    assert_eq!(
+        bootstrap.declared_answer_fid("v", Some(primary)),
+        Some([primary, repair])
+    );
     let adopted = bootstrap
         .stage_configuration(
             &[(bootstrap_binding, true)],
@@ -1679,6 +1797,10 @@ fn pause_preserves_egress_but_terminal_omission_requires_a_fresh_identity() {
     bootstrap.commit_configuration(adopted);
     assert_eq!(bootstrap.stats().1.len(), 1);
     assert_eq!(bootstrap.stats().1[0].ssrc, primary);
+    assert_eq!(
+        bootstrap.declared_answer_fid("v", Some(primary)),
+        Some([primary, repair])
+    );
     let other = PhysicalBinding {
         outbound: true,
         binding: binding("other", 200),
@@ -1700,6 +1822,7 @@ fn pause_preserves_egress_but_terminal_omission_requires_a_fresh_identity() {
         )
         .unwrap();
     egress.commit_configuration(update);
+    assert_eq!(egress.declared_answer_fid("other", Some(200)), None);
     let reserved = egress.test_runtime_bytes();
     let replacement_budget = reserved
         .checked_add(std::mem::size_of::<(u32, u32)>())
@@ -2064,8 +2187,15 @@ fn codec_parameter_model_accepts_opus_vp8_h264_and_representative_vp9_without_en
     let mut vp9 = codec();
     vp9.name = "vp9".into();
     vp9.fmtp.insert("profile-id".into(), "0".into());
+    let mut av1 = codec();
+    av1.name = "av1".into();
+    av1.fmtp.extend([
+        ("profile".into(), "1".into()),
+        ("level-idx".into(), "12".into()),
+        ("tier".into(), "1".into()),
+    ]);
     caps.codecs.extend(
-        [opus, h264, vp9]
+        [opus, h264, vp9, av1]
             .into_iter()
             .map(|parameters| RtpCodecCapability {
                 repair: parameters.name != "vp9",
@@ -2101,13 +2231,57 @@ fn codec_parameter_model_accepts_opus_vp8_h264_and_representative_vp9_without_en
         let update = state.stage(config).unwrap();
         let staged = &update.bindings;
         assert_eq!(staged[0].0.binding.codec.parameters, *parameters);
+        let facts = staged[0].0.ingress_facts();
+        let codec = &facts.payloads[0];
+        assert_eq!(codec.payload_type, 96);
+        assert_eq!(codec.name.as_ref(), parameters.name.to_ascii_lowercase());
+        assert_eq!(codec.clock_rate, parameters.clock_rate);
+        assert_eq!(codec.channels, parameters.channels);
         assert_eq!(
-            staged[0].0.ingress_facts().payloads[0],
-            crate::RtpPayloadInfo {
-                payload_type: 96,
-                name: parameters.name.to_ascii_lowercase().into_boxed_str(),
-                clock_rate: parameters.clock_rate,
+            codec.profile,
+            match parameters.name.as_str() {
+                "opus" => Some(crate::CodecProfile::Opus),
+                "h264" => Some(crate::CodecProfile::H264 {
+                    profile_level_id: Some(0x42e01f),
+                    packetization_mode: 1,
+                    level_asymmetry_allowed: false,
+                }),
+                "av1" => Some(crate::CodecProfile::Av1 {
+                    profile: 1,
+                    level_idx: 12,
+                    tier: 1
+                }),
+                _ => None,
             }
+        );
+    }
+}
+
+#[test]
+fn av1_config_defaults_and_reserved_parameters() {
+    assert_eq!(
+        av1_profile(&BTreeMap::new()),
+        Some(crate::CodecProfile::Av1 {
+            profile: 0,
+            level_idx: 5,
+            tier: 0
+        })
+    );
+    for (key, value) in [
+        ("profile", "3"),
+        ("level-idx", "24"),
+        ("level-idx", "30"),
+        ("level-idx", "32"),
+        ("tier", "2"),
+        ("tier", "+1"),
+        ("unknown", "0"),
+    ] {
+        let mut params = codec();
+        params.name = "av1".into();
+        params.fmtp.insert(key.into(), value.into());
+        assert_eq!(
+            validate_codec(&params),
+            Err(RtpConfigurationError::Unsupported)
         );
     }
 }

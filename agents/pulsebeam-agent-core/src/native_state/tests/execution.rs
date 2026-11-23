@@ -22,6 +22,7 @@ fn logical_receiver_reports_follow_the_owned_offer_not_the_publication() {
         }),
         declaration: Some(wire::resource_spec::Declaration::LogicalSubscription(
             wire::LogicalSubscriptionSpec {
+                data_version: None,
                 source: Some(wire::LogicalSourceAddress {
                     room: selector.room.clone(),
                     participant_id: selector.participant_id.clone(),
@@ -39,6 +40,7 @@ fn logical_receiver_reports_follow_the_owned_offer_not_the_publication() {
                 rejection: None,
                 value: Some(wire::confirmed_state::Value::LogicalSubscription(Box::new(
                     wire::LogicalSubscriptionState {
+                        data_v1: None,
                         spec: Some(spec.clone()),
                         source_revision,
                         source: source.map(|id| wire::Track {
@@ -170,6 +172,7 @@ fn receiver_failure_has_its_own_revision_and_cannot_retarget_or_revive_a_lifetim
         rejection: None,
         value: Some(wire::confirmed_state::Value::Owned(Box::new(
             wire::LiveResource {
+                data_v1_source: None,
                 spec: Some(desired.clone()),
                 participant: Some(wire::Participant {
                     participant_id: "peer".into(),

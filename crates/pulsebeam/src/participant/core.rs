@@ -3,6 +3,8 @@ use crate::control::native::OutputError;
 #[cfg(test)]
 use crate::control::native::failure;
 use crate::control::native::handoff::{EndpointHandoff, Fact, Opened};
+#[cfg(test)]
+mod fabric_shadow_tests;
 mod native_data;
 mod native_receiver;
 mod native_rtp;
@@ -10,7 +12,6 @@ mod native_rtp;
 mod topic_tests;
 use crate::media::{Direction, KeyframeRequestKind, MediaKind, Mid, Pt, Ssrc};
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
-use pulsebeam_proto::topic::TopicFrame;
 use pulsebeam_rtc::{DataChannelEvent, DataMessage, Event};
 use pulsebeam_runtime::net::{self};
 use pulsebeam_runtime::time::Instant;
@@ -21,15 +22,16 @@ use crate::entity::{self, PublicationKey, TrackKind};
 use crate::id::ShardId;
 use crate::keys::TrackHandle;
 use crate::log::{LogCtx, plog_debug, plog_info, plog_trace, plog_warn};
-use crate::participant::data::{DataChannelState, DataOpenError, DataState};
+use crate::participant::data_fabric::{self, Lease as FabricDataLease};
 use crate::participant::downstream::SlotConfig;
 use crate::participant::effect::ParticipantEffect;
 use crate::participant::event::ParticipantSink;
 use crate::participant::reverse::{ReverseInput, ReversePacket};
+use crate::shard::router::{FabricLocalBranch, FabricSourceHandle};
 
+use crate::participant::TrackPacketRef;
 #[cfg(test)]
 use crate::participant::upstream::{MAX_UPSTREAM_ENCODED_STREAMS, UpstreamRouteTable};
-use crate::participant::{TrackPacket, TrackPacketRef};
 use crate::participant::{
     batcher::NetworkEgress,
     downstream::DownstreamAllocator,
@@ -40,10 +42,12 @@ use crate::participant::{
     upstream::{IncomingRtpRoute, UpstreamAllocator, UpstreamSlotKey},
 };
 use crate::rtp::cache::TrackStreamCache;
+use crate::rtp::fabric_egress::{AdmissionError, CandidatePacket, SenderLeg, SourceMetadata};
+use crate::rtp::fabric_ingress::{DropReason, Observation, RtpIngressShadow};
 use crate::track::{
-    self, DataLane, DataTopicChannel, DataTrackDirection, DataTrackIntent, DataTrackIntentError,
-    KEYFRAME_DEBOUNCE, SourceEncoding, StreamId, StreamWrite, StreamWriter, Track,
+    self, DataLane, KEYFRAME_DEBOUNCE, SourceEncoding, StreamId, StreamWrite, StreamWriter, Track,
 };
+use pulsebeam_core::fabric::{WireError, media_source::Rejected};
 
 const SLOW_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const POLL_WORK_BUDGET: usize = 256;
@@ -82,16 +86,8 @@ pub enum DisconnectReason {
     IceDisconnected,
     #[error("Unsupported media direction (must be SendOnly or RecvOnly)")]
     InvalidMediaDirection,
-    #[error("Invalid data channel protocol: {0}")]
-    InvalidDataTrackIntent(#[from] DataTrackIntentError),
-    #[error("Duplicate data channel label for same direction: {0}")]
-    DuplicateDataChannelLabel(DataTopicChannel),
     #[error("Exceeded maximum upstream tracks: only 2 video and 2 audio allowed")]
     TooManyUpstreamTracks,
-    #[error(
-        "Exceeded maximum data topic channels: only 64 channels (across all topics/scopes) allowed"
-    )]
-    TooManyDataTopicChannels,
     #[error("Room closed")]
     RoomClosed,
     #[error("System terminated")]
@@ -103,8 +99,6 @@ pub struct ConnectionConfig {
     pub participant_id: entity::ParticipantId,
     pub connection_id: entity::ConnectionId,
     pub profile: SignalingProtocol,
-    pub allow_topic_channels: bool,
-    pub(crate) topic_publications: super::policy::TopicPublications,
     pub authorization_expiry: Option<pulsebeam_core::auth::AuthorizationExpiry>,
     pub rtc: pulsebeam_rtc::AcceptedConnection,
     pub resources: NegotiatedResources,
@@ -157,6 +151,88 @@ struct PendingSdpSender {
     codec: Option<pulsebeam_rtc::CodecInfo>,
 }
 
+struct BoundFabricOutput {
+    branch: FabricLocalBranch,
+    leg: SenderLeg<FabricLocalBranch>,
+    source: SourceMetadata,
+}
+
+impl BoundFabricOutput {
+    fn contains_branch(&self, branch: FabricLocalBranch) -> bool {
+        self.branch == branch || self.leg.committed_branch() == Some(branch)
+    }
+}
+
+struct BoundFabricIngress {
+    publication: PublicationKey,
+    fanout: TrackHandle,
+    ingress: RtpIngressShadow,
+    publisher_source: Option<FabricSourceHandle>,
+    geometry_refresh_at: Option<Instant>,
+    #[cfg(test)]
+    observation: Option<(u32, Observation)>,
+}
+
+impl BoundFabricIngress {
+    fn geometry_refresh_due(&mut self, arrival: Instant) -> bool {
+        let Some(due) = self.geometry_refresh_at else {
+            self.geometry_refresh_at = arrival.checked_add(Duration::from_millis(500));
+            return false;
+        };
+        if arrival < due {
+            return false;
+        }
+        self.geometry_refresh_at = arrival.checked_add(Duration::from_secs(5));
+        true
+    }
+
+    fn input(
+        &mut self,
+        now: Instant,
+        wall: std::time::SystemTime,
+        rtp: pulsebeam_rtc::AuthenticatedRtp<'_>,
+        events: &mut impl ParticipantSink,
+    ) {
+        let Some(source) = self.publisher_source else {
+            self.observe(now, wall, rtp);
+            return;
+        };
+        let stamp = crate::clock::NtpTime::from_system_time(wall).middle32();
+        if let Ok(Some(input)) = self.ingress.prepare(stamp, rtp) {
+            events.publish_fabric_media(source, input);
+        }
+    }
+
+    fn observe(
+        &mut self,
+        now: Instant,
+        wall: std::time::SystemTime,
+        rtp: pulsebeam_rtc::AuthenticatedRtp<'_>,
+    ) {
+        let stamp = crate::clock::NtpTime::from_system_time(wall).middle32();
+        let outcome = self.ingress.observe(now.into(), stamp, rtp);
+        #[cfg(test)]
+        if let Ok(observation) = outcome {
+            self.observation = Some((stamp, observation));
+        }
+        match outcome {
+            Ok(Observation::Media {
+                first: true,
+                wan_plaintext_bytes,
+                ..
+            }) => {
+                metrics::histogram!("participant_fabric_shadow_wan_plaintext_bytes")
+                    .record(wan_plaintext_bytes as f64);
+            }
+            Err(DropReason::Admission(Rejected::Wire(WireError::Oversize))) => {
+                metrics::counter!("participant_fabric_shadow_reject", "reason" => "oversize")
+                    .increment(1);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Shard-owned media execution for one participant connection incarnation.
 pub struct Connection {
     // Hot: touched on every packet
@@ -167,8 +243,10 @@ pub struct Connection {
     upstream: UpstreamAllocator,
     sdp_senders: HashMap<Mid, PendingSdpSender>,
     negotiated: NegotiatedResources,
-    allow_topic_channels: bool,
-    topic_publications: super::policy::TopicPublications,
+    signaling_profile: SignalingProtocol,
+    media_ingress: HashMap<u32, Box<BoundFabricIngress>>,
+    media_egress: std::collections::BTreeMap<Mid, BoundFabricOutput>,
+    fenced_fabric_sources: HashSet<FabricSourceHandle>,
     pub(crate) participant_id: entity::ParticipantId,
     pub(crate) connection_id: entity::ConnectionId,
     last_keyframe_request: HashMap<(Mid, SourceEncoding), Instant>,
@@ -179,7 +257,7 @@ pub struct Connection {
     /// frame reaches its fanout without hashing a room, a publisher or a
     /// topic — the identity it would otherwise have to reassemble on every
     /// packet.
-    data: DataState,
+    fabric_data: HashMap<crate::media::ChannelId, FabricDataLease>,
     native_data: native_data::NativeData,
     native_execution: native_data::NativeExecution,
     native_preparation_budget: usize,
@@ -233,11 +311,13 @@ impl Connection {
             stream_writer: StreamWriter::new(),
             participant_id: cfg.participant_id,
             connection_id: cfg.connection_id,
-            allow_topic_channels: cfg.allow_topic_channels,
-            topic_publications: cfg.topic_publications,
             upstream: UpstreamAllocator::new(ctx),
             sdp_senders: HashMap::new(),
             negotiated: cfg.resources,
+            signaling_profile: cfg.profile,
+            media_ingress: HashMap::new(),
+            media_egress: Default::default(),
+            fenced_fabric_sources: HashSet::new(),
             downstream: DownstreamAllocator::new(ctx),
             disconnect_reason: None,
             native_handoff,
@@ -250,7 +330,7 @@ impl Connection {
             last_slow_poll: now,
             last_keyframe_request: HashMap::new(),
             pending_keyframe_requests: HashSet::new(),
-            data: DataState::new(),
+            fabric_data: HashMap::new(),
             native_data: native_data::NativeData::default(),
             native_execution: native_data::NativeExecution::default(),
             native_preparation_budget: NATIVE_PREPARATION_BUDGET,
@@ -336,6 +416,9 @@ impl Connection {
                     debug_assert!(false, "a track effect must resolve to a local handle");
                     return;
                 };
+                self.retain_media_ingress(|binding| {
+                    binding.publication != publication_id || binding.fanout == key
+                });
                 if publication_id.kind() != TrackKind::Data {
                     if self.native_rtp.bind_source(publication_id, key)
                         || (!self.upstream.owns_managed_track(publication_id)
@@ -345,24 +428,21 @@ impl Connection {
                     }
                     return;
                 }
-                self.native_data.bind_source(publication_id, key);
-                if self.data.bind_source(publication_id, key) {
-                    self.upstream.bind_track_handle(publication_id, key);
-                }
             }
             ParticipantEffect::TrackUnpublished { publication_id } => {
                 let Some(key) = track_handle else {
                     debug_assert!(false, "a track effect must resolve to a local handle");
                     return;
                 };
+                self.retain_media_ingress(|binding| {
+                    binding.publication != publication_id || binding.fanout != key
+                });
                 if publication_id.kind() != TrackKind::Data {
                     if !self.upstream.owns_managed_track(publication_id) {
                         self.upstream.unbind_track_handle(publication_id, key);
                     }
                     return;
                 }
-                self.upstream.unbind_track_handle(publication_id, key);
-                self.data.unpublish(publication_id, key);
             }
         }
     }
@@ -418,7 +498,6 @@ impl Connection {
         if self.native_receivers.contains_source(publication_id) {
             self.native_source_added(key, &track);
         }
-        self.data.add_candidate(key, &track);
         if track.kind() != TrackKind::Data {
             self.on_track_published(key, track);
         }
@@ -448,7 +527,6 @@ impl Connection {
             return;
         };
         debug_assert_eq!(candidate.publication_id, publication_id);
-        self.data.remove_candidate(key);
         if self.native_receivers.contains_source(publication_id)
             && publication_id.kind() == TrackKind::Video
         {
@@ -467,39 +545,6 @@ impl Connection {
         packet: TrackPacketRef<'_>,
         cache: Option<&TrackStreamCache>,
     ) {
-        let TrackPacketRef::Rtp(packet) = packet else {
-            let (stream, lane, bytes) = match packet {
-                TrackPacketRef::Data { lane, bytes } => (key, lane, bytes),
-                TrackPacketRef::Rtp(_) => {
-                    debug_assert!(false, "the RTP path must be handled before data dispatch");
-                    return;
-                }
-            };
-            self.native_data_delivery(stream, lane, bytes);
-            if self.disconnect_reason.is_some() {
-                return;
-            }
-            let Some(channel) = self.data.forwarding(stream) else {
-                return;
-            };
-            let required = if matches!(lane, DataLane::Ordered) {
-                let Ok(frame) = pulsebeam_proto::topic::TopicFrame::decode_bounded(bytes) else {
-                    return;
-                };
-                !matches!(
-                    frame.body,
-                    Some(pulsebeam_proto::topic::topic_frame::Body::Message(_))
-                )
-            } else {
-                false
-            };
-            self.enqueue_fanout(TransportMutation::Data {
-                channel,
-                bytes: bytes.to_vec(),
-                required,
-            });
-            return;
-        };
         let Some(entry) = self.downstream.track_candidate(key) else {
             debug_assert!(false, "a TrackPacket must target an installed track");
             return;
@@ -562,6 +607,29 @@ impl Connection {
         self.transport.enqueue_tcp(packet)
     }
 
+    pub(crate) fn staged_handoff(
+        &self,
+        participant: crate::keys::ParticipantHandle,
+    ) -> Option<super::batcher::Handoff> {
+        self.transport.staged_handoff(participant)
+    }
+
+    pub(crate) fn dispatch_handoff(&mut self, handoff: super::batcher::Handoff, authorized: bool) {
+        self.transport.dispatch_handoff(handoff, authorized);
+    }
+
+    pub(crate) fn network_pending(&self) -> bool {
+        self.transport.network_pending()
+    }
+
+    pub(crate) fn handoff_pending(&self, id: u64) -> bool {
+        self.transport.handoff_pending(id)
+    }
+
+    pub(crate) fn resolve_handoff(&mut self, id: u64, accepted: bool) -> bool {
+        self.transport.resolve_handoff(id, accepted)
+    }
+
     pub fn drain_network(&mut self, egress: &mut impl NetworkEgress) {
         self.transport.drain_network(egress);
     }
@@ -610,15 +678,6 @@ impl Connection {
         removed
     }
 
-    fn enqueue_fanout(&mut self, work: TransportMutation) -> bool {
-        let required = matches!(&work, TransportMutation::Data { required: true, .. });
-        let accepted = self.transport.enqueue_mutation(work);
-        if required && !accepted {
-            self.disconnect(DisconnectReason::SignalingOutput);
-        }
-        accepted
-    }
-
     fn on_reverse(&mut self, stream: TrackHandle, packet: ReversePacket) {
         match packet.decode() {
             Some(ReverseInput::Keyframe { encoding, kind }) => {
@@ -630,31 +689,6 @@ impl Connection {
                     return;
                 };
                 self.enqueue_remote_keyframe((publication_id, encoding), kind);
-            }
-            Some(ReverseInput::ReliableControl { requester, bytes }) => {
-                if self.native_data.owns_fanout(stream) {
-                    self.native_data_reverse(stream, requester, bytes);
-                    return;
-                }
-                let Some(channel) = self.data.source(stream) else {
-                    return;
-                };
-                let Ok(frame) = TopicFrame::decode_bounded(&bytes) else {
-                    return;
-                };
-                let Some(publication) = self.data.publication(channel) else {
-                    return;
-                };
-                if !frame.is_subscriber_control()
-                    || frame.publication_id() != Some(publication.id.as_str().as_str())
-                {
-                    return;
-                }
-                self.enqueue_fanout(TransportMutation::Data {
-                    channel,
-                    bytes,
-                    required: true,
-                });
             }
             None => {
                 debug_assert!(false, "reverse route carried an invalid endpoint envelope");
@@ -691,11 +725,14 @@ impl Connection {
             );
             return;
         }
-        if self.enqueue_fanout(TransportMutation::Keyframe {
-            mid,
-            encoding: stream_id.1,
-            kind,
-        }) {
+        if self
+            .transport
+            .enqueue_mutation(TransportMutation::Keyframe {
+                mid,
+                encoding: stream_id.1,
+                kind,
+            })
+        {
             debug_assert!(self.pending_keyframe_requests.insert(key));
         }
     }
@@ -708,7 +745,9 @@ impl Connection {
         let assignments_changed = self.downstream.poll_slow(now, events);
         self.transport
             .set_desired_bitrate(self.downstream.desired_bitrate());
-        let _ = assignments_changed;
+        if assignments_changed {
+            self.stage_allocated_rtp_receivers(events);
+        }
     }
 
     fn apply_one_rtc_mutation(&mut self, now: Instant) -> bool {
@@ -768,9 +807,6 @@ impl Connection {
                 playout_delay,
             });
             match result {
-                AppliedMutation::ControlNotWritten => {
-                    self.disconnect(DisconnectReason::SignalingOutput);
-                }
                 AppliedMutation::RtpWritten if playout_delay.is_some() => {
                     self.downstream.record_playout_delay_stamp(mid, rid, seq_no);
                 }
@@ -778,27 +814,13 @@ impl Connection {
                     debug_assert!(self.pending_keyframe_requests.remove(&(mid, encoding)));
                 }
                 AppliedMutation::KeyframeRequested { .. }
-                | AppliedMutation::Applied
-                | AppliedMutation::DataNotWritten
                 | AppliedMutation::RtpWritten
                 | AppliedMutation::RtpNotWritten => {}
             }
             return true;
         }
-        let signaling = self.native_channel_id();
-        let topics = &self.data;
-        let data = &self.native_data;
-        let receivers = &self.native_receivers;
-        let applied = self.transport.apply_next_mutation(now, |channel| {
-            Some(channel) == signaling
-                || topics.channel(channel).is_some()
-                || data.can_write(channel)
-                || receivers.can_write(channel)
-        });
+        let applied = self.transport.apply_next_mutation();
         match applied {
-            Some(AppliedMutation::ControlNotWritten) => {
-                self.disconnect(DisconnectReason::SignalingOutput);
-            }
             Some(AppliedMutation::KeyframeRequested { mid, encoding }) => {
                 debug_assert!(self.pending_keyframe_requests.remove(&(mid, encoding)));
                 self.last_keyframe_request.insert((mid, encoding), now);
@@ -917,8 +939,10 @@ impl Connection {
                 let assignments_changed = self.downstream.update_allocations(now);
                 self.transport
                     .set_desired_bitrate(self.downstream.desired_bitrate());
-                let _ = assignments_changed;
                 self.downstream.reconcile_routes(now, events);
+                if assignments_changed {
+                    self.stage_allocated_rtp_receivers(events);
+                }
                 self.transport.mark_needs_drain();
                 continue;
             }
@@ -983,6 +1007,989 @@ impl Connection {
         self.transport.advance_clock(candidate, wall_now);
     }
 
+    pub(crate) fn retire_fabric_rtp_scope(&mut self, branch: FabricLocalBranch) {
+        self.downstream.video.retire_fabric_selection(branch);
+        if let Some(scope) = branch.scope() {
+            self.transport.retire_fabric_rtp_scope(scope);
+        }
+    }
+
+    pub(crate) fn discard_pending_fabric_rtp(&mut self, scope: pulsebeam_rtc::MediaScope) -> bool {
+        self.transport.discard_pending_fabric_rtp(scope)
+    }
+
+    pub(crate) fn attach_fabric_rtp_output(
+        &mut self,
+        branch: FabricLocalBranch,
+        leg: SenderLeg<FabricLocalBranch>,
+        source: SourceMetadata,
+    ) -> bool {
+        let output = leg.output();
+        if !self.fabric_io_authorized()
+            || self.media_egress.len() >= crate::route::fabric::local::MAX_BRANCHES
+            || self.media_egress.contains_key(&output.mid)
+            || self.has_fabric_rtp_output(branch)
+            || !self.transport.fabric_rtp_sender_is_fresh(output)
+        {
+            return false;
+        }
+        self.media_egress.insert(
+            output.mid,
+            BoundFabricOutput {
+                branch,
+                leg,
+                source,
+            },
+        );
+        true
+    }
+
+    pub(crate) fn selected_fabric_video_encoding(
+        &self,
+        mid: Mid,
+        track: TrackHandle,
+    ) -> Option<(crate::track::SourceEncoding, u8)> {
+        self.downstream.video.selected_encoding(mid, track)
+    }
+
+    pub(crate) fn fabric_video_output_selects(
+        &self,
+        branch: FabricLocalBranch,
+        track: TrackHandle,
+        encoding: crate::route::fabric::RtpSourceEncoding,
+        target: u8,
+    ) -> bool {
+        self.media_egress.iter().any(|(&mid, output)| {
+            output.contains_branch(branch)
+                && self.downstream.video.allows_fabric_encoding(
+                    mid,
+                    branch,
+                    (track, encoding, target),
+                    output.branch == branch,
+                )
+        })
+    }
+
+    pub(crate) fn fabric_rtp_output_branches(
+        &self,
+        mid: Mid,
+    ) -> Option<(FabricLocalBranch, Option<FabricLocalBranch>)> {
+        let output = self.media_egress.get(&mid)?;
+        Some((output.branch, output.leg.committed_branch()))
+    }
+
+    pub(crate) fn whep_rtp_output(&self, publication: PublicationKey) -> Option<(Mid, u32)> {
+        let kind = match publication.kind() {
+            TrackKind::Audio => MediaKind::Audio,
+            TrackKind::Video => MediaKind::Video,
+            TrackKind::Data => return None,
+        };
+        let media = self.negotiated.media_sections().iter().find(|media| {
+            media.receive_publication == Some(publication)
+                && media.kind == kind
+                && media.direction == Direction::SendOnly
+        })?;
+        Some((media.mid, self.transport.stream_tx_ssrc(media.mid)?.into()))
+    }
+
+    #[cfg(feature = "sim")]
+    pub(crate) fn has_whep_output(&self) -> bool {
+        self.negotiated
+            .media_sections()
+            .iter()
+            .any(|media| media.receive_publication.is_some())
+    }
+
+    pub(crate) fn bind_local_rtp_output(
+        &mut self,
+        branch: FabricLocalBranch,
+        mid: Mid,
+        primary: u32,
+        emission: crate::route::fabric::local::Emission,
+    ) -> bool {
+        use crate::rtp::fabric_egress::{
+            CaptureClock, EndpointHints, Mapping, OutputLeg, Vad, timeline,
+        };
+        use crate::rtp::fabric_ingress::AUDIO_LEVEL_URI;
+        use pulsebeam_core::fabric::ExtensionKind;
+        let profile = emission.profile();
+        let requires_dd = emission.selects_dd_encoding();
+        if let Some(output) = self.media_egress.get_mut(&mid) {
+            if output.leg.output().primary != Some(primary) {
+                return false;
+            }
+            output.branch = branch;
+            return true;
+        }
+        let Some(form) = self.transport.local_rtp_output_form(mid, primary) else {
+            return false;
+        };
+        let mut mappings = arrayvec::ArrayVec::<_, 1>::new();
+        if profile == pulsebeam_core::fabric::Profile::Opus
+            && let Some(id) = self
+                .transport
+                .fabric_rtp_extension_id(mid, primary, AUDIO_LEVEL_URI)
+        {
+            mappings.push(Mapping {
+                id,
+                uri: AUDIO_LEVEL_URI,
+                attributes: None,
+            });
+        }
+        if emission.includes(ExtensionKind::DependencyDescriptor)
+            && let Some(id) =
+                self.transport
+                    .fabric_rtp_extension_id(mid, primary, pulsebeam_core::dd::URI)
+        {
+            mappings.push(Mapping {
+                id,
+                uri: pulsebeam_core::dd::URI,
+                attributes: None,
+            });
+        }
+        let Ok(hints) = EndpointHints::new(profile, form, &mappings, None) else {
+            return false;
+        };
+        let [.., a, b, c, d, e, f] = *self.connection_id.as_bytes();
+        let Some(timeline) = timeline::Timeline::new(
+            u16::from_be_bytes([a, b]),
+            u32::from_be_bytes([c, d, e, f]),
+            profile.clock_rate(),
+            64,
+        ) else {
+            return false;
+        };
+        let mut leg = SenderLeg::new(
+            OutputLeg {
+                mid,
+                primary: Some(primary),
+                max_wire_bytes: 1_216,
+                replace_queued: false,
+            },
+            hints,
+            timeline,
+        )
+        .with_source_wire_budget();
+        if requires_dd {
+            leg = leg.with_required_dd_evidence(u16::from_be_bytes([a, b]));
+        }
+        if requires_dd {
+            let Some(pair) = self.ready_fabric_receiver_fid(mid, primary) else {
+                return false;
+            };
+            leg = leg.with_answer_fid(pair);
+        } else if profile == pulsebeam_core::fabric::Profile::Av1 {
+            // Native joins this branch only after the receiver reports its applied binding.
+            let Some(pair) = self.transport.fabric_rtp_answer_fid(mid, primary) else {
+                return false;
+            };
+            leg = leg
+                .with_answer_fid(pair)
+                .with_dependency_descriptors(u16::from_be_bytes([a, b]));
+        }
+        self.attach_fabric_rtp_output(
+            branch,
+            leg,
+            SourceMetadata {
+                vad: Vad::On,
+                capture: CaptureClock::Unmapped,
+                same_topology: false,
+            },
+        )
+    }
+
+    pub(crate) fn has_fabric_rtp_output(&self, branch: FabricLocalBranch) -> bool {
+        self.media_egress
+            .values()
+            .any(|output| output.contains_branch(branch))
+    }
+
+    pub(crate) fn queue_bound_fabric_rtp(
+        &mut self,
+        branch: FabricLocalBranch,
+        packet: CandidatePacket<'_, '_>,
+        video_source: Option<(TrackHandle, crate::route::fabric::RtpSourceEncoding)>,
+        now: Instant,
+    ) -> Result<Option<FabricLocalBranch>, AdmissionError> {
+        use pulsebeam_core::dd::output::Mode;
+
+        self.advance_rtc_clock(now, now);
+        let (&mid, output) = self
+            .media_egress
+            .iter_mut()
+            .find(|(_, output)| output.contains_branch(branch))
+            .ok_or(AdmissionError::Rtc(
+                pulsebeam_rtc::WriteError::UnknownStream,
+            ))?;
+        let target = match packet.2.mode {
+            Mode::Filtered(index) => Some(index),
+            Mode::Whole => None,
+        };
+        let replaced = output
+            .leg
+            .committed_branch()
+            .filter(|active| *active != branch);
+        output.leg.stage_branch(branch);
+        self.transport
+            .queue_fabric_rtp(&mut output.leg, branch, output.source, packet)?;
+        if let Some((source, target)) = video_source.zip(target) {
+            self.downstream
+                .video
+                .note_fabric_admission(mid, branch, source, target);
+        }
+        Ok(replaced)
+    }
+
+    pub(crate) fn queue_fabric_rtp(
+        &mut self,
+        leg: &mut crate::rtp::fabric_egress::SenderLeg<crate::shard::router::FabricLocalBranch>,
+        branch: crate::shard::router::FabricLocalBranch,
+        source: crate::rtp::fabric_egress::SourceMetadata,
+        packet: crate::rtp::fabric_egress::CandidatePacket<'_, '_>,
+        now: Instant,
+    ) -> Result<(), crate::rtp::fabric_egress::AdmissionError> {
+        self.advance_rtc_clock(now, now);
+        self.transport.queue_fabric_rtp(leg, branch, source, packet)
+    }
+
+    pub(crate) fn matches_network_repair(
+        &self,
+        branch: crate::shard::router::FabricLocalBranch,
+        child: crate::route::fabric::network_repair::RepairChild,
+        packet: &crate::route::fabric::local::OwnedPacket,
+    ) -> bool {
+        self.connection_id == child.receiver
+            && self.reliable_subscriber_branch(branch).is_some_and(|lease| {
+                lease.endpoint.source == child.route.source && lease.endpoint.branch == child.route.branch
+            })
+            && self.fabric_data.values().any(|lease| {
+                matches!(lease, FabricDataLease::Output(output) if output.branch == branch && output.matches_repair(packet, child.demand.request.fragment))
+            })
+    }
+
+    pub(crate) fn write_fabric_data(
+        &mut self,
+        branch: crate::shard::router::FabricLocalBranch,
+        packet: crate::route::fabric::local::PacketView<'_>,
+        repair: Option<crate::route::fabric::local::RepairFragment>,
+    ) -> Result<(), data_fabric::WriteError> {
+        let output = self
+            .fabric_data
+            .values()
+            .find_map(|lease| match lease {
+                FabricDataLease::Output(output) if output.branch == branch => Some(output),
+                _ => None,
+            })
+            .ok_or(data_fabric::WriteError::Binding)?;
+        let installation = output.installation;
+        if !self.fabric_io_authorized()
+            || (self
+                .native_receivers
+                .channels
+                .contains_key(&installation.channel())
+                && !self.native_receivers.fabric_can_write(installation))
+        {
+            return Err(data_fabric::WriteError::Binding);
+        }
+        if repair.is_some() && self.reliable_subscriber_branch(branch).is_none() {
+            return Err(data_fabric::WriteError::Binding);
+        }
+        output.write(&mut self.transport, packet, repair)
+    }
+
+    pub(crate) fn attach_fabric_data_output(&mut self, output: data_fabric::Output) -> bool {
+        if !self.can_stage_fabric_data(output.installation, false)
+            || self.fabric_data.values().any(|entry| matches!(entry, FabricDataLease::Output(other) if other.branch == output.branch))
+        {
+            return false;
+        }
+        self.fabric_data.insert(
+            output.installation.channel(),
+            FabricDataLease::Output(output),
+        );
+        true
+    }
+
+    fn can_stage_fabric_data(
+        &self,
+        installation: pulsebeam_rtc::DataChannelInstallation,
+        publisher: bool,
+    ) -> bool {
+        let cid = installation.channel();
+        self.fabric_io_authorized()
+            && !self
+                .negotiated
+                .signaling_channel
+                .as_ref()
+                .is_some_and(|channel| channel.designates(cid))
+            && (!self.owns_data_channel(cid)
+                || if publisher {
+                    self.native_data.staging_fabric_installation(installation)
+                } else {
+                    self.native_receivers
+                        .staging_fabric_installation(installation)
+                })
+            && !self.fabric_data.contains_key(&cid)
+            && (matches!(
+                self.transport.data_channel_installation(installation),
+                Some(pulsebeam_rtc::DataChannelInstallationState::Pending)
+            ) || self.transport.supports_fabric_data(installation))
+    }
+
+    pub(crate) fn attach_fabric_data_source(
+        &mut self,
+        source: FabricSourceHandle,
+        binding: data_fabric::InstalledBinding,
+    ) -> bool {
+        if !self.can_stage_fabric_data(binding.channel.association, true)
+            || self.fabric_data.values().any(
+                |entry| matches!(entry, FabricDataLease::Input(input) if input.source == source),
+            )
+        {
+            return false;
+        }
+        let Some(input) = data_fabric::Input::from_publisher(source, binding) else {
+            return false;
+        };
+        self.fabric_data
+            .insert(input.installation.channel(), FabricDataLease::Input(input));
+        true
+    }
+
+    pub(crate) fn fabric_data_source_authorized(&self, source: FabricSourceHandle) -> bool {
+        self.fabric_data_input_installation(source).is_some()
+    }
+
+    pub(crate) fn fabric_data_input_installation(
+        &self,
+        source: FabricSourceHandle,
+    ) -> Option<pulsebeam_rtc::DataChannelInstallation> {
+        if !self.fabric_io_authorized() {
+            return None;
+        }
+        self.fabric_data.values().find_map(|entry| match entry {
+            FabricDataLease::Input(input)
+                if input.source == source
+                    && self.transport.supports_fabric_data(input.installation) =>
+            {
+                Some(input.installation)
+            }
+            _ => None,
+        })
+    }
+
+    fn retire_fabric_data(
+        &mut self,
+        cid: crate::media::ChannelId,
+        events: &mut impl ParticipantSink,
+    ) {
+        if let Some(entry) = self.fabric_data.remove(&cid) {
+            self.transport
+                .cancel_data_channel_installation(entry.installation());
+            if let FabricDataLease::Input(input) = entry {
+                events.fence_fabric_source(input.source);
+            }
+        }
+    }
+
+    fn receive_fabric_data(
+        &mut self,
+        cid: crate::media::ChannelId,
+        message: &DataMessage,
+        now: Instant,
+        events: &mut impl ParticipantSink,
+    ) -> bool {
+        let Some(entry) = self.fabric_data.get(&cid) else {
+            return false;
+        };
+        if !self.fabric_io_authorized()
+            || !self.transport.supports_fabric_data(entry.installation())
+        {
+            self.retire_fabric_data(cid, events);
+            return true;
+        }
+        if self.native_data.channels.contains_key(&cid) && !self.native_data.can_write(cid) {
+            return true;
+        }
+        if let DataMessage::Binary(bytes) = message
+            && let Some(FabricDataLease::Input(input)) = self.fabric_data.get(&cid)
+        {
+            if input.reliable_endpoint.is_some() && !self.native_data.can_write(cid) {
+                return true;
+            }
+            let stamp =
+                crate::clock::NtpTime::from_system_time(net::ReceiveTime::now().wall).middle32();
+            match events.publish_fabric_data(input.source, input.installation, bytes, now, stamp) {
+                Ok(()) => (),
+                Err(data_fabric::Error::SourceConflict) => {
+                    self.retire_fabric_data(cid, events);
+                }
+                Err(_) => {}
+            }
+        }
+        true
+    }
+
+    pub(crate) fn reliable_publisher_lease(
+        &self,
+        source: FabricSourceHandle,
+        installation: pulsebeam_rtc::DataChannelInstallation,
+    ) -> Option<(u64, pulsebeam_proto::data_control::PublisherBinding)> {
+        let cid = installation.channel();
+        let &owned = self.native_data.channels.get(&cid)?;
+        let FabricDataLease::Input(input) = self.fabric_data.get(&cid)? else {
+            return None;
+        };
+        if input.source != source
+            || input.installation != installation
+            || !self.fabric_source_authorized(source)
+            || !self.native_data.can_write(cid)
+            || !self.transport.supports_fabric_data(installation)
+        {
+            return None;
+        }
+        Some((owned, input.reliable_endpoint?))
+    }
+
+    pub(crate) fn authorize_fabric_original_request(
+        &mut self,
+        source: FabricSourceHandle,
+        installation: pulsebeam_rtc::DataChannelInstallation,
+    ) -> Option<(u64, pulsebeam_proto::data_control::PublisherBinding)> {
+        self.observe_native_terminal();
+        self.reliable_publisher_lease(source, installation)
+    }
+
+    pub(crate) fn send_fabric_original_request(
+        &mut self,
+        owned: u64,
+        endpoint: pulsebeam_proto::data_control::PublisherBinding,
+        request: pulsebeam_proto::data_control::OriginalDemand,
+    ) {
+        use pulsebeam_proto::{
+            data_control::{self, PublisherObservation, publisher_observation},
+            state::{NativeDataControl, OwnedDataControl, native_data_control::Endpoint},
+        };
+        let observation = PublisherObservation {
+            record: Some(publisher_observation::Record::RequestOriginal(request)),
+        };
+        if let Ok(record) = data_control::encode(endpoint, &observation) {
+            self.write_fabric_control(NativeDataControl {
+                endpoint: Some(Endpoint::Publisher(OwnedDataControl { owned, record })),
+            });
+        }
+    }
+
+    fn receive_original_unavailable(
+        &mut self,
+        frame: pulsebeam_proto::state::OwnedDataControl,
+        now: Instant,
+        events: &mut impl ParticipantSink,
+    ) {
+        use pulsebeam_proto::data_control::{
+            self, OriginalUnavailable, PublisherControl, publisher_control::Record,
+        };
+        let Some(cid) = self.native_data.publication_channel(frame.owned) else {
+            return;
+        };
+        let Some(FabricDataLease::Input(input)) = self.fabric_data.get(&cid) else {
+            return;
+        };
+        let Some((owned, endpoint)) =
+            self.reliable_publisher_lease(input.source, input.installation)
+        else {
+            return;
+        };
+        if owned != frame.owned {
+            return;
+        }
+        let Ok(PublisherControl {
+            record:
+                Some(Record::Unavailable(OriginalUnavailable {
+                    demand: Some(demand),
+                })),
+        }) = data_control::decode(endpoint, &frame.record)
+        else {
+            return;
+        };
+        events.settle_fabric_original_unavailable(input.source, input.installation, demand, now);
+    }
+
+    pub(crate) fn acknowledge_fabric_admission(
+        &mut self,
+        source: FabricSourceHandle,
+        admission: data_fabric::ReliableAdmission,
+    ) -> bool {
+        use pulsebeam_proto::{
+            data_control::{self, PublisherObservation, SourceUnit, publisher_observation},
+            state::{NativeDataControl, OwnedDataControl, native_data_control::Endpoint},
+        };
+
+        self.observe_native_terminal();
+        let Some((owned, endpoint)) = self.reliable_publisher_lease(source, admission.installation)
+        else {
+            return false;
+        };
+        let observation = PublisherObservation {
+            record: Some(publisher_observation::Record::Admission(SourceUnit {
+                source_incarnation: endpoint.source.get(),
+                unit_seq: Some(admission.unit.unit_seq),
+            })),
+        };
+        let Ok(record) = data_control::encode(endpoint, &observation) else {
+            return false;
+        };
+        self.write_fabric_control(NativeDataControl {
+            endpoint: Some(Endpoint::Publisher(OwnedDataControl { owned, record })),
+        })
+    }
+
+    pub(crate) fn write_fabric_delivery_report(
+        &mut self,
+        source: FabricSourceHandle,
+        installation: pulsebeam_rtc::DataChannelInstallation,
+        report: crate::route::fabric::local::DeliveryReport,
+    ) -> crate::route::fabric::local::ExpectationWrite {
+        use crate::route::fabric::local::{DeliveryOutcome, ExpectationWrite};
+        use pulsebeam_proto::{
+            data_control::{
+                self, BranchUnit, ControlOutcome, Expectation, PublisherObservation, SourceUnit,
+                publisher_observation,
+            },
+            state::{NativeDataControl, OwnedDataControl, native_data_control::Endpoint},
+        };
+        self.observe_native_terminal();
+        let Some((owned, endpoint)) = self.reliable_publisher_lease(source, installation) else {
+            return ExpectationWrite::Revoked;
+        };
+        let outcome = match report.outcome {
+            DeliveryOutcome::Confirmed => ControlOutcome::Confirmed,
+            DeliveryOutcome::Failed => ControlOutcome::Failed,
+            DeliveryOutcome::Unknown => ControlOutcome::Unknown,
+        };
+        let observation = PublisherObservation {
+            record: Some(publisher_observation::Record::Delivery(
+                data_control::DeliveryOutcome {
+                    expectation: Some(Expectation {
+                        unit: Some(BranchUnit {
+                            source: Some(SourceUnit {
+                                source_incarnation: endpoint.source.get(),
+                                unit_seq: Some(report.unit.unit_seq),
+                            }),
+                            branch_incarnation: report.branch_incarnation.get(),
+                        }),
+                        fragment_count: u32::from(report.unit.fragment_count),
+                    }),
+                    outcome: outcome as i32,
+                },
+            )),
+        };
+        let Ok(record) = data_control::encode(endpoint, &observation) else {
+            return ExpectationWrite::Revoked;
+        };
+        if self.write_fabric_control(NativeDataControl {
+            endpoint: Some(Endpoint::Publisher(OwnedDataControl { owned, record })),
+        }) {
+            ExpectationWrite::Queued
+        } else {
+            ExpectationWrite::Backpressured
+        }
+    }
+
+    pub(crate) fn write_fabric_expectation(
+        &mut self,
+        branch: crate::shard::router::FabricLocalBranch,
+        unit: crate::route::fabric::local::DataExpectation,
+        incarnation: std::num::NonZeroU64,
+    ) -> crate::route::fabric::local::ExpectationWrite {
+        use crate::route::fabric::local::ExpectationWrite;
+        use pulsebeam_proto::data_control::subscriber_observation::Record;
+
+        self.observe_native_terminal();
+        let Some(lease) = self
+            .reliable_subscriber_branch(branch)
+            .filter(|lease| lease.endpoint.branch == incarnation)
+        else {
+            return ExpectationWrite::Revoked;
+        };
+        if self.write_fabric_subscriber_control(lease, unit, Record::Expectation) {
+            ExpectationWrite::Queued
+        } else {
+            ExpectationWrite::Backpressured
+        }
+    }
+
+    pub(crate) fn write_fabric_receipt_ack(
+        &mut self,
+        lease: data_fabric::SubscriberLease,
+        unit: crate::route::fabric::local::DataExpectation,
+    ) -> bool {
+        self.observe_native_terminal();
+        self.reliable_subscriber_lease(lease.owned) == Some(lease)
+            && self.write_fabric_subscriber_control(
+                lease,
+                unit,
+                pulsebeam_proto::data_control::subscriber_observation::Record::ReceiptAck,
+            )
+    }
+
+    fn write_fabric_subscriber_control(
+        &mut self,
+        lease: data_fabric::SubscriberLease,
+        unit: crate::route::fabric::local::DataExpectation,
+        observation: impl FnOnce(
+            pulsebeam_proto::data_control::Expectation,
+        )
+            -> pulsebeam_proto::data_control::subscriber_observation::Record,
+    ) -> bool {
+        use pulsebeam_proto::data_control::{BranchUnit, Expectation, SourceUnit};
+        self.write_fabric_subscriber_observation(
+            lease,
+            observation(Expectation {
+                unit: Some(BranchUnit {
+                    source: Some(SourceUnit {
+                        source_incarnation: lease.endpoint.source.get(),
+                        unit_seq: Some(unit.unit_seq),
+                    }),
+                    branch_incarnation: lease.endpoint.branch.get(),
+                }),
+                fragment_count: u32::from(unit.fragment_count),
+            }),
+        )
+    }
+
+    pub(crate) fn write_fabric_repair_outcome(
+        &mut self,
+        lease: data_fabric::SubscriberLease,
+        request: crate::route::fabric::local::RepairRequest,
+        status: pulsebeam_proto::data_control::RepairStatus,
+    ) -> bool {
+        use pulsebeam_proto::data_control::{
+            BranchUnit, RepairDemand, RepairOutcome, SourceUnit, subscriber_observation,
+        };
+        self.observe_native_terminal();
+        if self.reliable_subscriber_lease(lease.owned) != Some(lease) {
+            return false;
+        }
+        self.write_fabric_subscriber_observation(
+            lease,
+            subscriber_observation::Record::Repair(RepairOutcome {
+                demand: Some(RepairDemand {
+                    unit: Some(BranchUnit {
+                        source: Some(SourceUnit {
+                            source_incarnation: lease.endpoint.source.get(),
+                            unit_seq: Some(request.fragment.unit_seq),
+                        }),
+                        branch_incarnation: lease.endpoint.branch.get(),
+                    }),
+                    fragment_index: Some(u32::from(request.fragment.index)),
+                    request_id: request.id.get(),
+                }),
+                status: status as i32,
+            }),
+        )
+    }
+
+    fn write_fabric_subscriber_observation(
+        &mut self,
+        lease: data_fabric::SubscriberLease,
+        record: pulsebeam_proto::data_control::subscriber_observation::Record,
+    ) -> bool {
+        use pulsebeam_proto::{
+            data_control::{self, SubscriberObservation},
+            state::{NativeDataControl, OwnedDataControl, native_data_control::Endpoint},
+        };
+        let Ok(record) = data_control::encode(
+            lease.endpoint,
+            &SubscriberObservation {
+                record: Some(record),
+            },
+        ) else {
+            return false;
+        };
+        self.write_fabric_control(NativeDataControl {
+            endpoint: Some(Endpoint::Subscriber(OwnedDataControl {
+                owned: lease.owned,
+                record,
+            })),
+        })
+    }
+
+    fn write_fabric_control(&mut self, control: pulsebeam_proto::state::NativeDataControl) -> bool {
+        let Some(cid) = self
+            .native_channel_id()
+            .filter(|_| self.native_handoff.is_some())
+        else {
+            return false;
+        };
+        if !self.fabric_io_authorized() || self.transport.signaling_pending() {
+            return false;
+        }
+        let Ok(bytes) = pulsebeam_proto::state::codec::encode_data_control(&control) else {
+            return false;
+        };
+        self.transport.write_channel(cid, true, &bytes)
+    }
+
+    fn receive_fabric_control(
+        &mut self,
+        frame: pulsebeam_proto::state::NativeDataControl,
+        now: Instant,
+        events: &mut impl ParticipantSink,
+    ) {
+        use super::event::{FabricFeedbackKind, FabricSubscriberFeedback};
+        use crate::route::fabric::local::{
+            DataExpectation, PropagationOutcome, RepairFragment, RepairRequest,
+        };
+        use pulsebeam_proto::{
+            data_control::{self, ControlOutcome, SubscriberControl, subscriber_control::Record},
+            state::native_data_control::Endpoint,
+        };
+        use std::num::NonZeroU64;
+        let frame = match frame.endpoint {
+            Some(Endpoint::Subscriber(frame)) => frame,
+            Some(Endpoint::Publisher(frame)) => {
+                self.receive_original_unavailable(frame, now, events);
+                return;
+            }
+            None => return,
+        };
+        let Some(lease) = self.reliable_subscriber_lease(frame.owned) else {
+            return;
+        };
+        let Ok(SubscriberControl {
+            record: Some(record),
+        }) = data_control::decode(lease.endpoint, &frame.record)
+        else {
+            return;
+        };
+        let expectation = |expected: data_control::Expectation| -> Option<DataExpectation> {
+            Some(DataExpectation {
+                unit_seq: expected.unit?.source?.unit_seq?,
+                fragment_count: u16::try_from(expected.fragment_count).ok()?,
+            })
+        };
+        let repair = |demand: data_control::RepairDemand| -> Option<RepairRequest> {
+            Some(RepairRequest {
+                fragment: RepairFragment {
+                    unit_seq: demand.unit?.source?.unit_seq?,
+                    index: u16::try_from(demand.fragment_index?).ok()?,
+                },
+                id: NonZeroU64::new(demand.request_id)?,
+            })
+        };
+        let kind = match record {
+            Record::ExpectationOutcome(ack) => {
+                let Some(unit) = ack.expectation.and_then(expectation) else {
+                    return;
+                };
+                let outcome = match ControlOutcome::try_from(ack.outcome) {
+                    Ok(ControlOutcome::Confirmed) => PropagationOutcome::Confirmed,
+                    Ok(ControlOutcome::Failed) => PropagationOutcome::Failed,
+                    Ok(ControlOutcome::Unknown) => PropagationOutcome::Unknown,
+                    _ => return,
+                };
+                Some(FabricFeedbackKind::Propagation(unit, outcome))
+            }
+            Record::AssemblyReceipt(expected) => {
+                expectation(expected).map(FabricFeedbackKind::Assembled)
+            }
+            Record::RequestRepair(demand) => repair(demand).map(FabricFeedbackKind::Repair),
+            Record::CancelRepair(demand) => repair(demand).map(FabricFeedbackKind::CancelRepair),
+        };
+        if let Some(kind) = kind {
+            events.observe_fabric_subscriber(FabricSubscriberFeedback { lease, kind });
+        }
+    }
+
+    pub(crate) fn prepare_whip_opus_ingress(
+        &mut self,
+        publication: PublicationKey,
+        fanout: TrackHandle,
+    ) -> Option<(crate::track::TrackMeta, RtpIngressShadow)> {
+        if self.signaling_profile != SignalingProtocol::Whip
+            || publication.kind() != TrackKind::Audio
+            || self.authorization_expiry.is_none()
+            || !self.fabric_io_authorized()
+            || self.upstream.track_fanout(publication) != Some(fanout)
+        {
+            return None;
+        }
+        let mid = self.upstream.mid_for_track_id(publication)?;
+        let binding = self.transport.whip_opus_receive_binding(mid)?;
+        if self.media_ingress.contains_key(&binding.primary_ssrc) {
+            return None;
+        }
+        let ingress =
+            RtpIngressShadow::bind_local_endpoint(pulsebeam_core::fabric::Profile::Opus, binding)?;
+        let (track, announced) = self.upstream.announce_state_mut(mid)?;
+        (*announced && track.id() == publication).then(|| (track.meta().clone(), ingress))
+    }
+
+    /// Attach one explicitly qualified diagnostic binding to an installed local
+    /// media publication. It emits measurements only and is not enabled by
+    /// negotiation or publication creation.
+    pub fn attach_fabric_media_shadow(
+        &mut self,
+        publication: PublicationKey,
+        ingress: RtpIngressShadow,
+    ) -> bool {
+        self.bind_fabric_media(publication, ingress, None)
+    }
+
+    pub(crate) fn attach_fabric_media_source(
+        &mut self,
+        publication: PublicationKey,
+        ingress: RtpIngressShadow,
+        source: FabricSourceHandle,
+    ) -> bool {
+        self.fabric_source_authorized(source)
+            && self.bind_fabric_media(publication, ingress, Some(source))
+    }
+
+    fn bind_fabric_media(
+        &mut self,
+        publication: PublicationKey,
+        ingress: RtpIngressShadow,
+        publisher_source: Option<FabricSourceHandle>,
+    ) -> bool {
+        if publication.kind() == TrackKind::Data || !self.media_ingress_authorized() {
+            return false;
+        }
+        let Some(fanout) = self.upstream.track_fanout(publication) else {
+            return false;
+        };
+        let std::collections::hash_map::Entry::Vacant(entry) =
+            self.media_ingress.entry(ingress.primary_ssrc())
+        else {
+            return false;
+        };
+        entry.insert(Box::new(BoundFabricIngress {
+            publication,
+            fanout,
+            ingress,
+            publisher_source,
+            geometry_refresh_at: None,
+            #[cfg(test)]
+            observation: None,
+        }));
+        true
+    }
+
+    pub(crate) fn request_fabric_refresh(&mut self, ssrc: u32) -> bool {
+        self.fabric_io_authorized() && self.transport.request_fabric_refresh(ssrc)
+    }
+
+    pub(crate) fn fabric_io_authorized(&self) -> bool {
+        !self.native_terminal && self.media_ingress_authorized()
+    }
+
+    pub(crate) fn fence_fabric_media(&mut self, source: FabricSourceHandle) {
+        self.fenced_fabric_sources.insert(source);
+    }
+
+    pub(crate) fn fabric_source_authorized(&self, source: FabricSourceHandle) -> bool {
+        !self.fenced_fabric_sources.contains(&source) && self.fabric_io_authorized()
+    }
+
+    pub(crate) fn measure_fabric_structure(
+        &mut self,
+        source: FabricSourceHandle,
+        encoding: crate::route::fabric::RtpSourceEncoding,
+        facts: crate::rtp::normalize::StreamFacts,
+    ) {
+        let primary = *encoding.primary;
+        if self
+            .media_ingress
+            .get(&primary)
+            .is_some_and(|binding| binding.publisher_source == Some(source))
+            && let Some(slot) = self.native_rtp.fabric_measurement_slot(primary)
+            && let Some(track) = self.upstream.track_mut(slot)
+        {
+            track
+                .monitor
+                .measure_fabric_structure(encoding.primary, encoding.rid, facts);
+        }
+    }
+
+    pub(crate) fn detach_fabric_media_source(&mut self, source: FabricSourceHandle) {
+        self.retain_media_ingress(|binding| binding.publisher_source != Some(source));
+    }
+
+    fn retain_media_ingress(&mut self, retain: impl Fn(&BoundFabricIngress) -> bool) {
+        self.media_ingress.retain(|_, binding| {
+            if retain(binding) {
+                return true;
+            }
+            if let Some(source) = binding.publisher_source {
+                self.fenced_fabric_sources.remove(&source);
+            }
+            false
+        });
+    }
+
+    fn media_ingress_authorized(&self) -> bool {
+        self.disconnect_reason.is_none()
+            && !self
+                .authorization_expiry
+                .is_some_and(|expiry| expiry.is_expired_at(native_data::unix_now()))
+    }
+
+    fn poll_transport(
+        &mut self,
+        now: Instant,
+        events: &mut impl ParticipantSink,
+    ) -> TransportPollOutput {
+        if self.media_ingress.is_empty() || !self.media_ingress_authorized() {
+            return self.transport.poll_output(None);
+        }
+        let upstream = &self.upstream;
+        let native_rtp = &self.native_rtp;
+        let native_authorized = self.authorization_expiry.is_some();
+        let ingress = &mut self.media_ingress;
+        let fenced = &self.fenced_fabric_sources;
+        let mut observer = |rtp: pulsebeam_rtc::AuthenticatedRtp<'_>, wall| {
+            let Some(shadow) = ingress.get_mut(&rtp.primary_ssrc) else {
+                return;
+            };
+            if shadow
+                .publisher_source
+                .is_some_and(|source| fenced.contains(&source))
+                || upstream.track_fanout(shadow.publication) != Some(shadow.fanout)
+            {
+                return;
+            }
+            let Ok(mid) = Mid::new(rtp.mid) else {
+                return;
+            };
+            let Ok(rid) = rtp.rid.map(crate::media::Rid::new).transpose() else {
+                return;
+            };
+            let authorized = if native_rtp.owns_encoding(rtp.primary_ssrc) {
+                native_authorized
+                    && native_rtp
+                        .ingress_route(rtp.primary_ssrc, mid, rid)
+                        .is_some_and(|route| {
+                            route.publication_id == shadow.publication
+                                && route.fanout == Some(shadow.fanout)
+                        })
+            } else {
+                !upstream
+                    .route_for_ssrc(rtp.primary_ssrc.into())
+                    .is_some_and(|route| {
+                        route.mid != mid || route.rid.is_some() && route.rid != rid
+                    })
+                    && upstream
+                        .slot_for_mid(mid)
+                        .is_some_and(|(_, publication)| publication == shadow.publication)
+            };
+            if authorized {
+                shadow.input(now, wall, rtp, events);
+            }
+        };
+        self.transport.poll_output(Some(&mut observer))
+    }
+
     fn poll_rtc(
         &mut self,
         now: Instant,
@@ -994,7 +2001,7 @@ impl Connection {
                 return RtcDrainResult::Pending;
             }
             *work_budget = work_budget.saturating_sub(1);
-            match self.transport.poll_output() {
+            match self.poll_transport(now, events) {
                 TransportPollOutput::Pending => return RtcDrainResult::Pending,
                 TransportPollOutput::Timeout(deadline) => {
                     return RtcDrainResult::Quiescent(deadline);
@@ -1053,9 +2060,25 @@ impl Connection {
                 }
             }
             Event::EncodingRetired { ssrc, .. } => {
+                if let Some(binding) = self.media_ingress.get(&ssrc) {
+                    if let Some(source) = binding.publisher_source {
+                        if self.fenced_fabric_sources.insert(source) {
+                            events.fence_fabric_source(source);
+                        }
+                    } else {
+                        self.media_ingress.remove(&ssrc);
+                    }
+                }
                 self.native_rtp_ended(ssrc);
                 self.transport.retire_encoding(ssrc);
                 self.upstream.clear_routes();
+            }
+            Event::ScopedKeyframeRequested { scope } => {
+                if self.fabric_io_authorized()
+                    && let Some(branch) = crate::shard::router::FabricLocalBranch::from_scope(scope)
+                {
+                    events.request_fabric_refresh(branch);
+                }
             }
             Event::KeyframeRequested { ssrc } => {
                 if let Some(req) = self.transport.keyframe_request(ssrc)
@@ -1101,84 +2124,17 @@ impl Connection {
                     }
                     return;
                 }
+                if let Some(entry) = self.fabric_data.get(&cid) {
+                    if !self.transport.supports_fabric_data(entry.installation()) {
+                        self.retire_fabric_data(cid, events);
+                    }
+                    return;
+                }
                 if self.owns_data_channel(cid) {
                     self.native_data_opened(cid, cfg, events);
                     return;
                 }
-                if !self.allow_topic_channels {
-                    self.transport.close_native_data(cid);
-                    return;
-                }
-                let intent = match DataTrackIntent::try_from(&cfg) {
-                    Ok(intent) => intent,
-                    Err(err) => {
-                        self.disconnect(err.into());
-                        return;
-                    }
-                };
-
-                match intent {
-                    DataTrackIntent::InternalSignaling => {}
-                    DataTrackIntent::UserTopic(channel) => {
-                        let Ok(track_id) = entity::TrackId::new(&channel.topic) else {
-                            self.transport.close_native_data(cid);
-                            return;
-                        };
-                        let publishing = channel.direction == DataTrackDirection::Publish;
-                        let policy_label = publishing
-                            .then(|| crate::track::publication_label(channel.lane, &channel.topic));
-                        if self
-                            .authorization_expiry
-                            .is_some_and(|expiry| expiry.is_expired_at(native_data::unix_now()))
-                            || policy_label
-                                .as_deref()
-                                .is_some_and(|label| !self.topic_publications.allows(label))
-                        {
-                            self.transport.close_native_data(cid);
-                            return;
-                        }
-                        if let Some(previous) = self.data.close(cid) {
-                            self.release_data_channel(previous, events);
-                        }
-                        let publication = match self.data.open(cid, channel.clone(), || {
-                            self.scope.joined_room().filter(|_| publishing).map(|room| {
-                                Track::data(
-                                    crate::track::TrackMeta {
-                                        room,
-                                        id: PublicationKey::Data(entity::PublicationId::mint()),
-                                        origin: self.participant_id,
-                                        connection_id: self.connection_id,
-                                        track_id: Some(track_id),
-                                    },
-                                    channel.topic.clone(),
-                                    channel.lane,
-                                    None,
-                                )
-                            })
-                        }) {
-                            Ok(publication) => publication,
-                            Err(error) => {
-                                self.disconnect(match error {
-                                    DataOpenError::DuplicateDataChannelLabel(channel) => {
-                                        DisconnectReason::DuplicateDataChannelLabel(channel)
-                                    }
-                                    DataOpenError::TooManyDataTopicChannels => {
-                                        DisconnectReason::TooManyDataTopicChannels
-                                    }
-                                });
-                                return;
-                            }
-                        };
-                        if let Some(track) = publication {
-                            events.publish_track(track);
-                        } else {
-                            events.subscribe_tracks(
-                                DataState::selector(&channel),
-                                crate::track::SelectionPolicy::All,
-                            );
-                        }
-                    }
-                }
+                self.transport.close_native_data(cid);
             }
             Event::DataChannel(
                 DataChannelEvent::ResetComplete { .. } | DataChannelEvent::ResetFailed { .. },
@@ -1186,6 +2142,14 @@ impl Connection {
                 self.evaluate_native_preparations(events);
             }
             Event::DataChannel(DataChannelEvent::InstallationFailed { installation }) => {
+                let cid = installation.channel();
+                if self
+                    .fabric_data
+                    .get(&cid)
+                    .is_some_and(|entry| entry.installation() == installation)
+                {
+                    self.retire_fabric_data(cid, events);
+                }
                 self.native_data_installation_failed(installation);
                 self.evaluate_native_preparations(events);
             }
@@ -1194,19 +2158,20 @@ impl Connection {
                     self.disconnect(DisconnectReason::SignalingClosed);
                     return;
                 }
+                if self.fabric_data.contains_key(&cid) {
+                    self.retire_fabric_data(cid, events);
+                }
                 if self.owns_data_channel(cid) {
                     self.native_data_closed(cid, events);
-                    return;
                 }
-                let Some(channel) = self.data.close(cid) else {
-                    return;
-                };
-                self.release_data_channel(channel, events);
             }
             Event::DataChannel(DataChannelEvent::Message {
                 channel: cid,
                 message,
             }) => {
+                if self.receive_fabric_data(cid, &message, now, events) {
+                    return;
+                }
                 let DataMessage::Binary(bytes) = message else {
                     if Some(cid) == self.native_channel_id() {
                         self.disconnect(DisconnectReason::SignalingClosed);
@@ -1214,6 +2179,14 @@ impl Connection {
                     return;
                 };
                 if Some(cid) == self.native_channel_id() {
+                    if let Some(control) =
+                        pulsebeam_proto::state::codec::decode_data_control_frame(&bytes)
+                    {
+                        if let Ok(control) = control {
+                            self.receive_fabric_control(control, now, events);
+                        }
+                        return;
+                    }
                     if let Some(handoff) = &self.native_handoff {
                         if !handoff.input(bytes) {
                             self.disconnect(DisconnectReason::SignalingInput);
@@ -1221,58 +2194,6 @@ impl Connection {
                         return;
                     }
                     return;
-                }
-                if self
-                    .authorization_expiry
-                    .is_some_and(|expiry| expiry.is_expired_at(native_data::unix_now()))
-                {
-                    return;
-                }
-                if self.owns_data_channel(cid) {
-                    self.native_data_message(cid, &bytes, events);
-                    return;
-                }
-                let Some(channel) = self.data.channel(cid).cloned() else {
-                    return;
-                };
-                match (channel.lane, channel.direction) {
-                    (lane, DataTrackDirection::Publish) => {
-                        let Ok(frame) = TopicFrame::decode_bounded(bytes.as_ref()) else {
-                            return;
-                        };
-                        if !frame.repair_target.is_empty()
-                            || frame.recipient_connections.is_some()
-                            || !self.data.accepts_publisher_frame(cid, &frame)
-                        {
-                            return;
-                        }
-                        events.publish_track_packet(
-                            self.data.published_stream(cid),
-                            TrackPacket::data(lane, bytes.as_ref()),
-                        );
-                    }
-                    (DataLane::Ordered, DataTrackDirection::Subscribe) => {
-                        let Ok(control) = TopicFrame::decode_bounded(bytes.as_ref()) else {
-                            return;
-                        };
-                        if !control.is_subscriber_control() {
-                            return;
-                        }
-                        let Some(publication_id) = control.publication_id().and_then(|id| {
-                            id.parse::<entity::PublicationId>()
-                                .ok()
-                                .map(|id| PublicationKey::Data(id))
-                        }) else {
-                            return;
-                        };
-                        if let Some(stream) = self.data.subscribed_stream(cid, publication_id) {
-                            events.request_reverse(
-                                stream,
-                                ReversePacket::reliable_control(bytes.to_vec()),
-                            );
-                        }
-                    }
-                    (DataLane::Latest | DataLane::Lossy, DataTrackDirection::Subscribe) => {}
                 }
             }
             _ => {
@@ -1319,14 +2240,6 @@ impl Connection {
     fn owns_data_channel(&self, channel: crate::media::ChannelId) -> bool {
         self.native_data.channels.contains_key(&channel)
             || self.native_receivers.channels.contains_key(&channel)
-    }
-
-    fn release_data_channel(&mut self, state: DataChannelState, events: &mut impl ParticipantSink) {
-        if let Some(meta) = state.publication {
-            events.unpublish_track(meta);
-        } else {
-            events.unsubscribe_tracks(DataState::selector(&state.channel));
-        }
     }
 
     fn handle_upstream_track_state(
@@ -1489,13 +2402,13 @@ impl Connection {
         rid: Option<crate::media::Rid>,
         events: &mut impl ParticipantSink,
     ) {
-        if self.disconnect_reason.is_some()
-            || self
-                .authorization_expiry
-                .is_some_and(|expiry| expiry.is_expired_at(native_data::unix_now()))
-        {
+        if !self.media_ingress_authorized() {
             return;
         }
+        let fabric_binding = self
+            .media_ingress
+            .get(&rtp.header.ssrc)
+            .and_then(|binding| binding.publisher_source);
         if self.native_rtp.owns_encoding(rtp.header.ssrc) {
             if self.authorization_expiry.is_none() {
                 return;
@@ -1503,9 +2416,34 @@ impl Connection {
             let Some(route) = self.native_rtp.ingress_route(rtp.header.ssrc, mid, rid) else {
                 return;
             };
-            if let Some(incoming) = self.transport.convert_rtp(rtp, mid, rid) {
+            if self.native_rtp.requires_dd_fabric(rtp.header.ssrc) {
+                if fabric_binding.is_some_and(|source| self.fabric_source_authorized(source))
+                    && let Some(incoming) = self.transport.convert_rtp(rtp, mid, rid)
+                    && let Some(track) = self.upstream.track_mut(route.upstream_slot)
+                    && track.monitor.measure_fabric(rid, &incoming.packet)
+                    && self
+                        .media_ingress
+                        .get_mut(&*route.ssrc)
+                        .is_some_and(|binding| {
+                            binding.geometry_refresh_due(incoming.packet.arrival_ts)
+                        })
+                {
+                    // An owned ceiling cannot select an encoding until its height
+                    // is known. Request a fresh frame from the exact active source.
+                    self.enqueue_remote_keyframe(
+                        (route.publication_id, route.encoding),
+                        KeyframeRequestKind::Pli,
+                    );
+                }
+            } else if fabric_binding.is_none()
+                && !self.native_rtp.requires_fabric(rtp.header.ssrc)
+                && let Some(incoming) = self.transport.convert_rtp(rtp, mid, rid)
+            {
                 self.handle_incoming_rtp_after_lookup(route, incoming, events);
             }
+            return;
+        }
+        if fabric_binding.is_some() {
             return;
         }
         if self.upstream.slot_for_mid(mid).is_none() {
@@ -1590,10 +2528,10 @@ impl Connection {
             self.enqueue_remote_keyframe((publication_id, encoding), KeyframeRequestKind::Pli);
         }
         if let Some(packet) = processed.first {
-            events.publish_track_packet(fanout, TrackPacket::Rtp(packet));
+            events.publish_track_packet(fanout, packet);
         }
         for packet in processed.remaining {
-            events.publish_track_packet(fanout, TrackPacket::Rtp(packet));
+            events.publish_track_packet(fanout, packet);
         }
     }
 
@@ -1665,6 +2603,9 @@ impl Connection {
         }
         plog_info!(self.log_ctx(), %reason, "Connection disconnecting");
         self.disconnect_reason = Some(reason);
+        self.media_ingress.clear();
+        self.fenced_fabric_sources.clear();
+        self.fabric_data.clear();
         self.stream_writer.discard();
         self.transport.disconnect();
     }
@@ -1841,8 +2782,6 @@ mod rtc_clock_tests {
                         participant_id: crate::entity::fixture_participant_id(),
                         connection_id,
                         profile: SignalingProtocol::State,
-                        allow_topic_channels: false,
-                        topic_publications: Default::default(),
                         authorization_expiry: None,
                         rtc,
                         resources,
@@ -1904,8 +2843,6 @@ mod rtc_clock_tests {
                 participant_id: crate::entity::fixture_participant_id(),
                 connection_id,
                 profile: SignalingProtocol::State,
-                allow_topic_channels: false,
-                topic_publications: Default::default(),
                 authorization_expiry: None,
                 rtc,
                 resources,
@@ -1941,8 +2878,6 @@ mod rtc_clock_tests {
                 participant_id: crate::entity::fixture_participant_id(),
                 connection_id,
                 profile: SignalingProtocol::State,
-                allow_topic_channels: false,
-                topic_publications: Default::default(),
                 authorization_expiry: Some(
                     pulsebeam_core::auth::AuthorizationExpiry::from_unix_seconds(200),
                 ),
@@ -2142,8 +3077,6 @@ mod upstream_route_table_tests {
                 participant_id,
                 connection_id,
                 profile: SignalingProtocol::Whip,
-                allow_topic_channels: true,
-                topic_publications: Default::default(),
                 authorization_expiry: None,
                 rtc: crate::control::application_only_test_connection(),
                 resources: NegotiatedResources::empty_for_test(),
@@ -2232,13 +3165,69 @@ mod upstream_route_table_tests {
                 .all(|handle| *handle == old)
         );
 
+        let shadow = || {
+            use crate::rtp::fabric_ingress::{EndpointBinding, ExtensionForm};
+            use pulsebeam_core::fabric::media_source::{Anchors, Limits};
+            RtpIngressShadow::new(
+                EndpointBinding {
+                    mid: mid.as_str().into(),
+                    rid: Some(rid.as_str().into()),
+                    primary_ssrc: 77,
+                    codec: pulsebeam_rtc::RtpReceiveCodec {
+                        payload_type: 96,
+                        name: "h264".into(),
+                        clock_rate: 90_000,
+                        channels: None,
+                        profile: Some(pulsebeam_rtc::CodecProfile::H264 {
+                            profile_level_id: None,
+                            packetization_mode: 1,
+                            level_asymmetry_allowed: false,
+                        }),
+                    },
+                    repair: None,
+                    receive_extensions: Box::new([]),
+                    extension_form: ExtensionForm::OneByte,
+                    allow_mixed_extensions: false,
+                    qualified_extensions: Default::default(),
+                    capture_clock_ssrc: None,
+                    allow_csrc_stripping: false,
+                },
+                Anchors::default(),
+                Limits {
+                    positions: std::num::NonZeroU16::new(4).unwrap(),
+                    max_age: Duration::from_millis(120),
+                    max_idle: Duration::from_secs(2),
+                },
+            )
+            .unwrap()
+        };
+        assert!(connection.media_ingress.is_empty());
+        connection.authorization_expiry =
+            Some(pulsebeam_core::auth::AuthorizationExpiry::from_unix_seconds(0));
+        assert!(!connection.attach_fabric_media_shadow(publication_id, shadow()));
+        connection.authorization_expiry = None;
+        assert!(connection.attach_fabric_media_shadow(publication_id, shadow()));
+        assert!(!connection.attach_fabric_media_shadow(publication_id, shadow()));
         connection.apply(
             ParticipantEffect::TrackPublished { publication_id },
             Some(current),
         );
+        let _ = connection.poll_transport(
+            now,
+            &mut crate::participant::event::test_utils::MockParticipantSink::default(),
+        );
+        assert!(
+            connection.media_ingress.is_empty(),
+            "replacement fences the old shadow"
+        );
+        assert!(connection.attach_fabric_media_shadow(publication_id, shadow()));
         connection.apply(
             ParticipantEffect::TrackUnpublished { publication_id },
             Some(old),
+        );
+        assert!(
+            !connection.media_ingress.is_empty(),
+            "late removal cannot clear the successor"
         );
         assert_eq!(
             connection.upstream.track_fanout(publication_id),

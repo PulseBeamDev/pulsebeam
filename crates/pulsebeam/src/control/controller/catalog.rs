@@ -522,9 +522,6 @@ fn catalog_entry(
     }
     tracks.sort_by(|left, right| left.publication_id.cmp(&right.publication_id));
     Ok(Some(wire::CatalogParticipantEntry {
-        data_recipient_id: Some(pulsebeam_proto::topic::data_recipient_id(
-            publisher.connection_id.as_bytes(),
-        )),
         participant: Some(wire::Participant {
             participant_id: participant.as_str().to_owned(),
             room_id: literal.to_owned(),

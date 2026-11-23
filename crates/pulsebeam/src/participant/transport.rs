@@ -16,7 +16,7 @@ use crate::ice_tcp::{FlowRoute, TcpFlow, TcpFlowId, TcpPacket};
 use crate::media::{
     ChannelId, KeyframeRequest, KeyframeRequestKind, MediaKind, Mid, Pt, Rid, SeqNo, Ssrc,
 };
-use crate::participant::batcher::{NetworkEgress, OwnedPacketQueue};
+use crate::participant::batcher::{Handoff, NetworkEgress, OwnedPacketQueue};
 use crate::participant::signaling::{SignalingOutput, SignalingWrite, SignalingWriter};
 use crate::rtp::{Codec as RtpCodec, Frequency, MediaTime, RtpExtensions, RtpPacket};
 use crate::track::SourceEncoding;
@@ -65,6 +65,17 @@ pub(super) fn native_data_config(
         },
         priority: pulsebeam_rtc::DataChannelPriority::MEDIUM,
     }
+}
+
+pub(super) fn fabric_data_config(
+    parameters: pulsebeam_proto::state::SctpDataV1Parameters,
+) -> Option<pulsebeam_rtc::DataChannelConfig> {
+    parameters.format()?;
+    let stream = u16::try_from(parameters.stream_id?).ok()?;
+    Some(pulsebeam_rtc::DataChannelConfig {
+        protocol: "pulsebeam.data.v1".into(),
+        ..native_data_config(ChannelId::from_value(stream), crate::track::DataLane::Lossy)
+    })
 }
 
 fn tcp_frame_payload(frame: &[u8]) -> Option<&[u8]> {
@@ -146,11 +157,6 @@ pub(crate) enum IngressResult {
     Received,
 }
 pub(crate) enum TransportMutation {
-    Data {
-        channel: ChannelId,
-        bytes: Vec<u8>,
-        required: bool,
-    },
     Keyframe {
         mid: Mid,
         encoding: SourceEncoding,
@@ -177,9 +183,6 @@ pub(crate) struct RtpIngress {
 }
 
 pub(crate) enum AppliedMutation {
-    Applied,
-    ControlNotWritten,
-    DataNotWritten,
     KeyframeUnavailable { mid: Mid, encoding: SourceEncoding },
     KeyframeRequested { mid: Mid, encoding: SourceEncoding },
     RtpNotWritten,
@@ -190,8 +193,20 @@ struct PendingIngress {
     batch: RecvPacketBatch,
     source_shard: crate::id::ShardId,
 }
+pub(super) type AuthenticatedIngressObserver<'a> =
+    dyn for<'packet> FnMut(pulsebeam_rtc::AuthenticatedRtp<'packet>, std::time::SystemTime) + 'a;
+
+struct ScopedMedia {
+    id: u64,
+    branch: crate::shard::router::FabricLocalBranch,
+    ingress: Option<std::num::NonZeroU64>,
+    transmit: pulsebeam_rtc::Transmit,
+    tcp_flow: Option<TcpFlowId>,
+}
+
 struct InputObservation {
     path: AuthenticatedPath,
+    wall: std::time::SystemTime,
     source_shard: crate::id::ShardId,
     tcp_flow: Option<TcpFlowId>,
 }
@@ -263,6 +278,7 @@ pub(crate) struct RtcDriver {
     pending_reports: indexmap::IndexMap<u32, pulsebeam_rtc::SenderReport>,
     input_observation: Option<InputObservation>,
     udp_packets: OwnedPacketQueue,
+    scoped_media: Option<ScopedMedia>,
     tcp_flows: HashMap<SocketAddr, TcpFlow>,
     pending_tcp: VecDeque<TcpPacket>,
     pending_ingress: VecDeque<PendingIngress>,
@@ -318,6 +334,7 @@ impl RtcDriver {
             pending_reports: Default::default(),
             input_observation: None,
             udp_packets: OwnedPacketQueue::with_capacity(udp_gso_size),
+            scoped_media: None,
             tcp_flows: HashMap::new(),
             pending_tcp: VecDeque::new(),
             pending_ingress: VecDeque::new(),
@@ -413,39 +430,8 @@ impl RtcDriver {
         self.pending_mutations.push_back(mutation);
         true
     }
-    pub(crate) fn apply_next_mutation(
-        &mut self,
-        _now: Instant,
-        allow_data: impl Fn(crate::media::ChannelId) -> bool,
-    ) -> Option<AppliedMutation> {
+    pub(crate) fn apply_next_mutation(&mut self) -> Option<AppliedMutation> {
         Some(match self.pending_mutations.pop_front()? {
-            TransportMutation::Data {
-                channel,
-                bytes,
-                required,
-            } => {
-                if !allow_data(channel) {
-                    return Some(AppliedMutation::Applied);
-                }
-                // Best-effort payload must not build a stale FIFO behind a blocked
-                // SCTP send window. Required control keeps the bounded native queue.
-                let queued = !required
-                    && self
-                        .rtc
-                        .data_channel_queued_payload_bytes(channel)
-                        .is_some_and(|bytes| bytes > 0);
-                if queued {
-                    metrics::counter!("participant_fanout_shed").increment(1);
-                    AppliedMutation::DataNotWritten
-                } else if self.write_channel(channel, true, &bytes) {
-                    AppliedMutation::Applied
-                } else if required {
-                    AppliedMutation::ControlNotWritten
-                } else {
-                    metrics::counter!("participant_fanout_shed").increment(1);
-                    AppliedMutation::DataNotWritten
-                }
-            }
             TransportMutation::Keyframe {
                 mid,
                 encoding,
@@ -460,6 +446,107 @@ impl RtcDriver {
         })
     }
 
+    pub(super) fn staged_handoff(
+        &self,
+        participant: crate::keys::ParticipantHandle,
+    ) -> Option<Handoff> {
+        let scoped = self.scoped_media.as_ref()?;
+        Some(Handoff {
+            participant,
+            branch: scoped.branch,
+            ingress: scoped.ingress,
+            id: scoped.id,
+        })
+    }
+
+    pub(super) fn dispatch_handoff(&mut self, handoff: Handoff, authorized: bool) {
+        let Some(scoped) = self.scoped_media.take_if(|media| {
+            media.id == handoff.id
+                && media.branch == handoff.branch
+                && media.ingress == handoff.ingress
+        }) else {
+            return;
+        };
+        if !authorized || !self.rtc.handoff_pending(handoff.id) {
+            self.resolve_handoff(handoff.id, false);
+            return;
+        }
+        match scoped.transmit.target {
+            TransmitTarget::Udp { remote, .. } => {
+                if !self.udp_packets.push_with_handoff(
+                    remote,
+                    scoped.transmit.payload.to_vec(),
+                    Some(handoff),
+                ) {
+                    self.resolve_handoff(handoff.id, false);
+                }
+            }
+            TransmitTarget::IceTcp { remote, .. } => {
+                let accepted = tcp_frame_payload(&scoped.transmit.payload).is_some_and(|payload| {
+                    !payload.is_empty() && self.send_tcp(remote, scoped.tcp_flow, payload)
+                });
+                self.resolve_handoff(handoff.id, accepted);
+            }
+        }
+    }
+
+    fn tcp_flow_for(&self, local: SocketAddr, remote: SocketAddr) -> Option<TcpFlowId> {
+        self.input_observation
+            .as_ref()
+            .filter(|observation| {
+                observation.path.protocol == NetworkProtocol::IceTcp
+                    && observation.path.local == local
+                    && observation.path.remote == remote
+            })
+            .map_or_else(
+                || self.tcp_flows.get(&remote).map(|flow| flow.route.id),
+                |observation| observation.tcp_flow,
+            )
+    }
+
+    fn send_tcp(&mut self, remote: SocketAddr, flow: Option<TcpFlowId>, payload: &[u8]) -> bool {
+        let Some(handle) = self
+            .tcp_flows
+            .get(&remote)
+            .filter(|handle| Some(handle.route.id) == flow)
+        else {
+            metrics::counter!("participant_tcp_egress_dropped_bytes", "reason" => "missing_flow")
+                .increment(payload.len() as u64);
+            return false;
+        };
+        let id = handle.route.id;
+        if handle.try_send(payload) {
+            return true;
+        }
+        tracing::debug!(%remote, ?id, "ICE-TCP egress full or closed; retiring flow");
+        self.tcp_flows.remove(&remote);
+        false
+    }
+
+    pub(super) fn network_pending(&self) -> bool {
+        !self.udp_packets.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(super) fn fabric_primary_progress(&self, mid: Mid) -> Option<u64> {
+        self.rtc.rtp_egress_progress(mid.as_str(), None)?.0
+    }
+
+    #[cfg(all(test, feature = "transport-conformance"))]
+    pub(super) fn connection_stats(&self) -> pulsebeam_rtc::ConnectionStats {
+        self.rtc.stats().connection
+    }
+
+    pub(super) fn handoff_pending(&self, id: u64) -> bool {
+        self.rtc.handoff_pending(id)
+    }
+
+    pub(super) fn resolve_handoff(&mut self, id: u64, accepted: bool) -> bool {
+        let resolved = self.rtc.resolve_handoff(id, accepted);
+        self.rtc_needs_drain |= resolved;
+        resolved
+    }
+
     pub(crate) fn drain_network(&mut self, egress: &mut impl NetworkEgress) {
         loop {
             match egress.append_udp(&mut self.udp_packets) {
@@ -469,11 +556,26 @@ impl RtcDriver {
             }
         }
     }
-    pub(crate) fn poll_output(&mut self) -> TransportPollOutput {
+    pub(super) fn poll_output(
+        &mut self,
+        observer: Option<&mut AuthenticatedIngressObserver<'_>>,
+    ) -> TransportPollOutput {
         if self.udp_packets.is_full() {
             return TransportPollOutput::Pending;
         }
-        match self.rtc.poll(self.rtc_clock.into()) {
+        let now = self.rtc_clock.into();
+        let output = match (observer, &self.input_observation) {
+            (Some(observer), Some(input)) => self.rtc.poll_with_rtp_observer(
+                now,
+                &mut |packet: pulsebeam_rtc::AuthenticatedRtp<'_>| {
+                    if packet.arrival == input.path.arrival {
+                        observer(packet, input.wall);
+                    }
+                },
+            ),
+            _ => self.rtc.poll(now),
+        };
+        match output {
             Output::Idle { next_wakeup } => {
                 if next_wakeup.is_some_and(|deadline| deadline <= self.rtc_clock.into_std()) {
                     return TransportPollOutput::Pending;
@@ -485,6 +587,31 @@ impl RtcDriver {
                         .checked_add(Duration::from_secs(1))
                         .unwrap_or(self.rtc_clock)
                 }))
+            }
+            Output::Handoff {
+                id,
+                scope,
+                transmit,
+            } => {
+                let Some((scope, branch)) = scope.and_then(|scope| {
+                    crate::shard::router::FabricLocalBranch::from_scope(scope)
+                        .map(|branch| (scope, branch))
+                }) else {
+                    self.resolve_handoff(id, false);
+                    return TransportPollOutput::Pending;
+                };
+                let tcp_flow = match transmit.target {
+                    TransmitTarget::IceTcp { local, remote } => self.tcp_flow_for(local, remote),
+                    _ => None,
+                };
+                self.scoped_media = Some(ScopedMedia {
+                    id,
+                    branch,
+                    ingress: scope.provenance(),
+                    transmit,
+                    tcp_flow,
+                });
+                TransportPollOutput::Pending
             }
             Output::Transmit(tx) => {
                 match tx.target {
@@ -499,33 +626,9 @@ impl RtcDriver {
                         match tcp_frame_payload(&tx.payload) {
                             Some([]) => {}
                             Some(payload) => {
-                                // Deferred input's replies must stay on its socket, even after EOF.
-                                let flow = self
-                                    .input_observation
-                                    .as_ref()
-                                    .filter(|observation| {
-                                        observation.path.protocol == NetworkProtocol::IceTcp
-                                            && observation.path.local == local
-                                            && observation.path.remote == remote
-                                    })
-                                    .map_or_else(
-                                        || self.tcp_flows.get(&remote).map(|flow| flow.route.id),
-                                        |observation| observation.tcp_flow,
-                                    );
-                                if let Some(id) = flow {
-                                    // Attribution includes the original flow incarnation. Never
-                                    // move a deferred reply to a replacement with the same peer.
-                                    if let Some(handle) = self.tcp_flows.get(&remote)
-                                        && handle.route.id == id
-                                        && !handle.try_send(payload)
-                                    {
-                                        tracing::debug!(%remote, ?id, "ICE-TCP egress full or closed; retiring flow");
-                                        self.tcp_flows.remove(&remote);
-                                    }
-                                } else {
-                                    metrics::counter!("participant_tcp_egress_dropped_bytes", "reason" => "missing_flow")
-                                        .increment(tx.payload.len() as u64);
-                                }
+                                // Deferred replies belong to the original socket, even after EOF.
+                                let flow = self.tcp_flow_for(local, remote);
+                                self.send_tcp(remote, flow, payload);
                             }
                             None => self.rtc.abort(),
                         }
@@ -592,21 +695,38 @@ impl RtcDriver {
         self.rtc.data_channel_installation(installation)
     }
 
+    pub(super) fn install_fabric_data(
+        &mut self,
+        parameters: pulsebeam_proto::state::SctpDataV1Parameters,
+    ) -> Result<pulsebeam_rtc::DataChannelInstallation, pulsebeam_rtc::WriteError> {
+        let config =
+            fabric_data_config(parameters).ok_or(pulsebeam_rtc::WriteError::InvalidState)?;
+        let cap = std::num::NonZeroUsize::new(pulsebeam_proto::data_record::MAX_RECORD_BYTES)
+            .ok_or(pulsebeam_rtc::WriteError::InvalidState)?;
+        let installation = self
+            .rtc
+            .install_bounded_data_channel(self.rtc_clock.into(), config, cap)
+            .map_err(|(reason, _)| reason)?;
+        self.rtc_needs_drain = true;
+        Ok(installation)
+    }
+
+    pub(super) fn supports_fabric_data(
+        &self,
+        installation: pulsebeam_rtc::DataChannelInstallation,
+    ) -> bool {
+        self.rtc
+            .supports_unordered_data(installation, pulsebeam_proto::data_record::MAX_RECORD_BYTES)
+    }
+
     pub(crate) fn cancel_data_channel_installation(
         &mut self,
         installation: pulsebeam_rtc::DataChannelInstallation,
     ) {
-        if self.rtc.data_channel_installation(installation).is_some() {
-            self.discard_channel_mutations(installation.channel());
-        }
         let _ = self
             .rtc
             .cancel_data_channel_installation(self.rtc_clock.into(), installation);
         self.rtc_needs_drain = true;
-    }
-
-    pub(crate) fn discard_channel_mutations(&mut self, cid: ChannelId) {
-        self.pending_mutations.retain(|mutation| !matches!(mutation, TransportMutation::Data { channel, .. } if *channel == cid));
     }
 
     fn prepare_rtp_senders<'a>(
@@ -701,7 +821,6 @@ impl RtcDriver {
     }
 
     pub(crate) fn close_native_data(&mut self, cid: ChannelId) {
-        self.discard_channel_mutations(cid);
         let _ = self.rtc.close_data_channel(self.rtc_clock.into(), cid);
         self.rtc_needs_drain = true;
     }
@@ -724,6 +843,22 @@ impl RtcDriver {
             SignalingWrite::Admitted(_) | SignalingWrite::Blocked
         );
         result
+    }
+
+    pub(super) fn write_installed_binary(
+        &mut self,
+        installation: pulsebeam_rtc::DataChannelInstallation,
+        bytes: &[u8],
+    ) -> Result<(), pulsebeam_rtc::WriteError> {
+        self.rtc
+            .send_installed_data(
+                self.rtc_clock.into(),
+                installation,
+                DataMessage::Binary(rtc_bytes(bytes)),
+            )
+            .map_err(|rejected| rejected.reason)?;
+        self.rtc_needs_drain = true;
+        Ok(())
     }
 
     pub(crate) fn write_channel(&mut self, cid: ChannelId, binary: bool, bytes: &[u8]) -> bool {
@@ -810,6 +945,112 @@ impl RtcDriver {
         });
         self.pending_reports.shift_remove(&info.ssrc)
     }
+    pub(super) fn rtp_receive_binding(
+        &self,
+        primary: u32,
+    ) -> Option<pulsebeam_rtc::RtpReceiveBinding<'_>> {
+        self.rtc.rtp_receive_binding(primary)
+    }
+
+    pub(super) fn whip_opus_receive_binding(
+        &self,
+        mid: Mid,
+    ) -> Option<pulsebeam_rtc::RtpReceiveBinding<'_>> {
+        let media = self
+            .session
+            .inbound_media
+            .iter()
+            .find(|media| media.mid.as_ref() == mid.as_str())?;
+        let [primary] = media.primary_ssrcs.as_ref() else {
+            return None;
+        };
+        let [codec] = media.codecs.as_ref() else {
+            return None;
+        };
+        if !media.rids.is_empty() || codec.profile != pulsebeam_rtc::CodecProfile::Opus {
+            return None;
+        }
+        let binding = self.rtc.sdp_receive_binding(*primary)?;
+        (binding.mid == mid.as_str()
+            && binding.rid.is_none()
+            && binding.primary_codec.payload_type == codec.payload_type)
+            .then_some(binding)
+    }
+
+    pub(super) fn local_rtp_output_form(
+        &self,
+        mid: Mid,
+        primary: u32,
+    ) -> Option<crate::rtp::fabric_ingress::ExtensionForm> {
+        use crate::rtp::fabric_ingress::ExtensionForm;
+        use pulsebeam_rtc::RtpExtensionForm;
+        Some(
+            match self
+                .rtc
+                .rtp_egress_extension_form(mid.as_str(), Some(primary))?
+            {
+                RtpExtensionForm::OneByte => ExtensionForm::OneByte,
+                RtpExtensionForm::TwoByte => ExtensionForm::TwoByte,
+                RtpExtensionForm::Mixed => ExtensionForm::Mixed,
+            },
+        )
+    }
+
+    pub(super) fn fabric_rtp_answer_fid(&self, mid: Mid, primary: u32) -> Option<[u32; 2]> {
+        self.rtc.rtp_egress_answer_fid(mid.as_str(), primary)
+    }
+
+    pub(super) fn fabric_rtp_extension_id(&self, mid: Mid, primary: u32, uri: &str) -> Option<u8> {
+        self.rtc
+            .rtp_egress_extension_id(mid.as_str(), Some(primary), uri)
+    }
+
+    pub(super) fn fabric_rtp_sender_is_fresh(
+        &self,
+        output: crate::rtp::fabric_egress::OutputLeg,
+    ) -> bool {
+        self.rtc
+            .rtp_egress_progress(output.mid.as_str(), output.primary)
+            == Some((None, None))
+    }
+
+    pub(super) fn retire_fabric_rtp_scope(&mut self, scope: pulsebeam_rtc::MediaScope) {
+        if self.rtc.retire_rtp_scope(scope).is_ok() {
+            self.scoped_media
+                .take_if(|media| !self.rtc.handoff_pending(media.id));
+            self.rtc_needs_drain = true;
+        }
+    }
+
+    pub(super) fn discard_pending_fabric_rtp(&mut self, scope: pulsebeam_rtc::MediaScope) -> bool {
+        if self.rtc.discard_pending_rtp_scope(scope).is_err() {
+            return false;
+        }
+        self.scoped_media
+            .take_if(|media| !self.rtc.handoff_pending(media.id));
+        self.rtc_needs_drain = true;
+        true
+    }
+
+    pub(super) fn queue_fabric_rtp(
+        &mut self,
+        leg: &mut crate::rtp::fabric_egress::SenderLeg<crate::shard::router::FabricLocalBranch>,
+        branch: crate::shard::router::FabricLocalBranch,
+        source: crate::rtp::fabric_egress::SourceMetadata,
+        packet: crate::rtp::fabric_egress::CandidatePacket<'_, '_>,
+    ) -> Result<(), crate::rtp::fabric_egress::AdmissionError> {
+        // Let already protected UDP datagrams cross the adapter before
+        // committing a cut. At this point they cannot be scoped by sender.
+        if leg.cut_pending() && !self.udp_packets.is_empty() {
+            return Err(crate::rtp::fabric_egress::AdmissionError::Rtc(
+                pulsebeam_rtc::WriteError::WouldBlock,
+            ));
+        }
+        leg.admit(&mut self.rtc, self.rtc_clock.into(), branch, source, packet)?;
+        self.rtc_needs_drain = true;
+        Ok(())
+    }
+
     pub(crate) fn retire_encoding(&mut self, ssrc: u32) {
         self.encodings.remove(&ssrc.into());
         self.pending_reports.shift_remove(&ssrc);
@@ -956,6 +1197,12 @@ impl RtcDriver {
         }
     }
 
+    pub(super) fn request_fabric_refresh(&mut self, ssrc: u32) -> bool {
+        let accepted = self.rtc.request_keyframe(ssrc).is_ok();
+        self.rtc_needs_drain |= accepted;
+        accepted
+    }
+
     pub(crate) fn request_keyframe(&mut self, request: KeyframeRequest) -> bool {
         let known = self
             .encodings
@@ -1046,11 +1293,11 @@ impl RtcDriver {
         AppliedMutation::RtpWritten
     }
     pub(crate) fn receive_pending(&mut self, at: Instant) -> IngressResult {
-        let (protocol, local, remote, arrival, tcp_flow, source_shard, input) =
+        let (protocol, local, remote, received_at, tcp_flow, source_shard, input) =
             if let Some(pending) = self.pending_ingress.front_mut() {
                 let source_shard = pending.source_shard;
                 let batch = &mut pending.batch;
-                let (remote, local, arrival) = (batch.src, batch.dst, batch.received_at.monotonic);
+                let (remote, local, received_at) = (batch.src, batch.dst, batch.received_at);
                 let Some(packet) = batch.next_packet() else {
                     self.pending_ingress.pop_front();
                     return IngressResult::Empty;
@@ -1059,7 +1306,7 @@ impl RtcDriver {
                     NetworkProtocol::Udp,
                     local,
                     remote,
-                    arrival,
+                    received_at,
                     None,
                     source_shard,
                     NetworkInput::Udp {
@@ -1086,7 +1333,7 @@ impl RtcDriver {
                     NetworkProtocol::IceTcp,
                     local,
                     remote,
-                    packet.received_at.monotonic,
+                    packet.received_at,
                     Some(id),
                     address.shard(),
                     NetworkInput::IceTcp {
@@ -1098,7 +1345,9 @@ impl RtcDriver {
             } else {
                 return IngressResult::Empty;
             };
+        let arrival = received_at.monotonic;
         self.input_observation = Some(InputObservation {
+            wall: received_at.wall,
             path: AuthenticatedPath {
                 protocol,
                 local,
@@ -1169,7 +1418,7 @@ mod tests {
                     IngressResult::Received
                 ));
                 loop {
-                    match transport.poll_output() {
+                    match transport.poll_output(None) {
                         TransportPollOutput::Timeout(_) => break,
                         TransportPollOutput::Event(event) => {
                             if let Event::AuthenticatedPath(path) = *event {
@@ -1209,12 +1458,12 @@ mod tests {
             }
             assert!(!transport.udp_packets.push_back(remote, vec![2]));
             assert!(matches!(
-                transport.poll_output(),
+                transport.poll_output(None),
                 TransportPollOutput::Pending
             ));
             transport.disconnect();
             assert!(matches!(
-                transport.poll_output(),
+                transport.poll_output(None),
                 TransportPollOutput::Closed(_)
             ));
             assert!(transport.pending_ingress.is_empty());

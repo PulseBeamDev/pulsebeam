@@ -40,6 +40,7 @@ impl DestinationServer {
                 pulsebeam::node::NodeBuilder::new()
                     .workers(1)
                     .work_stealing(1)
+                    .with_reliable_data_v1()
                     .local_addr("127.0.0.1:0".parse()?)
                     .advertise_bound_udp()
                     .rng(pulsebeam_runtime::rand::os_rng())

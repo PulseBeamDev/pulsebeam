@@ -2,7 +2,8 @@ use std::{net::IpAddr, rc::Rc, time::Duration};
 
 use anyhow::Context;
 use pulsebeam_proto::{
-    prelude::Message,
+    data_endpoint::DATA_V1,
+    data_record::{Header, Record},
     state::{self as wire, codec, validation},
 };
 use pulsebeam_rtc_simulation::{
@@ -16,24 +17,31 @@ use super::common::{
     DEFAULT_SIM_SHARDS,
     client::create_http_client,
     native::{NativeHost, RuntimeLease},
-    reserve_subnet, run_sim_or_timeout, start_sfu_node_with, subnet_ip,
+    reserve_subnet, run_sim_or_timeout, sfu_node_builder, subnet_ip,
 };
 
 mod audio;
+mod av1;
 
 struct WirePeer {
     media: Option<pulsebeam_agent_core::client_sdp::Context>,
     peer: PeerConnection,
     control: DataChannel,
-    payload: [DataChannel; 2],
+    payload: [DataChannel; 3],
     gathered: bool,
     initial_complete: bool,
+    data_v1: bool,
     _factory: PeerConnectionFactory,
     _lease: Rc<RuntimeLease>,
     _host: NativeHost,
 }
 
 const DATA_ROOM: &str = "native-state-wire";
+
+enum Av1Bootstrap<'a> {
+    External(&'a pulsebeam_rtc_simulation::EncodedVideoInput),
+    Stock,
+}
 
 impl WirePeer {
     async fn connect(
@@ -61,25 +69,72 @@ impl WirePeer {
         audio: bool,
         room: &str,
     ) -> anyhow::Result<(Self, String)> {
+        Self::connect_with_peer(host, server, subject, room, audio, None, |_, _| Ok(())).await
+    }
+
+    async fn connect_with_peer(
+        host: NativeHost,
+        server: IpAddr,
+        subject: &str,
+        room: &str,
+        media: bool,
+        av1: Option<Av1Bootstrap<'_>>,
+        prepare: impl FnOnce(&PeerConnectionFactory, &PeerConnection) -> anyhow::Result<()>,
+    ) -> anyhow::Result<(Self, String)> {
         let (_runtime, lease) = host.runtime()?;
-        let factory = host.raw_peer_factory()?;
-        let peer = factory.create_peer_connection(PeerConfiguration {
+        let factory = host.raw_peer_factory(match &av1 {
+            Some(Av1Bootstrap::External(input)) => Some(input.encoder_factory()),
+            Some(Av1Bootstrap::Stock) => {
+                Some(pulsebeam_rtc_simulation::VideoEncoderFactoryHandle::builtin()?)
+            }
+            None => None,
+        })?;
+        let mut configuration: pulsebeam_rtc_simulation::RtcConfiguration = PeerConfiguration {
             always_negotiate_data_channels: true,
             ..Default::default()
-        })?;
-        let channel = |id, label| {
+        }
+        .into();
+        if media {
+            configuration.options.crypto_options =
+                pulsebeam_rtc_simulation::CryptoOptions::prefer_gcm();
+        }
+        let mut dependencies = pulsebeam_rtc_simulation::PeerConnectionDependencies::default();
+        if let Some(av1) = av1 {
+            let trials = match av1 {
+                Av1Bootstrap::External(_) => {
+                    "WebRTC-RFC8888CongestionControlFeedback/Enabled,offer:true/"
+                }
+                Av1Bootstrap::Stock => concat!(
+                    "WebRTC-RFC8888CongestionControlFeedback/Enabled,offer:true/",
+                    "WebRTC-DependencyDescriptorAdvertised/Enabled/",
+                ),
+            };
+            dependencies =
+                dependencies.field_trials(pulsebeam_rtc_simulation::FieldTrials::parse(trials)?);
+        }
+        let peer = factory.create_peer_connection_with_dependencies(configuration, dependencies)?;
+        let control = peer.create_data_channel(
+            "v1/sys/signaling",
+            DataChannelConfiguration {
+                negotiated: true,
+                id: Some(0),
+                ..Default::default()
+            },
+        )?;
+        let channel = |id| {
             peer.create_data_channel(
-                label,
+                "",
                 DataChannelConfiguration {
                     negotiated: true,
                     id: Some(id),
-                    ordered: true,
+                    ordered: false,
+                    max_retransmits: Some(0),
+                    protocol: b"pulsebeam.data.v1".to_vec(),
                     ..Default::default()
                 },
             )
         };
-        let control = channel(0, "v1/sys/signaling")?;
-        let payload = [channel(1, "prepared-one")?, channel(2, "prepared-two")?];
+        let payload = [channel(1)?, channel(2)?, channel(3)?];
         let mut result = Self {
             media: None,
             peer,
@@ -87,10 +142,12 @@ impl WirePeer {
             payload,
             gathered: false,
             initial_complete: false,
+            data_v1: false,
             _factory: factory,
             _lease: lease,
             _host: host,
         };
+        prepare(&result._factory, &result.peer)?;
         let offer = result
             .operation(result.peer.create_offer()?)
             .await?
@@ -166,17 +223,27 @@ impl WirePeer {
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         anyhow::ensure!(
             response.status() == http::StatusCode::CREATED,
-            "native bootstrap: {} {}",
+            "native bootstrap: {} {}; offered RTP: {:?}",
             response.status(),
-            String::from_utf8_lossy(response.body())
+            String::from_utf8_lossy(response.body()),
+            offer
+                .lines()
+                .filter(
+                    |line| ["m=", "a=rtpmap:", "a=fmtp:", "a=rtcp-fb:", "a=extmap:"]
+                        .iter()
+                        .any(|prefix| line.starts_with(prefix))
+                )
+                .collect::<Vec<_>>(),
         );
         let body: serde_json::Value = serde_json::from_slice(response.body())?;
+        result.data_v1 = body.get("data_version").and_then(serde_json::Value::as_u64)
+            == Some(u64::from(DATA_V1));
         let participant = body["participant_id"]
             .as_str()
             .context("canonical participant")?
             .to_owned();
         let answer = body["answer"].as_str().context("native answer")?.to_owned();
-        if audio {
+        if media {
             result.media = Some(pulsebeam_agent_core::client_sdp::Context::new(
                 &offer,
                 &answer,
@@ -223,26 +290,42 @@ impl WirePeer {
         Ok((result, participant))
     }
 
-    async fn execution(
+    async fn logical_when(
         &mut self,
-        reference: u64,
         revision: u64,
-        status: wire::ExecutionStatus,
-    ) -> anyhow::Result<wire::ConfirmedState> {
+        accepts: impl Fn(&wire::LogicalSubscriptionState) -> bool,
+    ) -> anyhow::Result<wire::LogicalSubscriptionState> {
         loop {
-            let value = self.confirmed(reference, revision).await?;
-            anyhow::ensure!(value.rejection.is_none(), "receiver rejected: {value:?}");
-            let Some(wire::confirmed_state::Value::Owned(live)) = &value.value else {
-                anyhow::bail!("receiver absent: {value:?}");
-            };
-            if live.execution == status as i32 {
-                return Ok(value);
-            }
+            let value = self.confirmed(1, revision).await?;
             anyhow::ensure!(
-                live.execution == wire::ExecutionStatus::WaitingForSource as i32,
-                "unexpected execution: {value:?}"
+                value.rejection.is_none(),
+                "logical receiver rejected: {value:?}"
             );
+            let Some(wire::confirmed_state::Value::LogicalSubscription(state)) = value.value else {
+                anyhow::bail!("logical receiver absent");
+            };
+            if accepts(&state) {
+                return Ok(*state);
+            }
         }
+    }
+
+    fn prepare_receiver(&self, source_revision: u64, revision: u64, channel: u32) {
+        self.send_state(wire::ClientStateRecord {
+            owned: 1,
+            desired: None,
+            execution: Some(wire::ExecutionReport {
+                revision,
+                outcome: Some(wire::execution_report::Outcome::LogicalReceiver(
+                    wire::LogicalReceiverReport {
+                        source_revision,
+                        outcome: Some(wire::logical_receiver_report::Outcome::Prepared(
+                            payload_binding(channel),
+                        )),
+                    },
+                )),
+            }),
+        });
     }
 
     async fn ended(&mut self, reference: u64, revision: u64) -> anyhow::Result<()> {
@@ -262,7 +345,7 @@ impl WirePeer {
         }
     }
 
-    async fn payload(&self, channel: usize) -> anyhow::Result<pulsebeam_proto::topic::TopicFrame> {
+    async fn payload(&self, channel: usize) -> anyhow::Result<Vec<u8>> {
         loop {
             while let Some(event) = self.payload[channel].try_next_event() {
                 if let DataChannelEvent::Message(message) = event {
@@ -270,8 +353,7 @@ impl WirePeer {
                         message.kind == DataChannelMessageKind::Binary,
                         "non-binary payload"
                     );
-                    return pulsebeam_proto::topic::TopicFrame::decode_bounded(&message.bytes)
-                        .map_err(|error| anyhow::anyhow!("{error:?}"));
+                    return Ok(message.bytes.to_vec());
                 }
             }
             anyhow::ensure!(
@@ -288,9 +370,9 @@ impl WirePeer {
         }
     }
 
-    fn send_payload(&self, channel: usize, frame: &pulsebeam_proto::topic::TopicFrame) {
+    fn send_payload(&self, channel: usize, frame: Vec<u8>) {
         assert_eq!(
-            self.payload[channel].send(DataChannelMessage::binary(frame.encode_to_vec())),
+            self.payload[channel].send(DataChannelMessage::binary(frame)),
             DataChannelSendResult::Sent
         );
     }
@@ -345,18 +427,22 @@ impl WirePeer {
     }
 
     fn desire(&self, reference: u64, revision: u64, spec: Option<wire::ResourceSpec>) {
-        let bytes = codec::encode_client(&wire::ClientStateBatch {
-            records: vec![wire::ClientStateRecord {
-                owned: reference,
-                execution: None,
-                desired: Some(wire::DesiredState {
-                    revision,
-                    value: Some(match spec {
-                        Some(spec) => wire::desired_state::Value::Present(Box::new(spec)),
-                        None => wire::desired_state::Value::Absent(true),
-                    }),
+        self.send_state(wire::ClientStateRecord {
+            owned: reference,
+            execution: None,
+            desired: Some(wire::DesiredState {
+                revision,
+                value: Some(match spec {
+                    Some(spec) => wire::desired_state::Value::Present(Box::new(spec)),
+                    None => wire::desired_state::Value::Absent(true),
                 }),
-            }],
+            }),
+        });
+    }
+
+    fn send_state(&self, record: wire::ClientStateRecord) {
+        let bytes = codec::encode_client(&wire::ClientStateBatch {
+            records: vec![record],
             ..Default::default()
         })
         .unwrap();
@@ -392,6 +478,19 @@ impl WirePeer {
     }
 }
 
+fn payload_binding(channel: u32) -> wire::TrackBinding {
+    wire::TrackBinding {
+        transport: Some(wire::track_binding::Transport::SctpDataV1(
+            wire::SctpDataV1Parameters {
+                stream_id: Some(channel),
+                version: u32::from(DATA_V1),
+                channel_incarnation: u64::from(channel),
+                delivery: wire::DataV1Delivery::Latest as i32,
+            },
+        )),
+    }
+}
+
 fn publication(channel: u32, enabled: bool) -> wire::ResourceSpec {
     wire::ResourceSpec {
         settings: Some(wire::ResourceSettings {
@@ -402,21 +501,21 @@ fn publication(channel: u32, enabled: bool) -> wire::ResourceSpec {
             wire::PublicationSpec {
                 track_id: "camera-updates".into(),
                 kind: Some(wire::publication_spec::Kind::Data(wire::DataPublication {
-                    delivery: wire::DataDelivery::Ordered as i32,
-                    binding: Some(wire::TrackBinding {
-                        transport: Some(wire::track_binding::Transport::Sctp(
-                            wire::SctpParameters {
-                                stream_id: Some(channel),
-                            },
-                        )),
-                    }),
+                    delivery: wire::DataDelivery::Latest as i32,
+                    binding: Some(payload_binding(channel)),
                 })),
             },
         )),
     }
 }
 
-fn live(value: wire::ConfirmedState, spec: &wire::ResourceSpec, participant: &str) -> wire::Track {
+#[derive(Clone, Debug, PartialEq)]
+struct Published {
+    track: wire::Track,
+    incarnation: u64,
+}
+
+fn live(value: wire::ConfirmedState, spec: &wire::ResourceSpec, participant: &str) -> Published {
     assert!(value.rejection.is_none());
     let Some(wire::confirmed_state::Value::Owned(live)) = value.value else {
         panic!("expected admitted resource: {value:?}")
@@ -437,52 +536,85 @@ fn live(value: wire::ConfirmedState, spec: &wire::ResourceSpec, participant: &st
     assert_eq!(
         track.kind,
         Some(wire::track::Kind::Data(wire::DataTrack {
-            delivery: wire::DataDelivery::Ordered as i32
+            delivery: wire::DataDelivery::Latest as i32
         }))
     );
     assert!(!track.publication_id.is_empty());
-    track
+    let incarnation = live
+        .data_v1_source
+        .expect("installed DATA source incarnation");
+    assert_ne!(incarnation, 0);
+    Published { track, incarnation }
 }
 
-fn subscription(source: &wire::Track, channel: u32, enabled: bool) -> wire::ResourceSpec {
+fn subscription(source: &Published, enabled: bool) -> wire::ResourceSpec {
     wire::ResourceSpec {
         settings: Some(wire::ResourceSettings {
             enabled: Some(enabled),
             receive: None,
         }),
-        declaration: Some(wire::resource_spec::Declaration::Subscription(
-            wire::SubscriptionSpec {
-                publication_id: source.publication_id.clone(),
-                kind: wire::TrackKind::Data as i32,
-                source_room: DATA_ROOM.into(),
-                binding: Some(wire::TrackBinding {
-                    transport: Some(wire::track_binding::Transport::Sctp(wire::SctpParameters {
-                        stream_id: Some(channel),
-                    })),
+        declaration: Some(wire::resource_spec::Declaration::LogicalSubscription(
+            wire::LogicalSubscriptionSpec {
+                data_version: Some(u32::from(DATA_V1)),
+                source: Some(wire::LogicalSourceAddress {
+                    room: DATA_ROOM.into(),
+                    participant_id: source.track.participant_id.clone(),
+                    kind: wire::TrackKind::Data as i32,
+                    track_id: source.track.track_id.clone(),
                 }),
             },
         )),
     }
 }
 
-fn message(source: &wire::Track, sequence: u64, payload: u8) -> pulsebeam_proto::topic::TopicFrame {
-    pulsebeam_proto::topic::TopicFrame {
-        recipient_connections: None,
-        repair_target: Default::default(),
-        body: Some(pulsebeam_proto::topic::topic_frame::Body::Message(
-            pulsebeam_proto::topic::TopicMessage {
-                captured_at: None,
-                publication_id: source.publication_id.clone(),
-                sequence,
-                payload: vec![payload],
-            },
-        )),
-    }
+fn message(sequence: u64, payload: u8) -> Vec<u8> {
+    let bytes = [payload];
+    let record = Record::new(
+        Header {
+            unit_seq: sequence,
+            unit_len: 1,
+            index: 0,
+            count: 1,
+            capture: None,
+        },
+        &bytes,
+        None,
+    )
+    .unwrap();
+    let mut output = vec![0; record.encoded_len()];
+    record.write(&mut output).unwrap();
+    output
+}
+
+async fn install_receiver(
+    peer: &mut WirePeer,
+    source: &Published,
+    desired_revision: u64,
+    report_revision: u64,
+    channel: u32,
+) -> anyhow::Result<wire::LogicalSubscriptionState> {
+    let offer = peer
+        .logical_when(desired_revision, |state| {
+            state.source.as_ref() == Some(&source.track) && state.data_v1.is_some()
+        })
+        .await?;
+    assert_eq!(offer.data_v1.as_ref().unwrap().source, source.incarnation);
+    assert!(offer.execution.is_none());
+    peer.prepare_receiver(offer.source_revision, report_revision, channel);
+    let installed =
+        wire::logical_subscription_state::Execution::Installed(payload_binding(channel));
+    let settled = peer
+        .logical_when(desired_revision, |state| state.execution.is_some())
+        .await?;
+    assert_eq!(settled.source_revision, offer.source_revision);
+    assert_eq!(settled.execution, Some(installed));
+    Ok(settled)
 }
 
 #[derive(Debug)]
 enum PeerStep {
-    Source(wire::Track),
+    ReceiverConnected,
+    Source(Published),
     Ready,
     Delivered,
     Retired,
@@ -491,14 +623,19 @@ enum PeerStep {
 async fn run_publisher(
     ip: IpAddr,
     server: IpAddr,
+    cross_shard: bool,
     tx: tokio::sync::mpsc::Sender<PeerStep>,
     mut rx: tokio::sync::mpsc::Receiver<PeerStep>,
 ) -> anyhow::Result<()> {
+    // The DATA receiver reserves partition zero. The publisher's second
+    // partition must differ from the later audio listener's first partition.
+    anyhow::ensure!(matches!(rx.recv().await, Some(PeerStep::ReceiverConnected)));
     let (mut peer, participant) = WirePeer::connect(ip, server, "publisher", true).await?;
+    assert!(peer.data_v1);
     let spec = publication(1, true);
     peer.desire(1, 1, Some(spec.clone()));
     let first = live(peer.confirmed(1, 1).await?, &spec, &participant);
-    peer.send_payload(0, &message(&first, 0, 42));
+    peer.send_payload(0, message(0, 42));
     let disabled = publication(1, false);
     peer.desire(1, 2, Some(disabled.clone()));
     assert_eq!(
@@ -512,20 +649,9 @@ async fn run_publisher(
     );
     tx.send(PeerStep::Source(first.clone())).await?;
     assert!(matches!(rx.recv().await, Some(PeerStep::Ready)));
-    let mut excluded = message(&first, 1, 43);
-    excluded.recipient_connections = Some(vec![0; 16]);
-    peer.send_payload(0, &excluded);
-    let probe = peer.payload(0).await?;
-    assert!(probe.is_subscriber_control());
-    assert_eq!(probe.publication_id(), Some(first.publication_id.as_str()));
-    let requester = probe
-        .requester()
-        .context("missing server-stamped requester")?;
-    assert_eq!(requester.len(), 16);
-    assert_ne!(requester, [0; 16]);
-    let mut included = message(&first, 2, 44);
-    included.recipient_connections = Some(requester.to_vec());
-    peer.send_payload(0, &included);
+    peer.send_payload(0, message(1, 43));
+    assert!(matches!(rx.recv().await, Some(PeerStep::Ready)));
+    peer.send_payload(0, message(2, 44));
     assert!(matches!(rx.recv().await, Some(PeerStep::Delivered)));
     peer.desire(1, 4, None);
     let removed = peer.confirmed(1, 4).await?;
@@ -545,19 +671,23 @@ async fn run_publisher(
     let spec = publication(2, true);
     peer.desire(6, 6, Some(spec.clone()));
     let second = live(peer.confirmed(6, 6).await?, &spec, &participant);
-    assert_ne!(first.publication_id, second.publication_id);
+    assert_ne!(first.track.publication_id, second.track.publication_id);
+    assert_ne!(first.incarnation, second.incarnation);
     tx.send(PeerStep::Source(second.clone())).await?;
     assert!(matches!(rx.recv().await, Some(PeerStep::Ready)));
-    peer.send_payload(1, &message(&second, 0, 46));
+    peer.send_payload(1, message(0, 46));
     assert!(matches!(rx.recv().await, Some(PeerStep::Delivered)));
     peer.payload[1].close()?;
     peer.ended(6, 6).await?;
     tx.send(PeerStep::Retired).await?;
     assert!(matches!(rx.recv().await, Some(PeerStep::Retired)));
     assert_eq!(peer.control.state(), DataChannelState::Open);
-    peer.prove_audio_publication(server, &participant)
+    peer.prove_audio_publication(server, &participant, cross_shard)
         .await
         .context("real Native RTP source lifecycle")?;
+    peer.prove_whip_whep_opus(server, cross_shard)
+        .await
+        .context("real WHIP-to-WHEP Opus over Fabric")?;
     peer.peer.close()?;
     Ok(())
 }
@@ -568,71 +698,64 @@ async fn run_receiver(
     tx: tokio::sync::mpsc::Sender<PeerStep>,
     mut rx: tokio::sync::mpsc::Receiver<PeerStep>,
 ) -> anyhow::Result<()> {
+    let (mut peer, _) = WirePeer::connect(ip, server, "receiver", false).await?;
+    assert!(peer.data_v1);
+    tx.send(PeerStep::ReceiverConnected).await?;
     let Some(PeerStep::Source(first)) = rx.recv().await else {
         anyhow::bail!("first source not announced");
     };
-    let (mut peer, _) = WirePeer::connect(ip, server, "receiver", false).await?;
-    let spec = subscription(&first, 1, true);
+    let spec = subscription(&first, true);
     peer.desire(1, 1, Some(spec.clone()));
-    let value = peer
-        .execution(1, 1, wire::ExecutionStatus::Installed)
-        .await?;
-    assert_eq!(live(value, &spec, &first.participant_id), first);
+    let first_binding = install_receiver(&mut peer, &first, 1, 2, 1).await?;
     tx.send(PeerStep::Ready).await?;
-    use pulsebeam_proto::topic::{TopicFrame, TopicOmission, topic_frame::Body};
-    assert_eq!(
-        peer.payload(0).await?,
-        TopicFrame::from(Body::Omission(TopicOmission {
-            publication_id: first.publication_id.clone(),
-            sequence: 1,
-        }))
-    );
-    let disabled = subscription(&first, 1, false);
-    peer.desire(1, 2, Some(disabled.clone()));
-    let value = peer
-        .execution(1, 2, wire::ExecutionStatus::Disabled)
+    assert_eq!(peer.payload(0).await?, message(1, 43));
+
+    let disabled = subscription(&first, false);
+    peer.desire(1, 3, Some(disabled.clone()));
+    let state = peer
+        .logical_when(3, |state| {
+            state.source.is_none() && state.execution.is_none()
+        })
         .await?;
-    assert_eq!(live(value, &disabled, &first.participant_id), first);
-    peer.desire(1, 3, Some(spec.clone()));
-    let value = peer
-        .execution(1, 3, wire::ExecutionStatus::Installed)
-        .await?;
-    assert_eq!(live(value, &spec, &first.participant_id), first);
-    peer.send_payload(
-        0,
-        &pulsebeam_proto::topic::TopicFrame {
-            recipient_connections: None,
-            repair_target: Default::default(),
-            body: Some(pulsebeam_proto::topic::topic_frame::Body::Probe(
-                pulsebeam_proto::topic::TopicProbe {
-                    requester: Default::default(),
-                    publication_id: first.publication_id.clone(),
-                    from_sequence: 2,
-                    live: true,
-                },
-            )),
-        },
-    );
-    assert_eq!(peer.payload(0).await?, message(&first, 2, 44));
-    tx.send(PeerStep::Delivered).await?;
-    peer.ended(1, 3).await?;
+    assert_eq!(state.spec, Some(disabled));
     peer.closed(0).await;
+
+    peer.desire(1, 4, Some(spec.clone()));
+    let resumed = install_receiver(&mut peer, &first, 4, 5, 2).await?;
+    assert_eq!(resumed.spec, Some(spec));
+    assert!(resumed.source_revision > first_binding.source_revision);
+    assert_ne!(
+        resumed.data_v1.as_ref().unwrap().branch,
+        first_binding.data_v1.unwrap().branch
+    );
+    tx.send(PeerStep::Ready).await?;
+    assert_eq!(peer.payload(1).await?, message(2, 44));
+    tx.send(PeerStep::Delivered).await?;
+
+    peer.logical_when(4, |state| {
+        state.source.is_none() && state.execution.is_none()
+    })
+    .await?;
+    peer.closed(1).await;
     assert!(matches!(rx.recv().await, Some(PeerStep::Retired)));
     tx.send(PeerStep::Retired).await?;
     let Some(PeerStep::Source(second)) = rx.recv().await else {
         anyhow::bail!("replacement source not announced");
     };
-    let spec = subscription(&second, 2, true);
-    peer.desire(4, 4, Some(spec.clone()));
-    let value = peer
-        .execution(4, 4, wire::ExecutionStatus::Installed)
-        .await?;
-    assert_eq!(live(value, &spec, &second.participant_id), second);
+    let replacement = install_receiver(&mut peer, &second, 4, 6, 3).await?;
+    assert!(replacement.source_revision > resumed.source_revision);
+    assert_ne!(
+        replacement.data_v1.unwrap().branch,
+        resumed.data_v1.unwrap().branch
+    );
     tx.send(PeerStep::Ready).await?;
-    assert_eq!(peer.payload(1).await?, message(&second, 0, 46));
+    assert_eq!(peer.payload(2).await?, message(0, 46));
     tx.send(PeerStep::Delivered).await?;
-    peer.ended(4, 4).await?;
-    peer.closed(1).await;
+    peer.logical_when(4, |state| {
+        state.source.is_none() && state.execution.is_none()
+    })
+    .await?;
+    peer.closed(2).await;
     assert!(matches!(rx.recv().await, Some(PeerStep::Retired)));
     tx.send(PeerStep::Retired).await?;
     assert_eq!(peer.control.state(), DataChannelState::Open);
@@ -642,6 +765,15 @@ async fn run_receiver(
 
 #[test]
 fn native_state_data_lifetimes_route_and_retire_exact_receivers() {
+    prove_native_state_data_lifetimes(DEFAULT_SIM_SHARDS);
+}
+
+#[test]
+fn native_state_data_lifetimes_route_and_retire_exact_receivers_same_shard() {
+    prove_native_state_data_lifetimes(1);
+}
+
+fn prove_native_state_data_lifetimes(shards: usize) {
     let seed = std::env::var("PULSEBEAM_SIM_SEED")
         .map(|seed| seed.parse().unwrap())
         .unwrap_or(1);
@@ -656,21 +788,19 @@ fn native_state_data_lifetimes_route_and_retire_exact_receivers() {
     let subnet = reserve_subnet();
     let server = subnet_ip(subnet, 1);
     sim.host(server, move || async move {
-        start_sfu_node_with(
-            server,
-            pulsebeam_runtime::rand::seeded_rng(seed),
-            DEFAULT_SIM_SHARDS,
-            false,
-        )
-        .await
-        .map_err(Into::into)
+        sfu_node_builder(server, pulsebeam_runtime::rand::seeded_rng(seed), shards)
+            .with_local_data_v1()
+            .with_local_rtp_v1()
+            .run(tokio_util::sync::CancellationToken::new())
+            .await
+            .map_err(Into::into)
     });
     let (pub_tx, viewer_rx) = tokio::sync::mpsc::channel(1);
     let (viewer_tx, pub_rx) = tokio::sync::mpsc::channel(1);
     sim.client(subnet_ip(subnet, 2), async move {
         tokio::time::timeout(
             Duration::from_secs(10),
-            run_publisher(subnet_ip(subnet, 2), server, pub_tx, pub_rx),
+            run_publisher(subnet_ip(subnet, 2), server, shards > 1, pub_tx, pub_rx),
         )
         .await
         .context("native StateBatch publisher deadline")??;
@@ -687,4 +817,5 @@ fn native_state_data_lifetimes_route_and_retire_exact_receivers() {
     });
     run_sim_or_timeout(&mut sim, Duration::from_secs(30))
         .expect("native StateBatch/SCTP proof failed");
+    assert!(pulsebeam::sim_metrics::routing_counter("fabric_whep_rtp_enqueued") > 0);
 }

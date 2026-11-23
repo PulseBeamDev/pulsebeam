@@ -1,5 +1,4 @@
 use crate::entity::{ParticipantId, PublicationKey, TrackId, TrackKind};
-use crate::media::ChannelId;
 use crate::participant::Connection;
 use crate::participant::policy::{
     PublicationExecution, ReceiverExecution, ReceiverRtpConfiguration, VideoPolicy,
@@ -21,9 +20,31 @@ pub(crate) use super::permissions::ResourcePermissions;
 
 pub(crate) use session::track_descriptor;
 pub(crate) use session::{
-    ExecutionAction, ExecutionCommand, InputError, LookupInterestChange, NativeSession,
-    OutputError, Preparation, failure,
+    DataBranchIds, ExecutionAction, ExecutionCommand, InputError, LookupInterestChange,
+    NativeSession, OutputError, Preparation, failure,
 };
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum DataProfile {
+    #[default]
+    Legacy,
+    FabricLive,
+    FabricReliable,
+}
+
+impl DataProfile {
+    pub(super) const fn delivery_modes(self) -> &'static [wire::DataDelivery] {
+        use wire::DataDelivery::{Latest, Lossy, Ordered};
+        match self {
+            Self::FabricLive => &[Latest, Lossy],
+            Self::Legacy | Self::FabricReliable => &[Latest, Lossy, Ordered],
+        }
+    }
+
+    pub(super) fn version(self) -> Option<u32> {
+        (self != Self::Legacy).then_some(u32::from(pulsebeam_proto::data_endpoint::DATA_V1))
+    }
+}
 
 pub(crate) struct ResolvedSource<'a> {
     pub(crate) track: &'a Track,
@@ -127,8 +148,13 @@ pub(crate) struct Receiver {
 }
 
 pub(crate) enum ReceiveTransport {
-    Sctp { channel: ChannelId, lane: DataLane },
+    FabricData(Box<FabricDataReceiver>),
     Rtp(Box<ReceiverRtpConfiguration>),
+}
+
+pub(crate) struct FabricDataReceiver {
+    pub(crate) parameters: wire::SctpDataV1Parameters,
+    pub(crate) endpoint: pulsebeam_proto::data_control::SubscriberBinding,
 }
 
 pub(crate) struct ReceiverPolicy {
@@ -158,6 +184,17 @@ pub(crate) fn receiver_target(
         .parse()
         .map_err(|_| wire::FailureCode::InvalidConfiguration)?;
     let source = PublicationKey::new(kind, id);
+    if kind == TrackKind::Data
+        && !matches!(
+            subscription
+                .binding
+                .as_ref()
+                .and_then(|binding| binding.transport.as_ref()),
+            Some(wire::track_binding::Transport::SctpDataV1(_))
+        )
+    {
+        return Err(wire::FailureCode::Unsupported);
+    }
     Ok(ReceiverTarget {
         source,
         source_room: subscription.source_room.clone(),
@@ -176,6 +213,7 @@ pub(crate) fn receiver(
     source: &Track,
     track: &wire::Track,
     capabilities: Option<&wire::RtpCapabilities>,
+    data_v1_endpoint: Option<pulsebeam_proto::data_control::SubscriberBinding>,
 ) -> Result<(ReceiveTransport, ReceiverPolicy), wire::FailureCode> {
     let Some(wire::resource_spec::Declaration::Subscription(subscription)) = &spec.declaration
     else {
@@ -190,23 +228,27 @@ pub(crate) fn receiver(
     ) {
         (
             Some(wire::track::Kind::Data(data)),
-            Some(wire::track_binding::Transport::Sctp(binding)),
+            Some(wire::track_binding::Transport::SctpDataV1(parameters)),
         ) if subscription.kind == wire::TrackKind::Data as i32 => {
-            let lane = match wire::DataDelivery::try_from(data.delivery) {
-                Ok(wire::DataDelivery::Ordered) => DataLane::Ordered,
-                Ok(wire::DataDelivery::Latest) => DataLane::Latest,
-                Ok(wire::DataDelivery::Lossy) => DataLane::Lossy,
-                _ => return Err(wire::FailureCode::Incompatible),
-            };
-            let channel = ChannelId::from_value(
-                u16::try_from(
-                    binding
-                        .stream_id
-                        .ok_or(wire::FailureCode::InvalidConfiguration)?,
-                )
-                .map_err(|_| wire::FailureCode::InvalidConfiguration)?,
-            );
-            Ok(ReceiveTransport::Sctp { channel, lane })
+            use pulsebeam_proto::data_endpoint::{Delivery, Format};
+            let endpoint = data_v1_endpoint
+                .filter(|endpoint| Some(endpoint.source) == source.fabric_data_source())
+                .ok_or(wire::FailureCode::Incompatible)?;
+            if !matches!(
+                (
+                    wire::DataDelivery::try_from(data.delivery),
+                    parameters.format().map(Format::delivery)
+                ),
+                (Ok(wire::DataDelivery::Lossy), Some(Delivery::Unreliable))
+                    | (Ok(wire::DataDelivery::Latest), Some(Delivery::Latest))
+                    | (Ok(wire::DataDelivery::Ordered), Some(Delivery::Reliable))
+            ) {
+                return Err(wire::FailureCode::InvalidConfiguration);
+            }
+            Ok(ReceiveTransport::FabricData(Box::new(FabricDataReceiver {
+                parameters: *parameters,
+                endpoint,
+            })))
         }
         (
             Some(wire::track::Kind::Audio(_) | wire::track::Kind::Video(_)),
@@ -223,7 +265,7 @@ pub(crate) fn receiver(
     }?;
     let video = match &transport {
         ReceiveTransport::Rtp(rtp) => rtp.video.clone(),
-        ReceiveTransport::Sctp { .. } => None,
+        ReceiveTransport::FabricData(_) => None,
     };
     Ok((
         transport,
@@ -259,7 +301,7 @@ pub(crate) fn receiver_policy(
 pub(crate) struct DataPublication {
     pub(crate) track_id: TrackId,
     pub(crate) lane: DataLane,
-    pub(crate) channel: ChannelId,
+    pub(crate) parameters: Box<wire::SctpDataV1Parameters>,
     pub(crate) enabled: bool,
 }
 
@@ -268,6 +310,7 @@ pub(crate) struct RtpPublication {
     pub(crate) kind: TrackKind,
     pub(crate) binding: CompiledRtpBinding,
     pub(crate) format: Option<wire::CodecFormat>,
+    pub(crate) fabric_dd_video: bool,
     pub(crate) enabled: bool,
 }
 
@@ -304,23 +347,30 @@ pub(crate) fn publication(
                 Ok(wire::DataDelivery::Ordered) => DataLane::Ordered,
                 _ => return Err(wire::FailureCode::Unsupported),
             };
-            let Some(wire::track_binding::Transport::Sctp(binding)) = data
+            let parameters = match data
                 .binding
                 .as_ref()
                 .and_then(|binding| binding.transport.as_ref())
-            else {
-                return Err(wire::FailureCode::Unsupported);
+            {
+                Some(wire::track_binding::Transport::SctpDataV1(binding)) => {
+                    use pulsebeam_proto::data_endpoint::{Delivery, Format};
+                    if !matches!(
+                        (lane, binding.format().map(Format::delivery)),
+                        (DataLane::Lossy, Some(Delivery::Unreliable))
+                            | (DataLane::Latest, Some(Delivery::Latest))
+                            | (DataLane::Ordered, Some(Delivery::Reliable))
+                    ) {
+                        return Err(wire::FailureCode::InvalidConfiguration);
+                    }
+                    Box::new(*binding)
+                }
+                _ => return Err(wire::FailureCode::Unsupported),
             };
-            let channel = binding
-                .stream_id
-                .and_then(|id| u16::try_from(id).ok())
-                .map(ChannelId::from_value)
-                .ok_or(wire::FailureCode::Unsupported)?;
             Publication::Data(DataPublication {
                 track_id: TrackId::new(&declaration.track_id)
                     .map_err(|_| wire::FailureCode::InvalidConfiguration)?,
                 lane,
-                channel,
+                parameters,
                 enabled,
             })
         }
@@ -332,13 +382,25 @@ pub(crate) fn publication(
                 wire::TrackKind::Video => TrackKind::Video,
                 _ => return Err(wire::FailureCode::Unsupported),
             };
-            let format = policy::publication_declaration(spec)
-                .and_then(|(_, _, parameters)| parameters.codec.as_ref()?.format.clone());
+            let (_, _, parameters) = policy::publication_declaration(spec)
+                .ok_or(wire::FailureCode::InvalidConfiguration)?;
+            let format = parameters
+                .codec
+                .as_ref()
+                .and_then(|codec| codec.format.clone());
+            let fabric_dd_video = kind == TrackKind::Video
+                && binding.description().codec.parameters.name == "h264"
+                && (parameters.encodings.len() > 1
+                    || parameters.encodings.iter().any(|encoding| {
+                        encoding.scalability_mode.as_deref()
+                            == Some(wire::RtpScalabilityMode::L1t3.as_str())
+                    }));
             Publication::Rtp(Box::new(RtpPublication {
                 track_id,
                 kind,
                 binding,
                 format,
+                fabric_dd_video,
                 enabled,
             }))
         }

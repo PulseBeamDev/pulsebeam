@@ -9,7 +9,7 @@
 
 mod support;
 
-use pulsebeam_rtc::{Output, WriteError};
+use pulsebeam_rtc::{BoundedRtp, Output, WriteError};
 use std::time::Duration;
 use support::{PeerFixture, rtp_write};
 
@@ -53,6 +53,208 @@ fn caller_numbering_timestamps_markers_and_payload_cross_the_native_boundary() {
             .transmitted_padding_bytes,
         0
     );
+}
+
+#[test]
+fn bounded_write_refuses_oversize_without_consuming_the_index() {
+    let mut fixture = PeerFixture::connected();
+    let source = fixture.send_source(b"bounded-rtp");
+    let media = rtp_write(source, 24);
+    let now = fixture.at();
+    let mid = fixture.sender_mid.clone();
+    let before = fixture.connection.stats().connection.queued_media_bytes;
+    let limits = BoundedRtp {
+        max_wire_bytes: 12,
+        max_primary_wire_bytes: None,
+        clock: None,
+        scope: None,
+        replace_queued: false,
+    };
+    let rejected = fixture
+        .connection
+        .write_rtp_bounded(now, &mid, None, media.clone(), limits)
+        .unwrap_err();
+    assert_eq!(rejected.reason, WriteError::RtpTooLarge);
+    assert_eq!(rejected.packet, media);
+    assert_eq!(
+        fixture.connection.stats().connection.queued_media_bytes,
+        before
+    );
+    fixture
+        .connection
+        .write_rtp_bounded(
+            now,
+            &mid,
+            None,
+            rejected.packet,
+            BoundedRtp {
+                max_wire_bytes: 1_200,
+                max_primary_wire_bytes: None,
+                ..limits
+            },
+        )
+        .unwrap();
+    let (header, payload) = fixture.receive_egress();
+    assert_eq!(header.sequence_number, 24);
+    assert_eq!(payload, b"bounded-rtp");
+}
+
+#[test]
+fn admitted_cut_replaces_only_uncommitted_writes() {
+    let mut fixture = PeerFixture::connected();
+    let source = fixture.send_source(b"source-cut");
+    let now = fixture.at();
+    let mid = fixture.sender_mid.clone();
+    let policy = BoundedRtp {
+        max_wire_bytes: 1_200,
+        max_primary_wire_bytes: None,
+        clock: None,
+        scope: None,
+        replace_queued: false,
+    };
+    fixture
+        .connection
+        .write_rtp_bounded(now, &mid, None, rtp_write(source.clone(), 100), policy)
+        .unwrap();
+    assert_eq!(fixture.receive_egress().0.sequence_number, 100);
+    let now = fixture.at();
+    fixture
+        .connection
+        .write_rtp_bounded(now, &mid, None, rtp_write(source.clone(), 101), policy)
+        .unwrap();
+    fixture
+        .connection
+        .write_rtp_bounded(now, &mid, None, rtp_write(source.clone(), 102), policy)
+        .unwrap();
+    let before = fixture.connection.stats().senders[0].queued_packets;
+    assert_eq!(before, 2);
+    assert_eq!(
+        fixture
+            .connection
+            .rtp_egress_progress(&mid, None)
+            .unwrap()
+            .0,
+        Some(100)
+    );
+    let replacement = rtp_write(source, 104);
+    let rejected = fixture
+        .connection
+        .write_rtp_bounded(
+            now,
+            &mid,
+            None,
+            replacement,
+            BoundedRtp {
+                max_primary_wire_bytes: Some(12),
+                replace_queued: true,
+                ..policy
+            },
+        )
+        .unwrap_err();
+    assert_eq!(rejected.reason, WriteError::RtpTooLarge);
+    assert_eq!(fixture.connection.stats().senders[0].queued_packets, before);
+    fixture
+        .connection
+        .write_rtp_bounded(
+            now,
+            &mid,
+            None,
+            rejected.packet,
+            BoundedRtp {
+                replace_queued: true,
+                ..policy
+            },
+        )
+        .unwrap();
+    assert_eq!(fixture.connection.stats().senders[0].queued_packets, 1);
+    assert_eq!(fixture.receive_egress().0.sequence_number, 104);
+    assert_eq!(
+        fixture
+            .connection
+            .rtp_egress_progress(&mid, None)
+            .unwrap()
+            .0,
+        Some(104)
+    );
+    assert_eq!(fixture.connection.stats().senders[0].transmitted_packets, 2);
+}
+
+#[test]
+fn deferred_rejection_leaves_a_media_hole_without_breaking_transport_feedback() {
+    let mut fixture = PeerFixture::connected();
+    let source = fixture.send_source(b"handoff");
+    let mid = fixture.sender_mid.clone();
+    fixture.write_rtp(rtp_write(source.clone(), 99)).unwrap();
+    let (first, _) = fixture.receive_egress();
+    let first_twcc = first.ext_vals.transport_cc.unwrap();
+    fixture.drive_for(Duration::from_millis(100));
+    assert!(fixture.twcc_sent() > 0);
+    assert_eq!(fixture.connection.stats().connection.rtp_bytes_in_flight, 0);
+    let now = fixture.at();
+    let owner = pulsebeam_rtc::MediaScope::new(std::num::NonZeroU128::new(42).unwrap());
+    let scope = owner.with_provenance(Some(std::num::NonZeroU64::MIN));
+    fixture
+        .connection
+        .write_rtp_bounded(
+            now,
+            &mid,
+            None,
+            rtp_write(source.clone(), 100),
+            BoundedRtp {
+                max_wire_bytes: 1200,
+                max_primary_wire_bytes: None,
+                clock: None,
+                scope: Some(scope),
+                replace_queued: false,
+            },
+        )
+        .unwrap();
+    let id = (0..100)
+        .find_map(|_| match fixture.connection.poll(fixture.at()) {
+            Output::Handoff {
+                id,
+                scope: Some(actual),
+                transmit,
+            } if matches!(transmit.kind, pulsebeam_rtc::TransmitKind::Original { .. }) => {
+                assert_eq!(actual, scope);
+                Some(id)
+            }
+            Output::Handoff { id, .. } => {
+                assert!(fixture.connection.resolve_handoff(id, false));
+                None
+            }
+            Output::Closed(reason) => panic!("RTC closed: {reason:?}"),
+            _ => {
+                fixture.advance_clock_without_poll(Duration::from_millis(1));
+                None
+            }
+        })
+        .expect("protected original offered to adapter");
+    assert!(fixture.connection.handoff_pending(id));
+    assert_eq!(fixture.connection.stats().senders[0].transmitted_packets, 1);
+    fixture.connection.discard_pending_rtp_scope(owner).unwrap();
+    assert!(!fixture.connection.resolve_handoff(id, true));
+    assert_eq!(
+        fixture
+            .connection
+            .rtp_egress_progress(&mid, None)
+            .unwrap()
+            .0,
+        Some(99)
+    );
+
+    fixture
+        .connection
+        .write_rtp(fixture.at(), &mid, rtp_write(source, 102))
+        .unwrap();
+    let (next, _) = fixture.receive_egress();
+    assert_eq!(next.sequence_number, 102);
+    assert_eq!(next.ext_vals.transport_cc, Some(first_twcc.wrapping_add(1)));
+    assert_eq!(fixture.connection.stats().senders[0].transmitted_packets, 2);
+    assert!(fixture.connection.stats().connection.rtp_bytes_in_flight > 0);
+    fixture.drive_for(Duration::from_millis(100));
+    assert_eq!(fixture.connection.stats().connection.rtp_bytes_in_flight, 0);
+    assert_eq!(fixture.connection.stats().connection.unknown_feedback, 0);
 }
 
 #[test]

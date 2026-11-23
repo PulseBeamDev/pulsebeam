@@ -61,7 +61,9 @@ shapes! {
     LogicalSourceAddress {},
     SourceLookupState { 1 => ResourceSpec, 2 => Participant, 3 => Track },
     LogicalSubscriptionSpec { 1 => LogicalSourceAddress },
-    LogicalSubscriptionState { 1 => ResourceSpec, 3 => Track, 4 => TrackBinding, 5 => Failure },
+    LogicalSubscriptionState { 1 => ResourceSpec, 3 => Track, 4 => TrackBinding, 5 => Failure, 6 => DataV1ReceiverOffer },
+    DataV1ReceiverOffer { 3 => DataV1CaptureClock },
+    DataV1CaptureClock {},
     ResourceSettings { 2 => AudioReceiveOptions, 3 => VideoReceiveOptions },
     PublicationSpec { 2 => AudioPublication, 3 => VideoPublication, 4 => DataPublication },
     AudioPublication { 1 => TrackBinding },
@@ -72,8 +74,9 @@ shapes! {
     AudioReceiveOptions { 1 => PlayoutDelay },
     VideoReceiveOptions { 5 => PlayoutDelay },
     PlayoutDelay {},
-    TrackBinding { 1 => RtpParameters, 2 => SctpParameters },
+    TrackBinding { 1 => RtpParameters, 2 => SctpParameters, 3 => SctpDataV1Parameters },
     SctpParameters {},
+    SctpDataV1Parameters {},
     RtpParameters { 2 => RtpCodecParameters, 3 => RtpHeaderExtensionParameters, 4 => RtpEncodingParameters, 5 => RtcpParameters },
     RtpCodecParameters { 4 => CodecFormat },
     CodecFormat { 4 => CodecParameter },
@@ -103,8 +106,32 @@ fn message(
     }
     charge(allocation, shape.map_or(0, Shape::storage))?;
     let mut records = 0usize;
+    let mut members = 0_u8;
     while !bytes.is_empty() {
         let (field, wire) = tag(&mut bytes)?;
+        if matches!(
+            shape,
+            Some(Shape::ClientStateBatch | Shape::ServerStateBatch)
+        ) && matches!(
+            field,
+            super::DATA_PUBLISHER_FIELD | super::DATA_SUBSCRIBER_FIELD
+        ) {
+            return Err(DecodeError::Structure);
+        }
+        let member = match (shape, field, wire) {
+            (Some(Shape::TrackBinding), 1..=3, 2) | (Some(Shape::SctpDataV1Parameters), 1, 0) => 1,
+            (Some(Shape::SctpDataV1Parameters), 2, 0) => 2,
+            (Some(Shape::SctpDataV1Parameters), 3, 1) => 4,
+            (Some(Shape::SctpDataV1Parameters), 4, 0) => 8,
+            (Some(Shape::TrackBinding), 1..=3, _) | (Some(Shape::SctpDataV1Parameters), _, _) => {
+                return Err(DecodeError::Structure);
+            }
+            _ => 0,
+        };
+        if members & member != 0 {
+            return Err(DecodeError::Structure);
+        }
+        members |= member;
         if matches!(
             shape,
             Some(Shape::ClientStateBatch | Shape::ServerStateBatch)
@@ -235,6 +262,18 @@ fn take<'a>(bytes: &mut &'a [u8], len: usize) -> Result<&'a [u8], DecodeError> {
 mod tests {
     use super::*;
     use prost::Message;
+
+    #[test]
+    fn conflicting_payload_profiles_are_not_protobuf_last_wins() {
+        let mixed = [0x12, 2, 0x08, 1, 0x1a, 2, 0x08, 1];
+        let duplicate_stream = [0x1a, 4, 0x08, 1, 0x08, 2];
+        for bytes in [&mixed[..], &duplicate_stream[..]] {
+            assert_eq!(
+                message(bytes, Some(Shape::TrackBinding), 0, &mut 0),
+                Err(DecodeError::Structure)
+            );
+        }
+    }
 
     #[test]
     #[allow(clippy::expect_used)]

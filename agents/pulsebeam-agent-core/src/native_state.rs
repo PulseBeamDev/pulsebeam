@@ -767,11 +767,22 @@ impl NativeState {
             .map_err(|_| SignalingError::Encode)
     }
 
+    #[cfg(test)]
     pub(crate) fn apply(&mut self, frame: &[u8]) -> Result<Vec<Change>, SignalingError> {
         if self.terminal {
             return Ok(Vec::new());
         }
         let batch = codec::decode_server(frame).map_err(|_| SignalingError::Malformed)?;
+        self.apply_batch(batch)
+    }
+
+    pub(crate) fn apply_batch(
+        &mut self,
+        batch: wire::ServerStateBatch,
+    ) -> Result<Vec<Change>, SignalingError> {
+        if self.terminal {
+            return Ok(Vec::new());
+        }
         let mut changes = Vec::new();
         for record in batch.records {
             if self.terminal {
@@ -938,7 +949,8 @@ impl NativeState {
                 .and_then(|state| state.value.as_ref())
             {
                 let aliased = previous.source.as_ref().map(|track| &track.publication_id)
-                    != next.source.as_ref().map(|track| &track.publication_id);
+                    != next.source.as_ref().map(|track| &track.publication_id)
+                    || previous.data_v1 != next.data_v1;
                 let revived = matches!(
                     previous.execution,
                     Some(wire::logical_subscription_state::Execution::Failure(_))
@@ -968,6 +980,9 @@ impl NativeState {
                 .as_ref()
                 .and_then(|state| state.value.as_ref())
                 && (previous.participant != live.participant
+                    || previous
+                        .data_v1_source
+                        .is_some_and(|source| live.data_v1_source != Some(source))
                     || !matches!((&previous.track, &live.track), (Some(previous), Some(next)) if tracks_equal(previous, next)))
             {
                 return Err(SignalingError::Invalid("owned source identity"));
@@ -1256,6 +1271,11 @@ impl NativeState {
 
     pub(crate) fn reference(&self, resource: &Resource) -> Option<u64> {
         self.targets.get(resource)?.reference
+    }
+
+    pub(crate) fn resource_for_reference(&self, reference: u64) -> Option<&Resource> {
+        let resource = &self.owned.get(&reference)?.resource;
+        (self.reference(resource) == Some(reference)).then_some(resource)
     }
 
     pub(crate) fn confirmed(&self, resource: &Resource) -> Option<&wire::ConfirmedState> {

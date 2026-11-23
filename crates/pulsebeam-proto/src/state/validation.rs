@@ -223,10 +223,7 @@ pub fn validate_spec(spec: &ResourceSpec) -> Result {
                     validate_binding(video.binding.as_ref(), TrackKind::Video, true)
                 }
                 publication_spec::Kind::Data(data) => {
-                    if !known::<DataDelivery>(data.delivery) {
-                        return Err(ValidationError::Binding);
-                    }
-                    validate_binding(data.binding.as_ref(), TrackKind::Data, true)
+                    validate_data_binding(data.binding.as_ref(), data.delivery)
                 }
             }
         }
@@ -244,6 +241,11 @@ pub fn validate_spec(spec: &ResourceSpec) -> Result {
                 .ok_or(ValidationError::Identity)?;
             crate::catalog::validate_address(source).map_err(|_| ValidationError::Identity)?;
             let kind = TrackKind::try_from(source.kind).map_err(|_| ValidationError::Binding)?;
+            if let Some(version) = subscription.data_version
+                && (kind != TrackKind::Data || version != u32::from(crate::data_endpoint::DATA_V1))
+            {
+                return Err(ValidationError::Binding);
+            }
             validate_receive_settings(settings, kind)
         }
         resource_spec::Declaration::Subscription(subscription) => {
@@ -390,6 +392,24 @@ pub fn validate_live(live: &LiveResource) -> Result {
         .ok_or(ValidationError::Settings)?;
     let execution =
         ExecutionStatus::try_from(live.execution).map_err(|_| ValidationError::Confirmed)?;
+    let data_v1_publication = matches!(
+        &spec.declaration,
+        Some(resource_spec::Declaration::Publication(publication))
+            if matches!(
+                &publication.kind,
+                Some(publication_spec::Kind::Data(data))
+                    if matches!(data.binding.as_ref().and_then(|binding| binding.transport.as_ref()),
+                        Some(track_binding::Transport::SctpDataV1(_)))
+            )
+    );
+    if live.data_v1_source == Some(0)
+        || (live.data_v1_source.is_some() && !data_v1_publication)
+        || (execution == ExecutionStatus::Installed
+            && data_v1_publication
+            && live.data_v1_source.is_none())
+    {
+        return Err(ValidationError::Binding);
+    }
     match execution {
         ExecutionStatus::Disabled if !enabled && live.execution_failure.is_none() => Ok(()),
         ExecutionStatus::Installed if enabled && live.execution_failure.is_none() => Ok(()),
@@ -465,18 +485,42 @@ pub fn validate_logical_subscription(subscription: &LogicalSubscriptionState) ->
         if !matches_source_address(track, address) {
             return Err(ValidationError::Identity);
         }
+        let data_v1_requested = declaration.data_version.is_some();
+        if let Some(offer) = &subscription.data_v1
+            && (!data_v1_requested
+                || offer.endpoint().is_none()
+                || !matches!(&track.kind, Some(track::Kind::Data(_)))
+                || offer
+                    .capture_clock
+                    .as_ref()
+                    .is_some_and(|clock| !transport_text(&clock.id, 256)))
+        {
+            return Err(ValidationError::Binding);
+        }
         match &subscription.execution {
             Some(logical_subscription_state::Execution::Installed(binding)) => {
-                let kind =
-                    TrackKind::try_from(address.kind).map_err(|_| ValidationError::Binding)?;
-                validate_binding(Some(binding), kind, false)?;
+                if matches!(
+                    binding.transport,
+                    Some(track_binding::Transport::SctpDataV1(_))
+                ) != data_v1_requested
+                    || data_v1_requested != subscription.data_v1.is_some()
+                {
+                    return Err(ValidationError::Binding);
+                }
+                if let Some(track::Kind::Data(data)) = &track.kind {
+                    validate_data_binding(Some(binding), data.delivery)?;
+                } else {
+                    let kind =
+                        TrackKind::try_from(address.kind).map_err(|_| ValidationError::Binding)?;
+                    validate_binding(Some(binding), kind, false)?;
+                }
             }
             Some(logical_subscription_state::Execution::Failure(failure)) => {
                 validate_failure(failure)?;
             }
             None => {}
         }
-    } else if subscription.execution.is_some() {
+    } else if subscription.execution.is_some() || subscription.data_v1.is_some() {
         return Err(ValidationError::Confirmed);
     }
     Ok(())
@@ -548,10 +592,37 @@ pub fn validate_execution_report(report: &ExecutionReport) -> Result {
     }
 }
 
+fn validate_data_binding(binding: Option<&TrackBinding>, delivery: i32) -> Result {
+    use crate::data_endpoint::{Delivery, Format};
+
+    if !known::<DataDelivery>(delivery) {
+        return Err(ValidationError::Binding);
+    }
+    if let Some(track_binding::Transport::SctpDataV1(parameters)) =
+        binding.and_then(|binding| binding.transport.as_ref())
+    {
+        return match (
+            parameters.format().map(Format::delivery),
+            DataDelivery::try_from(delivery),
+        ) {
+            (Some(Delivery::Unreliable), Ok(DataDelivery::Lossy))
+            | (Some(Delivery::Latest), Ok(DataDelivery::Latest))
+            | (Some(Delivery::Reliable), Ok(DataDelivery::Ordered)) => Ok(()),
+            _ => Err(ValidationError::Binding),
+        };
+    }
+    validate_binding(binding, TrackKind::Data, false)
+}
+
 fn validate_binding(binding: Option<&TrackBinding>, kind: TrackKind, publication: bool) -> Result {
     match binding.and_then(|b| b.transport.as_ref()) {
         Some(track_binding::Transport::Sctp(sctp))
             if kind == TrackKind::Data && matches!(sctp.stream_id, Some(1..=65534)) =>
+        {
+            Ok(())
+        }
+        Some(track_binding::Transport::SctpDataV1(sctp))
+            if kind == TrackKind::Data && sctp.format().is_some() =>
         {
             Ok(())
         }
@@ -688,7 +759,7 @@ pub fn declarations_equivalent(left: &ResourceSpec, right: &ResourceSpec) -> boo
         (
             Some(Declaration::LogicalSubscription(left)),
             Some(Declaration::LogicalSubscription(right)),
-        ) => left.source == right.source,
+        ) => left == right,
         _ => false,
     }
 }
@@ -718,6 +789,7 @@ pub fn bindings_equivalent(left: Option<&TrackBinding>, right: Option<&TrackBind
         right.and_then(|v| v.transport.as_ref()),
     ) {
         (Some(Transport::Sctp(left)), Some(Transport::Sctp(right))) => left == right,
+        (Some(Transport::SctpDataV1(left)), Some(Transport::SctpDataV1(right))) => left == right,
         (Some(Transport::Rtp(left)), Some(Transport::Rtp(right))) => {
             left.mid == right.mid
                 && left.rtcp == right.rtcp

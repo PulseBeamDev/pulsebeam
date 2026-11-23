@@ -7,6 +7,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use anyhow::Context;
 use pulsebeam_agent_core::ffi as core_ffi;
 use pulsebeam_agent_native::ffi::{
     Agent, AudioSubscription, EventUpdate, NativeEvent, SnapshotUpdate, VideoSubscription,
@@ -22,8 +23,7 @@ use super::common::native::NativeHost;
 use super::common::native_audio::NativePcmLog;
 use super::common::native_video::NativeDecodedVideoLog;
 use super::common::{
-    DEFAULT_SIM_SHARDS, reserve_subnet, run_sim_or_timeout, sfu_node_builder, start_sfu_node_with,
-    subnet_ip,
+    DEFAULT_SIM_SHARDS, reserve_subnet, run_sim_or_timeout, sfu_node_builder, subnet_ip,
 };
 
 const NATIVE_RUNTIME_SEED: u64 = 1;
@@ -157,8 +157,6 @@ impl Drop for RuntimeRetirement {
 struct ExchangeReport {
     video_frames: u64,
     audio_frames: u64,
-    latest_messages: u64,
-    ordered_messages: u64,
     // Original owning values, held across later callbacks, reconnect and close.
     retained: Vec<OutputFrame>,
 }
@@ -401,144 +399,81 @@ impl MediaProbe {
     }
 }
 
-#[derive(Default)]
-struct TopicObservation {
-    route_ready: bool,
-    latest_messages: u64,
-    ordered_messages: u64,
-    ordered_sequence: Option<u64>,
-    failure: Option<String>,
+struct LatestData {
+    sender: Arc<pulsebeam_agent_native::ffi::DataPublication>,
+    receiver: Arc<pulsebeam_agent_native::ffi::DataSubscription>,
 }
 
-/// Validate messages continuously, including while the caller awaits native
-/// commands. Retain only bounded oracle state, not another event/message queue.
-struct TopicProbe {
-    state: Arc<Mutex<TopicObservation>>,
-    reader: tokio::task::JoinHandle<()>,
-}
-
-impl Drop for TopicProbe {
-    fn drop(&mut self) {
-        self.reader.abort();
+impl LatestData {
+    fn new(agent: &Agent, room: &RoomId, remote: &str) -> anyhow::Result<Self> {
+        Ok(Self {
+            sender: agent.data("latest-state".into())?.publish(Some(
+                core_ffi::DataPublishOptions {
+                    delivery: Some(core_ffi::DataDelivery::Latest),
+                    ..Default::default()
+                },
+            ))?,
+            receiver: agent
+                .room(room.as_str().into())?
+                .participant(remote.into())?
+                .data("latest-state".into())?
+                .subscribe(Some(core_ffi::DataSubscribeOptions {
+                    delivery: Some(core_ffi::DataDelivery::Latest),
+                }))?,
+        })
     }
-}
 
-impl TopicProbe {
-    fn start(
-        events: Arc<pulsebeam_agent_native::ffi::EventStream>,
-        local_name: &str,
-        latest: &core_ffi::TopicPublisher,
-        ordered: &core_ffi::TopicPublisher,
-        round: u64,
-    ) -> Self {
-        let state = Arc::new(Mutex::new(TopicObservation::default()));
-        let observed = state.clone();
-        let local_name = local_name.to_owned();
-        let latest = latest.name.clone();
-        let ordered = ordered.name.clone();
-        let reader = tokio::task::spawn_local(async move {
+    async fn exchange(
+        &self,
+        remote: &str,
+        barrier: &tokio::sync::Barrier,
+        marker: u8,
+    ) -> anyhow::Result<String> {
+        barrier.wait().await;
+        let expected = [marker];
+        let ready = async {
             loop {
-                let update = events.next().await;
-                let mut state = observed.lock().unwrap();
-                let result = (|| {
-                    match update {
-                        EventUpdate::Event {
-                            event:
-                                NativeEvent::Core {
-                                    notification:
-                                        core_ffi::Notification::Topic {
-                                            notification:
-                                                core_ffi::TopicNotification::Message { message },
-                                        },
-                                },
-                        } => match message.mode {
-                            core_ffi::TopicMode::Latest => {
-                                if message.name == latest
-                                    && message.payload == format!("latest-{round}").as_bytes()
-                                    && message.participant_id != local_name
-                                {
-                                    state.latest_messages = state.latest_messages.saturating_add(1);
-                                }
-                            }
-                            core_ffi::TopicMode::Ordered => {
-                                if message.name == ordered
-                                    && message.payload == b"route-ready"
-                                    && message.participant_id != local_name
-                                {
-                                    state.route_ready = true;
-                                } else if message.payload.starts_with(b"ordered-") {
-                                    anyhow::ensure!(message.name == ordered, "wrong ordered topic");
-                                    anyhow::ensure!(
-                                        message.participant_id != local_name,
-                                        "ordered topic looped back to sender"
-                                    );
-                                    anyhow::ensure!(
-                                        message.payload
-                                            == format!(
-                                                "ordered-{round}-{}",
-                                                state.ordered_messages
-                                            )
-                                            .as_bytes(),
-                                        "ordered topic payload arrived out of order"
-                                    );
-                                    if let Some(previous) = state.ordered_sequence {
-                                        anyhow::ensure!(
-                                            Some(message.sequence) == previous.checked_add(1),
-                                            "ordered topic sequence gap"
-                                        );
-                                    }
-                                    state.ordered_sequence = Some(message.sequence);
-                                    state.ordered_messages =
-                                        state.ordered_messages.saturating_add(1);
-                                }
-                            }
-                            core_ffi::TopicMode::Lossy => {
-                                anyhow::bail!("undeclared lossy mode delivered to native fixture")
-                            }
-                        },
-                        EventUpdate::Event {
-                            event:
-                                NativeEvent::Core {
-                                    notification:
-                                        core_ffi::Notification::Topic {
-                                            notification:
-                                                core_ffi::TopicNotification::ChannelFailed {
-                                                    name,
-                                                    message,
-                                                    ..
-                                                },
-                                        },
-                                },
-                        } => anyhow::bail!("native topic channel {name} failed: {message}"),
-                        EventUpdate::Lagged { skipped } => {
-                            anyhow::bail!("native event receiver dropped {skipped} events")
+                let update = self.receiver.next().await?;
+                match update {
+                    Some(pulsebeam_agent_core::DataEvent::Message {
+                        participant_id,
+                        publication_id,
+                        data,
+                        ..
+                    }) => {
+                        anyhow::ensure!(participant_id == remote);
+                        if data == expected {
+                            barrier.wait().await;
+                            return Ok(publication_id);
                         }
-                        EventUpdate::Closed => anyhow::bail!("native event receiver closed"),
-                        EventUpdate::Event { .. } => {}
                     }
-                    anyhow::Ok(())
-                })();
-                if let Err(error) = result {
-                    state.failure = Some(error.to_string());
-                    return;
+                    None => {
+                        anyhow::bail!("Latest cursor closed")
+                    }
+                    _ => {}
                 }
             }
-        });
-        Self { state, reader }
+        };
+        tokio::pin!(ready);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut tick = tokio::time::interval(Duration::from_millis(50));
+            loop {
+                tokio::select! {
+                    result = &mut ready => break result,
+                    _ = tick.tick() => self.sender.send(expected.to_vec(), None).await?,
+                }
+            }
+        })
+        .await?
     }
 
-    fn observation(&self) -> anyhow::Result<(bool, u64, u64)> {
-        let state = self.state.lock().unwrap();
-        anyhow::ensure!(state.failure.is_none(), "{:?}", state.failure);
-        Ok((
-            state.route_ready,
-            state.latest_messages,
-            state.ordered_messages,
-        ))
+    async fn close(&self) -> anyhow::Result<()> {
+        self.sender.close().await?;
+        self.receiver.close().await?;
+        Ok(())
     }
 }
 
-#[derive(Debug)]
 struct PeerReport {
     participant: String,
     reconnected: bool,
@@ -546,8 +481,6 @@ struct PeerReport {
     final_generation: u64,
     video_frames: u64,
     audio_frames: u64,
-    latest_messages: u64,
-    ordered_messages: u64,
 }
 
 #[derive(Clone)]
@@ -566,23 +499,25 @@ struct OwnedData {
 }
 
 impl OwnedData {
-    async fn new(agent: &Agent, remote: String) -> anyhow::Result<Self> {
-        let sender = agent.data("owned-bytes".into())?.publish(None)?;
-        Self::with_sender(agent, remote, sender)
+    fn new(agent: &Agent, room: &RoomId, remote: String) -> anyhow::Result<Self> {
+        let sender =
+            agent
+                .data("owned-bytes".into())?
+                .publish(Some(core_ffi::DataPublishOptions {
+                    delivery: Some(core_ffi::DataDelivery::Unreliable),
+                    ..Default::default()
+                }))?;
+        Self::with_sender(agent, room, remote, sender)
     }
 
     fn with_sender(
         agent: &Agent,
+        room: &RoomId,
         remote: String,
         sender: Arc<pulsebeam_agent_native::ffi::DataPublication>,
     ) -> anyhow::Result<Self> {
         let source = agent
-            .room(
-                agent
-                    .snapshot()
-                    .room_id
-                    .ok_or_else(|| anyhow::anyhow!("owned data has no admitted room"))?,
-            )?
+            .room(room.as_str().into())?
             .participant(remote.clone())?
             .data("owned-bytes".into())?;
         let room = source.subscribe(None)?;
@@ -611,7 +546,7 @@ impl OwnedData {
                 ..
             } = &event
             else {
-                anyhow::bail!("owned data cursor unexpectedly lost ordered messages");
+                anyhow::bail!("owned data cursor lagged");
             };
             anyhow::ensure!(
                 participant_id == &self.remote && !publication_id.is_empty(),
@@ -628,8 +563,7 @@ impl OwnedData {
         barrier.wait().await;
         let payload = vec![0, 255, 128, round];
         tokio::time::timeout(Duration::from_secs(5), async {
-            // Ordered receive starts at a live frontier, not retained history.
-            // Establish it with received setup traffic before sending the marker once.
+            // Both cursors must have a live DATA v1 branch before the marker.
             let setup = vec![0, 255, 128, 0];
             let ready = async {
                 let room = self.message(&self.room, &setup).await?;
@@ -690,8 +624,9 @@ fn native_agents_prove_media_topics_reconnect_and_close() {
                 pulsebeam_runtime::rand::seeded_rng(seed),
                 DEFAULT_SIM_SHARDS,
             )
+            .with_local_data_v1()
             .with_cluster(pulsebeam::cluster::Options {
-                ownership_peer: None,
+                ownership_peers: Vec::new(),
                 cluster_id: "native-reconnect".into(),
                 topology: pulsebeam::cluster::Topology::SingleNode,
                 listen: gossip,
@@ -751,8 +686,6 @@ fn native_agents_prove_media_topics_reconnect_and_close() {
         }
         assert!(report.video_frames > 0);
         assert!(report.audio_frames > 0);
-        assert!(report.latest_messages > 0);
-        assert_eq!(report.ordered_messages, 6);
     }
     // Stable semantic replay evidence, not ciphertext, timing-adaptive codec
     // bytes or an assertion of unavailable per-frame publication provenance.
@@ -766,8 +699,6 @@ fn native_agents_prove_media_topics_reconnect_and_close() {
                 "same_peer_media_readded": true,
                 "video_progress": report.video_frames > 0,
                 "pcm_progress": report.audio_frames > 0,
-                "latest_progress": report.latest_messages > 0,
-                "ordered_delivered": report.ordered_messages,
                 "owned_frames_and_close": true,
             })
         })
@@ -806,6 +737,7 @@ fn native_joined_recovery_moves_to_a_distinct_controller_attempt() {
                 let link = link.lock().unwrap().take().unwrap();
                 sfu_node_builder(ip, pulsebeam_runtime::rand::seeded_rng(node_seed), 1)
                     .with_sim_ownership_peer(peer)
+                    .with_local_data_v1()
                     .with_link_control((ip, 0).into(), link)
                     .run(tokio_util::sync::CancellationToken::new())
                     .await
@@ -987,9 +919,10 @@ async fn prove_joined_recovery(
         .data("feed".into())?
         .publish(Some(core_ffi::DataPublishOptions {
             delivery: Some(core_ffi::DataDelivery::Latest),
+            ..Default::default()
         }))?;
     agent.join(room.into())?;
-    let first = wait_connected(&agent, None).await?;
+    let first = wait_connected_when(&agent, None, |_| true).await?;
     let first_support = agent.support_report();
     let first_connection: pulsebeam_core::identity::ConnectionId = first_support
         .connection_id
@@ -997,10 +930,20 @@ async fn prove_joined_recovery(
         .ok_or_else(|| anyhow::anyhow!("admitted publisher has no support key"))?
         .parse()?;
     anyhow::ensure!(viewer_connection != first_connection);
-    let initial_id = first.topics.publishers[0]
-        .publication_id
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("initial publication not admitted"))?;
+    use anyhow::Context as _;
+    let initial_id = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let state = feed_updates
+                .next()
+                .await?
+                .context("feed closed before initial installation")?;
+            if state.execution == core_ffi::PublicationExecution::Installed {
+                return state.source_track_id.context("initial DATA source missing");
+            }
+        }
+    })
+    .await
+    .context("initial DATA receiver not installed")??;
     let receive_payload = |expected, expected_id| {
         let publisher = &publisher;
         let feed = &feed;
@@ -1029,10 +972,10 @@ async fn prove_joined_recovery(
             ))?
         }
     };
-    receive_payload(b"before".as_slice(), initial_id).await?;
+    receive_payload(b"before".as_slice(), initial_id.as_str()).await?;
     issuer.deliver_receipt_facts(unix_now() + 20);
     runtime.reconnect().await?;
-    let recovered = wait_connected(&agent, first.generation).await?;
+    let recovered = wait_connected_when(&agent, first.generation, |_| true).await?;
     let recovered_support = agent.support_report();
     let recovered_connection: pulsebeam_core::identity::ConnectionId = recovered_support
         .connection_id
@@ -1044,9 +987,6 @@ async fn prove_joined_recovery(
     );
     anyhow::ensure!(
         recovered.participant_id == first.participant_id && recovered.room_id == first.room_id
-    );
-    anyhow::ensure!(
-        recovered.topics.publishers[0].publication_id != first.topics.publishers[0].publication_id
     );
     {
         let evidence = evidence.lock().unwrap();
@@ -1080,62 +1020,15 @@ async fn prove_joined_recovery(
         issuer.local_claim_count().await? == 1 && receiver.local_claim_count().await? == 1
     );
     let [ingress, egress] = link_recovery_peers(&issuer_link, &receiver_link).await?;
-    let recovered_id = recovered.topics.publishers[0]
-        .publication_id
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("replacement publication not admitted"))?;
-    let replacement = pulsebeam_core::identity::PublicationKey::Data(recovered_id.parse()?);
-    let attach_relay = || {
-        let issuer_link = &issuer_link;
-        let receiver_link = &receiver_link;
-        let feed = &feed;
-        async move {
-            let addresses = tokio::time::timeout(Duration::from_secs(4), async {
-                loop {
-                    let destinations = issuer_link
-                        .destinations(same_project, replacement)
-                        .await
-                        .map_err(relay_error)?;
-                    if !destinations.is_empty() {
-                        anyhow::ensure!(
-                            destinations
-                                .iter()
-                                .all(|route| route.kind == pulsebeam::link::ReceiveKind::Forward)
-                        );
-                        return anyhow::Ok(
-                            destinations
-                                .into_iter()
-                                .map(|route| route.address)
-                                .collect(),
-                        );
-                    }
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-            })
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "replacement ingress route was not installed; subscription: {:?}",
-                    feed.state()
-                )
-            })??;
-            let route = issuer_link
-                .bind_receive(ingress, addresses)
-                .await
-                .map_err(|error| anyhow::anyhow!("bind relay receive: {error:?}"))?;
-            let binding = receiver_link
-                .bind_send(same_project, replacement, egress, route.address)
-                .await
-                .map_err(|error| anyhow::anyhow!("bind relay send: {error:?}"))?;
-            Ok::<_, anyhow::Error>((route.address, binding))
-        }
-    };
     let until = pulsebeam_runtime::time::Instant::now() + Duration::from_secs(4);
-    receiver.deliver_linked_snapshot(ingress, until).await?;
-    let (first_address, first_send) = attach_relay().await?;
-    receive_payload(b"after".as_slice(), recovered_id).await?;
+    let (replacement, first_label) = receiver
+        .relay_fabric_data(egress, ingress, recovered_connection, until)
+        .await?;
+    let recovered_id = replacement.as_str();
+    anyhow::ensure!(recovered_id != initial_id);
+    receive_payload(b"after".as_slice(), recovered_id.as_str()).await?;
     let bound = feed.state();
-    anyhow::ensure!(bound.source_track_id.as_deref() == Some(recovered_id));
+    anyhow::ensure!(bound.source_track_id.as_deref() == Some(recovered_id.as_str()));
 
     tokio::time::timeout_at(until + Duration::from_secs(2), async {
         loop {
@@ -1167,19 +1060,16 @@ async fn prove_joined_recovery(
         matches!(withdrawn, Err(pulsebeam_link::BindError::Closed)),
         "expired publication is still visible to Link: {withdrawn:?}"
     );
-    receiver_link
-        .request_unbind_send(first_send)
-        .map_err(|error| anyhow::anyhow!("unbind expired relay send: {error:?}"))?;
-
-    receiver
-        .deliver_linked_snapshot(
+    let (refreshed, new_label) = receiver
+        .relay_fabric_data(
+            egress,
             ingress,
+            recovered_connection,
             pulsebeam_runtime::time::Instant::now() + Duration::from_secs(10),
         )
         .await?;
-    let (new_address, _) = attach_relay().await?;
-    anyhow::ensure!(first_address != new_address);
-    receive_payload(b"refreshed".as_slice(), recovered_id).await?;
+    anyhow::ensure!(refreshed == replacement && first_label != new_label);
+    receive_payload(b"refreshed".as_slice(), recovered_id.as_str()).await?;
     anyhow::ensure!(feed.state().accepted_revision == bound.accepted_revision);
     anyhow::ensure!(viewer.snapshot().generation == viewer_generation && !feed.is_closed());
     anyhow::ensure!(viewer.support_report() == viewer_support);
@@ -1232,7 +1122,11 @@ async fn link_recovery_peers(
     issuer: &pulsebeam::link::Control,
     receiver: &pulsebeam::link::Control,
 ) -> anyhow::Result<[pulsebeam_link::NetworkId; 2]> {
-    use pulsebeam_link::{NetworkClass, NetworkPeer, PeerRole, SecretCredential};
+    use pulsebeam_link::{FabricPath, NetworkClass, NetworkPeer, PeerRole, SecretCredential};
+    let path = FabricPath {
+        udp_payload_limit: 1200,
+        additional_overhead: 0,
+    };
     let left = SecretCredential::generate().map_err(relay_error)?;
     let right = SecretCredential::generate().map_err(relay_error)?;
     let left_fingerprint = left.fingerprint();
@@ -1240,13 +1134,16 @@ async fn link_recovery_peers(
     let local = issuer.health().await.map_err(relay_error)?.local_addr;
     let remote = receiver.health().await.map_err(relay_error)?.local_addr;
     let egress = receiver
-        .open_peer(NetworkPeer {
-            endpoint: local,
-            credential: right,
-            expected_peer: left_fingerprint,
-            role: PeerRole::Responder,
-            class: NetworkClass::Lan,
-        })
+        .open_peer(
+            NetworkPeer {
+                endpoint: local,
+                credential: right,
+                expected_peer: left_fingerprint,
+                role: PeerRole::Responder,
+                class: NetworkClass::Lan,
+            }
+            .with_fabric_path(path),
+        )
         .await
         .map_err(relay_error)?;
     let installed = receiver.health().await.map_err(relay_error)?;
@@ -1258,13 +1155,16 @@ async fn link_recovery_peers(
         "relay responder was not installed"
     );
     let ingress = issuer
-        .open_peer(NetworkPeer {
-            endpoint: remote,
-            credential: left,
-            expected_peer: right_fingerprint,
-            role: PeerRole::Initiator,
-            class: NetworkClass::Lan,
-        })
+        .open_peer(
+            NetworkPeer {
+                endpoint: remote,
+                credential: left,
+                expected_peer: right_fingerprint,
+                role: PeerRole::Initiator,
+                class: NetworkClass::Lan,
+            }
+            .with_fabric_path(path),
+        )
         .await
         .map_err(relay_error)?;
     tokio::time::timeout(Duration::from_secs(4), async {
@@ -1310,12 +1210,13 @@ fn native_roomless_reception_survives_join_and_leave() {
     let server_ip = subnet_ip(subnet, 1);
     let client_ip = subnet_ip(subnet, 2);
     sim.host(server_ip, move || async move {
-        start_sfu_node_with(
+        sfu_node_builder(
             server_ip,
             pulsebeam_runtime::rand::seeded_rng(seed),
             DEFAULT_SIM_SHARDS,
-            false,
         )
+        .with_local_data_v1()
+        .run(tokio_util::sync::CancellationToken::new())
         .await
         .map_err(Into::into)
     });
@@ -1410,15 +1311,40 @@ async fn roomless_presence_scenario(client_ip: IpAddr, server_ip: IpAddr) -> any
     let replacement_generation = replacement_viewer.snapshot().generation;
     anyhow::ensure!(replacement_generation.is_some());
 
-    let sender = publisher.data("events".into())?.publish(None)?;
+    let sender = publisher
+        .data("events".into())?
+        .publish(Some(core_ffi::DataPublishOptions {
+            delivery: Some(core_ffi::DataDelivery::Latest),
+            ..Default::default()
+        }))?;
     publisher.join("stage".into())?;
-    wait_connected(&publisher, None).await?;
+    let sender_updates = sender.updates()?;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let state = sender_updates
+                .next()
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("DATA v1 publisher observation closed"))?;
+            anyhow::ensure!(
+                state.error.is_none() && state.execution_error.is_none(),
+                "DATA v1 publisher failed: {state:?}"
+            );
+            if state.admission == Admission::Admitted
+                && state.execution == core_ffi::PublicationExecution::Installed
+            {
+                return anyhow::Ok(());
+            }
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("DATA v1 publisher installation timed out"))??;
 
     let replacement_topic = publisher.data("replacement".into())?;
     let mut first_source = None;
     for value in [b"original", b"replaced"] {
         let source = replacement_topic.publish(Some(core_ffi::DataPublishOptions {
             delivery: Some(core_ffi::DataDelivery::Unreliable),
+            ..Default::default()
         }))?;
         let id = await_source(true)
             .await?
@@ -1481,7 +1407,7 @@ async fn roomless_presence_scenario(client_ip: IpAddr, server_ip: IpAddr) -> any
                 "old presence remained visible"
             );
         }
-        let active = wait_connected(&viewer, previous).await?;
+        let active = wait_connected_when(&viewer, previous, |_| true).await?;
         anyhow::ensure!(active.room_id.as_deref() == room);
         previous = active.generation;
         match room {
@@ -1664,34 +1590,8 @@ async fn run_peer(
             && !pending_video.forwarding_requested,
         "detached publication claimed admission or forwarding before join"
     );
-    let latest = core_ffi::TopicPublisher {
-        name: "latest-state".into(),
-        mode: core_ffi::TopicMode::Latest,
-    };
-    let ordered = core_ffi::TopicPublisher {
-        name: "ordered-events".into(),
-        mode: core_ffi::TopicMode::Ordered,
-    };
-    let desired = core_ffi::DesiredState {
-        connected: true,
-        topic_publishers: vec![latest.clone(), ordered.clone()],
-        topic_subscribers: vec![
-            core_ffi::TopicSubscriber {
-                room: room.as_str().to_owned(),
-                participant_id: remote.to_owned(),
-                name: latest.name.clone(),
-                mode: latest.mode,
-            },
-            core_ffi::TopicSubscriber {
-                room: room.as_str().to_owned(),
-                participant_id: remote.to_owned(),
-                name: ordered.name.clone(),
-                mode: ordered.mode,
-            },
-        ],
-        ..Default::default()
-    };
-    replace_transport_desired(&runtime, desired.clone()).await?;
+    let latest_data = LatestData::new(&agent, &room, remote)?;
+    let owned_data = OwnedData::new(&agent, &room, remote.to_owned())?;
     runtime.join(room.as_str().to_owned())?;
 
     let connected = wait_connected(&agent, None).await?;
@@ -1788,8 +1688,12 @@ async fn run_peer(
         MediaProbe::start(remote_video.clone(), generation, core_ffi::MediaKind::Video);
     let mut audio_probe =
         MediaProbe::start(remote_audio.clone(), generation, core_ffi::MediaKind::Audio);
-    let events = TopicProbe::start(agent.events(), name, &latest, &ordered, 1);
-    prime_ordered_topic(&runtime, &agent, &ordered, &events, &barriers.before_media).await?;
+    // The two Lossy cursors share one subscription stream.
+    native_payload_channels(&runtime, first_generation, 4, None).await?;
+    let old_latest = latest_data
+        .exchange(remote, &barriers.before_media, 1)
+        .await?;
+    owned_data.exchange(&barriers.before_media, 1).await?;
 
     let accepted = agent.snapshot();
     let errors = agent.events();
@@ -1844,42 +1748,18 @@ async fn run_peer(
     let first = exchange(
         &barriers.before_reconnect,
         &agent,
-        &runtime,
         &video,
         &audio,
         &video_probe,
         &audio_probe,
-        &events,
-        &latest,
-        &ordered,
-        &desired,
         1,
         &mut frame_cursor,
     )
     .await?;
-    drop(events);
     let (original_payloads, closed_before) =
         native_payload_channels(&runtime, first_generation, 4, None).await?;
-    // Either peer withdrawing Latest can invalidate the other peer's baseline.
     barriers.before_reconnect.wait().await;
-    let old_latest = agent
-        .snapshot()
-        .topics
-        .publishers
-        .into_iter()
-        .find(|publisher| publisher.publisher == latest)
-        .and_then(|publisher| publisher.publication_id)
-        .ok_or_else(|| anyhow::anyhow!("latest source was not installed"))?;
-    let mut reduced = desired.clone();
-    reduced
-        .topic_publishers
-        .retain(|publisher| publisher == &ordered);
-    reduced
-        .topic_subscribers
-        .retain(|subscriber| subscriber.name == ordered.name);
-    replace_transport_desired(&runtime, reduced).await?;
-    // Channel rows disappear before signaling observes kClosed. Only the
-    // withdrawn pair may close in this phase; wait for their terminal counter.
+    latest_data.close().await?;
     let closed_after = closed_before
         .checked_add(2)
         .ok_or_else(|| anyhow::anyhow!("native closed-channel counter overflow"))?;
@@ -1892,21 +1772,16 @@ async fn run_peer(
         );
     }
     barriers.before_reconnect.wait().await;
-    replace_transport_desired(&runtime, desired.clone()).await?;
-    let rebound = wait_connected(&agent, None).await?;
-    let new_latest = rebound
-        .topics
-        .publishers
-        .iter()
-        .find(|publisher| publisher.publisher == latest)
-        .and_then(|publisher| publisher.publication_id.as_ref())
-        .ok_or_else(|| anyhow::anyhow!("latest replacement was not installed"))?;
-    anyhow::ensure!(
-        new_latest != &old_latest,
-        "retired latest source identity was revived"
-    );
+    let latest_data = LatestData::new(&agent, &room, remote)?;
     let (reused, _) =
         native_payload_channels(&runtime, first_generation, 4, Some(closed_after)).await?;
+    let new_latest = latest_data
+        .exchange(remote, &barriers.before_reconnect, 2)
+        .await?;
+    anyhow::ensure!(
+        new_latest != old_latest,
+        "retired Latest source identity was revived"
+    );
     anyhow::ensure!(
         original_payloads.keys().eq(reused.keys()),
         "payload stream IDs grew instead of being reused"
@@ -1925,7 +1800,9 @@ async fn run_peer(
         }
     }
     anyhow::ensure!(
-        rebound.generation == Some(first_generation) && created.get() == 1 && retired.get() == 0,
+        agent.snapshot().generation == Some(first_generation)
+            && created.get() == 1
+            && retired.get() == 0,
         "payload reuse replaced the native peer"
     );
     audio_subscription
@@ -2052,34 +1929,18 @@ async fn run_peer(
         first_generation,
         core_ffi::MediaKind::Audio,
     );
-    let events = TopicProbe::start(agent.events(), name, &latest, &ordered, 2);
-    prime_ordered_topic(
-        &runtime,
-        &agent,
-        &ordered,
-        &events,
-        &barriers.before_reconnect,
-    )
-    .await?;
     let same_peer = exchange(
         &barriers.before_reconnect,
         &agent,
-        &runtime,
         &video,
         &audio,
         &video_probe,
         &audio_probe,
-        &events,
-        &latest,
-        &ordered,
-        &desired,
         2,
         &mut frame_cursor,
     )
     .await?;
-    drop(events);
-    let owned_data = OwnedData::new(&agent, remote.to_owned()).await?;
-    owned_data.exchange(&barriers.before_reconnect, 1).await?;
+    owned_data.exchange(&barriers.before_reconnect, 2).await?;
     let same_peer_expected = same_peer.retained.clone();
     anyhow::ensure!(
         agent.snapshot().generation == Some(first_generation)
@@ -2237,15 +2098,18 @@ async fn run_peer(
         core_ffi::MediaKind::Audio,
     );
     barriers.after_reconnect.wait().await;
-    let events = TopicProbe::start(agent.events(), name, &latest, &ordered, 3);
-    prime_ordered_topic(
-        &runtime,
-        &agent,
-        &ordered,
-        &events,
-        &barriers.after_reconnect,
-    )
-    .await?;
+    native_payload_channels(&runtime, final_generation, 4, None)
+        .await
+        .with_context(|| {
+            format!(
+                "{name} replacement payload lanes; owned-bytes subscriber: {:?}; publisher: {:?}",
+                owned_data.participant.state(),
+                owned_data.sender.state(),
+            )
+        })?;
+    latest_data
+        .exchange(remote, &barriers.after_reconnect, 3)
+        .await?;
 
     anyhow::ensure!(
         first.retained == first_expected,
@@ -2254,25 +2118,20 @@ async fn run_peer(
     let second = exchange(
         &barriers.before_close,
         &agent,
-        &runtime,
         &video,
         &audio,
         &video_probe,
         &audio_probe,
-        &events,
-        &latest,
-        &ordered,
-        &desired,
         3,
         &mut frame_cursor,
     )
     .await?;
-    drop(events);
     let owned_data = if reconnect {
         owned_data.exchange(&barriers.before_close, 2).await?;
         owned_data
     } else {
-        let replacement = OwnedData::with_sender(&agent, remote.into(), owned_data.sender.clone())?;
+        let replacement =
+            OwnedData::with_sender(&agent, &room, remote.into(), owned_data.sender.clone())?;
         replacement.exchange(&barriers.before_close, 2).await?;
         for retired in [&owned_data.room, &owned_data.participant] {
             tokio::time::timeout(Duration::from_secs(3), async {
@@ -2400,14 +2259,6 @@ async fn run_peer(
             .audio_frames
             .saturating_add(same_peer.audio_frames)
             .saturating_add(second.audio_frames),
-        latest_messages: first
-            .latest_messages
-            .saturating_add(same_peer.latest_messages)
-            .saturating_add(second.latest_messages),
-        ordered_messages: first
-            .ordered_messages
-            .saturating_add(same_peer.ordered_messages)
-            .saturating_add(second.ordered_messages),
     })
 }
 
@@ -2663,6 +2514,7 @@ async fn native_payload_channels(
     closed_at_least: Option<u64>,
 ) -> anyhow::Result<(BTreeMap<u16, String>, u64)> {
     let mut statistics = runtime.statistics();
+    let mut last = None;
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let current = statistics.borrow_and_update().clone();
@@ -2705,12 +2557,13 @@ async fn native_payload_channels(
                 {
                     return Ok((channels, closed));
                 }
+                last = Some((channels, closed));
             }
             statistics.changed().await?;
         }
     })
     .await
-    .map_err(|_| anyhow::anyhow!("native payload channel count did not reach {count}"))?
+    .map_err(|_| anyhow::anyhow!("native payload channel count did not reach {count} in generation {generation}; last open SID/label map and closed count: {last:?}"))?
 }
 
 async fn wait_publication_admitted(
@@ -2742,6 +2595,14 @@ async fn wait_connected(
     agent: &Agent,
     previous: Option<u64>,
 ) -> anyhow::Result<core_ffi::Snapshot> {
+    wait_connected_when(agent, previous, |_| true).await
+}
+
+async fn wait_connected_when(
+    agent: &Agent,
+    previous: Option<u64>,
+    ready: impl Fn(&core_ffi::Snapshot) -> bool,
+) -> anyhow::Result<core_ffi::Snapshot> {
     let snapshots = agent.snapshots();
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
@@ -2751,19 +2612,9 @@ async fn wait_connected(
             let generation_ready = snapshot
                 .generation
                 .is_some_and(|generation| Some(generation) != previous);
-            let topics_ready = snapshot
-                .topics
-                .publishers
-                .iter()
-                .all(|publisher| publisher.connected && publisher.publication_id.is_some())
-                && snapshot
-                    .topics
-                    .subscribers
-                    .iter()
-                    .all(|subscriber| subscriber.connected);
             if snapshot.connection == core_ffi::ConnectionState::Connected
                 && generation_ready
-                && topics_ready
+                && ready(&snapshot)
             {
                 return Ok(snapshot);
             }
@@ -2771,31 +2622,6 @@ async fn wait_connected(
     })
     .await
     .map_err(|_| anyhow::anyhow!("native agent did not connect"))?
-}
-
-async fn wait_ordered_admitted(
-    agent: &Agent,
-    publisher: &core_ffi::TopicPublisher,
-    previous: u64,
-) -> anyhow::Result<()> {
-    let snapshots = agent.snapshots();
-    tokio::time::timeout(Duration::from_secs(20), async {
-        loop {
-            let SnapshotUpdate::Snapshot { snapshot } = snapshots.next().await else {
-                anyhow::bail!("native snapshot stream closed")
-            };
-            if snapshot
-                .topics
-                .publishers
-                .iter()
-                .any(|state| state.publisher == *publisher && state.next_sequence > previous)
-            {
-                return Ok(());
-            }
-        }
-    })
-    .await
-    .map_err(|_| anyhow::anyhow!("native ordered topic send was not admitted"))?
 }
 
 async fn wait_media_absent(
@@ -2874,93 +2700,6 @@ async fn wait_media_bindings(
 }
 
 // Raw transport churn is a controlled-host fixture, not a generated SDK policy path.
-async fn replace_transport_desired(
-    runtime: &RuntimeAgent,
-    state: core_ffi::DesiredState,
-) -> anyhow::Result<()> {
-    let revision = runtime
-        .snapshot()
-        .desired_revision
-        .checked_add(1)
-        .ok_or_else(|| anyhow::anyhow!("transport fixture revision overflow"))?;
-    let desired = state
-        .into_core(revision)
-        .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-    runtime.replace_desired(desired).await?;
-    Ok(())
-}
-
-async fn send_transport_topic(
-    runtime: &RuntimeAgent,
-    publisher: core_ffi::TopicPublisher,
-    payload: Vec<u8>,
-) -> anyhow::Result<()> {
-    runtime
-        .send_topic(pulsebeam_agent_core::TopicSend {
-            publisher: publisher.into(),
-            payload,
-        })
-        .await?;
-    Ok(())
-}
-
-async fn prime_ordered_topic(
-    runtime: &RuntimeAgent,
-    agent: &Agent,
-    publisher: &core_ffi::TopicPublisher,
-    events: &TopicProbe,
-    barrier: &tokio::sync::Barrier,
-) -> anyhow::Result<()> {
-    // Setup traffic must not evict its own history while waiting for the live
-    // cursor. Still require a real peer message, not admission or elapsed time.
-    let mut tick = tokio::time::interval(Duration::from_millis(200));
-    let synchronized = barrier.wait();
-    tokio::pin!(synchronized);
-    // Ordered subscriptions start at a live frontier. Catalog presence and local
-    // send admission do not establish that the peer's live cursor is ready.
-    let result = tokio::time::timeout(Duration::from_secs(20), async {
-        loop {
-            let (received, _, _) = events.observation()?;
-            tokio::select! {
-                _ = &mut synchronized, if received => return Ok(()),
-                _ = tick.tick() => {
-                    send_transport_topic(runtime, publisher.clone(), b"route-ready".to_vec()).await?;
-                }
-            }
-        }
-    })
-    .await;
-    match result {
-        Ok(result) => result,
-        Err(_) => {
-            let counters = agent
-                .statistics()
-                .and_then(|statistics| {
-                    serde_json::from_slice::<serde_json::Value>(&statistics.report_json).ok()
-                })
-                .map(|report| {
-                    if let Some(entries) = report.as_array() {
-                        serde_json::Value::Array(
-                            entries
-                                .iter()
-                                .filter(|entry| entry["type"] == "data-channel")
-                                .cloned()
-                                .collect(),
-                        )
-                    } else {
-                        report
-                    }
-                });
-            anyhow::bail!(
-                "native ordered peer message did not establish readiness: observed={:?}, snapshot={:?}, native_channels={counters}",
-                events.observation(),
-                agent.snapshots().next().await,
-                counters = counters.unwrap_or(serde_json::Value::Null),
-            )
-        }
-    }
-}
-
 async fn wait_remote_media(
     agent: &Agent,
     video_subscription: &VideoSubscription,
@@ -3034,75 +2773,20 @@ fn video_frame_for(
 async fn exchange(
     completion: &tokio::sync::Barrier,
     agent: &Agent,
-    runtime: &RuntimeAgent,
     video: &pulsebeam_agent_native::ffi::VideoSource,
     audio: &pulsebeam_agent_native::ffi::AudioSource,
     video_probe: &MediaProbe,
     audio_probe: &MediaProbe,
-    events: &TopicProbe,
-    latest: &core_ffi::TopicPublisher,
-    ordered: &core_ffi::TopicPublisher,
-    desired: &core_ffi::DesiredState,
     round: u64,
     frame_number: &mut u64,
 ) -> anyhow::Result<ExchangeReport> {
-    send_transport_topic(
-        runtime,
-        latest.clone(),
-        format!("latest-{round}-old").into_bytes(),
-    )
-    .await?;
-    send_transport_topic(
-        runtime,
-        latest.clone(),
-        format!("latest-{round}").into_bytes(),
-    )
-    .await?;
-    let snapshot = agent.snapshots().next().await;
-    let SnapshotUpdate::Snapshot { snapshot } = snapshot else {
-        anyhow::bail!("native snapshot stream closed")
-    };
-    let next_sequence = snapshot
-        .topics
-        .publishers
-        .iter()
-        .find(|state| state.publisher == *ordered)
-        .map(|state| state.next_sequence)
-        .ok_or_else(|| anyhow::anyhow!("native ordered topic publisher is not connected"))?;
-    send_transport_topic(
-        runtime,
-        ordered.clone(),
-        format!("ordered-{round}-0").into_bytes(),
-    )
-    .await?;
-    wait_ordered_admitted(agent, ordered, next_sequence).await?;
-    if round == 1 {
-        // The actor processes these commands separately; this exercises real
-        // registration churn between ordered sends, not a same-turn batch.
-        let mut without_latest = desired.clone();
-        without_latest
-            .topic_subscribers
-            .retain(|subscriber| subscriber.name != latest.name);
-        replace_transport_desired(runtime, without_latest).await?;
-        replace_transport_desired(runtime, desired.clone()).await?;
-        events.state.lock().unwrap().latest_messages = 0;
-    }
-    send_transport_topic(
-        runtime,
-        ordered.clone(),
-        format!("ordered-{round}-1").into_bytes(),
-    )
-    .await?;
-    wait_ordered_admitted(agent, ordered, next_sequence.saturating_add(1)).await?;
-
-    let generation = snapshot
+    let generation = agent
+        .snapshot()
         .generation
         .ok_or_else(|| anyhow::anyhow!("exchange without generation"))?;
     video_probe.begin_window()?;
     audio_probe.begin_window()?;
     let mut video_ready = false;
-    let mut latest_messages = 0u64;
-    let mut ordered_messages = 0u64;
     let mut tick = tokio::time::interval(Duration::from_millis(20));
     let mut audio_ready = false;
     let started = Instant::now();
@@ -3138,11 +2822,10 @@ async fn exchange(
 
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
-            (_, latest_messages, ordered_messages) = events.observation()?;
             if proof.is_none() {
                 video_ready = video_probe.ready(generation)?;
                 audio_ready = audio_probe.ready(generation)?;
-                if video_ready && audio_ready && latest_messages > 0 && ordered_messages >= 2 {
+                if video_ready && audio_ready {
                     // Finish at the actual fresh observation, not after waiting
                     // for the peer. Keep sourcing until both proofs are finished.
                     let (video_frames, retained_video) = video_probe.finish_window(generation)?;
@@ -3150,8 +2833,6 @@ async fn exchange(
                     proof = Some(ExchangeReport {
                         video_frames,
                         audio_frames,
-                        latest_messages,
-                        ordered_messages,
                         retained: vec![retained_video, retained_audio],
                     });
                 }
@@ -3159,9 +2840,6 @@ async fn exchange(
             tokio::select! {
                 _ = &mut completed, if proof.is_some() => break,
                 _ = tick.tick() => {
-                    // Keep the peer's latest state and media live until both
-                    // receivers have completed, not only this receiver.
-                    send_transport_topic(runtime, latest.clone(), format!("latest-{round}").into_bytes()).await?;
                     if !video_diagnosed && started.elapsed() >= Duration::from_secs(1) {
                         let observed = video_probe.state.lock().unwrap();
                         let error = observed.video.require(&observed.video_baseline, generation, (320, 180), 2, Instant::now()).err();
@@ -3201,7 +2879,7 @@ async fn exchange(
                 frames = observed.blocks, submitted = *frame_number, ?native_rtp,
                 native_video = ?observed.video, "native media boundary at final timeout");
             anyhow::anyhow!(
-                "native media/topic exchange {round} timed out: participant={:?} video_ready={video_ready} audio_ready={audio_ready} latest={latest_messages} ordered={ordered_messages} video_oracle={video_error:?}",
+                "native media exchange {round} timed out: participant={:?} video_ready={video_ready} audio_ready={audio_ready} video_oracle={video_error:?}",
                 agent.snapshot().participant_id,
             )
     })??;

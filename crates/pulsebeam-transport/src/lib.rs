@@ -8,6 +8,8 @@ mod backend;
 #[cfg(feature = "datagram")]
 mod datagram;
 #[cfg(feature = "datagram")]
+mod fabric_negotiation;
+#[cfg(feature = "datagram")]
 mod quic;
 #[cfg(feature = "datagram")]
 mod service;
@@ -19,10 +21,14 @@ pub use datagram::*;
 pub use quic::{QuicCongestion, QuicCredential, QuicPeer, QuicStats, QuicTuning};
 #[cfg(feature = "datagram")]
 pub use service::{Application, Datagram, Error, Health, SendOutcome, Staging, Transport};
+#[cfg(feature = "datagram")]
+pub use wire::{CONTROL_CONTEXT, CONTROL_FRAME_BYTES};
 #[cfg(feature = "dtls-srtp")]
 pub mod dtls_srtp;
 #[cfg(all(feature = "datagram", feature = "test-utils"))]
 pub mod experiment;
+#[cfg(any(feature = "datagram", feature = "dtls-srtp"))]
+pub mod fabric_wan;
 
 #[cfg(all(test, feature = "datagram"))]
 mod tests;

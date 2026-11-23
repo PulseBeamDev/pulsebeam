@@ -7,6 +7,8 @@ use str0m::rtp_::{SrtpContext, extend_u16};
 
 use super::packet::RtpPacket;
 
+pub mod wan;
+
 const MAX_RTP_EXTENSION_BYTES: usize = 16 * 1024;
 const SRTCP_INDEX_MASK: u64 = 0x7fff_ffff;
 const MAX_SRTP_INDEX: u64 = 1 << 48;

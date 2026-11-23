@@ -296,6 +296,23 @@ impl Receiver {
         })
     }
 
+    /// Visit retained receipts in an issued report range in a single pass.
+    pub fn report_receipts(&self, report: ReportWindow) -> impl Iterator<Item = &Receipt> {
+        self.receipts
+            .iter()
+            .map(|entry| &entry.receipt)
+            .filter(move |receipt| {
+                report.epoch == self.epoch
+                    && report.version == self.version
+                    && receipt.space == report.space
+                    && receipt
+                        .packet
+                        .0
+                        .checked_sub(report.base.0)
+                        .is_some_and(|offset| offset < report.count as u64)
+            })
+    }
+
     /// The first retained receipt at or beyond the window base, even if beyond
     /// its bounded end. Callers can anchor loss-only windows without inventing a source.
     pub fn first_receipt(&self, report: ReportWindow) -> Option<&Receipt> {

@@ -5,7 +5,7 @@ use crate::route::NodeRouteAddress;
 use pulsebeam_link::{BindError, BindingId, LinkError, NetworkId, NodeRouteKey, PeerConfig};
 use pulsebeam_runtime::sync::oneshot;
 
-use super::{BindReceive, BindReverse, BindSend, OpenPeer, ReceiveRoute, UnbindSend};
+use super::{BindReceive, BindReverse, OpenPeer, ReceiveRoute, UnbindSend};
 
 /// A trusted embedding capability for Link provisioning, not tenant signaling.
 /// It cannot create participants, authorize sources, or discover peer identities.
@@ -64,7 +64,7 @@ impl Control {
         result.await.map_err(|_| BindError::Closed)?
     }
 
-    /// Binds only routes whose existing shard installations have been acknowledged.
+    /// Binds acknowledged reverse routes on a reverse-control peer.
     pub async fn bind_receive(
         &self,
         peer: NetworkId,
@@ -74,24 +74,6 @@ impl Control {
         self.submit_binding(ControllerCommand::BindLinkReceive(BindReceive {
             peer,
             destinations,
-            reply,
-        }))?;
-        result.await.map_err(|_| BindError::Closed)?
-    }
-
-    pub async fn bind_send(
-        &self,
-        room: ProjectRoomKey,
-        track: PublicationKey,
-        peer: NetworkId,
-        address: NodeRouteKey,
-    ) -> Result<BindingId, BindError> {
-        let (reply, result) = oneshot::channel();
-        self.submit_binding(ControllerCommand::BindLinkSend(BindSend {
-            room,
-            track,
-            peer,
-            address,
             reply,
         }))?;
         result.await.map_err(|_| BindError::Closed)?

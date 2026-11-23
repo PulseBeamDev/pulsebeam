@@ -22,8 +22,8 @@ use crate::{
     scheduler::SenderScheduler,
     time::ProtocolClock,
     transport::{
-        DatagramKind, PreparedRtpIdentity, PreparedTransmit, RtpAdmission, RtpService, Transport,
-        TransportError,
+        DatagramKind, PathEpoch, PreparedRtpIdentity, PreparedTransmit, RtpAdmission, RtpService,
+        Transport, TransportError,
     },
 };
 
@@ -62,7 +62,7 @@ pub(crate) struct MediaEgress {
     retained_expiry: BTreeSet<(Instant, RetainedKey)>,
     retained_bytes: usize,
     retained_runtime_bytes: usize,
-    repair_requests: BTreeMap<u64, RetainedKey>,
+    repair_requests: BTreeMap<RepairRequest, RetainedKey>,
     next_repair_request: Option<u64>,
     next_twcc: u64,
     pending: Option<PendingTransmit>,
@@ -97,12 +97,13 @@ pub(crate) struct EgressUpdate {
 struct RetiringSender {
     sender: u64,
     queue: VecDeque<QueuedMedia>,
-    repairs: BTreeMap<u64, u64>,
+    repairs: BTreeMap<u64, RepairRequest>,
 }
 
 struct Sender {
     facts: EgressSenderFacts,
     bootstrap: bool,
+    declared_in_answer: bool,
     runtime_bytes: usize,
     retirement_reserved: bool,
     active: bool,
@@ -112,12 +113,15 @@ struct Sender {
     ssrc: u32,
     rtx_ssrc: u32,
     next_rtx_sequence: u64,
-    latest_rtp: Option<(u32, Instant)>,
+    latest_rtp: Option<(u64, Instant)>,
+    media_scope: Option<crate::MediaScope>,
+    scope_retired: bool,
     highest_sequence: Option<u64>,
+    highest_sender_report: Option<u64>,
     queue: VecDeque<QueuedMedia>,
     queued_payload_bytes: usize,
-    requested_repairs: BTreeMap<u64, u64>,
-    keyframe_requested: bool,
+    requested_repairs: BTreeMap<u64, RepairRequest>,
+    keyframe_scope: Option<RefreshScope>,
     reported_sequence: Option<u32>,
     pending_report: Option<(Instant, u32)>,
     fir_sequences: BTreeMap<u32, u8>,
@@ -125,9 +129,36 @@ struct Sender {
     committed_payload_bytes: u64,
 }
 
+#[derive(Clone, Copy)]
+enum RefreshScope {
+    Legacy,
+    Scoped(crate::MediaScope),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct MediaLayout {
+    pub(crate) emit_mid: bool,
+    pub(crate) path: Option<PathEpoch>,
+}
+
+impl MediaLayout {
+    pub(crate) const STANDARD: Self = Self {
+        emit_mid: true,
+        path: None,
+    };
+
+    fn matches_path(self, transport: &Transport) -> bool {
+        self.path
+            .is_none_or(|epoch| Some(epoch) == transport.authenticated_rtp_epoch())
+    }
+}
+
 struct QueuedMedia {
     enqueued_at: Duration,
     media: RtpWrite,
+    layout: MediaLayout,
+    clock: Option<crate::RtpClockAnchor>,
+    scope: Option<crate::MediaScope>,
     payload_bytes: usize,
     transport_estimate: usize,
 }
@@ -140,8 +171,16 @@ struct RetainedKey {
     index: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct RepairRequest {
+    eligible_at: Instant,
+    id: u64,
+}
+
 struct RetainedPacket {
     index: u64,
+    scope: Option<crate::MediaScope>,
+    layout: MediaLayout,
     timestamp: u32,
     packet: Vec<u8>,
     retained_at: Instant,
@@ -159,12 +198,15 @@ enum PendingTransmit {
     },
     Repair {
         sender: u64,
-        request: u64,
+        request: RepairRequest,
         original_index: u64,
         sequence: u16,
         twcc: Option<u16>,
     },
-    Control,
+    Control {
+        sender: u64,
+        timestamp: u64,
+    },
     Padding {
         sender: u64,
         ssrc: u32,
@@ -206,6 +248,7 @@ impl MediaEgress {
                     facts.id.value(),
                     Sender {
                         bootstrap: true,
+                        declared_in_answer: true,
                         active: true,
                         runtime_bytes: 0,
                         retirement_reserved: true,
@@ -216,11 +259,14 @@ impl MediaEgress {
                         rtx_ssrc,
                         next_rtx_sequence: u64::from(rtx_sequence),
                         latest_rtp: None,
+                        media_scope: None,
+                        scope_retired: false,
                         highest_sequence: None,
+                        highest_sender_report: None,
                         queue: VecDeque::new(),
                         queued_payload_bytes: 0,
                         requested_repairs: BTreeMap::new(),
-                        keyframe_requested: false,
+                        keyframe_scope: None,
                         reported_sequence: None,
                         pending_report: None,
                         fir_sequences: BTreeMap::new(),
@@ -332,6 +378,92 @@ impl MediaEgress {
         clippy::result_large_err,
         reason = "preserve caller-owned packet on rejection"
     )]
+    fn active_sender(&self, mid: &str, ssrc: Option<u32>) -> Option<u64> {
+        let mut matches = self.by_mid.get(mid)?.iter().copied().filter(|id| {
+            self.senders
+                .get(id)
+                .is_some_and(|sender| sender.active && ssrc.is_none_or(|ssrc| sender.ssrc == ssrc))
+        });
+        let first = matches.next()?;
+        matches.next().is_none().then_some(first)
+    }
+
+    pub(crate) fn declared_answer_fid(&self, mid: &str, primary: Option<u32>) -> Option<[u32; 2]> {
+        self.fid(mid, primary, true)
+    }
+
+    pub(crate) fn fid(
+        &self,
+        mid: &str,
+        primary: Option<u32>,
+        answer_only: bool,
+    ) -> Option<[u32; 2]> {
+        let key = match primary {
+            Some(primary) => *self.by_ssrc.get(&primary)?,
+            None => self.active_sender(mid, None)?,
+        };
+        let sender = self.senders.get(&key)?;
+        (sender.facts.mid.as_ref() == mid
+            && (!answer_only || sender.declared_in_answer)
+            && sender.facts.kind == MediaKind::Video
+            && sender.facts.retransmission_payload_type.is_some()
+            && sender.rid.is_none()
+            && sender.ssrc != sender.rtx_ssrc)
+            .then_some([sender.ssrc, sender.rtx_ssrc])
+    }
+
+    pub(crate) fn extension_form(
+        &self,
+        mid: &str,
+        ssrc: Option<u32>,
+    ) -> Option<crate::RtpExtensionForm> {
+        self.senders
+            .get(&self.active_sender(mid, ssrc)?)
+            .map(sender_extension_form)
+    }
+
+    pub(crate) fn extension_id(&self, mid: &str, primary: Option<u32>, uri: &str) -> Option<u8> {
+        media_extension_id(self.senders.get(&self.active_sender(mid, primary)?)?, uri)
+    }
+
+    pub(crate) fn progress(
+        &self,
+        mid: &str,
+        primary: Option<u32>,
+    ) -> Option<(Option<u64>, Option<u64>)> {
+        let sender = self.senders.get(&self.active_sender(mid, primary)?)?;
+        Some((sender.highest_sequence, sender.highest_sender_report))
+    }
+
+    pub(crate) fn plaintext_rtp_sizes(
+        &self,
+        mid: &str,
+        primary: Option<u32>,
+        media: &RtpWrite,
+        emit_mid: bool,
+    ) -> Result<(usize, Option<usize>), WriteError> {
+        let sender = self
+            .senders
+            .get(
+                &self
+                    .active_sender(mid, primary)
+                    .ok_or(WriteError::UnknownStream)?,
+            )
+            .ok_or(WriteError::UnknownStream)?;
+        let original = layout::PacketLayout::original(sender, media, emit_mid)
+            .ok_or(WriteError::InvalidRtp)?;
+        let repair = if sender.facts.retransmission_payload_type.is_some() {
+            Some(
+                layout::PacketLayout::repair(sender, media, emit_mid)
+                    .ok_or(WriteError::InvalidRtp)?
+                    .bytes,
+            )
+        } else {
+            None
+        };
+        Ok((original.bytes, repair))
+    }
+
     pub(crate) fn admit_encoding(
         &mut self,
         at: Instant,
@@ -339,16 +471,44 @@ impl MediaEgress {
         ssrc: Option<u32>,
         media: RtpWrite,
     ) -> Result<(), (WriteError, RtpWrite)> {
+        self.admit_with_policy(
+            at,
+            mid,
+            ssrc,
+            media,
+            crate::BoundedRtp {
+                max_wire_bytes: usize::MAX,
+                max_primary_wire_bytes: None,
+                clock: None,
+                replace_queued: false,
+                scope: None,
+            },
+            MediaLayout::STANDARD,
+        )
+    }
+
+    pub(crate) fn admit_with_policy(
+        &mut self,
+        at: Instant,
+        mid: &str,
+        ssrc: Option<u32>,
+        media: RtpWrite,
+        policy: crate::BoundedRtp,
+        media_layout: MediaLayout,
+    ) -> Result<(), (WriteError, RtpWrite)> {
+        let crate::BoundedRtp {
+            clock,
+            scope,
+            replace_queued,
+            ..
+        } = policy;
         let result = (|| {
-            let mut matches = self.by_mid.get(mid).into_iter().flatten().filter(|id| {
-                self.senders
-                    .get(id)
-                    .is_some_and(|s| s.active && ssrc.is_none_or(|ssrc| s.ssrc == ssrc))
-            });
-            let index = *matches.next().ok_or(WriteError::UnknownStream)?;
-            if matches.next().is_some() {
-                return Err(WriteError::UnknownStream);
+            if replace_queued && self.pending.is_some() {
+                return Err(WriteError::WouldBlock);
             }
+            let index = self
+                .active_sender(mid, ssrc)
+                .ok_or(WriteError::UnknownStream)?;
             if media.sequence >= (1_u64 << 48) {
                 return Err(WriteError::IndexExhausted);
             }
@@ -374,8 +534,8 @@ impl MediaEgress {
             }) {
                 return Err(WriteError::InvalidRtp);
             }
-            let layout =
-                layout::PacketLayout::original(state, &media).ok_or(WriteError::InvalidRtp)?;
+            let layout = layout::PacketLayout::original(state, &media, media_layout.emit_mid)
+                .ok_or(WriteError::InvalidRtp)?;
             if layout.bytes > usize::from(u16::MAX) {
                 return Err(WriteError::InvalidRtp);
             }
@@ -419,6 +579,9 @@ impl MediaEgress {
         })();
         match result {
             Ok((index, payload_bytes, transport_estimate)) => {
+                if replace_queued {
+                    while self.pop_head(index).is_some() {}
+                }
                 let enqueued_at = self.queue_time_at(at);
                 self.queue_enqueued_time_sum = self
                     .queue_enqueued_time_sum
@@ -430,6 +593,9 @@ impl MediaEgress {
                 state.queue.push_back(QueuedMedia {
                     enqueued_at,
                     media,
+                    layout: media_layout,
+                    clock,
+                    scope,
                     payload_bytes,
                     transport_estimate,
                 });
@@ -463,6 +629,65 @@ impl MediaEgress {
         }
         self.refresh_pacer_queue(self.queue_time_updated_at);
         Ok(())
+    }
+
+    pub(crate) fn retire_scope(&mut self, scope: crate::MediaScope) {
+        self.discard_pending_scope(scope);
+        for (&key, sender) in &mut self.senders {
+            if sender
+                .media_scope
+                .is_some_and(|current| scope.includes(current))
+            {
+                sender.scope_retired = true;
+                sender.keyframe_scope = None;
+                self.keyframe_ready.remove(&key);
+                self.rtcp_senders.remove(&key);
+                self.padding_senders.remove(&key);
+            }
+        }
+    }
+
+    pub(crate) fn pending_primary_scope(&self) -> Option<crate::MediaScope> {
+        let PendingTransmit::Original { sender, .. } = self.pending.as_ref()? else {
+            return None;
+        };
+        self.senders.get(sender)?.queue.front()?.scope
+    }
+
+    pub(crate) fn discard_pending_scope(&mut self, scope: crate::MediaScope) {
+        debug_assert!(
+            self.pending_primary_scope()
+                .is_none_or(|pending| !scope.includes(pending))
+        );
+        for (&index, state) in &mut self.senders {
+            let before = state.queue.len();
+            state.queue.retain(|queued| {
+                if queued.scope.is_none_or(|queued| !scope.includes(queued)) {
+                    return true;
+                }
+                Self::debit_queue(
+                    queued,
+                    &mut self.runtime_bytes,
+                    &mut self.queue_enqueued_time_sum,
+                    &mut self.queued_packets,
+                    &mut self.queued_payload_bytes,
+                    &mut self.queued_transport_bytes,
+                );
+                state.queued_payload_bytes = state
+                    .queued_payload_bytes
+                    .saturating_sub(queued.payload_bytes);
+                false
+            });
+            if state.queue.len() == before {
+                continue;
+            }
+            if let Some(next) = state.queue.front() {
+                self.eligible.insert(index, next.transport_estimate);
+            } else {
+                self.eligible.remove(&index);
+            }
+        }
+        self.refresh_pacer_queue(self.queue_time_updated_at);
     }
 
     pub(crate) fn stage_configuration(
@@ -501,7 +726,16 @@ impl MediaEgress {
             }
             if let Some(&key) = self.by_ssrc.get(&encoding.primary) {
                 let sender = self.senders.get(&key).ok_or(Error::ConnectionState)?;
-                let facts = physical.egress_facts(sender.facts.id);
+                let mut facts = physical.egress_facts(sender.facts.id);
+                // Typed adoption cannot renegotiate an established SDP wire form.
+                if physical
+                    .binding
+                    .extmap_allow_mixed
+                    .is_some_and(|mixed| mixed != sender.facts.allow_mixed_extensions)
+                {
+                    return Err(Error::Collision);
+                }
+                facts.allow_mixed_extensions = sender.facts.allow_mixed_extensions;
                 let mut previous = sender.facts.clone();
                 previous.forwarded_extensions.sort_by(|a, b| a.0.cmp(&b.0));
                 if previous != facts
@@ -529,6 +763,7 @@ impl MediaEgress {
                 Sender {
                     facts,
                     bootstrap: false,
+                    declared_in_answer: false,
                     active: *active,
                     runtime_bytes: 0,
                     retirement_reserved: true,
@@ -539,11 +774,14 @@ impl MediaEgress {
                     rtx_ssrc: encoding.repair.unwrap_or(fallback_repair),
                     next_rtx_sequence: u64::from(rtx_sequence),
                     latest_rtp: None,
+                    media_scope: None,
+                    scope_retired: false,
                     highest_sequence: None,
+                    highest_sender_report: None,
                     queue: VecDeque::new(),
                     queued_payload_bytes: 0,
                     requested_repairs: BTreeMap::new(),
-                    keyframe_requested: false,
+                    keyframe_scope: None,
                     reported_sequence: None,
                     pending_report: None,
                     fir_sequences: BTreeMap::new(),
@@ -613,12 +851,12 @@ impl MediaEgress {
         };
         sender.active = active;
         if !active {
-            sender.keyframe_requested = false;
+            sender.keyframe_scope = None;
             self.keyframe_ready.remove(&key);
             self.rtcp_senders.remove(&key);
             self.padding_senders.remove(&key);
             self.cancel_sender_work(key);
-        } else {
+        } else if !sender.scope_retired {
             if sender.committed_packets > 0 {
                 self.rtcp_senders.insert(key);
             }
@@ -799,6 +1037,16 @@ impl MediaEgress {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_retained_repair_pending(&self, ssrc: u32, sequence: u16) -> Option<bool> {
+        let sender = *self.by_ssrc.get(&ssrc)?;
+        let index = self.retained.get(&sender)?.get(&sequence)?.index;
+        Some(
+            self.requested_repair(RetainedKey { sender, index })
+                .is_some(),
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) const fn test_runtime_bytes(&self) -> usize {
         self.runtime_bytes
     }
@@ -870,7 +1118,7 @@ impl MediaEgress {
         let Some(sender) = self
             .senders
             .get_mut(&key)
-            .filter(|s| s.active && s.facts.kind == MediaKind::Video)
+            .filter(|s| s.active && !s.scope_retired && s.facts.kind == MediaKind::Video)
         else {
             return;
         };
@@ -895,15 +1143,23 @@ impl MediaEgress {
                 self.runtime_bytes = total;
             }
         }
-        sender.keyframe_requested = true;
+        sender.keyframe_scope = Some(
+            sender
+                .media_scope
+                .map_or(RefreshScope::Legacy, RefreshScope::Scoped),
+        );
         self.keyframe_ready.insert(key);
     }
 
-    pub(crate) fn request_repair(&mut self, media_ssrc: u32, sequence: u16) {
+    pub(crate) fn request_repair(&mut self, at: Instant, media_ssrc: u32, sequence: u16) {
         let Some(&sender) = self.by_ssrc.get(&media_ssrc) else {
             return;
         };
-        let Some(state) = self.senders.get(&sender).filter(|state| state.active) else {
+        let Some(state) = self
+            .senders
+            .get(&sender)
+            .filter(|state| state.active && !state.scope_retired)
+        else {
             return;
         };
         let Some(packet) = self
@@ -920,13 +1176,23 @@ impl MediaEgress {
         if state.requested_repairs.contains_key(&key.index) {
             return;
         }
-        let Some(request) = self.next_repair_request else {
+        let Some(id) = self.next_repair_request else {
             return;
         };
+        // A repeat NACK may precede our RTT estimate. Retain one request while
+        // it cools down instead of relying on the receiver to ask again.
+        let rtt = self
+            .envelope
+            .map_or(Duration::from_millis(50), |envelope| envelope.smoothed_rtt);
+        let eligible_at = packet
+            .last_repair_at
+            .and_then(|last| last.checked_add(rtt))
+            .map_or(at, |due| due.max(at));
         if !self.reserve_repair_request(sender) {
             return;
         }
-        self.next_repair_request = request.checked_add(1);
+        let request = RepairRequest { eligible_at, id };
+        self.next_repair_request = id.checked_add(1);
         if let Some(state) = self.senders.get_mut(&sender) {
             state.requested_repairs.insert(key.index, request);
         }
@@ -962,8 +1228,10 @@ impl MediaEgress {
         }
         if let Some(key) = self.keyframe_ready.pop_first() {
             let sender = self.senders.get_mut(&key)?;
-            sender.keyframe_requested = false;
-            return Some(Event::KeyframeRequested { ssrc: sender.ssrc });
+            return match sender.keyframe_scope.take()? {
+                RefreshScope::Legacy => Some(Event::KeyframeRequested { ssrc: sender.ssrc }),
+                RefreshScope::Scoped(scope) => Some(Event::ScopedKeyframeRequested { scope }),
+            };
         }
         let key = self.report_ready.pop_first()?;
         let sender = self.senders.get_mut(&key)?;
@@ -1117,6 +1385,10 @@ impl MediaEgress {
         let Some(queued) = sender.queue.front() else {
             return PrepareResult::Fatal;
         };
+        if !queued.layout.matches_path(transport) {
+            self.pop_head(sender_index);
+            return PrepareResult::Blocked;
+        }
         let media = &queued.media;
         let sequence = wire_u16(media.sequence);
         let twcc = sender
@@ -1136,6 +1408,7 @@ impl MediaEgress {
             sender.ssrc,
             false,
             &extensions,
+            queued.layout.emit_mid,
             &mut packet,
         ) {
             self.recycle_original(packet);
@@ -1177,6 +1450,28 @@ impl MediaEgress {
         }
     }
 
+    pub(crate) fn pending_scope(&self) -> Option<crate::MediaScope> {
+        match self.pending.as_ref()? {
+            PendingTransmit::Original { sender, .. } => {
+                self.senders.get(sender)?.queue.front()?.scope
+            }
+            PendingTransmit::Repair {
+                sender,
+                original_index,
+                ..
+            } => {
+                self.retained_packet(RetainedKey {
+                    sender: *sender,
+                    index: *original_index,
+                })?
+                .scope
+            }
+            PendingTransmit::Control { sender, .. } | PendingTransmit::Padding { sender, .. } => {
+                self.senders.get(sender)?.media_scope
+            }
+        }
+    }
+
     pub(crate) fn preflight_commit(&self, prepared: &PreparedTransmit) -> bool {
         if prepared.kind == DatagramKind::Rtp
             && self.controller.ready(
@@ -1195,7 +1490,7 @@ impl MediaEgress {
                 | PendingTransmit::Repair { sender, .. }
                 | PendingTransmit::Padding { sender, .. },
             ) => sender,
-            Some(PendingTransmit::Control) => {
+            Some(PendingTransmit::Control { .. }) => {
                 return prepared.kind == DatagramKind::Rtcp && prepared.rtp.is_none();
             }
             None => return prepared.rtp.is_none(),
@@ -1247,7 +1542,7 @@ impl MediaEgress {
         let Some(pending) = self.pending.take() else {
             return;
         };
-        if !matches!(pending, PendingTransmit::Control) {
+        if !matches!(pending, PendingTransmit::Control { .. }) {
             self.controller.commit_send(
                 at.saturating_duration_since(self.controller_origin),
                 prepared.wire_len,
@@ -1273,7 +1568,15 @@ impl MediaEgress {
                     return;
                 };
                 self.rtcp_senders.insert(sender);
-                state.latest_rtp = Some((queued.media.timestamp, queued.media.wallclock));
+                if state.scope_retired && state.facts.retransmission_payload_type.is_some() {
+                    self.padding_senders.insert(sender);
+                }
+                state.scope_retired = false;
+                state.media_scope = queued.scope;
+                state.latest_rtp = Some(queued.clock.map_or_else(
+                    || (u64::from(queued.media.timestamp), queued.media.wallclock),
+                    |clock| (clock.timestamp, clock.wallclock),
+                ));
                 state.highest_sequence = Some(
                     state
                         .highest_sequence
@@ -1295,6 +1598,7 @@ impl MediaEgress {
                     packet,
                     at,
                     prepared.wire_len,
+                    queued.layout,
                 );
             }
             PendingTransmit::Repair {
@@ -1327,7 +1631,14 @@ impl MediaEgress {
                     },
                 );
             }
-            PendingTransmit::Control => {
+            PendingTransmit::Control { sender, timestamp } => {
+                if let Some(state) = self.senders.get_mut(&sender) {
+                    state.highest_sender_report = Some(
+                        state
+                            .highest_sender_report
+                            .map_or(timestamp, |previous| previous.max(timestamp)),
+                    );
+                }
                 self.next_rtcp = at.checked_add(Duration::from_secs(1)).unwrap_or(at);
             }
             PendingTransmit::Padding {
@@ -1344,6 +1655,48 @@ impl MediaEgress {
             }
         }
         self.refresh_pacer_queue(at);
+    }
+
+    /// Drop a protected datagram refused by the final handoff. Protection
+    /// already consumed its index; no sender, pacing or repair credit follows.
+    pub(crate) fn reject_protected(&mut self, at: Instant) {
+        let Some(pending) = self.pending.take() else {
+            return;
+        };
+        // No peer can acknowledge a definitively unsent TWCC position. Unlike
+        // SRTP indexes, TWCC advances only on a committed transport send.
+        match pending {
+            PendingTransmit::Original { sender, packet, .. } => {
+                self.pop_head(sender);
+                self.recycle_original(packet);
+            }
+            PendingTransmit::Repair {
+                sender,
+                request,
+                original_index,
+                ..
+            } => {
+                self.consume_repair_index(sender);
+                self.finish_repair_request(
+                    request,
+                    RetainedKey {
+                        sender,
+                        index: original_index,
+                    },
+                );
+            }
+            PendingTransmit::Padding { sender, .. } => self.consume_repair_index(sender),
+            PendingTransmit::Control { .. } => {
+                self.next_rtcp = at.checked_add(Duration::from_secs(1)).unwrap_or(at);
+            }
+        }
+        self.refresh_pacer_queue(at);
+    }
+
+    fn consume_repair_index(&mut self, sender: u64) {
+        if let Some(state) = self.senders.get_mut(&sender) {
+            state.next_rtx_sequence = state.next_rtx_sequence.saturating_add(1);
+        }
     }
 
     pub(crate) fn maintenance_deadline(&self, at: Instant) -> Option<Instant> {
@@ -1365,7 +1718,7 @@ impl MediaEgress {
     pub(crate) fn next_deadline(&self, at: Instant) -> Option<Instant> {
         let queue_idle = self.queued_packets == 0 && self.repair_requests.is_empty();
         let candidate = self
-            .next_packet_transport_bytes()
+            .next_packet_transport_bytes(at)
             .map(|bytes| (self.rtp_bytes_in_flight, bytes));
         let padding = queue_idle
             .then(|| self.padding_transport_bytes())
@@ -1373,6 +1726,10 @@ impl MediaEgress {
             .map(|bytes| (self.rtp_bytes_in_flight, bytes));
         [
             self.maintenance_deadline(at),
+            self.repair_requests
+                .first_key_value()
+                .map(|(request, _)| request.eligible_at)
+                .filter(|due| *due > at),
             (self.scheduler.deferred()
                 && !self.eligible.is_empty()
                 && candidate.is_some_and(|(flight, bytes)| {
@@ -1408,8 +1765,12 @@ impl MediaEgress {
         .min()
     }
 
-    fn next_packet_transport_bytes(&self) -> Option<usize> {
-        if let Some((_, key)) = self.repair_requests.first_key_value() {
+    fn next_packet_transport_bytes(&self, at: Instant) -> Option<usize> {
+        if let Some((_, key)) = self
+            .repair_requests
+            .first_key_value()
+            .filter(|(request, _)| request.eligible_at <= at)
+        {
             let retained = self.retained_packet(*key)?;
             let sender = self.senders.get(&key.sender)?;
             let original = RtpPacket::parse(&retained.packet).ok()?;
@@ -1417,26 +1778,20 @@ impl MediaEgress {
                 .extensions()
                 .into_iter()
                 .flatten()
-                .filter(|extension| {
-                    sender.facts.dependency_extension_id == Some(extension.id())
-                        || sender
-                            .facts
-                            .forwarded_extensions
-                            .iter()
-                            .any(|(id, _)| *id == extension.id())
-                })
+                .filter(|extension| retains_repair_extension(sender, extension.id()))
                 .map(|extension| (extension.id(), extension.value().len()));
             let layout = layout::PacketLayout::new(
                 original.payload().len().checked_add(2)?,
-                forwarded.chain(repair_header_extensions(sender)),
-                sender_uses_one_byte_extensions(sender),
+                forwarded.chain(repair_header_extensions(sender, retained.layout.emit_mid)),
+                sender_extension_form(sender),
             )?;
             return layout.bytes.checked_add(RTP_TRANSPORT_ALLOWANCE);
         }
         let sender = self
             .senders
             .get(&self.scheduler.candidate(&self.eligible)?)?;
-        layout::PacketLayout::original(sender, &sender.queue.front()?.media)?
+        let queued = sender.queue.front()?;
+        layout::PacketLayout::original(sender, &queued.media, queued.layout.emit_mid)?
             .bytes
             .checked_add(RTP_TRANSPORT_ALLOWANCE)
     }
@@ -1445,8 +1800,8 @@ impl MediaEgress {
         let sender = self.senders.get(&self.padding_candidate()?)?;
         let header = layout::PacketLayout::new(
             0,
-            repair_header_extensions(sender),
-            sender_uses_one_byte_extensions(sender),
+            repair_header_extensions(sender, true),
+            sender_extension_form(sender),
         )?
         .bytes;
         let padding = self
@@ -1517,28 +1872,39 @@ impl MediaEgress {
     fn pop_head(&mut self, sender: u64) -> Option<QueuedMedia> {
         let state = self.senders.get_mut(&sender)?;
         let queued = state.queue.pop_front()?;
-        self.runtime_bytes = self
-            .runtime_bytes
-            .saturating_sub(runtime::extension_bytes(&queued.media));
         if let Some(next) = state.queue.front() {
             self.eligible.insert(sender, next.transport_estimate);
         } else {
             self.eligible.remove(&sender);
         }
-        self.queue_enqueued_time_sum = self
-            .queue_enqueued_time_sum
-            .saturating_sub(queued.enqueued_at.as_nanos());
         state.queued_payload_bytes = state
             .queued_payload_bytes
             .saturating_sub(queued.payload_bytes);
-        self.queued_packets = self.queued_packets.saturating_sub(1);
-        self.queued_payload_bytes = self
-            .queued_payload_bytes
-            .saturating_sub(queued.payload_bytes);
-        self.queued_transport_bytes = self
-            .queued_transport_bytes
-            .saturating_sub(queued.transport_estimate);
+        Self::debit_queue(
+            &queued,
+            &mut self.runtime_bytes,
+            &mut self.queue_enqueued_time_sum,
+            &mut self.queued_packets,
+            &mut self.queued_payload_bytes,
+            &mut self.queued_transport_bytes,
+        );
         Some(queued)
+    }
+
+    fn debit_queue(
+        queued: &QueuedMedia,
+        runtime_bytes: &mut usize,
+        queue_enqueued_time_sum: &mut u128,
+        queued_packets: &mut usize,
+        queued_payload_bytes: &mut usize,
+        queued_transport_bytes: &mut usize,
+    ) {
+        *runtime_bytes = runtime_bytes.saturating_sub(runtime::extension_bytes(&queued.media));
+        *queue_enqueued_time_sum =
+            queue_enqueued_time_sum.saturating_sub(queued.enqueued_at.as_nanos());
+        *queued_packets = queued_packets.saturating_sub(1);
+        *queued_payload_bytes = queued_payload_bytes.saturating_sub(queued.payload_bytes);
+        *queued_transport_bytes = queued_transport_bytes.saturating_sub(queued.transport_estimate);
     }
 
     fn desired_bitrate(&self) -> u64 {
@@ -1619,7 +1985,7 @@ impl MediaEgress {
         }
     }
 
-    fn requested_repair(&self, key: RetainedKey) -> Option<u64> {
+    fn requested_repair(&self, key: RetainedKey) -> Option<RepairRequest> {
         self.senders
             .get(&key.sender)?
             .requested_repairs
@@ -1627,7 +1993,7 @@ impl MediaEgress {
             .copied()
     }
 
-    fn finish_repair_request(&mut self, request: u64, key: RetainedKey) {
+    fn finish_repair_request(&mut self, request: RepairRequest, key: RetainedKey) {
         self.release_repair_index(request);
         if self.requested_repair(key) == Some(request)
             && let Some(state) = self.senders.get_mut(&key.sender)
@@ -1649,8 +2015,18 @@ impl MediaEgress {
         mut packet: Vec<u8>,
         at: Instant,
         wire_len: usize,
+        layout: MediaLayout,
     ) {
-        if !self.try_retain_original(sender, index, timestamp, &mut packet, at, wire_len, true) {
+        if !self.try_retain_original(
+            sender,
+            index,
+            timestamp,
+            &mut packet,
+            at,
+            wire_len,
+            true,
+            layout,
+        ) {
             self.recycle_original(packet);
         }
     }
@@ -1666,7 +2042,16 @@ impl MediaEgress {
         at: Instant,
         wire_len: usize,
     ) {
-        self.try_retain_original(sender, index, timestamp, &mut packet, at, wire_len, false);
+        self.try_retain_original(
+            sender,
+            index,
+            timestamp,
+            &mut packet,
+            at,
+            wire_len,
+            false,
+            MediaLayout::STANDARD,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1679,6 +2064,7 @@ impl MediaEgress {
         at: Instant,
         wire_len: usize,
         working: bool,
+        layout: MediaLayout,
     ) -> bool {
         if self
             .senders
@@ -1775,10 +2161,16 @@ impl MediaEgress {
             self.original_workspace = buffer;
         }
         let key = RetainedKey { sender, index };
+        let scope = self
+            .senders
+            .get(&sender)
+            .and_then(|state| state.media_scope);
         self.retained.entry(sender).or_default().insert(
             sequence,
             RetainedPacket {
                 index,
+                scope,
+                layout,
                 timestamp,
                 packet: std::mem::take(packet),
                 retained_at: at,
@@ -1818,15 +2210,6 @@ impl MediaEgress {
         }
     }
 
-    fn repair_due(&self, retained: &RetainedPacket, now: Instant) -> bool {
-        let rtt = self
-            .envelope
-            .map_or(Duration::from_millis(50), |envelope| envelope.smoothed_rtt);
-        retained
-            .last_repair_at
-            .is_none_or(|last| now.saturating_duration_since(last) >= rtt)
-    }
-
     fn prepare_repair(
         &mut self,
         at: Instant,
@@ -1835,6 +2218,9 @@ impl MediaEgress {
         admission: &mut RtpAdmission<'_>,
     ) -> Option<PrepareResult> {
         let (&request, &key) = self.repair_requests.first_key_value()?;
+        if request.eligible_at > at {
+            return None;
+        }
         if self.requested_repair(key) != Some(request) {
             return Some(PrepareResult::Blocked);
         }
@@ -1842,44 +2228,29 @@ impl MediaEgress {
             self.finish_repair_request(request, key);
             return None;
         };
-        if at.saturating_duration_since(retained.retained_at) >= Duration::from_secs(3)
-            || !self.repair_due(retained, at)
-        {
+        if !retained.layout.matches_path(transport) {
+            self.remove_retained(key);
+            return None;
+        }
+        if at.saturating_duration_since(retained.retained_at) >= Duration::from_secs(3) {
             self.finish_repair_request(request, key);
             return Some(PrepareResult::Blocked);
         }
         let sender_index = key.sender;
-        let original_sequence = wire_u16(key.index);
         let Some(sender) = self.senders.get(&sender_index) else {
             self.finish_repair_request(request, key);
             return None;
         };
-        if !sender.active {
+        if !sender.active || sender.scope_retired {
             self.finish_repair_request(request, key);
             return None;
         }
-        let payload_type = sender.facts.retransmission_payload_type?;
         let sequence = wire_u16(sender.next_rtx_sequence);
         let twcc = sender
             .facts
             .twcc_extension_id
             .map(|_| wire_u16(self.next_twcc));
-        let original = RtpPacket::parse(&retained.packet).ok()?;
-        let extensions = repair_extensions(sender, &original);
-        let mut payload = original_sequence.to_be_bytes().to_vec();
-        payload.extend_from_slice(original.payload());
-        let packet = build_rtp(
-            sender,
-            original.marker(),
-            sequence,
-            retained.timestamp,
-            twcc,
-            &payload,
-            payload_type,
-            sender.rtx_ssrc,
-            false,
-            &extensions,
-        )?;
+        let packet = encode_repair(sender, retained, sequence, twcc)?;
         if !self.fits_send_window(bytes_in_flight, packet.len()) {
             return Some(PrepareResult::Blocked);
         }
@@ -1918,11 +2289,14 @@ impl MediaEgress {
             .next()
             .or_else(|| self.rtcp_senders.first())?;
         let sender = self.senders.get(&sender_index)?;
-        let packet = sender_report(sender, at, &self.clock)?;
+        let (timestamp, packet) = sender_report(sender, at, &self.clock)?;
         match transport.send_rtcp(&packet) {
             Ok(()) => {
                 self.rtcp_cursor = sender_index;
-                self.pending = Some(PendingTransmit::Control);
+                self.pending = Some(PendingTransmit::Control {
+                    sender: sender_index,
+                    timestamp,
+                });
                 Some(PrepareResult::Prepared)
             }
             Err(TransportError::QueueFull | TransportError::Protocol) => {
@@ -1974,7 +2348,7 @@ impl MediaEgress {
             .facts
             .twcc_extension_id
             .map(|_| wire_u16(self.next_twcc));
-        let timestamp = sender.latest_rtp.map_or(0, |(rtp, _)| rtp);
+        let timestamp = sender.latest_rtp.map_or(0, |(rtp, _)| wire_u32(rtp));
         let Some(mut packet) = build_rtp(
             sender,
             false,
@@ -1986,6 +2360,7 @@ impl MediaEgress {
             ssrc,
             true,
             &[],
+            true,
         ) else {
             self.controller.padding_unavailable();
             return PrepareResult::Fatal;
@@ -2019,10 +2394,14 @@ impl MediaEgress {
     }
 }
 
-fn repair_header_extensions(sender: &Sender) -> impl Iterator<Item = (u8, usize)> + Clone {
+fn repair_header_extensions(
+    sender: &Sender,
+    emit_mid: bool,
+) -> impl Iterator<Item = (u8, usize)> + Clone {
     let mid = sender
         .facts
         .mid_extension_id
+        .filter(|_| emit_mid)
         .map(|id| (id, sender.facts.mid.len()));
     let rid = sender
         .repaired_rid_extension_id
@@ -2052,6 +2431,10 @@ fn padding_bytes(requested: usize, header_bytes: usize) -> Vec<u8> {
 
 fn wire_u16(value: u64) -> u16 {
     u16::try_from(value % 65_536).unwrap_or_default()
+}
+
+fn wire_u32(value: u64) -> u32 {
+    u32::try_from(value % (1_u64 << 32)).unwrap_or_default()
 }
 
 pub(crate) fn sender_rtp_identity(
@@ -2107,19 +2490,47 @@ fn write_media_extensions(sender: &Sender, media: &RtpWrite) -> Vec<(u8, Vec<u8>
         .collect()
 }
 
+fn encode_repair(
+    sender: &Sender,
+    retained: &RetainedPacket,
+    sequence: u16,
+    twcc: Option<u16>,
+) -> Option<Vec<u8>> {
+    let payload_type = sender.facts.retransmission_payload_type?;
+    let original = RtpPacket::parse(&retained.packet).ok()?;
+    let extensions = repair_extensions(sender, &original);
+    let mut payload = wire_u16(retained.index).to_be_bytes().to_vec();
+    payload.extend_from_slice(original.payload());
+    build_rtp(
+        sender,
+        original.marker(),
+        sequence,
+        retained.timestamp,
+        twcc,
+        &payload,
+        payload_type,
+        sender.rtx_ssrc,
+        false,
+        &extensions,
+        retained.layout.emit_mid,
+    )
+}
+
+fn retains_repair_extension(sender: &Sender, id: u8) -> bool {
+    sender.facts.dependency_extension_id == Some(id)
+        || sender
+            .facts
+            .forwarded_extensions
+            .iter()
+            .any(|(forwarded, _)| *forwarded == id)
+}
+
 fn repair_extensions(sender: &Sender, original: &RtpPacket<'_>) -> Vec<(u8, Vec<u8>)> {
     original
         .extensions()
         .into_iter()
         .flatten()
-        .filter(|extension| {
-            sender.facts.dependency_extension_id == Some(extension.id())
-                || sender
-                    .facts
-                    .forwarded_extensions
-                    .iter()
-                    .any(|(id, _)| *id == extension.id())
-        })
+        .filter(|extension| retains_repair_extension(sender, extension.id()))
         .map(|extension| (extension.id(), extension.value().to_vec()))
         .collect()
 }
@@ -2129,10 +2540,12 @@ fn rtp_extensions<'a>(
     ssrc: u32,
     twcc: Option<&'a [u8; 2]>,
     forwarded_extensions: &'a [(u8, Vec<u8>)],
+    emit_mid: bool,
 ) -> impl Iterator<Item = (u8, &'a [u8])> + Clone {
     let mid = sender
         .facts
         .mid_extension_id
+        .filter(|_| emit_mid)
         .map(|id| (id, sender.facts.mid.as_bytes()));
     let rid_id = if ssrc == sender.rtx_ssrc {
         sender.repaired_rid_extension_id
@@ -2167,13 +2580,20 @@ fn build_rtp(
     ssrc: u32,
     padding: bool,
     forwarded_extensions: &[(u8, Vec<u8>)],
+    emit_mid: bool,
 ) -> Option<Vec<u8>> {
     let twcc_bytes = twcc.map(u16::to_be_bytes);
-    let extensions = rtp_extensions(sender, ssrc, twcc_bytes.as_ref(), forwarded_extensions);
+    let extensions = rtp_extensions(
+        sender,
+        ssrc,
+        twcc_bytes.as_ref(),
+        forwarded_extensions,
+        emit_mid,
+    );
     let layout = layout::PacketLayout::new(
         payload.len(),
         extensions.map(|(id, value)| (id, value.len())),
-        sender_uses_one_byte_extensions(sender),
+        sender_extension_form(sender),
     )?;
     let mut packet = Vec::with_capacity(layout.bytes);
     encode_rtp(
@@ -2187,6 +2607,7 @@ fn build_rtp(
         ssrc,
         padding,
         forwarded_extensions,
+        emit_mid,
         &mut packet,
     )
     .then_some(packet)
@@ -2204,14 +2625,21 @@ fn encode_rtp(
     ssrc: u32,
     padding: bool,
     forwarded_extensions: &[(u8, Vec<u8>)],
+    emit_mid: bool,
     packet: &mut Vec<u8>,
 ) -> bool {
     let twcc_bytes = twcc.map(u16::to_be_bytes);
-    let extensions = rtp_extensions(sender, ssrc, twcc_bytes.as_ref(), forwarded_extensions);
+    let extensions = rtp_extensions(
+        sender,
+        ssrc,
+        twcc_bytes.as_ref(),
+        forwarded_extensions,
+        emit_mid,
+    );
     let Some(layout) = layout::PacketLayout::new(
         payload.len(),
         extensions.clone().map(|(id, value)| (id, value.len())),
-        sender_uses_one_byte_extensions(sender),
+        sender_extension_form(sender),
     ) else {
         return false;
     };
@@ -2236,8 +2664,12 @@ fn encode_rtp(
     true
 }
 
-fn sender_uses_one_byte_extensions(sender: &Sender) -> bool {
-    sender.facts.dependency_extension_id.is_none()
+fn sender_extension_form(sender: &Sender) -> crate::RtpExtensionForm {
+    use crate::RtpExtensionForm;
+    if sender.facts.allow_mixed_extensions {
+        return RtpExtensionForm::Mixed;
+    }
+    if sender.facts.dependency_extension_id.is_none()
         && sender.rid.as_ref().is_none_or(|rid| rid.len() <= 16)
         && [sender.rid_extension_id, sender.repaired_rid_extension_id]
             .into_iter()
@@ -2261,6 +2693,11 @@ fn sender_uses_one_byte_extensions(sender: &Sender) -> bool {
                         | "http://www.webrtc.org/experiments/rtp-hdrext/abs-capture-time"
                 )
         })
+    {
+        RtpExtensionForm::OneByte
+    } else {
+        RtpExtensionForm::TwoByte
+    }
 }
 
 fn write_extensions<'a>(
@@ -2292,20 +2729,20 @@ fn write_extensions<'a>(
     true
 }
 
-fn sender_report(sender: &Sender, at: Instant, clock: &ProtocolClock) -> Option<Vec<u8>> {
+fn sender_report(sender: &Sender, at: Instant, clock: &ProtocolClock) -> Option<(u64, Vec<u8>)> {
     let (rtp, wallclock) = sender.latest_rtp?;
     let ticks = at
         .saturating_duration_since(wallclock)
         .as_nanos()
         .saturating_mul(u128::from(sender.facts.clock_rate))
         / 1_000_000_000;
-    let timestamp = rtp.wrapping_add(u32::try_from(ticks % (1_u128 << 32)).unwrap_or_default());
+    let timestamp = rtp.checked_add(u64::try_from(ticks).ok()?)?;
     let (seconds, fraction) = clock.ntp(at);
     let mut packet = vec![0x80, 200, 0, 6];
     packet.extend_from_slice(&sender.ssrc.to_be_bytes());
     packet.extend_from_slice(&seconds.to_be_bytes());
     packet.extend_from_slice(&fraction.to_be_bytes());
-    packet.extend_from_slice(&timestamp.to_be_bytes());
+    packet.extend_from_slice(&wire_u32(timestamp).to_be_bytes());
     packet.extend_from_slice(
         &u32::try_from(sender.committed_packets)
             .unwrap_or(u32::MAX)
@@ -2322,7 +2759,7 @@ fn sender_report(sender: &Sender, at: Instant, clock: &ProtocolClock) -> Option<
         sender.ssrc,
         sender.facts.rtcp.as_ref()?.cname.as_bytes(),
     )?;
-    Some(packet)
+    Some((timestamp, packet))
 }
 
 #[cfg(test)]
@@ -2348,6 +2785,7 @@ mod tests {
             twcc_extension_id: Some(2),
             playout_extension_id: None,
             dependency_extension_id: None,
+            allow_mixed_extensions: false,
             forwarded_extensions: Box::new([]),
         };
         MediaEgress::new(
@@ -2378,6 +2816,27 @@ mod tests {
             ProtocolClock::new(start, UNIX_EPOCH),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn retiring_scope_stops_periodic_datagrams_for_only_that_sender() {
+        let mut egress = repair_egress(Instant::now(), 1024);
+        let scope = crate::MediaScope::new(std::num::NonZeroU128::MIN);
+        egress.senders.get_mut(&1).unwrap().media_scope = Some(scope);
+        egress.rtcp_senders.extend([1, 2]);
+        egress.padding_senders.extend([1, 2]);
+
+        egress.retire_scope(scope);
+        assert_eq!(egress.rtcp_senders.iter().copied().collect::<Vec<_>>(), [2]);
+        assert_eq!(
+            egress.padding_senders.iter().copied().collect::<Vec<_>>(),
+            [2]
+        );
+        egress.set_sender_active(1, true);
+        assert!(
+            !egress.padding_senders.contains(&1),
+            "activation cannot revive a retired scope"
+        );
     }
 
     fn queue_owned_bytes(queue: &VecDeque<QueuedMedia>) -> usize {
@@ -2522,12 +2981,16 @@ mod tests {
         let uri = "urn:ietf:params:rtp-hdrext:ssrc-audio-level";
         sender.facts.forwarded_extensions = Box::new([(14, uri.into())]);
         sender.rid_extension_id = Some(3);
-        for (mid, rid, value, one_byte) in [
-            (1, 0, 16, true),
-            (16, 16, 1, true),
-            (17, 17, 17, false),
-            (64, 32, 255, false),
+        for (mid, rid, value, mixed, one_byte) in [
+            (1, 0, 16, false, true),
+            (16, 16, 1, false, true),
+            (17, 17, 17, false, false),
+            (64, 32, 255, false, false),
+            (1, 0, 17, true, false),
+            (1, 0, 1, true, true),
+            (17, 0, 1, false, false),
         ] {
+            sender.facts.allow_mixed_extensions = mixed;
             sender.facts.mid = "m".repeat(mid).into();
             sender.rid = (rid > 0).then(|| "r".repeat(rid));
             let media = RtpWrite {
@@ -2541,7 +3004,7 @@ mod tests {
                     value: vec![9; value].into(),
                 }],
             };
-            let layout = layout::PacketLayout::original(&sender, &media).unwrap();
+            let layout = layout::PacketLayout::original(&sender, &media, true).unwrap();
             assert_eq!(layout.extensions.unwrap().one_byte, one_byte);
             let forwarded = write_media_extensions(&sender, &media);
             let packet = build_rtp(
@@ -2555,6 +3018,7 @@ mod tests {
                 sender.ssrc,
                 false,
                 &forwarded,
+                true,
             )
             .unwrap();
             assert_eq!(packet.len(), layout.bytes);
@@ -2580,10 +3044,12 @@ mod tests {
                 value
             );
         }
-        assert!(layout::PacketLayout::new(0, [(1, 256)].into_iter(), true).is_none());
-        assert!(layout::PacketLayout::new(0, [(0, 1)].into_iter(), false).is_none());
-        assert!(layout::PacketLayout::new(usize::MAX, std::iter::empty(), false).is_none());
-        let zero = layout::PacketLayout::new(0, [(15, 0)].into_iter(), true).unwrap();
+        use crate::RtpExtensionForm::{Mixed, OneByte, TwoByte};
+        assert!(layout::PacketLayout::new(0, [(1, 256)].into_iter(), Mixed).is_none());
+        assert!(layout::PacketLayout::new(0, [(0, 1)].into_iter(), TwoByte).is_none());
+        assert!(layout::PacketLayout::new(usize::MAX, std::iter::empty(), TwoByte).is_none());
+        assert!(layout::PacketLayout::new(0, [(1, 17)].into_iter(), OneByte).is_none());
+        let zero = layout::PacketLayout::new(0, [(15, 0)].into_iter(), Mixed).unwrap();
         assert!(!zero.extensions.unwrap().one_byte);
         assert_eq!(zero.bytes, 20);
     }
@@ -2618,6 +3084,7 @@ mod tests {
                 sender.ssrc,
                 false,
                 &[],
+                true,
                 &mut packet
             ));
             assert_eq!(packet.as_ptr(), pointer);
@@ -2660,7 +3127,7 @@ mod tests {
             panic!()
         };
         owner.pop_head(1).unwrap();
-        owner.finish_original(1, 0, 0, packet, now, 64);
+        owner.finish_original(1, 0, 0, packet, now, 64, MediaLayout::STANDARD);
         assert_eq!(owner.retained[&1][&0].packet.as_ptr(), pointer);
         assert_eq!(owner.runtime_bytes, runtime_owned_bytes(&owner));
         owner.expire_repair(now.checked_add(Duration::from_secs(3)).unwrap());
@@ -2669,7 +3136,7 @@ mod tests {
         let pointer = packet.as_ptr();
         owner.pop_head(2).unwrap();
         owner.max_runtime_bytes = owner.runtime_bytes;
-        owner.finish_original(2, 0, 0, packet, now, 256);
+        owner.finish_original(2, 0, 0, packet, now, 256, MediaLayout::STANDARD);
         assert!(owner.retained.is_empty());
         assert_eq!(owner.original_workspace.as_ptr(), pointer);
         assert_eq!(owner.runtime_bytes, runtime_owned_bytes(&owner));
@@ -2679,7 +3146,7 @@ mod tests {
         let capacity = packet.capacity();
         owner.pop_head(2).unwrap();
         owner.max_runtime_bytes = limit;
-        owner.finish_original(2, 1, 0, packet, now, 256);
+        owner.finish_original(2, 1, 0, packet, now, 256, MediaLayout::STANDARD);
         assert_eq!(owner.retained[&2][&1].packet.as_ptr(), pointer);
         assert!(owner.original_workspace.capacity() >= capacity);
         assert_eq!(owner.runtime_bytes, runtime_owned_bytes(&owner));
@@ -2699,6 +3166,52 @@ mod tests {
         assert_eq!(owner.original_workspace.capacity(), 0);
         assert!(owner.pending.is_none());
         assert_eq!(owner.runtime_bytes, runtime_owned_bytes(&owner));
+    }
+
+    #[test]
+    fn rejected_protected_primary_leaves_a_hole_without_repair_credit() {
+        let now = Instant::now();
+        let mut owner = repair_egress(now, 4096);
+        for sequence in [100, 102] {
+            owner
+                .admit(
+                    now,
+                    "audio",
+                    RtpWrite {
+                        sequence,
+                        timestamp: 9000,
+                        wallclock: now,
+                        marker: true,
+                        payload: vec![7, 8].into(),
+                        extensions: vec![],
+                    },
+                )
+                .unwrap();
+        }
+        let before_twcc = owner.next_twcc;
+        let packet = std::mem::take(&mut owner.original_workspace);
+        let capacity = packet.capacity();
+        owner.pending = Some(PendingTransmit::Original {
+            sender: 1,
+            sequence: 100,
+            timestamp: 9000,
+            twcc: Some(wire_u16(before_twcc)),
+            packet,
+        });
+        owner.reject_protected(now);
+        assert!(owner.pending.is_none());
+        assert_eq!(owner.next_twcc, before_twcc);
+        assert_eq!(owner.runtime_bytes, runtime_owned_bytes(&owner));
+        assert_eq!(owner.original_workspace.capacity(), capacity);
+        let sender = &owner.senders[&1];
+        assert_eq!(sender.queue.front().unwrap().media.sequence, 102);
+        assert_eq!(sender.highest_sequence, None);
+        assert_eq!(sender.latest_rtp, None);
+        assert_eq!(sender.committed_packets, 0);
+        let ssrc = sender.ssrc;
+        owner.request_repair(owner.controller_origin, ssrc, 100);
+        assert!(owner.repair_requests.is_empty());
+        assert!(owner.retained.is_empty());
     }
 
     #[test]
@@ -2751,7 +3264,7 @@ mod tests {
         let capacity = input.extensions.capacity();
         let queue_bytes = runtime::queue_bytes(&VecDeque::with_capacity(1));
         let workspace = Vec::<u8>::with_capacity(
-            layout::PacketLayout::original(&egress.senders[&1], &input)
+            layout::PacketLayout::original(&egress.senders[&1], &input, true)
                 .unwrap()
                 .bytes,
         )
@@ -2898,6 +3411,16 @@ mod tests {
                 matches!(egress.poll_event(), Some(Event::KeyframeRequested { ssrc: known }) if known == ssrc)
             );
         }
+        let scope = crate::MediaScope::new(std::num::NonZeroU128::MIN);
+        egress.senders.get_mut(&1).unwrap().media_scope = Some(scope);
+        egress.request_keyframe(crate::rtcp::KeyframeRequest {
+            media_ssrc: ssrc,
+            fir: None,
+        });
+        egress.senders.get_mut(&1).unwrap().media_scope = None;
+        assert!(
+            matches!(egress.poll_event(), Some(Event::ScopedKeyframeRequested { scope: queued }) if queued == scope)
+        );
         assert_eq!(egress.senders[&1].fir_sequences.len(), 257);
         assert_eq!(egress.runtime_bytes, egress.max_runtime_bytes);
         egress.request_keyframe(request(257, 0));
@@ -3013,7 +3536,7 @@ mod tests {
         };
         let extension_bytes = runtime::extension_bytes(&write(0));
         let workspace = Vec::<u8>::with_capacity(
-            layout::PacketLayout::original(&egress.senders[&1], &write(0))
+            layout::PacketLayout::original(&egress.senders[&1], &write(0), true)
                 .unwrap()
                 .bytes,
         )
@@ -3055,7 +3578,7 @@ mod tests {
                 let limit = egress.max_runtime_bytes;
                 let used = egress.runtime_bytes;
                 egress.max_runtime_bytes = used.checked_add(initial_retirement).unwrap();
-                egress.request_repair(ssrc, 7);
+                egress.request_repair(start, ssrc, 7);
                 assert_eq!(egress.next_repair_request, requests);
                 assert_eq!(egress.runtime_bytes, used);
                 assert!(!egress.senders[&1].retirement_reserved);
@@ -3084,7 +3607,7 @@ mod tests {
         assert_eq!(egress.retiring.len(), 2);
         assert_eq!(egress.runtime_bytes, egress.max_runtime_bytes);
         let requests = egress.next_repair_request;
-        egress.request_repair(ssrc, 7);
+        egress.request_repair(start, ssrc, 7);
         assert_eq!(egress.next_repair_request, requests);
         assert!(egress.repair_requests.is_empty());
         let (error, returned) = egress.admit(start, "audio", write(10)).unwrap_err();
@@ -3172,7 +3695,23 @@ mod tests {
         let original = packet(ssrc, 7, 64);
         let pointer = original.as_ptr();
         egress.max_runtime_bytes = exact;
+        let original_scope = crate::MediaScope::new(std::num::NonZeroU128::MIN)
+            .with_provenance(Some(std::num::NonZeroU64::MIN));
+        egress.senders.get_mut(&1).unwrap().media_scope = Some(original_scope);
         egress.retain_original(1, 7, 0, original, start, 64);
+        egress.senders.get_mut(&1).unwrap().media_scope = None;
+        egress.pending = Some(PendingTransmit::Repair {
+            sender: 1,
+            request: RepairRequest {
+                eligible_at: start,
+                id: 0,
+            },
+            original_index: 7,
+            sequence: 0,
+            twcc: None,
+        });
+        assert_eq!(egress.pending_scope(), Some(original_scope));
+        egress.pending = None;
         assert_eq!(egress.retained[&1][&7].packet.as_ptr(), pointer);
         assert_eq!(egress.runtime_bytes, exact);
         assert_eq!(egress.retained_bytes, 64);
@@ -3207,18 +3746,61 @@ mod tests {
         assert_eq!(egress.runtime_bytes, runtime_owned_bytes(&egress));
     }
 
+    fn retained_test_packet(ssrc: u32, index: u64, value: u8) -> Vec<u8> {
+        let mut packet = vec![0x80, 111];
+        packet.extend_from_slice(&wire_u16(index).to_be_bytes());
+        packet.extend_from_slice(&0_u32.to_be_bytes());
+        packet.extend_from_slice(&ssrc.to_be_bytes());
+        packet.push(value);
+        packet
+    }
+
+    #[test]
+    fn early_repeat_nack_waits_for_its_rtt_without_blocking_ready_repairs() {
+        let start = Instant::now();
+        let mut egress = repair_egress(start, 128);
+        let first_ssrc = egress.senders[&1].ssrc;
+        let second_ssrc = egress.senders[&2].ssrc;
+        egress.retain_original(1, 7, 0, retained_test_packet(first_ssrc, 7, 1), start, 64);
+        egress.retain_original(2, 8, 0, retained_test_packet(second_ssrc, 8, 1), start, 64);
+        egress
+            .retained
+            .get_mut(&1)
+            .unwrap()
+            .get_mut(&7)
+            .unwrap()
+            .last_repair_at = Some(start);
+        let early = start + Duration::from_millis(10);
+        let due = start + Duration::from_millis(50);
+        let repeated = RetainedKey {
+            sender: 1,
+            index: 7,
+        };
+        let immediate = RetainedKey {
+            sender: 2,
+            index: 8,
+        };
+        egress.request_repair(early, first_ssrc, 7);
+        egress.request_repair(early, first_ssrc, 7);
+        assert_eq!(egress.repair_requests.len(), 1);
+        assert_eq!(egress.requested_repair(repeated).unwrap().eligible_at, due);
+        assert_eq!(egress.next_deadline(early), Some(due));
+        assert!(egress.next_packet_transport_bytes(early).is_none());
+        egress.request_repair(early, second_ssrc, 8);
+        assert_eq!(
+            egress.repair_requests.first_key_value().unwrap().1,
+            &immediate
+        );
+        assert!(egress.next_packet_transport_bytes(early).is_some());
+        egress.finish_repair_request(egress.requested_repair(immediate).unwrap(), immediate);
+        assert!(egress.next_packet_transport_bytes(due).is_some());
+    }
+
     #[test]
     fn retained_repairs_fence_rollover_and_share_byte_and_cleanup_budgets() {
         let start = Instant::now();
         let mut egress = repair_egress(start, 128);
-        let packet = |ssrc: u32, index: u64, value: u8| {
-            let mut packet = vec![0x80, 111];
-            packet.extend_from_slice(&wire_u16(index).to_be_bytes());
-            packet.extend_from_slice(&0_u32.to_be_bytes());
-            packet.extend_from_slice(&ssrc.to_be_bytes());
-            packet.push(value);
-            packet
-        };
+        let packet = retained_test_packet;
         let first_ssrc = egress.senders[&1].ssrc;
         let second_ssrc = egress.senders[&2].ssrc;
         let old = RetainedKey {
@@ -3241,11 +3823,11 @@ mod tests {
             .checked_sub(1)
             .unwrap();
         let next = egress.next_repair_request;
-        egress.request_repair(first_ssrc, 7);
+        egress.request_repair(start, first_ssrc, 7);
         assert_eq!(egress.next_repair_request, next);
         assert_eq!(egress.runtime_bytes, cached);
         egress.max_runtime_bytes = cached.checked_add(request_bytes).unwrap();
-        egress.request_repair(first_ssrc, 7);
+        egress.request_repair(start, first_ssrc, 7);
         assert_eq!(egress.runtime_bytes, egress.max_runtime_bytes);
         let admitted = egress.requested_repair(old).unwrap();
         egress.finish_repair_request(admitted, old);
@@ -3253,7 +3835,7 @@ mod tests {
         egress.max_runtime_bytes = crate::ConnectionLimits::DEFAULT_MAX_SEND_RUNTIME_BYTES;
         for (sender, ssrc) in [(1, first_ssrc), (2, second_ssrc)] {
             egress.retain_original(sender, 7, 0, packet(ssrc, 7, 1), start, 64);
-            egress.request_repair(ssrc, 7);
+            egress.request_repair(start, ssrc, 7);
         }
         let replaced_at = start + Duration::from_secs(1);
         egress.retain_original(
@@ -3265,13 +3847,16 @@ mod tests {
             64,
         );
         egress.remove_retained(old);
-        egress.request_repair(first_ssrc, 7);
+        egress.request_repair(replaced_at, first_ssrc, 7);
         assert!(egress.retained_packet(old).is_none());
         assert!(egress.requested_repair(old).is_none());
-        assert_eq!(
-            egress.retained_packet(current).unwrap().packet.last(),
-            Some(&2)
-        );
+        let sender = &egress.senders[&1];
+        let retained = egress.retained_packet(current).unwrap();
+        let repair = encode_repair(sender, retained, 452, None).unwrap();
+        let decoded = RtpPacket::parse(&repair).unwrap();
+        assert_eq!(decoded.payload(), &[0, 7, 2]);
+        assert_eq!(&repair[2..4], &452_u16.to_be_bytes());
+        assert_eq!(&repair[8..12], &sender.rtx_ssrc.to_be_bytes());
         assert_eq!(egress.retained_bytes, 128);
         assert_eq!(egress.retained_expiry.len(), 2);
         let expired_at = start + Duration::from_secs(3);
@@ -3305,7 +3890,7 @@ mod tests {
         for offset in 0..=u64::try_from(REPAIR_MAINTENANCE_BUDGET).unwrap() {
             let index = 65_544 + offset;
             egress.retain_original(1, index, 0, packet(first_ssrc, index, 4), refill_at, 64);
-            egress.request_repair(first_ssrc, wire_u16(index));
+            egress.request_repair(refill_at, first_ssrc, wire_u16(index));
         }
         egress.expire_repair(cleanup_at);
         egress.clean_repair_requests();
@@ -3330,7 +3915,7 @@ mod tests {
         assert_eq!(egress.runtime_bytes, initial);
         for (sender, ssrc) in [(1, first_ssrc), (2, second_ssrc)] {
             egress.retain_original(sender, 131_079, 0, packet(ssrc, 131_079, 5), cleanup_at, 64);
-            egress.request_repair(ssrc, 7);
+            egress.request_repair(cleanup_at, ssrc, 7);
         }
         egress.cancel_sender_work(1);
         let charged = egress.runtime_bytes;
@@ -3408,8 +3993,8 @@ mod tests {
         continuing_packet.extend_from_slice(&continuing_ssrc.to_be_bytes());
         continuing_packet.push(8);
         egress.retain_original(2, 9, 0, continuing_packet, start, 64);
-        egress.request_repair(retired_ssrc, 7);
-        egress.request_repair(continuing_ssrc, 9);
+        egress.request_repair(start, retired_ssrc, 7);
+        egress.request_repair(start, continuing_ssrc, 9);
         egress.observe_receipt(
             start,
             crate::rtcp::ReportReceipt {
@@ -3447,7 +4032,7 @@ mod tests {
                 .0,
             WriteError::UnknownStream
         );
-        egress.request_repair(retired_ssrc, 8);
+        egress.request_repair(start, retired_ssrc, 8);
         assert_eq!(egress.repair_requests.len(), 2);
         assert_eq!(
             egress.queued_payload_bytes, queued_bytes,
@@ -3515,7 +4100,7 @@ mod tests {
             index: 9,
         };
         assert!(egress.requested_repair(original).is_none());
-        egress.request_repair(continuing_ssrc, 9);
+        egress.request_repair(start, continuing_ssrc, 9);
         assert!(egress.requested_repair(original).is_none());
         egress.senders.get_mut(&2).unwrap().active = true;
         egress
@@ -3532,7 +4117,7 @@ mod tests {
                 },
             )
             .unwrap();
-        egress.request_repair(continuing_ssrc, 9);
+        egress.request_repair(start, continuing_ssrc, 9);
         let requested = egress.requested_repair(original).unwrap();
         assert!(
             egress
@@ -3575,10 +4160,11 @@ mod tests {
 
         egress.finish_repair_request(requested, original);
         egress.next_repair_request = Some(u64::MAX);
-        egress.request_repair(continuing_ssrc, 9);
-        assert_eq!(egress.requested_repair(original), Some(u64::MAX));
-        egress.finish_repair_request(u64::MAX, original);
-        egress.request_repair(continuing_ssrc, 9);
+        egress.request_repair(start, continuing_ssrc, 9);
+        let last = egress.requested_repair(original).unwrap();
+        assert_eq!(last.id, u64::MAX);
+        egress.finish_repair_request(last, original);
+        egress.request_repair(start, continuing_ssrc, 9);
         assert!(egress.repair_requests.is_empty());
     }
 
@@ -3775,11 +4361,15 @@ mod tests {
         let start = Instant::now();
         let mut egress = audio_egress(start);
         let sender = egress.senders.get_mut(&1).unwrap();
-        sender.latest_rtp = Some((u32::MAX - 11_999, start + Duration::from_millis(250)));
+        sender.latest_rtp = Some((
+            u64::from(u32::MAX) - 11_999,
+            start + Duration::from_millis(250),
+        ));
         sender.committed_packets = 2;
         sender.committed_payload_bytes = 777;
-        let packet =
+        let (timestamp, packet) =
             sender_report(sender, start + Duration::from_millis(750), &egress.clock).unwrap();
+        assert_eq!(timestamp, u64::from(u32::MAX) + 12_001);
         assert_eq!(u32::from_be_bytes(packet[20..24].try_into().unwrap()), 2);
         assert_eq!(u32::from_be_bytes(packet[24..28].try_into().unwrap()), 777);
         let parsed = crate::rtcp::parse(

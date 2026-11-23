@@ -5,8 +5,12 @@ use std::collections::{HashSet, VecDeque};
 
 use crate::entity::{ConnectionId, PublicationKey};
 use crate::id::ShardId;
+use crate::route::fabric::{
+    LiveNetworkChild, LiveRelayChange, NetworkDataExpectation, network_repair::RepairChild,
+};
 use crate::route::{NodeRouteAddress, NodeTransportAddress};
 use pulsebeam_queue as mailbox;
+use pulsebeam_runtime::sync::oneshot;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CompiledRoute {
@@ -15,14 +19,30 @@ pub(crate) struct CompiledRoute {
     pub clock_origin: pulsebeam_runtime::time::Instant,
 }
 
+impl CompiledRoute {
+    pub(crate) fn targets_local_route(&self) -> bool {
+        self.tx.local_delivery_tag() == Some(crate::link::delivery_tag(self.address))
+    }
+
+    pub(crate) fn offer_fabric(&self, offer: crate::route::fabric::ShardOffer) -> bool {
+        offer.binding.destination == self.address
+            && self.targets_local_route()
+            && crate::shard::worker::send_link_frame(
+                &self.tx,
+                self.clock_origin,
+                crate::shard::worker::ShardFrame::Fabric(offer),
+            )
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct TrackPlan {
     pub local: Vec<ConnectionId>,
     pub remote: Vec<NodeRouteAddress>,
+    pub wan_transit: bool,
     pub reverse_route: Option<NodeRouteAddress>,
     pub compiled_remote: Vec<CompiledRoute>,
     pub compiled_reverse: Option<CompiledRoute>,
-    pub compiled_network: Vec<CompiledRoute>,
     pub compiled_network_reverse: Option<CompiledRoute>,
 }
 
@@ -35,10 +55,10 @@ impl TrackPlan {
         Self {
             local: unique(local, "local"),
             remote: unique(remote, "remote"),
+            wan_transit: false,
             reverse_route,
             compiled_remote: Vec::new(),
             compiled_reverse: None,
-            compiled_network: Vec::new(),
             compiled_network_reverse: None,
         }
     }
@@ -118,6 +138,18 @@ pub(crate) enum ShardUpdateOp {
         address: NodeRouteAddress,
         action: TrackRouteAction,
     },
+    InstallShardFabricSource {
+        binding: crate::route::fabric::ShardBinding,
+        encoding: Option<crate::route::fabric::RtpSourceEncoding>,
+        emission: crate::route::fabric::local::Emission,
+    },
+    BindShardFabricDestination {
+        binding: crate::route::fabric::ShardBinding,
+    },
+    SetShardDataReceiver {
+        ready: crate::route::fabric::ShardDataReady,
+        enabled: bool,
+    },
     RetireRoute {
         address: NodeRouteAddress,
     },
@@ -139,12 +171,93 @@ pub(crate) enum ShardUpdateOp {
 }
 
 #[derive(Debug)]
+pub(crate) struct InstallNetworkChild<T> {
+    pub child: T,
+    pub lifetime: pulsebeam_link::BindingCutoff,
+    pub result: oneshot::Sender<Option<T>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ObserveNetworkDataExpectation {
+    pub notice: NetworkDataExpectation,
+    pub result: oneshot::Sender<bool>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PublisherAnchor {
+    pub publication: PublicationKey,
+    pub connection: ConnectionId,
+    pub incarnation: std::num::NonZeroU64,
+    pub emission: crate::route::fabric::local::Emission,
+}
+
+impl PublisherAnchor {
+    pub(crate) fn data_publisher(self) -> Option<crate::route::fabric::DataPublisher> {
+        (self.emission == crate::route::fabric::local::Emission::DATA).then_some(
+            crate::route::fabric::DataPublisher {
+                publication: self.publication,
+                connection: self.connection,
+                incarnation: self.incarnation,
+            },
+        )
+    }
+}
+
+impl From<crate::route::fabric::DataPublisher> for PublisherAnchor {
+    fn from(publisher: crate::route::fabric::DataPublisher) -> Self {
+        Self {
+            publication: publisher.publication,
+            connection: publisher.connection,
+            incarnation: publisher.incarnation,
+            emission: crate::route::fabric::local::Emission::DATA,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct SamplePublisherAnchor {
+    pub publisher: PublisherAnchor,
+    pub result: oneshot::Sender<Option<u64>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct LocateRelayRepair {
+    pub lookup: crate::route::fabric::relay::PeerRepairLookup,
+    pub result: oneshot::Sender<Option<crate::route::fabric::relay::LocatedRepair>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct UpdatePublisherSend {
+    pub change: crate::route::fabric::PublisherSendChange,
+    pub result: oneshot::Sender<bool>,
+}
+
+#[derive(Debug)]
+pub(crate) struct UpdateLiveRelay {
+    pub change: LiveRelayChange,
+    pub result: oneshot::Sender<bool>,
+}
+
+#[derive(Debug)]
 pub(crate) struct ShardUpdate {
     pub shard: ShardId,
     pub generation: u64,
     pub participant_effects: Vec<(ConnectionId, crate::participant::ParticipantEffect)>,
     pub lifecycle: Vec<ShardUpdateOp>,
     pub plans: Vec<TrackPlanUpdate>,
+    pub fabric_children: Vec<InstallNetworkChild<LiveNetworkChild>>,
+    pub repair_children: Vec<InstallNetworkChild<RepairChild>>,
+    pub media_repair_children:
+        Vec<InstallNetworkChild<crate::route::fabric::network_repair::MediaRepairChild>>,
+    pub data_expectations: Vec<ObserveNetworkDataExpectation>,
+    pub relay_observations: Vec<crate::route::fabric::relay::RelayObservation>,
+    pub publisher_observations: Vec<crate::route::fabric::PublisherObservation>,
+    pub source_anchors: Vec<SamplePublisherAnchor>,
+    pub repair_lookups: Vec<LocateRelayRepair>,
+    pub repair_handoffs: Vec<crate::route::fabric::relay::PeerRepairHandoff>,
+    pub repair_unavailable: Vec<crate::route::fabric::network_repair::Interest>,
+    pub fabric_relays: Vec<UpdateLiveRelay>,
+    pub publisher_sends: Vec<UpdatePublisherSend>,
     pub cutoff_bindings: Vec<pulsebeam_link::BindingCutoff>,
     pub cutoff_acks: Vec<pulsebeam_runtime::sync::oneshot::Sender<()>>,
 }
@@ -157,6 +270,18 @@ impl ShardUpdate {
             participant_effects: Vec::new(),
             lifecycle: Vec::new(),
             plans: Vec::new(),
+            fabric_children: Vec::new(),
+            repair_children: Vec::new(),
+            media_repair_children: Vec::new(),
+            data_expectations: Vec::new(),
+            relay_observations: Vec::new(),
+            publisher_observations: Vec::new(),
+            source_anchors: Vec::new(),
+            repair_lookups: Vec::new(),
+            repair_handoffs: Vec::new(),
+            repair_unavailable: Vec::new(),
+            fabric_relays: Vec::new(),
+            publisher_sends: Vec::new(),
             cutoff_bindings: Vec::new(),
             cutoff_acks: Vec::new(),
         }
@@ -166,6 +291,18 @@ impl ShardUpdate {
         self.participant_effects.is_empty()
             && self.lifecycle.is_empty()
             && self.plans.is_empty()
+            && self.fabric_children.is_empty()
+            && self.repair_children.is_empty()
+            && self.media_repair_children.is_empty()
+            && self.data_expectations.is_empty()
+            && self.relay_observations.is_empty()
+            && self.publisher_observations.is_empty()
+            && self.source_anchors.is_empty()
+            && self.repair_lookups.is_empty()
+            && self.repair_handoffs.is_empty()
+            && self.repair_unavailable.is_empty()
+            && self.fabric_relays.is_empty()
+            && self.publisher_sends.is_empty()
             && self.cutoff_bindings.is_empty()
             && self.cutoff_acks.is_empty()
     }
@@ -174,6 +311,50 @@ impl ShardUpdate {
         self.shard == shard
             && self.generation > current_revision
             && self.lifecycle.iter().all(|op| op.is_owned_by(shard))
+            && self
+                .fabric_children
+                .iter()
+                .all(|install| install.child.destination.shard() == shard)
+            && self
+                .repair_children
+                .iter()
+                .all(|install| install.child.destination.shard() == shard)
+            && self
+                .media_repair_children
+                .iter()
+                .all(|install| install.child.parent.destination.shard() == shard)
+            && self
+                .data_expectations
+                .iter()
+                .all(|record| record.notice.parent.destination.shard() == shard)
+            && self
+                .relay_observations
+                .iter()
+                .all(|record| record.route.input.destination.shard() == shard)
+            && self
+                .publisher_observations
+                .iter()
+                .all(|observation| observation.route.shard == shard)
+            && self
+                .repair_lookups
+                .iter()
+                .all(|record| record.lookup.shard() == shard)
+            && self
+                .repair_handoffs
+                .iter()
+                .all(|handoff| handoff.located.lookup.shard() == shard)
+            && self
+                .repair_unavailable
+                .iter()
+                .all(|interest| interest.parent.destination.shard() == shard)
+            && self
+                .fabric_relays
+                .iter()
+                .all(|update| update.change.route().input.destination.shard() == shard)
+            && self
+                .publisher_sends
+                .iter()
+                .all(|update| update.change.route().shard == shard)
     }
 }
 
@@ -188,6 +369,226 @@ pub(crate) struct ShardUpdateWriter {
 impl ShardUpdateWriter {
     pub(crate) fn is_closed(&self) -> bool {
         self.closed
+    }
+
+    pub(crate) fn stage_live_relay(
+        &mut self,
+        generation: u64,
+        change: LiveRelayChange,
+    ) -> oneshot::Receiver<bool> {
+        let commit = self
+            .staged
+            .get_or_insert_with(|| Box::new(ShardUpdate::new(self.shard, generation)));
+        if commit.generation != generation || change.route().input.destination.shard() != self.shard
+        {
+            pulsebeam_runtime::fatal!("a Fabric relay update must target its shard generation");
+        }
+        let (result, receipt) = oneshot::channel();
+        commit
+            .fabric_relays
+            .push(UpdateLiveRelay { change, result });
+        receipt
+    }
+
+    pub(crate) fn stage_live_network_child(
+        &mut self,
+        generation: u64,
+        child: LiveNetworkChild,
+        lifetime: pulsebeam_link::BindingCutoff,
+    ) -> oneshot::Receiver<Option<LiveNetworkChild>> {
+        let commit = self
+            .staged
+            .get_or_insert_with(|| Box::new(ShardUpdate::new(self.shard, generation)));
+        if commit.generation != generation || child.destination.shard() != self.shard {
+            pulsebeam_runtime::fatal!("a Fabric child must be installed at its shard generation");
+        }
+        let (result, receipt) = oneshot::channel();
+        commit.fabric_children.push(InstallNetworkChild {
+            child,
+            lifetime,
+            result,
+        });
+        receipt
+    }
+
+    pub(crate) fn stage_repair_network_child(
+        &mut self,
+        generation: u64,
+        child: RepairChild,
+        lifetime: pulsebeam_link::BindingCutoff,
+    ) -> oneshot::Receiver<Option<RepairChild>> {
+        let commit = self
+            .staged
+            .get_or_insert_with(|| Box::new(ShardUpdate::new(self.shard, generation)));
+        if commit.generation != generation || child.destination.shard() != self.shard {
+            pulsebeam_runtime::fatal!(
+                "a Fabric repair child must be installed at its shard generation"
+            );
+        }
+        let (result, receipt) = oneshot::channel();
+        commit.repair_children.push(InstallNetworkChild {
+            child,
+            lifetime,
+            result,
+        });
+        receipt
+    }
+
+    pub(crate) fn stage_media_repair_child(
+        &mut self,
+        generation: u64,
+        child: crate::route::fabric::network_repair::MediaRepairChild,
+        lifetime: pulsebeam_link::BindingCutoff,
+    ) -> oneshot::Receiver<Option<crate::route::fabric::network_repair::MediaRepairChild>> {
+        let commit = self
+            .staged
+            .get_or_insert_with(|| Box::new(ShardUpdate::new(self.shard, generation)));
+        if commit.generation != generation || child.parent.destination.shard() != self.shard {
+            pulsebeam_runtime::fatal!("a WAN media repair child must target its shard generation");
+        }
+        let (result, receipt) = oneshot::channel();
+        commit.media_repair_children.push(InstallNetworkChild {
+            child,
+            lifetime,
+            result,
+        });
+        receipt
+    }
+
+    pub(crate) fn stage_publisher_send(
+        &mut self,
+        generation: u64,
+        change: crate::route::fabric::PublisherSendChange,
+    ) -> oneshot::Receiver<bool> {
+        let commit = self
+            .staged
+            .get_or_insert_with(|| Box::new(ShardUpdate::new(self.shard, generation)));
+        if commit.generation != generation || change.route().shard != self.shard {
+            pulsebeam_runtime::fatal!("a DATA publisher send must target its shard generation");
+        }
+        let (result, receipt) = oneshot::channel();
+        commit
+            .publisher_sends
+            .push(UpdatePublisherSend { change, result });
+        receipt
+    }
+
+    pub(crate) fn stage_publisher_anchor(
+        &mut self,
+        generation: u64,
+        publisher: PublisherAnchor,
+    ) -> oneshot::Receiver<Option<u64>> {
+        let commit = self
+            .staged
+            .get_or_insert_with(|| Box::new(ShardUpdate::new(self.shard, generation)));
+        if commit.generation != generation {
+            pulsebeam_runtime::fatal!("a publisher anchor must be sampled at its shard generation");
+        }
+        let (result, receipt) = oneshot::channel();
+        commit
+            .source_anchors
+            .push(SamplePublisherAnchor { publisher, result });
+        receipt
+    }
+
+    pub(crate) fn stage_unavailable_network_repair(
+        &mut self,
+        generation: u64,
+        interest: crate::route::fabric::network_repair::Interest,
+    ) {
+        let commit = self
+            .staged
+            .get_or_insert_with(|| Box::new(ShardUpdate::new(self.shard, generation)));
+        if commit.generation != generation || interest.parent.destination.shard() != self.shard {
+            pulsebeam_runtime::fatal!(
+                "a network DATA repair outcome must target its shard generation"
+            );
+        }
+        commit.repair_unavailable.push(interest);
+    }
+
+    pub(crate) fn stage_relay_repair_handoff(
+        &mut self,
+        generation: u64,
+        handoff: crate::route::fabric::relay::PeerRepairHandoff,
+    ) {
+        let commit = self
+            .staged
+            .get_or_insert_with(|| Box::new(ShardUpdate::new(self.shard, generation)));
+        if commit.generation != generation || handoff.located.lookup.shard() != self.shard {
+            pulsebeam_runtime::fatal!("a relay repair handoff must target its shard generation");
+        }
+        commit.repair_handoffs.push(handoff);
+    }
+
+    pub(crate) fn stage_relay_repair_lookup(
+        &mut self,
+        generation: u64,
+        lookup: crate::route::fabric::relay::PeerRepairLookup,
+    ) -> oneshot::Receiver<Option<crate::route::fabric::relay::LocatedRepair>> {
+        let commit = self
+            .staged
+            .get_or_insert_with(|| Box::new(ShardUpdate::new(self.shard, generation)));
+        if commit.generation != generation || lookup.shard() != self.shard {
+            pulsebeam_runtime::fatal!("a relay repair lookup must target its shard generation");
+        }
+        let (result, receipt) = oneshot::channel();
+        commit
+            .repair_lookups
+            .push(LocateRelayRepair { lookup, result });
+        receipt
+    }
+
+    pub(crate) fn stage_publisher_data_observation(
+        &mut self,
+        generation: u64,
+        observation: crate::route::fabric::PublisherObservation,
+    ) {
+        let commit = self
+            .staged
+            .get_or_insert_with(|| Box::new(ShardUpdate::new(self.shard, generation)));
+        if commit.generation != generation || observation.route.shard != self.shard {
+            pulsebeam_runtime::fatal!(
+                "a DATA publisher observation must target its shard generation"
+            );
+        }
+        commit.publisher_observations.push(observation);
+    }
+
+    pub(crate) fn stage_relay_data_observation(
+        &mut self,
+        generation: u64,
+        observation: crate::route::fabric::relay::RelayObservation,
+    ) {
+        let commit = self
+            .staged
+            .get_or_insert_with(|| Box::new(ShardUpdate::new(self.shard, generation)));
+        if commit.generation != generation
+            || observation.route.input.destination.shard() != self.shard
+        {
+            pulsebeam_runtime::fatal!("a relay DATA observation must target its shard generation");
+        }
+        commit.relay_observations.push(observation);
+    }
+
+    pub(crate) fn stage_network_data_expectation(
+        &mut self,
+        generation: u64,
+        notice: NetworkDataExpectation,
+    ) -> oneshot::Receiver<bool> {
+        let commit = self
+            .staged
+            .get_or_insert_with(|| Box::new(ShardUpdate::new(self.shard, generation)));
+        if commit.generation != generation || notice.parent.destination.shard() != self.shard {
+            pulsebeam_runtime::fatal!(
+                "a network DATA expectation must target its shard generation"
+            );
+        }
+        let (result, receipt) = oneshot::channel();
+        commit
+            .data_expectations
+            .push(ObserveNetworkDataExpectation { notice, result });
+        receipt
     }
 
     pub(crate) fn stage_cutoff(
@@ -354,6 +755,9 @@ pub(crate) fn new_shard_update(
 impl ShardUpdateOp {
     pub(crate) fn is_owned_by(&self, shard: ShardId) -> bool {
         match self {
+            Self::InstallShardFabricSource { binding, .. } => binding.destination.shard() == shard,
+            Self::BindShardFabricDestination { binding } => binding.origin == shard,
+            Self::SetShardDataReceiver { ready, .. } => ready.binding.origin == shard,
             Self::InstallRoute { address, .. } | Self::RetireRoute { address } => {
                 address.shard() == shard
             }

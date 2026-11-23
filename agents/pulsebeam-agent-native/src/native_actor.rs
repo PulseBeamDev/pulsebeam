@@ -1,5 +1,5 @@
 //! Shared application actor. Runtime selection changes services, not RTC/media policy.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::sync::{
     Arc, Weak,
@@ -553,6 +553,7 @@ impl Agent {
         let actor = Actor {
             config,
             core,
+            clock_origin: Instant::now(),
             peer: None,
             peer_owner: None,
             runtime,
@@ -584,7 +585,7 @@ impl Agent {
             http_tx,
             http_rx,
             timers: BTreeMap::new(),
-            core_wake: None,
+            core_wakes: VecDeque::new(),
             close_waiters: Vec::new(),
             next_playout: None,
             next_stats: None,
@@ -984,6 +985,7 @@ where
 {
     config: Config,
     core: Control,
+    clock_origin: Instant,
     // A generation is destroyed before the factory closure (which may own the
     // controlled world's affine services). There is no closed-peer history.
     peer: Option<NativePeer<R>>,
@@ -1017,7 +1019,7 @@ where
     http_tx: mpsc::Sender<HttpCompletion>,
     http_rx: mpsc::Receiver<HttpCompletion>,
     timers: BTreeMap<TimerId, Instant>,
-    core_wake: Option<TimerId>,
+    core_wakes: VecDeque<TimerId>,
     close_waiters: Vec<oneshot::Sender<Result<(), Error>>>,
     next_playout: Option<Instant>,
     next_stats: Option<Instant>,
@@ -1104,7 +1106,7 @@ where
     }
 
     fn wake_core(&mut self) -> bool {
-        if let Some(timer) = self.core_wake.take() {
+        if let Some(timer) = self.core_wakes.pop_front() {
             self.accept(HostEvent::Timer(TimerEvent::Fired { timer }));
             self.drain_effects();
             true
@@ -1116,7 +1118,9 @@ where
     fn timer_effect(&mut self, effect: TimerEffect) {
         match effect {
             TimerEffect::Schedule { timer, after } if after.is_zero() => {
-                self.core_wake = Some(timer);
+                if !self.core_wakes.contains(&timer) {
+                    self.core_wakes.push_back(timer);
+                }
             }
             TimerEffect::Schedule { timer, after } => {
                 if let Some(at) = self.later(after) {
@@ -1124,9 +1128,7 @@ where
                 }
             }
             TimerEffect::Cancel { timer } => {
-                if self.core_wake == Some(timer) {
-                    self.core_wake = None;
-                }
+                self.core_wakes.retain(|id| *id != timer);
                 self.timers.remove(&timer);
             }
         }
@@ -1155,7 +1157,7 @@ where
             tracing::debug!(target: "pulsebeam_sim_recovery", ?generation, kind,
                 "native core RTC input");
         }
-        if let Err(error) = self.core.handle(event) {
+        if let Err(error) = self.core.handle_at(event, self.clock_origin.elapsed()) {
             self.fail(Error::Core(error));
         }
     }
@@ -1224,10 +1226,13 @@ where
                 data,
                 options,
                 response,
-            } => match self
-                .core
-                .send_owned_data(owner, expected_join, data, options)
-            {
+            } => match self.core.send_owned_data(
+                owner,
+                expected_join,
+                data,
+                options,
+                self.clock_origin.elapsed(),
+            ) {
                 Ok(send) => {
                     self.data_sends.insert(send, response);
                 }
@@ -2253,7 +2258,7 @@ where
             task.abort();
         }
         self.timers.clear();
-        self.core_wake = None;
+        self.core_wakes.clear();
         self.retire_peer();
         for waiter in self.close_waiters.drain(..) {
             let _ = waiter.send(Err(Error::Closed));
@@ -2543,21 +2548,28 @@ mod tests {
         .unwrap();
         core.command(AgentCommand::Join("timer-room".into()))
             .unwrap();
-        let effect = core.next_effect().unwrap();
-        let Effect::Rtc(RtcEffect::CreateOffer { generation, .. }) = effect else {
-            panic!("expected offer, got {effect:?}");
-        };
-        core.handle(HostEvent::Rtc(RtcEvent::Failed {
-            generation,
-            message: "offline".into(),
-        }))
-        .unwrap();
-        let timer = std::iter::from_fn(|| core.next_effect())
-            .find_map(|effect| match effect {
-                Effect::Timer(TimerEffect::Schedule { timer, .. }) => Some(timer),
-                _ => None,
-            })
+        let fail_offer = |core: &mut agent_core::Agent| {
+            let effect = core.next_effect().unwrap();
+            let Effect::Rtc(RtcEffect::CreateOffer { generation, .. }) = effect else {
+                panic!("expected offer, got {effect:?}");
+            };
+            core.handle(HostEvent::Rtc(RtcEvent::Failed {
+                generation,
+                message: "offline".into(),
+            }))
             .unwrap();
+            std::iter::from_fn(|| core.next_effect())
+                .find_map(|effect| match effect {
+                    Effect::Timer(TimerEffect::Schedule { timer, .. }) => Some(timer),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        let timer = fail_offer(&mut core);
+        core.handle(HostEvent::Timer(TimerEvent::Fired { timer }))
+            .unwrap();
+        let other = fail_offer(&mut core);
+        assert_ne!(timer, other);
         let (_agent, mut actor) = Agent::parts(
             config(),
             Host::new(Box::new(reqwest::Client::new())),
@@ -2569,8 +2581,18 @@ mod tests {
             timer,
             after: Duration::ZERO,
         });
+        actor.timer_effect(TimerEffect::Schedule {
+            timer: other,
+            after: Duration::ZERO,
+        });
         assert!(actor.timers.is_empty());
+        assert_eq!(
+            actor.core_wakes.iter().copied().collect::<Vec<_>>(),
+            [timer, other]
+        );
         actor.timer_effect(TimerEffect::Cancel { timer });
+        assert_eq!(actor.core_wakes.front(), Some(&other));
+        assert!(actor.wake_core());
         assert!(!actor.wake_core());
         actor.timer_effect(TimerEffect::Schedule {
             timer,
@@ -2595,6 +2617,50 @@ mod tests {
         });
         actor.shutdown();
         assert!(!actor.wake_core());
+    }
+
+    #[tokio::test]
+    async fn closing_a_data_cursor_before_the_actor_sweep_settles_its_read() {
+        let (_agent, mut actor) = Agent::parts(
+            config(),
+            Host::new(Box::new(reqwest::Client::new())),
+            || Ok((rtc::ThreadedRuntime, ())),
+        )
+        .unwrap();
+        let cursor = actor
+            .receive_data(
+                agent_core::TrackSpec::Data {
+                    track_id: "control".into(),
+                    delivery: agent_core::TopicMode::Ordered,
+                },
+                agent_core::TrackSelector {
+                    room: "room".into(),
+                    participant_id: "remote".into(),
+                    track_id: "control".into(),
+                },
+            )
+            .unwrap();
+        let owner = *actor.data_receivers.keys().next().unwrap();
+        let mut closing = Box::pin(cursor.close());
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(closing.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        let (response, result) = oneshot::channel();
+        actor.read_data(owner, response);
+        actor.progress_data_reads();
+        assert!(matches!(
+            result.await.unwrap(),
+            Ok(agent_core::DataUpdate::Closed)
+        ));
+        let command = actor.commands.try_recv().unwrap();
+        actor.command(command);
+        closing.await.unwrap();
+        assert!(matches!(
+            cursor.next().await,
+            Ok(agent_core::DataUpdate::Closed)
+        ));
     }
 
     #[tokio::test]

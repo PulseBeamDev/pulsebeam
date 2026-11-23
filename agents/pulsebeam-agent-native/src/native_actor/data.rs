@@ -563,7 +563,13 @@ where
             if response.is_closed() {
                 continue;
             }
-            match self.core.resource(ResourceCommand::ReadData { owner }) {
+            let result = self.core.resource(ResourceCommand::ReadData { owner });
+            // Closing a cursor releases the resource before the actor drains its lease queue.
+            let Some(lease) = io.lease.upgrade().filter(|lease| !lease.closed.is_closed()) else {
+                let _ = response.send(Ok(DataUpdate::Closed));
+                continue;
+            };
+            match result {
                 Ok(ResourceResult::Event { event: Some(event) }) => {
                     let _ = response.send(Ok(DataUpdate::Event { event }));
                 }
@@ -572,10 +578,8 @@ where
                     let error = result.err().map(Error::Core).unwrap_or_else(|| {
                         Error::Rtc("Core did not return a data receive event".into())
                     });
-                    if let Some(lease) = io.lease.upgrade() {
-                        let _ = lease.failure.set(error.clone());
-                        lease.closed.close();
-                    }
+                    let _ = lease.failure.set(error.clone());
+                    lease.closed.close();
                     self.leases_changed.notify_one();
                     let _ = response.send(Err(error));
                 }

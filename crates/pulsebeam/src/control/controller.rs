@@ -16,7 +16,8 @@ use super::api::creation;
 use super::native::handler::StateProtocolHandler;
 use super::{MAX_NATIVE_SDP_BYTES, egress::CommandBacklog, placement};
 use crate::control::steering::Steering;
-use crate::track::{DataTrackIntent, SelectionPolicy, TrackSelector};
+#[cfg(test)]
+use crate::track::{SelectionPolicy, TrackSelector};
 use crate::{
     control::{
         core::{ControllerCore, RoomPartitionPlacement},
@@ -235,7 +236,6 @@ pub enum ControllerCommand {
     LinkDestinations(crate::link::Destinations),
     CloseLink(pulsebeam_link::NetworkId),
     BindLinkReceive(crate::link::BindReceive),
-    BindLinkSend(crate::link::BindSend),
     BindLinkReverse(crate::link::BindReverse),
     UnbindLinkSend(crate::link::UnbindSend),
     UnbindLinkReceive(pulsebeam_link::BindingId),
@@ -653,7 +653,7 @@ pub struct ControllerActor {
     deletion_bytes: usize,
     ownership: ownership::Authority,
     peer_ownership: ownership::observations::Observations,
-    provisioned_peer: Option<peer_ownership::provisioned::Peer>,
+    provisioned_peers: Vec<peer_ownership::provisioned::Peer>,
     ownership_entropy: pulsebeam_runtime::rand::Rng,
     receipt_trust: Option<ownership::receipt::Authority>,
     delivery_budget: creation::DeliveryBudget,
@@ -662,6 +662,10 @@ pub struct ControllerActor {
     native_connections: std::collections::HashMap<ConnectionId, NativeService>,
     retiring_native: std::collections::HashMap<ConnectionId, native_service::RetiringNative>,
     source_lookup_index: native_service::SourceLookupIndex,
+    data_branches: super::native::DataBranchIds,
+    data_profile: super::native::DataProfile,
+    #[cfg(feature = "sim")]
+    sim_fabric_relay: Option<peer_ownership::SimFabricRelay>,
     catalog: catalog::CatalogRuntime,
     native_ready_tx: mailbox::Sender<ConnectionId>,
     native_ready_rx: mailbox::Receiver<ConnectionId>,
@@ -676,6 +680,12 @@ impl ControllerActor {
         origin: pulsebeam_runtime::time::Instant,
     ) {
         self.links = Some(super::link::Links::new(links, ports, origin));
+    }
+
+    pub(crate) fn set_link_node(&mut self, node: log::RelayNode) {
+        if let Some(links) = &mut self.links {
+            links.set_node(node);
+        }
     }
 
     pub(crate) fn set_link_host(
@@ -731,7 +741,7 @@ impl ControllerActor {
             deletion_bytes: 0,
             ownership: ownership::Authority::default(),
             peer_ownership: peer_ownership::new_observations(),
-            provisioned_peer: None,
+            provisioned_peers: Vec::new(),
             ownership_entropy,
             receipt_trust: None,
             delivery_budget: creation::DeliveryBudget::new(),
@@ -740,6 +750,10 @@ impl ControllerActor {
             native_connections: std::collections::HashMap::new(),
             retiring_native: std::collections::HashMap::new(),
             source_lookup_index: native_service::SourceLookupIndex::default(),
+            data_branches: super::native::DataBranchIds::default(),
+            data_profile: super::native::DataProfile::Legacy,
+            #[cfg(feature = "sim")]
+            sim_fabric_relay: None,
             catalog: catalog::CatalogRuntime::default(),
             native_ready_tx,
             native_ready_rx,
@@ -750,6 +764,10 @@ impl ControllerActor {
     #[cfg(feature = "sim")]
     pub(crate) fn set_sim_ownership_peer(&mut self, peer: ownership::sim::SimOwnershipPeer) {
         self.receipt_trust = Some(ownership::receipt::Authority::Local(peer.trust()));
+    }
+
+    pub(crate) fn set_data_profile(&mut self, data_profile: super::native::DataProfile) {
+        self.data_profile = data_profile;
     }
 
     pub(crate) fn set_ownership_mode(&mut self, mode: OwnershipMode) {
@@ -842,8 +860,8 @@ impl ControllerActor {
                 .chain(self.native_deadlines.first().map(|(deadline, _)| *deadline))
                 .chain(self.peer_ownership.deadline())
                 .chain(
-                    self.provisioned_peer
-                        .as_ref()
+                    self.provisioned_peers
+                        .iter()
                         .map(peer_ownership::provisioned::Peer::deadline),
                 )
                 .min();
@@ -895,7 +913,7 @@ impl ControllerActor {
         }
         self.expire_authorizations(started, SystemTime::now());
         self.expire_peer_sources(started);
-        self.drive_provisioned_peer(started);
+        self.drive_provisioned_peers(started);
         self.advance_materializations();
         if let Some(links) = &mut self.links {
             links.reap();
@@ -977,27 +995,6 @@ impl ControllerActor {
                     if let Some(links) = &mut self.links {
                         let _ = links.close_peer(peer);
                     }
-                }
-                None
-            }
-            ControllerCommand::BindLinkSend(command) => {
-                let result = self
-                    .lifecycle
-                    .network_source(command.room, command.track, &self.core.registry)
-                    .ok_or(pulsebeam_link::BindError::Closed)
-                    .and_then(|shard| {
-                        let (binding, plan) = self
-                            .links
-                            .as_mut()
-                            .ok_or(pulsebeam_link::BindError::Closed)?
-                            .bind_send(shard, command.track, command.peer, command.address)?;
-                        let generation = self.lifecycle.next_generation();
-                        self.stage_plans_at(shard, generation, vec![plan]);
-                        self.publish_staged();
-                        Ok(binding)
-                    });
-                if let Err(Ok(binding)) = command.reply.send(result) {
-                    self.retire_network_send(binding);
                 }
                 None
             }
@@ -1409,6 +1406,7 @@ impl ControllerActor {
                 pending.connection_id(),
                 capabilities,
                 &pending.answer,
+                self.data_profile,
             )
         } else {
             creation::CreationResponse::sdp(&location, &pending.answer)
@@ -1994,8 +1992,127 @@ impl ControllerActor {
             .is_some()
     }
 
-    fn handle_shard_event(&mut self, (_shard, event): ShardEventMessage) {
+    fn handle_shard_event(&mut self, (shard, event): ShardEventMessage) {
         match event {
+            ShardEvent::NetworkMediaRepair(interest) => {
+                if interest.parent.destination.shard() == shard
+                    && let Some(peer) = self
+                        .provisioned_peers
+                        .iter_mut()
+                        .find(|peer| peer.matches_network(interest.parent.ingress.association))
+                {
+                    peer.request_media_repair(*interest, pulsebeam_runtime::time::Instant::now());
+                }
+            }
+            ShardEvent::NetworkDataRepair(event) => {
+                use crate::route::fabric::network_repair::InterestEvent;
+                let network = match &*event {
+                    InterestEvent::Request(interest) | InterestEvent::Cancel(interest) => {
+                        interest.parent.ingress.association
+                    }
+                };
+                let Some(peer) = self
+                    .provisioned_peers
+                    .iter_mut()
+                    .find(|peer| peer.matches_network(network))
+                else {
+                    return;
+                };
+                let now = pulsebeam_runtime::time::Instant::now();
+                match *event {
+                    InterestEvent::Request(interest)
+                        if interest.parent.destination.shard() == shard
+                            && self.links.as_ref().is_some_and(|links| {
+                                links.allows_repair_interest(interest, now)
+                            }) =>
+                    {
+                        peer.request_repair(interest, now);
+                    }
+                    InterestEvent::Cancel(interest)
+                        if interest.parent.destination.shard() == shard =>
+                    {
+                        peer.cancel_repair(interest, now);
+                    }
+                    _ => {}
+                }
+            }
+            ShardEvent::PublisherDataExpectation(expectation) => {
+                let now = pulsebeam_runtime::time::Instant::now();
+                if let Some(peer) = self
+                    .provisioned_peers
+                    .iter()
+                    .find(|peer| peer.matches_network(expectation.route.next.peer))
+                    && (peer.allows_wan_data_expectation(&expectation, now)
+                        || self.links.as_ref().is_some_and(|links| {
+                            links.allows_publisher_data_expectation(&expectation, now)
+                        }))
+                {
+                    peer.send_publisher_data_expectation(expectation, now);
+                }
+            }
+            ShardEvent::RelayDataExpectation(expectation) => {
+                let now = pulsebeam_runtime::time::Instant::now();
+                if self
+                    .links
+                    .as_ref()
+                    .is_some_and(|links| links.allows_relay_data_expectation(&expectation, now))
+                    && let Some(peer) = self
+                        .provisioned_peers
+                        .iter()
+                        .find(|peer| peer.matches_network(expectation.route.next.peer))
+                {
+                    peer.send_relay_data_expectation(expectation, now);
+                }
+            }
+            ShardEvent::LocalFabricRtpSourceReady {
+                meta,
+                encoding,
+                incarnation,
+                emission,
+            } => {
+                if self
+                    .core
+                    .registry
+                    .get_incarnation(meta.origin, meta.connection_id)
+                    .is_some_and(|owner| owner.shard_id == shard)
+                    && let Some(outcome) = self.lifecycle.set_local_rtp_source(
+                        &meta,
+                        encoding,
+                        incarnation,
+                        emission,
+                        &self.core.registry,
+                        pulsebeam_runtime::time::Instant::now(),
+                    )
+                {
+                    self.publish_track_lifecycle(outcome);
+                }
+            }
+            ShardEvent::ShardDataReceiverReady(ready) => {
+                if ready.reference == 0
+                    || ready.binding.destination.shard() != shard
+                    || ready.binding.origin == shard
+                    || !self
+                        .core
+                        .registry
+                        .get_connection(ready.receiver.connection)
+                        .is_some_and(|(_, owner)| owner.shard_id == shard && owner.materialized)
+                    || !self
+                        .native_connections
+                        .contains_key(&ready.receiver.connection)
+                {
+                    return;
+                }
+                let previous = self.lifecycle.record_ordered_receiver(ready);
+                if previous == Some(ready) {
+                    return;
+                }
+                let generation = self.lifecycle.next_generation();
+                if let Some(previous) = previous {
+                    self.stage_ordered_receiver(generation, previous, false);
+                }
+                self.stage_ordered_receiver(generation, ready, true);
+                self.publish_staged();
+            }
             ShardEvent::TrackPublished(track) => {
                 if !self.current_incarnation(track.meta().origin, track.meta().connection_id) {
                     return;
@@ -2042,6 +2159,15 @@ impl ControllerActor {
                         .is_some_and(|_| self.native_connections.contains_key(&connection_id))
                 {
                     return;
+                }
+                if !request.enabled
+                    && let Some(ready) = self
+                        .lifecycle
+                        .withdraw_ordered_receiver(connection_id, request.reference)
+                {
+                    let generation = self.lifecycle.next_generation();
+                    self.stage_ordered_receiver(generation, ready, false);
+                    self.publish_staged();
                 }
                 let outcomes = self.lifecycle.set_owned_subscription(
                     connection_id,
@@ -2107,6 +2233,7 @@ impl ControllerActor {
                 );
                 self.publish_track_lifecycle(outcome);
             }
+            #[cfg(test)]
             ShardEvent::TrackSubscriptionAdded {
                 room_id,
                 subscriber,
@@ -2122,26 +2249,6 @@ impl ControllerActor {
                     subscriber,
                     selector,
                     selection,
-                    &self.core.registry,
-                    pulsebeam_runtime::time::Instant::now(),
-                );
-                for outcome in outcomes {
-                    self.publish_track_lifecycle(outcome);
-                }
-            }
-            ShardEvent::TrackSubscriptionRemoved {
-                room_id,
-                subscriber,
-                connection_id,
-                selector,
-            } => {
-                if !self.current_incarnation(subscriber, connection_id) {
-                    return;
-                }
-                let outcomes = self.lifecycle.unsubscribe(
-                    room_id,
-                    subscriber,
-                    selector,
                     &self.core.registry,
                     pulsebeam_runtime::time::Instant::now(),
                 );
@@ -2178,7 +2285,7 @@ impl ControllerActor {
                 participant,
                 connection_id,
                 token,
-            } => self.begin_renewal(_shard, participant, connection_id, token.0),
+            } => self.begin_renewal(shard, participant, connection_id, token.0),
         }
     }
 
@@ -2328,6 +2435,13 @@ impl ControllerActor {
             affected.resize(self.updates.len(), false);
         }
         self.publish_staged();
+        let ordered = publication
+            .is_none()
+            .then(|| {
+                self.lifecycle
+                    .withdraw_ordered_receiver(connection_id, reference)
+            })
+            .flatten();
         let outcomes = if let Some(meta) = publication {
             let outcome = self.lifecycle.unpublish(
                 EndpointKey {
@@ -2369,6 +2483,12 @@ impl ControllerActor {
                 }
             }
             self.apply_track_lifecycle(outcome);
+        }
+        if let Some(ready) = ordered {
+            if let Some(touched) = affected.get_mut(ready.binding.origin.index()) {
+                *touched = true;
+            }
+            self.stage_ordered_receiver(generation, ready, false);
         }
         if !admitted {
             // Local execution is fenced; withdraw topology even if receipt credit is unavailable.
@@ -2802,6 +2922,20 @@ impl ControllerActor {
         self.publish_staged();
     }
 
+    fn stage_ordered_receiver(
+        &mut self,
+        generation: u64,
+        ready: crate::route::fabric::ShardDataReady,
+        enabled: bool,
+    ) {
+        self.stage_update_at(
+            ready.binding.origin,
+            generation,
+            crate::shard_update::ShardUpdateOp::SetShardDataReceiver { ready, enabled },
+            None,
+        );
+    }
+
     fn stage_update_at(
         &mut self,
         shard: ShardId,
@@ -2885,6 +3019,494 @@ impl ControllerActor {
             links.retire_bindings_after(vec![binding], update.stage_cutoff(generation));
         }
         self.publish_staged();
+    }
+
+    fn stage_peer_data_observation(
+        &mut self,
+        peer: pulsebeam_link::NetworkId,
+        frame: peer_ownership::fabric_data::Frame,
+        now: pulsebeam_runtime::time::Instant,
+    ) {
+        let Some(links) = &self.links else {
+            return;
+        };
+        let observations = links.peer_data_observations(peer, frame, now);
+        let publisher_observations = links.peer_publisher_data_observations(peer, frame, now);
+        self.stage_data_observations(observations, publisher_observations);
+    }
+
+    fn stage_data_observations(
+        &mut self,
+        observations: Vec<crate::route::fabric::relay::RelayObservation>,
+        publisher_observations: Vec<crate::route::fabric::PublisherObservation>,
+    ) {
+        if observations.is_empty() && publisher_observations.is_empty() {
+            return;
+        }
+        let generation = self.lifecycle.next_generation();
+        for observation in observations {
+            let shard = observation.route.input.destination.shard();
+            if let Some(writer) = self
+                .updates
+                .get_mut(shard.index())
+                .filter(|writer| !writer.is_closed())
+            {
+                writer.stage_relay_data_observation(generation, observation);
+                self.mark_update_touched(shard);
+            }
+        }
+        for observation in publisher_observations {
+            let shard = observation.route.shard;
+            if let Some(writer) = self
+                .updates
+                .get_mut(shard.index())
+                .filter(|writer| !writer.is_closed())
+            {
+                writer.stage_publisher_data_observation(generation, observation);
+                self.mark_update_touched(shard);
+            }
+        }
+        self.publish_staged();
+    }
+
+    fn stage_peer_live_receive(
+        &mut self,
+        spec: super::link::LiveReceiveSpec,
+    ) -> Option<super::link::StagedLiveReceive> {
+        self.stage_live_children(|links, stage| links.stage_live_receive(spec, stage).ok())
+    }
+
+    fn stage_peer_wan_live_receive(
+        &mut self,
+        now: pulsebeam_runtime::time::Instant,
+        spec: super::link::wan::WanLiveReceiveSpec,
+    ) -> Option<pulsebeam_core::fabric::wan::Window> {
+        self.stage_live_children(|links, stage| links.stage_wan_live_receive(now, spec, stage).ok())
+    }
+
+    fn stage_live_children<T>(
+        &mut self,
+        stage: impl FnOnce(
+            &mut super::link::Links,
+            &mut dyn FnMut(
+                crate::route::fabric::LiveNetworkChild,
+                pulsebeam_link::BindingCutoff,
+            )
+                -> oneshot::Receiver<Option<crate::route::fabric::LiveNetworkChild>>,
+        ) -> Option<T>,
+    ) -> Option<T> {
+        let links = self.links.as_mut()?;
+        let updates = &mut self.updates;
+        let generation = self.lifecycle.next_generation();
+        let mut staged = Vec::new();
+        let receive = stage(links, &mut |child, lifetime| {
+            let shard = child.destination.shard();
+            if let Some(writer) = updates
+                .get_mut(shard.index())
+                .filter(|writer| !writer.is_closed())
+            {
+                staged.push(shard);
+                writer.stage_live_network_child(generation, child, lifetime)
+            } else {
+                let (tx, receipt) = oneshot::channel();
+                let _ = tx.send(None);
+                receipt
+            }
+        });
+        for shard in staged {
+            self.mark_update_touched(shard);
+        }
+        self.publish_staged();
+        receive
+    }
+
+    fn sample_data_publisher_anchors(
+        &mut self,
+        snapshot: &ownership::observations::Snapshot,
+    ) -> Vec<(
+        crate::route::fabric::DataPublisher,
+        oneshot::Receiver<Option<u64>>,
+    )> {
+        let candidates = snapshot
+            .iter()
+            .flat_map(|(endpoint, fact)| {
+                fact.publications.iter().filter_map(|publication| {
+                    Some((
+                        endpoint.room,
+                        publication.data_publisher(fact.claim.connection())?,
+                    ))
+                })
+            })
+            .take(peer_ownership::relay::LIMIT)
+            .filter_map(|(room, publisher)| {
+                let (shard, anchor) = self.lifecycle.network_publisher_anchor(
+                    room,
+                    publisher.publication,
+                    &self.core.registry,
+                )?;
+                (anchor == publisher.into()).then_some((shard, anchor, publisher))
+            })
+            .collect::<Vec<_>>();
+        self.stage_anchor_samples(candidates)
+    }
+
+    fn sample_wan_publisher_anchors(
+        &mut self,
+        snapshot: &ownership::observations::Snapshot,
+    ) -> Vec<(
+        (ProjectRoomKey, crate::shard_update::PublisherAnchor),
+        oneshot::Receiver<Option<u64>>,
+    )> {
+        let candidates = snapshot
+            .iter()
+            .flat_map(|(endpoint, fact)| {
+                fact.publications.iter().filter_map(|publication| {
+                    let connection = fact.claim.connection();
+                    let key = publication
+                        .data_publisher(connection)
+                        .map(|publisher| publisher.publication)
+                        .or_else(|| publication.opus_publication())?;
+                    Some((endpoint.room, key, connection))
+                })
+            })
+            .take(peer_ownership::relay::LIMIT)
+            .filter_map(|(room, publication, connection)| {
+                let (shard, publisher) = self.lifecycle.network_publisher_anchor(
+                    room,
+                    publication,
+                    &self.core.registry,
+                )?;
+                (publisher.connection == connection).then_some((
+                    shard,
+                    publisher,
+                    (room, publisher),
+                ))
+            })
+            .collect::<Vec<_>>();
+        self.stage_anchor_samples(candidates)
+    }
+
+    fn stage_anchor_samples<T>(
+        &mut self,
+        candidates: Vec<(ShardId, crate::shard_update::PublisherAnchor, T)>,
+    ) -> Vec<(T, oneshot::Receiver<Option<u64>>)> {
+        let generation = self.lifecycle.next_generation();
+        let mut receipts = Vec::new();
+        for (shard, anchor, publisher) in candidates {
+            let Some(writer) = self
+                .updates
+                .get_mut(shard.index())
+                .filter(|writer| !writer.is_closed())
+            else {
+                continue;
+            };
+            receipts.push((publisher, writer.stage_publisher_anchor(generation, anchor)));
+            self.mark_update_touched(shard);
+        }
+        self.publish_staged();
+        receipts
+    }
+
+    fn stage_unavailable_network_repair(
+        &mut self,
+        interest: crate::route::fabric::network_repair::Interest,
+        now: pulsebeam_runtime::time::Instant,
+    ) {
+        if !self
+            .links
+            .as_ref()
+            .is_some_and(|links| links.allows_repair_interest(interest, now))
+        {
+            return;
+        }
+        let shard = interest.parent.destination.shard();
+        let Some(writer) = self
+            .updates
+            .get_mut(shard.index())
+            .filter(|writer| !writer.is_closed())
+        else {
+            return;
+        };
+        let generation = self.lifecycle.next_generation();
+        writer.stage_unavailable_network_repair(generation, interest);
+        self.mark_update_touched(shard);
+        self.publish_staged();
+    }
+
+    fn stage_located_repair_receive(
+        &mut self,
+        interest: crate::route::fabric::network_repair::Interest,
+        sequence: u64,
+    ) -> Option<oneshot::Receiver<Result<crate::link::ReceiveRoute, pulsebeam_link::BindError>>>
+    {
+        let shard = interest.parent.destination.shard();
+        let links = self.links.as_mut()?;
+        let writer = self
+            .updates
+            .get_mut(shard.index())
+            .filter(|writer| !writer.is_closed())?;
+        let generation = self.lifecycle.next_generation();
+        let receipt = links
+            .stage_located_repair_receive(interest, sequence, |child, lifetime| {
+                writer.stage_repair_network_child(generation, child, lifetime)
+            })
+            .ok()?;
+        self.mark_update_touched(shard);
+        self.publish_staged();
+        Some(receipt)
+    }
+
+    fn stage_wan_repair_receive(
+        &mut self,
+        now: pulsebeam_runtime::time::Instant,
+        interest: crate::route::fabric::network_repair::Interest,
+        sequence: u64,
+    ) -> Option<crate::route::fabric::network_repair::RepairChild> {
+        let shard = interest.parent.destination.shard();
+        let links = self.links.as_mut()?;
+        let writer = self
+            .updates
+            .get_mut(shard.index())
+            .filter(|writer| !writer.is_closed())?;
+        let generation = self.lifecycle.next_generation();
+        let receipt = links.stage_wan_repair_receive(now, interest, sequence, |child, lifetime| {
+            writer.stage_repair_network_child(generation, child, lifetime)
+        });
+        self.mark_update_touched(shard);
+        self.publish_staged();
+        receipt.ok()
+    }
+
+    fn stage_wan_media_repair_receive(
+        &mut self,
+        now: pulsebeam_runtime::time::Instant,
+        parent: crate::route::fabric::LiveNetworkChild,
+        position: u64,
+        expires: pulsebeam_runtime::time::Instant,
+    ) -> Option<crate::route::fabric::network_repair::MediaRepairChild> {
+        let shard = parent.destination.shard();
+        let links = self.links.as_mut()?;
+        let writer = self
+            .updates
+            .get_mut(shard.index())
+            .filter(|writer| !writer.is_closed())?;
+        let generation = self.lifecycle.next_generation();
+        let receipt = links.stage_wan_media_repair_receive(
+            now,
+            parent,
+            position,
+            expires,
+            |child, lifetime| writer.stage_media_repair_child(generation, child, lifetime),
+        );
+        self.mark_update_touched(shard);
+        self.publish_staged();
+        receipt.ok()
+    }
+
+    fn peer_repair_receive_live(
+        &self,
+        route: crate::link::ReceiveRoute,
+        now: pulsebeam_runtime::time::Instant,
+    ) -> bool {
+        self.links
+            .as_ref()
+            .is_some_and(|links| links.repair_receive_live(route, now))
+    }
+
+    fn cancel_peer_repair_receive(
+        &mut self,
+        interest: crate::route::fabric::network_repair::Interest,
+    ) {
+        if let Some(links) = &mut self.links {
+            if interest.parent.window.is_some() {
+                links.cancel_wan_repair(interest);
+            } else {
+                links.cancel_repair_receive(interest);
+            }
+        }
+    }
+
+    fn stage_relay_repair_handoff(
+        &mut self,
+        located: crate::route::fabric::relay::LocatedRepair,
+        label: pulsebeam_link::NodeRouteKey,
+        now: pulsebeam_runtime::time::Instant,
+    ) -> Option<pulsebeam_link::BindingId> {
+        let shard = located.lookup.shard();
+        let writer = self
+            .updates
+            .get_mut(shard.index())
+            .filter(|writer| !writer.is_closed())?;
+        let generation = self.lifecycle.next_generation();
+        let (binding, handoff) = self
+            .links
+            .as_mut()?
+            .bind_peer_repair_send(located, label, now)
+            .ok()?;
+        writer.stage_relay_repair_handoff(generation, handoff);
+        self.mark_update_touched(shard);
+        self.publish_staged();
+        Some(binding)
+    }
+
+    fn stage_wan_repair_handoff(
+        &mut self,
+        handoff: crate::route::fabric::relay::PeerRepairHandoff,
+    ) -> bool {
+        let shard = handoff.located.lookup.shard();
+        let Some(writer) = self
+            .updates
+            .get_mut(shard.index())
+            .filter(|writer| !writer.is_closed())
+        else {
+            return false;
+        };
+        let generation = self.lifecycle.next_generation();
+        writer.stage_relay_repair_handoff(generation, handoff);
+        self.mark_update_touched(shard);
+        self.publish_staged();
+        true
+    }
+
+    fn cancel_relay_repair_send(&mut self, binding: pulsebeam_link::BindingId) {
+        if let Some(links) = &mut self.links {
+            links.cancel_relay_repair_send(binding);
+        }
+    }
+
+    fn stage_peer_repair_lookup(
+        &mut self,
+        peer: pulsebeam_link::NetworkId,
+        frame: peer_ownership::fabric_data::RepairFrame,
+        now: pulsebeam_runtime::time::Instant,
+    ) -> Vec<
+        pulsebeam_runtime::sync::oneshot::Receiver<
+            Option<crate::route::fabric::relay::LocatedRepair>,
+        >,
+    > {
+        let Some(links) = &self.links else {
+            return Vec::new();
+        };
+        use crate::route::fabric::relay::PeerRepairLookup;
+        let lookups: Vec<_> = links
+            .peer_repair_lookups(peer, frame, now)
+            .into_iter()
+            .map(PeerRepairLookup::Relay)
+            .chain(
+                links
+                    .peer_publisher_repair_lookups(peer, frame, now)
+                    .map(PeerRepairLookup::Publisher),
+            )
+            .collect();
+        self.stage_repair_lookups(lookups)
+    }
+
+    fn stage_repair_lookups(
+        &mut self,
+        lookups: Vec<crate::route::fabric::relay::PeerRepairLookup>,
+    ) -> Vec<oneshot::Receiver<Option<crate::route::fabric::relay::LocatedRepair>>> {
+        if lookups.is_empty() {
+            return Vec::new();
+        }
+        let generation = self.lifecycle.next_generation();
+        let mut receipts = Vec::with_capacity(lookups.len());
+        for lookup in lookups {
+            let shard = lookup.shard();
+            if let Some(writer) = self
+                .updates
+                .get_mut(shard.index())
+                .filter(|writer| !writer.is_closed())
+            {
+                receipts.push(writer.stage_relay_repair_lookup(generation, lookup));
+                self.mark_update_touched(shard);
+            }
+        }
+        self.publish_staged();
+        receipts
+    }
+
+    fn stage_peer_data_expectation(
+        &mut self,
+        peer: pulsebeam_link::NetworkId,
+        frame: peer_ownership::fabric_data::Frame,
+        now: pulsebeam_runtime::time::Instant,
+    ) -> Option<Vec<pulsebeam_runtime::sync::oneshot::Receiver<bool>>> {
+        let notices = self
+            .links
+            .as_ref()?
+            .peer_data_expectations(peer, frame, now)?;
+        if notices.is_empty()
+            || notices.iter().any(|notice| {
+                self.updates
+                    .get(notice.parent.destination.shard().index())
+                    .is_none_or(crate::shard_update::ShardUpdateWriter::is_closed)
+            })
+        {
+            return None;
+        }
+        let generation = self.lifecycle.next_generation();
+        let mut receipts = Vec::with_capacity(notices.len());
+        for notice in notices {
+            let shard = notice.parent.destination.shard();
+            let writer = self.updates.get_mut(shard.index())?;
+            receipts.push(writer.stage_network_data_expectation(generation, notice));
+            self.mark_update_touched(shard);
+        }
+        self.publish_staged();
+        Some(receipts)
+    }
+
+    fn stage_publisher_send(
+        &mut self,
+        change: crate::route::fabric::PublisherSendChange,
+    ) -> Option<oneshot::Receiver<bool>> {
+        let shard = change.route().shard;
+        let writer = self
+            .updates
+            .get_mut(shard.index())
+            .filter(|writer| !writer.is_closed())?;
+        let generation = self.lifecycle.next_generation();
+        let receipt = writer.stage_publisher_send(generation, change);
+        self.mark_update_touched(shard);
+        self.publish_staged();
+        Some(receipt)
+    }
+
+    fn stage_publisher_retirement(
+        &mut self,
+        binding: pulsebeam_link::BindingId,
+        change: crate::route::fabric::PublisherSendChange,
+    ) {
+        let receipt = self.stage_publisher_send(change);
+        if let Some(links) = &mut self.links {
+            links.record_fabric_retirement(binding, receipt);
+        }
+    }
+
+    fn stage_fabric_relay_change(
+        &mut self,
+        change: crate::route::fabric::LiveRelayChange,
+    ) -> Option<pulsebeam_runtime::sync::oneshot::Receiver<bool>> {
+        let shard = change.route().input.destination.shard();
+        let update = self.updates.get_mut(shard.index())?;
+        if update.is_closed() {
+            return None;
+        }
+        let receipt = update.stage_live_relay(self.lifecycle.next_generation(), change);
+        self.mark_update_touched(shard);
+        self.publish_staged();
+        Some(receipt)
+    }
+
+    fn stage_fabric_relay_retirement(
+        &mut self,
+        binding: pulsebeam_link::BindingId,
+        change: crate::route::fabric::LiveRelayChange,
+    ) {
+        let receipt = self.stage_fabric_relay_change(change);
+        if let Some(links) = &mut self.links {
+            links.record_fabric_retirement(binding, receipt);
+        }
     }
 
     fn stage_participant_at(
@@ -3254,7 +3876,7 @@ impl ControllerActor {
                 });
             }
             resources.native_rtp_capabilities = Some(capabilities);
-            let signaling = DataTrackIntent::native_signaling_config();
+            let signaling = crate::participant::signaling::native_signaling_config();
             resources.signaling_channel = Some(
                 crate::participant::signaling::SignalingChannel::compile(&signaling),
             );
@@ -3284,6 +3906,7 @@ impl ControllerActor {
                 self.core.release_transport(address, now);
                 return Err(ControllerError::ServiceUnavailable);
             };
+            native.model.configure_data_profile(self.data_profile);
             if let Some(lease) = authorization.as_ref() {
                 let initialized = lease.native_expiry().ok().and_then(|expiry| {
                     native
@@ -3613,6 +4236,17 @@ impl ControllerActor {
                 connection: meta.connection_id,
                 transport,
             });
+        }
+        let ordered = self
+            .lifecycle
+            .withdraw_ordered_connection(meta.connection_id);
+        if !ordered.is_empty() {
+            self.publish_staged();
+            let generation = self.lifecycle.next_generation();
+            for ready in ordered {
+                self.stage_ordered_receiver(generation, ready, false);
+            }
+            self.publish_staged();
         }
         let native = self.retire_native_connection(meta.connection_id);
         if let Some(lease) = meta.authorization.as_ref() {
@@ -3944,7 +4578,7 @@ mod replacement_tests {
                 deletion_bytes: 0,
                 ownership: ownership::Authority::default(),
                 peer_ownership: peer_ownership::new_observations(),
-                provisioned_peer: None,
+                provisioned_peers: Vec::new(),
                 ownership_entropy: pulsebeam_runtime::rand::seeded_rng(19),
                 receipt_trust: None,
                 delivery_budget: creation::DeliveryBudget::new(),
@@ -3953,6 +4587,10 @@ mod replacement_tests {
                 native_connections: std::collections::HashMap::new(),
                 retiring_native: std::collections::HashMap::new(),
                 source_lookup_index: native_service::SourceLookupIndex::default(),
+                data_branches: crate::control::native::DataBranchIds::default(),
+                data_profile: crate::control::native::DataProfile::Legacy,
+                #[cfg(feature = "sim")]
+                sim_fabric_relay: None,
                 catalog: catalog::CatalogRuntime::default(),
                 native_ready_tx,
                 native_ready_rx,
@@ -4015,20 +4653,17 @@ mod replacement_tests {
                     .unwrap();
                 actor.core.registry.mark_materialized(&participant);
             }
-            let track = crate::track::Track::data_publication(
-                crate::track::TrackMeta {
-                    room: crate::entity::ProjectRoomKey::fixture(source_room),
-                    id: connection_id(1).fixture_publication_at(
-                        TrackKind::Data,
-                        "private-topic",
-                        std::num::NonZeroU64::new(1).unwrap(),
-                    ),
-                    origin: publisher,
-                    connection_id: connection_id(1),
-                    track_id: Some(crate::entity::TrackId::new("private-topic").unwrap()),
-                },
-                crate::track::DataLane::Ordered,
-            );
+            let track = crate::control::native::fixture::audio_track(crate::track::TrackMeta {
+                room: crate::entity::ProjectRoomKey::fixture(source_room),
+                id: connection_id(1).fixture_publication_at(
+                    TrackKind::Audio,
+                    "private-topic",
+                    std::num::NonZeroU64::new(1).unwrap(),
+                ),
+                origin: publisher,
+                connection_id: connection_id(1),
+                track_id: Some(crate::entity::TrackId::new("private-topic").unwrap()),
+            });
             let publisher_lease = authorization_lease(
                 u64::MAX,
                 UNIX_EPOCH,
@@ -4049,8 +4684,13 @@ mod replacement_tests {
             }
             let (controller, mut endpoint) =
                 handoff::pair(connection_id(3), actor.native_ready_tx.clone());
-            let mut native =
-                StateProtocolHandler::new(subscriber, Some(room), None, controller).unwrap();
+            let mut native = StateProtocolHandler::new(
+                subscriber,
+                Some(room),
+                Some(crate::control::rtp::capabilities()),
+                controller,
+            )
+            .unwrap();
             native
                 .model
                 .authorization(
@@ -4077,24 +4717,10 @@ mod replacement_tests {
                     desired: Some(wire::DesiredState {
                         revision: 1,
                         value: Some(wire::desired_state::Value::Present(Box::new(
-                            wire::ResourceSpec {
-                                settings: Some(wire::ResourceSettings {
-                                    enabled: Some(true),
-                                    receive: None,
-                                }),
-                                declaration: Some(wire::resource_spec::Declaration::Subscription(
-                                    wire::SubscriptionSpec {
-                                        publication_id: track.id().as_str(),
-                                        kind: wire::TrackKind::Data as i32,
-                                        source_room: "source-authority".into(),
-                                        binding: Some(wire::TrackBinding {
-                                            transport: Some(wire::track_binding::Transport::Sctp(
-                                                wire::SctpParameters { stream_id: Some(1) },
-                                            )),
-                                        }),
-                                    },
-                                )),
-                            },
+                            crate::control::native::fixture::audio_receiver(
+                                track.id(),
+                                "source-authority",
+                            ),
                         ))),
                     }),
                 }],
@@ -4227,7 +4853,7 @@ mod replacement_tests {
                                     vec!["source-authority".into()],
                                     vec![Action::Discover],
                                     None,
-                                    Some(TrackKind::Data),
+                                    Some(TrackKind::Audio),
                                     Some("private-topic".into()),
                                 )
                                 .unwrap(),
@@ -4346,10 +4972,15 @@ mod replacement_tests {
 
         assert!(handler.handoff.schedule());
         assert_eq!(ready_rx.try_recv().unwrap(), connection);
-        handler.service(1, |_| None, |_, _| None, |_| None).unwrap();
+        let branches = crate::control::native::DataBranchIds::default();
+        handler
+            .service(1, &branches, |_| None, |_, _| None, |_| None)
+            .unwrap();
         assert!(handler.model.lookup_refresh_pending());
         assert_eq!(ready_rx.try_recv().unwrap(), connection);
-        handler.service(1, |_| None, |_, _| None, |_| None).unwrap();
+        handler
+            .service(1, &branches, |_| None, |_, _| None, |_| None)
+            .unwrap();
         assert!(!handler.model.lookup_refresh_pending());
         assert!(!handler.model.preparation_pending(1));
         assert!(endpoint.command().is_none());
@@ -4465,7 +5096,15 @@ mod replacement_tests {
                 crate::media::ChannelId::from_value(0),
                 pulsebeam_runtime::time::Instant::now(),
             );
-            native.service(0, |_| None, |_, _| None, |_| None).unwrap();
+            native
+                .service(
+                    0,
+                    &crate::control::native::DataBranchIds::default(),
+                    |_| None,
+                    |_, _| None,
+                    |_| None,
+                )
+                .unwrap();
             let initial = endpoint.output().expect("initial session output in flight");
             endpoint.acknowledge_wakeup();
             actor.native_connections.insert(
@@ -5095,8 +5734,6 @@ mod replacement_tests {
 
                     connection_id,
                     profile: SignalingProtocol::State,
-                    allow_topic_channels: false,
-                    topic_publications: Default::default(),
                     authorization_expiry: None,
                     rtc,
                     resources,
@@ -7358,8 +7995,6 @@ mod replacement_tests {
                     participant_id: subscriber,
                     connection_id: subscriber_connection,
                     profile: SignalingProtocol::State,
-                    allow_topic_channels: false,
-                    topic_publications: Default::default(),
                     authorization_expiry: None,
                     rtc: crate::control::application_only_test_connection(),
                     resources,

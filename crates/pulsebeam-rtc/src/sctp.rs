@@ -6,6 +6,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
+    num::NonZeroUsize,
     sync::Arc,
     time::Instant,
 };
@@ -162,6 +163,7 @@ struct Channel {
     stream: StreamId,
     config: DataChannelConfig,
     config_lease: Arc<ConfigLease>,
+    receive_budget: Option<NonZeroUsize>,
     state: ChannelState,
     reserved_events: u8,
     opened_emitted: bool,
@@ -360,6 +362,7 @@ impl Association {
                 config_lease: Arc::new(ConfigLease {
                     bytes: config_bytes,
                 }),
+                receive_budget: None,
                 state: if negotiated && connected {
                     ChannelState::Open
                 } else {
@@ -391,6 +394,15 @@ impl Association {
         at: Instant,
         config: DataChannelConfig,
     ) -> Result<DataChannelInstallation, (WriteError, DataChannelConfig)> {
+        self.install_with_receive_budget(at, config, None)
+    }
+
+    pub(crate) fn install_with_receive_budget(
+        &mut self,
+        at: Instant,
+        config: DataChannelConfig,
+        receive_budget: Option<NonZeroUsize>,
+    ) -> Result<DataChannelInstallation, (WriteError, DataChannelConfig)> {
         let admission = (|| {
             if self.stopped
                 || self.shutdown_deadline.is_some()
@@ -401,6 +413,13 @@ impl Association {
             }
             let stream = StreamId(config.id.ok_or(WriteError::InvalidState)?.value());
             if stream.0 == u16::MAX
+                || receive_budget.is_some_and(|budget| {
+                    stream.0 == 0
+                        || config.ordered
+                        || config.reliability != DataReliability::MaxRetransmits(0)
+                        || budget.get() > self.max_inbound_message_bytes
+                        || budget.get() > self.max_outbound_message_bytes
+                })
                 || self
                     .stream_capacity()
                     .is_some_and(|capacity| stream.0 >= capacity)
@@ -430,6 +449,9 @@ impl Association {
         events.commit(&mut self.events);
         self.future_events += usize::from(CHANNEL_NOTIFICATIONS);
         let channel = DataChannelId::from_value(stream.0);
+        if receive_budget.is_some() {
+            self.socket.set_receive_budget(stream, receive_budget);
+        }
         self.pending_installations.insert(
             stream,
             Channel {
@@ -440,6 +462,7 @@ impl Association {
                 config_lease: Arc::new(ConfigLease {
                     bytes: config_bytes,
                 }),
+                receive_budget,
                 state: ChannelState::Opening,
                 reserved_events: CHANNEL_NOTIFICATIONS,
                 opened_emitted: false,
@@ -546,6 +569,9 @@ impl Association {
         };
         self.socket
             .set_stream_priority(stream, channel.config.priority.weight());
+        if channel.receive_budget.is_none() {
+            self.socket.set_receive_budget(stream, None);
+        }
         channel.state = ChannelState::Open;
         self.channels.insert(stream, channel);
         if self.pending_installations.is_empty() {
@@ -585,6 +611,9 @@ impl Association {
         self.future_events -= usize::from(channel.reserved_events);
         self.reset_runtime_bytes -= RESET_BYTES;
         self.release_config(channel.config_lease);
+        if channel.receive_budget.is_some() && !self.resetting.contains_key(&stream) {
+            self.socket.set_receive_budget(stream, None);
+        }
         if self.pending_installations.is_empty() {
             self.installation_cursor = None;
         }
@@ -622,6 +651,44 @@ impl Association {
         Ok(())
     }
 
+    pub(crate) fn supports_unordered_data(
+        &self,
+        installation: DataChannelInstallation,
+        message_bytes: usize,
+    ) -> bool {
+        matches!(
+            self.installation_state(installation),
+            Some(DataChannelInstallationState::Open { .. })
+        ) && self
+            .channel(StreamId(installation.channel().value()))
+            .is_some_and(|channel| {
+                channel.config.negotiated
+                    && !channel.config.ordered
+                    && channel.config.reliability == DataReliability::MaxRetransmits(0)
+                    && channel
+                        .receive_budget
+                        .is_some_and(|cap| cap.get() == message_bytes)
+            })
+            && message_bytes != 0
+            && message_bytes <= self.max_inbound_message_bytes
+            && message_bytes <= self.max_outbound_message_bytes
+    }
+
+    pub(crate) fn send_installed(
+        &mut self,
+        at: Instant,
+        installation: DataChannelInstallation,
+        message: DataMessage,
+    ) -> Result<(), (WriteError, DataMessage)> {
+        if !matches!(
+            self.installation_state(installation),
+            Some(DataChannelInstallationState::Open { .. })
+        ) {
+            return Err((WriteError::InvalidState, message));
+        }
+        self.send(at, installation.channel(), message)
+    }
+
     pub(crate) fn send(
         &mut self,
         at: Instant,
@@ -640,8 +707,16 @@ impl Association {
             let payload_bytes = match &message {
                 DataMessage::Text(bytes) | DataMessage::Binary(bytes) => bytes.len(),
             };
+            if entry.receive_budget.is_some()
+                && !matches!(&message, DataMessage::Binary(bytes) if !bytes.is_empty())
+            {
+                return Err(WriteError::InvalidState);
+            }
             if payload_bytes > self.max_outbound_message_bytes
                 || payload_bytes.max(1) > self.peer_max_message_bytes
+                || entry
+                    .receive_budget
+                    .is_some_and(|cap| payload_bytes > cap.get())
             {
                 return Err(WriteError::MessageTooLarge);
             }
@@ -1036,6 +1111,10 @@ impl Association {
                         self.stopped = true;
                         break;
                     }
+                    SocketEvent::OnReceiveBudgetExceeded(stream) => {
+                        self.close_stream(stream);
+                        self.discard_installation(stream, true);
+                    }
                     SocketEvent::OnConnected()
                     | SocketEvent::OnConnectionRestarted()
                     | SocketEvent::OnError(_, _)
@@ -1133,9 +1212,18 @@ impl Association {
                 if self.reset_all_cursor.is_some() || channel.state != ChannelState::Open {
                     return;
                 }
+                if channel.receive_budget.is_some()
+                    && (message.ppid != BINARY_PPID || message.payload.is_empty())
+                {
+                    return;
+                }
                 let empty = message.ppid == EMPTY_TEXT_PPID || message.ppid == EMPTY_BINARY_PPID;
                 let semantic_len = if empty { 0 } else { message.payload.len() };
-                if semantic_len > self.max_inbound_message_bytes {
+                if semantic_len > self.max_inbound_message_bytes
+                    || channel
+                        .receive_budget
+                        .is_some_and(|cap| semantic_len > cap.get())
+                {
                     self.close_stream(stream);
                     return;
                 }
@@ -1229,6 +1317,7 @@ impl Association {
                         config_lease: Arc::new(ConfigLease {
                             bytes: config_bytes,
                         }),
+                        receive_budget: None,
                         state: ChannelState::Open,
                         reserved_events: CHANNEL_NOTIFICATIONS,
                         opened_emitted: false,
@@ -1406,6 +1495,13 @@ impl Association {
             }
             self.resetting.remove(&stream);
             self.reset_runtime_bytes -= RESET_BYTES;
+            if self
+                .pending_installations
+                .get(&stream)
+                .is_none_or(|pending| pending.receive_budget.is_none())
+            {
+                self.socket.set_receive_budget(stream, None);
+            }
             self.activate_installation(stream);
             self.release_idle_events();
             self.release_idle_packets();
@@ -2557,7 +2653,7 @@ mod tests {
         let mut now = start;
         let mut left = Association::new(facts(DtlsRole::Active), limits, start, [1; 32]).unwrap();
         let mut right = Association::new(facts(DtlsRole::Passive), limits, start, [2; 32]).unwrap();
-        let mut declaration = config(DataReliability::Reliable, true);
+        let mut declaration = config(DataReliability::MaxRetransmits(0), false);
         declaration.negotiated = true;
         let id = DataChannelId::from_value(0);
         let stream = StreamId(id.value());
@@ -2606,6 +2702,9 @@ mod tests {
             panic!("managed channel did not activate")
         };
         assert!(opened_at >= start && opened_at <= now);
+        assert!(!left.supports_unordered_data(original, 1_058));
+        assert!(!left.supports_unordered_data(original, limits.max_inbound_data_message_bytes + 1));
+        assert!(!right.supports_unordered_data(original, 1_058));
         assert_eq!(right.installation_state(original), None);
         right.cancel_installation(now, original).unwrap();
         assert!(right.channel(stream).unwrap().state == ChannelState::Open);
@@ -2647,9 +2746,20 @@ mod tests {
         assert_eq!(left.installation_state(original), None);
         left.cancel_installation(now, original).unwrap();
         right.open(now, declaration.clone()).unwrap();
-        left.send(
+        let stale = DataMessage::Binary(Bytes::from_static(b"stale"));
+        let before = left.buffered_payload_bytes;
+        assert_eq!(
+            left.send_installed(now, original, stale.clone()),
+            Err((WriteError::InvalidState, stale.clone()))
+        );
+        assert_eq!(
+            right.send_installed(now, replacement, stale.clone()),
+            Err((WriteError::InvalidState, stale))
+        );
+        assert_eq!(left.buffered_payload_bytes, before);
+        left.send_installed(
             now,
-            id,
+            replacement,
             DataMessage::Binary(Bytes::from_static(b"replacement")),
         )
         .unwrap();
@@ -2686,6 +2796,83 @@ mod tests {
         left.abort();
         assert_eq!(left.test_runtime_bytes(), 0);
         assert_eq!(left.installation_state(replacement), None);
+    }
+
+    #[test]
+    fn bounded_fragment_reassembly_fences_only_the_installed_stream() {
+        const LIMIT: usize = 1_058;
+        let limits = ConnectionLimits::default();
+        let start = Instant::now();
+        let mut now = start;
+        let mut left = Association::new(facts(DtlsRole::Active), limits, start, [3; 32]).unwrap();
+        let mut right = Association::new(facts(DtlsRole::Passive), limits, start, [4; 32]).unwrap();
+        let mut small = left.socket.options();
+        // Force genuine SCTP fragmentation: every individual chunk fits the
+        // bound even when the reconstructed message would exceed it.
+        small.mtu = 600;
+        left.socket = Socket::new("small-mtu-test", &small);
+        let stream = DataChannelId::from_value(2);
+        let signal = DataChannelId::from_value(0);
+        let mut data = config(DataReliability::MaxRetransmits(0), false);
+        data.negotiated = true;
+        data.id = Some(stream);
+        let mut control = config(DataReliability::Reliable, true);
+        control.negotiated = true;
+        control.id = Some(signal);
+        left.open(now, data.clone()).unwrap();
+        let installation = right
+            .install_with_receive_budget(now, data, NonZeroUsize::new(LIMIT))
+            .unwrap();
+        left.open(now, control.clone()).unwrap();
+        right.open(now, control).unwrap();
+        left.connect(now);
+        right.connect(now);
+        let mut left_events = Vec::new();
+        let mut right_events = Vec::new();
+        drive(
+            &mut left,
+            &mut right,
+            &mut now,
+            start,
+            &mut left_events,
+            &mut right_events,
+        );
+        assert!(right.supports_unordered_data(installation, LIMIT));
+        let legal = Bytes::from(vec![1; LIMIT]);
+        left.send(now, stream, DataMessage::Binary(legal.clone()))
+            .unwrap();
+        drive(
+            &mut left,
+            &mut right,
+            &mut now,
+            start,
+            &mut left_events,
+            &mut right_events,
+        );
+        assert!(right_events.iter().any(|event| matches!(event, Event::DataChannel(DataChannelEvent::Message { channel, message: DataMessage::Binary(bytes) }) if *channel == stream && *bytes == legal)));
+        right_events.clear();
+
+        left.send(
+            now,
+            stream,
+            DataMessage::Binary(Bytes::from(vec![2; LIMIT + 1])),
+        )
+        .unwrap();
+        let independent = Bytes::from(vec![3; 4_096]);
+        left.send(now, signal, DataMessage::Binary(independent.clone()))
+            .unwrap();
+        drive(
+            &mut left,
+            &mut right,
+            &mut now,
+            start,
+            &mut left_events,
+            &mut right_events,
+        );
+        assert!(!right.supports_unordered_data(installation, LIMIT));
+        assert!(right_events.iter().any(|event| matches!(event, Event::DataChannel(DataChannelEvent::Closed { channel }) if *channel == stream)));
+        assert!(!right_events.iter().any(|event| matches!(event, Event::DataChannel(DataChannelEvent::Message { channel, .. }) if *channel == stream)));
+        assert!(right_events.iter().any(|event| matches!(event, Event::DataChannel(DataChannelEvent::Message { channel, message: DataMessage::Binary(bytes) }) if *channel == signal && *bytes == independent)));
     }
 
     #[test]

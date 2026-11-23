@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use super::control::{self, HostLane};
-use super::network::{self, Outbound, ReceiveBinding, WireCodec};
+use super::network::{self, NetworkCodec, Outbound, ReceiveBinding};
 use super::*;
 pub use pulsebeam_transport::{Datagram, Error, SendOutcome};
 
@@ -31,13 +31,14 @@ pub struct Health {
 
 pub struct NetworkDriver<P> {
     transport: pulsebeam_transport::Transport,
-    codec: Shared<dyn WireCodec<P>>,
+    codec: NetworkCodec<P>,
     state: Shared<Fence>,
     table: Shared<Table>,
     outbound: pulsebeam_queue::Receiver<Outbound<P>>,
     commands: pulsebeam_queue::Receiver<ReceiveBinding<P>>,
     routes: HashMap<NodeRouteKey, ReceiveBinding<P>>,
     pending: Option<Outbound<P>>,
+    protected_relay: Option<(BindingId, BindingId)>,
     now: LinkTime,
     health: Health,
     unknown_label: Option<NodeRouteKey>,
@@ -47,14 +48,49 @@ pub struct NetworkDriver<P> {
 
 impl<P> Drop for NetworkDriver<P> {
     fn drop(&mut self) {
+        self.fence_receives();
+    }
+}
+
+impl<P> NetworkDriver<P> {
+    fn fence_receives(&mut self) {
         self.state.store(network::CLOSED, Ordering::Release);
+        if self.codec.is_fabric() {
+            let fence = |binding: BindingId| {
+                Table::retire(&self.table.bindings, binding.slot, binding.generation);
+            };
+            for route in self.routes.values() {
+                fence(route.binding);
+            }
+            while let Ok(route) = self.commands.try_recv() {
+                fence(route.binding);
+            }
+        }
+        self.routes.clear();
+    }
+}
+
+fn send_checked(
+    table: &Table,
+    relay: Option<(BindingId, BindingId)>,
+    datagram: Datagram<'_>,
+    send: &mut impl FnMut(Datagram<'_>) -> SendOutcome,
+) -> SendOutcome {
+    if datagram.is_fabric_application()
+        && relay.is_some_and(|(binding, parent)| {
+            !table.binding_live(binding) || !table.binding_live(parent)
+        })
+    {
+        SendOutcome::Rejected
+    } else {
+        send(datagram)
     }
 }
 
 impl<P: Clone + Send + 'static> NetworkDriver<P> {
     pub(crate) fn new(
         peer: pulsebeam_transport::PeerConfig,
-        codec: Shared<dyn WireCodec<P>>,
+        codec: NetworkCodec<P>,
         state: Shared<Fence>,
         table: Shared<Table>,
         outbound: pulsebeam_queue::Receiver<Outbound<P>>,
@@ -74,6 +110,7 @@ impl<P: Clone + Send + 'static> NetworkDriver<P> {
             commands,
             routes: HashMap::new(),
             pending: None,
+            protected_relay: None,
             now: LinkTime(0),
             health: Health::default(),
             unknown_label: None,
@@ -109,11 +146,15 @@ impl<P: Clone + Send + 'static> NetworkDriver<P> {
     pub fn health(&self) -> Health {
         let transport = self.transport.health();
         Health {
-            ready: transport.ready,
+            ready: transport.ready
+                && (!self.codec.is_fabric() || self.transport.payload_capacity() != 0),
             feedback_interval: transport.feedback_interval,
             sent: transport.sent,
             received: transport.received,
-            send_failed: transport.send_failed,
+            send_failed: self
+                .health
+                .send_failed
+                .saturating_add(transport.send_failed),
             expired: self.health.expired.saturating_add(transport.expired),
             invalid: self.health.invalid.saturating_add(transport.invalid),
             bytes_in_flight: transport.bytes_in_flight,
@@ -122,6 +163,26 @@ impl<P: Clone + Send + 'static> NetworkDriver<P> {
             quic: transport.quic,
             closed: transport.closed,
             ..self.health
+        }
+    }
+
+    pub fn set_fabric_path(&mut self, path: crate::FabricPath) -> Result<(), Error> {
+        self.ensure_live()?;
+        self.transport.set_fabric_path(path)?;
+        self.publish_readiness();
+        Ok(())
+    }
+
+    fn publish_readiness(&self) {
+        let (old, new) = if self.health().ready {
+            (network::NOT_READY, network::READY)
+        } else {
+            (network::READY, network::NOT_READY)
+        };
+        if self.state.load(Ordering::Relaxed) == old {
+            let _ = self
+                .state
+                .compare_exchange(old, new, Ordering::Release, Ordering::Relaxed);
         }
     }
 
@@ -203,7 +264,12 @@ impl<P: Clone + Send + 'static> NetworkDriver<P> {
         if now < self.now {
             return Err(Error::Time);
         }
-        self.transport.poll(now, 0, &mut *send, |_| {})?;
+        self.transport.poll(
+            now,
+            0,
+            |datagram| send_checked(&self.table, self.protected_relay, datagram, send),
+            |_| {},
+        )?;
         self.now = now;
         let mut work = 0usize;
         // Install queued receive bindings before dispatching authenticated input.
@@ -243,10 +309,10 @@ impl<P: Clone + Send + 'static> NetworkDriver<P> {
             work = work.saturating_add(self.transport.poll(
                 now,
                 budget.saturating_sub(work),
-                &mut *send,
+                |datagram| send_checked(table, self.protected_relay, datagram, send),
                 |application| {
                     if let Some(control) = control
-                        && application.context == control::CONTEXT
+                        && application.context == Some(control::CONTEXT)
                     {
                         if application.payload.len() > control::CONTROL_FRAME_BYTES {
                             health.invalid = health.invalid.saturating_add(1);
@@ -255,24 +321,10 @@ impl<P: Clone + Send + 'static> NetworkDriver<P> {
                         }
                         return;
                     }
-                    Self::deliver(
-                        table,
-                        routes,
-                        codec.as_ref(),
-                        health,
-                        unknown_label,
-                        application,
-                    );
+                    Self::deliver(table, routes, codec, health, unknown_label, application);
                 },
             )?);
-            if self.transport.health().ready {
-                let _ = self.state.compare_exchange(
-                    network::NOT_READY,
-                    network::READY,
-                    Ordering::Release,
-                    Ordering::Relaxed,
-                );
-            }
+            self.publish_readiness();
             if !self.transport.health().ready || self.transport.needs_progress() {
                 break;
             }
@@ -285,6 +337,12 @@ impl<P: Clone + Send + 'static> NetworkDriver<P> {
         Ok(work)
     }
 
+    #[cfg(test)]
+    pub(super) fn stage_test_outbound(&mut self) -> Result<bool, Error> {
+        self.pending = self.outbound.try_recv().ok();
+        self.prepare_next()
+    }
+
     fn prepare_next(&mut self) -> Result<bool, Error> {
         if (self.prefer_control || self.pending.is_none())
             && let Some(lane) = self.control.as_mut()
@@ -295,17 +353,20 @@ impl<P: Clone + Send + 'static> NetworkDriver<P> {
                 self.prefer_control = false;
                 return Ok(true);
             }
-            return match self.transport.try_submit(
-                control::CONTEXT,
-                &control.bytes,
-                control.expires_at,
-            ) {
+            let submission = if self.codec.is_fabric() {
+                self.transport
+                    .try_submit_fabric_control(&control.bytes, control.expires_at)
+            } else {
+                self.transport
+                    .try_submit(control::CONTEXT, &control.bytes, control.expires_at)
+            };
+            return match submission {
                 Ok(()) => {
                     lane.pending = None;
                     self.prefer_control = false;
                     Ok(true)
                 }
-                Err(Error::Blocked | Error::NotReady) => Ok(false),
+                Err(Error::Blocked | Error::NotReady | Error::PathIncapable) => Ok(false),
                 Err(error) => Err(error),
             };
         }
@@ -313,7 +374,11 @@ impl<P: Clone + Send + 'static> NetworkDriver<P> {
             return Ok(false);
         };
         self.prefer_control = true;
-        if !self.table.binding_live(pending.binding) {
+        if !self.table.binding_live(pending.binding)
+            || pending
+                .parent
+                .is_some_and(|parent| !self.table.binding_live(parent))
+        {
             self.pending = None;
             self.health.stale = self.health.stale.saturating_add(1);
             return Ok(true);
@@ -326,19 +391,37 @@ impl<P: Clone + Send + 'static> NetworkDriver<P> {
         match self.transport.admission() {
             Ok(()) => {}
             Err(Error::Blocked | Error::NotReady) => return Ok(false),
+            Err(Error::PathIncapable) => {
+                self.pending = None;
+                self.health.send_failed = self.health.send_failed.saturating_add(1);
+                return Ok(true);
+            }
             Err(error) => return Err(error),
         }
-        let mut payload = [0u8; wire::PAYLOAD_BUDGET];
+        let mut buffer = [0u8; wire::FABRIC_IMAGE];
+        let buffer = buffer
+            .get_mut(..self.codec.payload_limit())
+            .ok_or(Error::Codec)?;
         let length = self
             .codec
-            .encode(&pending.packet, &mut payload)
+            .encode(
+                &pending.packet,
+                pending.address,
+                pending.source_position,
+                buffer,
+            )
             .map_err(|_| Error::Codec)?;
-        let payload = payload.get(..length).ok_or(Error::Codec)?;
-        match self
-            .transport
-            .try_submit(pending.address.to_bytes(), payload, pending.expires_at)
-        {
+        let payload = buffer.get(..length).ok_or(Error::Codec)?;
+        let result = if self.codec.is_fabric() {
+            self.transport
+                .try_submit_fabric(payload, pending.expires_at)
+        } else {
+            self.transport
+                .try_submit(pending.address.to_bytes(), payload, pending.expires_at)
+        };
+        match result {
             Ok(()) => {
+                self.protected_relay = pending.parent.map(|parent| (pending.binding, parent));
                 self.pending = None;
                 Ok(true)
             }
@@ -350,24 +433,45 @@ impl<P: Clone + Send + 'static> NetworkDriver<P> {
     fn deliver(
         table: &Table,
         routes: &HashMap<NodeRouteKey, ReceiveBinding<P>>,
-        codec: &dyn WireCodec<P>,
+        codec: &NetworkCodec<P>,
         health: &mut Health,
         unknown_label: &mut Option<NodeRouteKey>,
         application: pulsebeam_transport::Application<'_>,
     ) {
-        let label = NodeRouteKey::from_bytes(application.context);
+        let Ok(label) = codec.route_key(application.context, application.payload) else {
+            health.invalid = health.invalid.saturating_add(1);
+            return;
+        };
         let Some(binding) = routes.get(&label) else {
             health.stale = health.stale.saturating_add(1);
             unknown_label.get_or_insert(label);
             return;
         };
-        if !table.binding_live(binding.binding) {
+        if !table.binding_live(binding.binding)
+            || binding
+                .fabric
+                .as_ref()
+                .is_some_and(|route| !route.is_active())
+        {
             health.stale = health.stale.saturating_add(1);
             return;
         }
         let Ok(packet) = codec.decode(application.payload) else {
             health.invalid = health.invalid.saturating_add(1);
             return;
+        };
+        let fabric = if let Some(policy) = &binding.fabric {
+            if !(policy.admits)(&packet) {
+                health.invalid = health.invalid.saturating_add(1);
+                return;
+            }
+            Some(FabricIngress {
+                association: policy.association,
+                key: label,
+                purpose: policy.purpose,
+            })
+        } else {
+            None
         };
         for destination in &binding.destinations {
             if !table.binding_live(destination.binding) {
@@ -379,11 +483,13 @@ impl<P: Clone + Send + 'static> NetworkDriver<P> {
             }
             let pending = Pending {
                 binding: destination.binding,
+                parent: fabric.is_some().then_some(binding.binding),
                 expires_at: LinkTime(u64::MAX),
                 received: Received {
                     tag: destination.tag,
                     packet: packet.clone(),
                     received_at: application.observed,
+                    fabric,
                 },
             };
             match destination.sender.try_send(pending) {
@@ -399,10 +505,10 @@ impl<P: Clone + Send + 'static> NetworkDriver<P> {
     }
 
     pub fn close(&mut self) {
-        self.state.store(network::CLOSED, Ordering::Release);
+        self.fence_receives();
         self.transport.close();
         self.pending = None;
-        self.routes.clear();
+        self.protected_relay = None;
     }
 
     fn ensure_live(&self) -> Result<(), Error> {

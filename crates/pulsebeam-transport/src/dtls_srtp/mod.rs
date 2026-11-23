@@ -34,7 +34,7 @@ pub enum DtlsRole {
     Passive,
 }
 
-pub use srtp::{ReplayLimits, RtpMetadata, SrtpError};
+pub use srtp::{ReplayLimits, RtpMetadata, SrtpError, wan};
 use srtp::{outbound_rtp_metadata, outbound_twcc_sequence};
 
 const MAX_EVENTS: usize = 256;
@@ -114,6 +114,7 @@ pub enum TransportEvent {
         arrival: Instant,
         path_epoch: PathEpoch,
         bytes: Vec<u8>,
+        protected_bytes: usize,
         metadata: RtpMetadata,
         ecn: Option<EcnCodepoint>,
     },
@@ -515,6 +516,35 @@ impl Transport {
         self.state == TransportState::Connected && self.selected.is_some()
     }
 
+    /// Check the selected path before submitting already protected media.
+    pub fn prepared_path_is_current(&self, prepared: &PreparedTransmit) -> bool {
+        self.can_send_user_data()
+            && prepared.path_epoch.is_some_and(|epoch| {
+                self.selected.as_ref().and_then(|path| path.epoch) == Some(epoch)
+            })
+    }
+
+    /// Identity of the selected path for authenticated RTP; not a size qualification.
+    pub fn authenticated_rtp_epoch(&self) -> Option<PathEpoch> {
+        if !self.can_send_user_data() || self.srtp.is_none() {
+            return None;
+        }
+        self.selected.as_ref()?.epoch
+    }
+
+    /// The current authenticated RTP path, if it is direct UDP. This epoch
+    /// describes identity only; it is not a socket or PMTU qualification.
+    pub fn direct_udp_rtp_epoch(&self) -> Option<PathEpoch> {
+        let path = self.selected.as_ref()?;
+        if self.state != TransportState::Connected
+            || self.srtp.is_none()
+            || !matches!(path.envelope, NetworkEnvelope::Udp { .. })
+        {
+            return None;
+        }
+        path.epoch
+    }
+
     pub fn smoothed_rtt(&self) -> Option<Duration> {
         self.ice.smoothed_rtt()
     }
@@ -693,6 +723,7 @@ impl Transport {
                 };
                 match kind {
                     DatagramKind::Rtp => {
+                        let protected_bytes = bytes.len();
                         match srtp.unprotect_rtp(bytes, self.allowed_inbound_ssrcs.is_some()) {
                             Ok((bytes, metadata)) => {
                                 if self.inbound_payload_types.contains(&metadata.payload_type) {
@@ -705,6 +736,7 @@ impl Transport {
                                         arrival,
                                         path_epoch,
                                         bytes,
+                                        protected_bytes,
                                         metadata,
                                         ecn,
                                     })?;
@@ -821,6 +853,24 @@ impl Transport {
         let provider = str0m::crypto::from_feature_flags();
         self.drain_ice(now, &provider)?;
         self.drain_dtls(now, DatagramKind::Dtls)
+    }
+
+    /// Protected RTP bytes at the selected transport handoff, including the
+    /// RFC 4571 prefix on TCP. Does not reserve or consume an SRTP index.
+    pub fn rtp_wire_bytes(&self, plaintext: usize) -> Result<usize, SrtpError> {
+        let path = self.selected.as_ref().ok_or(SrtpError::InvalidPacket)?;
+        let srtp = self.srtp.as_ref().ok_or(SrtpError::InvalidPacket)?;
+        let layout = srtp
+            .rtp_layout(plaintext)?
+            .check_limit(path.envelope.secure_body_limit())?;
+        let prefix = match path.envelope {
+            NetworkEnvelope::Udp { .. } => 0,
+            NetworkEnvelope::IceTcp { .. } => 2,
+        };
+        layout
+            .wire_bytes
+            .checked_add(prefix)
+            .ok_or(SrtpError::OutputTooLarge)
     }
 
     pub fn send_rtp_with_info(
@@ -1917,6 +1967,82 @@ mod tests {
             !std::iter::from_fn(|| right.poll_event())
                 .any(|event| matches!(event, TransportEvent::Rtp { .. }))
         );
+
+        // Authentication preserves the wire header and padding bytes. The
+        // RTP consumer, not SRTP, decides whether the payload is usable.
+        for (index, flags, tail, expected, extension_profile, padding_len) in [
+            (
+                65_539_u64,
+                0x91,
+                &[0xbe, 0xde, 0, 1, 0x10, 42, 0, 0, 5][..],
+                Ok(&[5][..]),
+                Some(0xbede),
+                0,
+            ),
+            (
+                65_540,
+                0x91,
+                &[0x10, 0x0f, 0, 1, 1, 1, 42, 0, 5][..],
+                Ok(&[5][..]),
+                Some(0x100f),
+                0,
+            ),
+            (65_541, 0xa1, &[0, 2][..], Ok(&[][..]), None, 2),
+            (
+                65_542,
+                0xa1,
+                &[0, 3][..],
+                Err(packet::PacketError::InvalidPadding),
+                None,
+                0,
+            ),
+        ] {
+            let mut plaintext = vec![flags, 96];
+            plaintext.extend_from_slice(&u16::try_from(index & 0xffff).unwrap().to_be_bytes());
+            plaintext.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 7, 0, 0, 1, 2]);
+            plaintext.extend_from_slice(tail);
+            let (source, destination, protected) = if expected.is_ok() {
+                left.send_rtp_with_info(
+                    &plaintext,
+                    index,
+                    TransmitKind::Original { ssrc: 7 },
+                    None,
+                    &mut |_, _, _| Ok(()),
+                )
+                .unwrap();
+                let output = left.poll_transmit().unwrap();
+                (output.source, output.destination, output.bytes)
+            } else {
+                // Model a peer that protects invalid RTP without checking padding.
+                let bytes = left
+                    .srtp
+                    .as_mut()
+                    .unwrap()
+                    .protect_rtp(&plaintext, index, None)
+                    .unwrap();
+                (address(4000), address(4001), bytes)
+            };
+            right
+                .handle_datagram(now, source, destination, protected)
+                .unwrap();
+            let bytes = std::iter::from_fn(|| right.poll_event())
+                .find_map(|event| match event {
+                    TransportEvent::Rtp { bytes, .. } => Some(bytes),
+                    _ => None,
+                })
+                .expect("authenticated RTP plaintext");
+            assert_eq!(bytes, plaintext);
+            let parsed = packet::RtpPacket::parse(&bytes);
+            assert_eq!(
+                parsed.as_ref().map(packet::RtpPacket::payload),
+                expected.as_ref().copied()
+            );
+            if let Ok(parsed) = parsed {
+                assert_eq!(parsed.first_csrc(), Some(0x0102));
+                assert_eq!(parsed.extension_profile(), extension_profile);
+                assert_eq!(parsed.padding_len(), padding_len);
+            }
+        }
 
         let rtcp = vec![0x80, 201, 0, 1, 0, 0, 0, 7];
         left.send_rtcp(&rtcp).expect("SRTCP");

@@ -62,6 +62,7 @@ async fn simulated_public_boundary_preserves_atomic_progress_metadata_and_counte
                 len,
                 stride,
                 received_at: time,
+                ecn: Some(Ecn::Ce),
             };
             let mut device = Device {
                 received: VecDeque::new(),

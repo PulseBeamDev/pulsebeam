@@ -38,6 +38,7 @@ pub(crate) fn fixture(format: wire::CodecFormat) -> (Binding, wire::RtpCapabilit
         rtcp_modes: vec![wire::RtcpMode::Compound.as_str().into()],
     };
     let binding = Binding {
+        extmap_allow_mixed: true,
         key: MediaKey("source".into()),
         group: None,
         mid: "v".into(),
@@ -115,6 +116,7 @@ fn actual_envelope_recovery_preserves_format_presence_zero_and_extension_ids() {
         let Some(wire::track_binding::Transport::Rtp(actual)) = actual.transport else {
             panic!("RTP expected");
         };
+        assert_eq!(actual.extmap_allow_mixed, Some(true));
         let codec = actual.codec.unwrap();
         assert_eq!(codec.format, Some(format));
         assert_eq!(codec.payload_type, Some(0));

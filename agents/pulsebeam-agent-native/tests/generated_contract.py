@@ -12,6 +12,21 @@ import tempfile
 async def witness():
     core = importlib.import_module("contract.pulsebeam_agent_core")
     native = importlib.import_module("contract.pulsebeam_agent_native")
+    assert core.DataPublishOptions().delivery is None
+    assert core.DataPublishOptions().capture_clock is None
+    assert core.DataSubscribeOptions().delivery is None
+    for delivery in (core.DataDelivery.UNRELIABLE, core.DataDelivery.LATEST):
+        assert core.DataPublishOptions(delivery=delivery).delivery is delivery
+        assert core.DataSubscribeOptions(delivery=delivery).delivery is delivery
+    assert core.DataSendOptions().captured_at is None
+    assert list(inspect.signature(core.DataSendOptions).parameters) == ["captured_at"]
+    capture = core.CaptureTimestamp(
+        clock=core.CaptureClock(id="camera", epoch=(1 << 64) - 1),
+        nanos=-(1 << 63),
+    )
+    assert capture.uncertainty_ns is None
+    assert capture.clock.epoch == (1 << 64) - 1 and capture.nanos == -(1 << 63)
+    assert core.DataSendOptions(captured_at=capture).captured_at == capture
     for endpoint, token, maximum_attempts in (
         ("relative", "secret-token", 2),
         ("http://pulsebeam.test", "", 2),

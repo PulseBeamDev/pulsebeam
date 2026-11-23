@@ -2,6 +2,7 @@ use std::{
     cell::{Cell, RefCell},
     collections::BTreeMap,
     rc::{Rc, Weak},
+    time::Duration,
 };
 
 use agent_core::{
@@ -11,7 +12,7 @@ use agent_core::{
     OperationId, RetryPolicy, RtcEffect, RtcEvent, TimerEffect, TimerEvent,
 };
 use js_sys::{Array, Function, Object, Reflect, Uint8Array};
-use wasm_bindgen::{JsCast, JsValue, closure::Closure};
+use wasm_bindgen::{JsCast, JsValue, closure::Closure, prelude::wasm_bindgen};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{
     AbortController, Event, Headers, MediaStreamTrack, MessageEvent, Request, RequestInit,
@@ -270,7 +271,17 @@ impl BrowserHost {
     }
 }
 
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = performance, js_name = now)]
+    fn performance_now() -> f64;
+}
+
 impl Host for BrowserHost {
+    fn monotonic_time(&self) -> Duration {
+        Duration::try_from_secs_f64(performance_now().mul_add(0.001, 0.0)).unwrap_or_default()
+    }
+
     fn publish_turn(&self, turn: &Turn) {
         let Some(inner) = self.inner.upgrade() else {
             return;
@@ -1843,6 +1854,7 @@ impl RuntimeInner {
                 inner.send_event(HostEvent::DataChannel(DataChannelEvent::Message {
                     generation,
                     channel: channel_id,
+                    binary: true,
                     payload,
                 }));
             } else {

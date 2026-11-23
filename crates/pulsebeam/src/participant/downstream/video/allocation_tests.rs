@@ -68,6 +68,27 @@ fn forwarded_quality(decision: AllocationDecision<'_>) -> Option<LayerQuality> {
 }
 
 #[test]
+fn fabric_bridge_keeps_an_affordable_upgrade_source_but_never_a_downgraded_rung() {
+    let (track, states) = camera();
+    let mut keys = SlotMap::<DownstreamSlotKey, ()>::with_key();
+    let low = track.by_quality(LayerQuality::Low).unwrap();
+    let high = track.by_quality(LayerQuality::High).unwrap();
+    let mut slot = view(&track, keys.insert(()), "s0", 0);
+    slot.current_stream = Some(low.stream_id());
+    slot.current_decode_target = DecodeTargetSelection::Target(0);
+    let engine = AllocationEngine::new(std::slice::from_ref(&slot), &states);
+    let up = AllocationDecision::Forward(high, Bitrate::from(1_250_000));
+    assert!(engine.can_bridge_fabric(&slot, &up));
+
+    slot.current_stream = Some(high.stream_id());
+    let down = AllocationDecision::Forward(low, Bitrate::from(150_000));
+    assert!(!engine.can_bridge_fabric(&slot, &down));
+    slot.current_stream = Some(low.stream_id());
+    slot.height_ceiling = Some(180);
+    assert!(!engine.can_bridge_fabric(&slot, &up));
+}
+
+#[test]
 fn positive_target_enforces_one_aggregate_minimum_but_zero_still_suspends() {
     let (track, states) = camera();
     let mut keys = SlotMap::<DownstreamSlotKey, ()>::with_key();

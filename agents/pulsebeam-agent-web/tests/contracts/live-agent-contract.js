@@ -208,6 +208,17 @@
       `no captured RTP for relay ${relay.id}, SSRC ${inbound[0].ssrc}`,
     );
   };
+  const rtpPeak = async (peer, direction) => {
+    const relay = relays.get(peer);
+    if (!relay) throw new Error("media peer has no packet relay");
+    const response = await fetch(`/__test/rtp-relay/${relay.id}/peaks`);
+    if (!response.ok) throw new Error(await response.text());
+    const bytes = (await response.json())[direction];
+    assert(
+      Number.isInteger(bytes) && bytes > 0 && bytes <= 1216,
+      `observed protected RTP ${direction} UDP peak must fit 1216 bytes, got ${bytes}`,
+    );
+  };
   const peerForTrack = (track) =>
     [...peers].find((peer) =>
       peer.getReceivers().some((receiver) => receiver.track === track),
@@ -558,8 +569,12 @@
           receiver.state().connectionId === receiverConnection,
         "payload reuse does not reconnect either peer",
       );
-      await steadyPublisher.send(Uint8Array.of(lifetime + 2));
-      await receiveValue(steadyIterator, lifetime + 2);
+      await sendOrdered(
+        steadyPublisher,
+        steadyIterator,
+        lifetime + 2,
+        "reuse-steady",
+      );
     }
     discoveryWatch = receiver.room("public-web-contract").watch();
     await until(
@@ -633,8 +648,7 @@
       );
     };
     const deliverDuringView = async (value) => {
-      await steadyPublisher.send(Uint8Array.of(value));
-      await receiveValue(steadyIterator, value);
+      await sendOrdered(steadyPublisher, steadyIterator, value, "reuse-steady");
     };
     video.style.cssText =
       "position:fixed;left:30px;top:20px;width:220px;height:160px";
@@ -788,6 +802,10 @@
     const publishingPeer = [...peers].find((peer) =>
       peer.getSenders().includes(allocatedSender),
     );
+    await Promise.all([
+      rtpPeak(publishingPeer, "browserToSfu"),
+      rtpPeak(peer, "sfuToBrowser"),
+    ]);
     const previousVideoTransceiver = fixedPeer
       .getTransceivers()
       .find((transceiver) => transceiver.receiver.track === current);

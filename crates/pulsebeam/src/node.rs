@@ -88,11 +88,13 @@ pub struct NodeBuilder {
 
     // Services
     cluster: Option<crate::cluster::Options>,
-    provisioned_peer: Option<ProvisionedPeer>,
+    provisioned_peers: Vec<ProvisionedPeer>,
     link_listen: Option<SocketAddr>,
     link_control: Option<pulsebeam_runtime::sync::oneshot::Sender<crate::link::Control>>,
     http_api: Option<ListenerSource>,
     key_registry: Option<KeyRegistry>,
+    data_profile: crate::control::native::DataProfile,
+    local_rtp_v1: bool,
     internal_metrics: Option<ListenerSource>,
     steering: Option<SteeringFactory>,
 
@@ -137,9 +139,11 @@ impl NodeBuilder {
             rng: None,
             udp_mode: UdpMode::Batch,
             cluster: None,
-            provisioned_peer: None,
+            provisioned_peers: Vec::new(),
             link_listen: None,
             link_control: None,
+            data_profile: crate::control::native::DataProfile::Legacy,
+            local_rtp_v1: false,
             http_api: None,
             key_registry: None,
             internal_metrics: None,
@@ -171,6 +175,25 @@ impl NodeBuilder {
     }
 
     /// Notify when the controller mailbox exists, before controller spawn and HTTP binding.
+    #[cfg(any(feature = "sim", feature = "transport-conformance"))]
+    pub fn with_local_data_v1(mut self) -> Self {
+        self.data_profile = crate::control::native::DataProfile::FabricLive;
+        self
+    }
+
+    /// Select the explicit reliable DATA_V1 profile for qualification fixtures.
+    pub fn with_reliable_data_v1(mut self) -> Self {
+        self.data_profile = crate::control::native::DataProfile::FabricReliable;
+        self
+    }
+
+    /// Exercise core-only, single-encoding Native RTP through Fabric.
+    #[cfg(feature = "sim")]
+    pub fn with_local_rtp_v1(mut self) -> Self {
+        self.local_rtp_v1 = true;
+        self
+    }
+
     #[cfg(feature = "sim")]
     pub fn with_sim_startup_notification(
         mut self,
@@ -410,6 +433,18 @@ impl NodeBuilder {
 
     /// Consumes the builder and runs the node until `shutdown` is cancelled.
     pub async fn run(mut self, shutdown: CancellationToken) -> Result<()> {
+        let simulated_wan_source = cfg!(feature = "sim")
+            && self.link_listen.is_none()
+            && self.cluster.as_ref().is_some_and(|options| {
+                !options.ownership_peers.is_empty()
+                    && options.ownership_peers.iter().all(|peer| peer.fabric_wan)
+            });
+        anyhow::ensure!(
+            !self.local_rtp_v1
+                || (self.cluster.is_none() && self.link_listen.is_none())
+                || simulated_wan_source,
+            "local Fabric RTP requires a standalone node or a simulated provisioned Fabric route"
+        );
         let Some(options) = self.cluster.take() else {
             return self
                 .run_media(
@@ -424,15 +459,16 @@ impl NodeBuilder {
             Topology::SingleNode => OwnershipMode::Standalone,
             Topology::MultiNode => OwnershipMode::Unavailable,
         };
-        if let Some(peer) = &options.ownership_peer {
+        if let Some(peer) = options.ownership_peers.first() {
             anyhow::ensure!(
-                self.link_listen
-                    .is_none_or(|address| address == peer.listen),
-                "ownership peer must use the node's Link listener"
+                self.link_listen.is_none_or(
+                    |address| options.ownership_peers.len() == 1 && address == peer.listen
+                ),
+                "explicit Link listener must match the only provisioned peer"
             );
-            self.link_listen = Some(peer.listen);
+            self.link_listen = (!peer.fabric_wan).then_some(peer.listen);
         }
-        self.provisioned_peer = options.ownership_peer.clone();
+        self.provisioned_peers = options.ownership_peers.clone();
         let membership = crate::cluster::Service::start(options).await?;
         let relay_node = crate::log::RelayNode {
             node: membership.incarnation().node_id,
@@ -555,6 +591,7 @@ impl NodeBuilder {
 
         debug_assert!(!udp_sockets.is_empty());
         let shard_count = udp_sockets.len();
+        let local_rtp_v1 = self.local_rtp_v1;
 
         if shard_count != requested_shard_count {
             tracing::warn!(
@@ -581,7 +618,7 @@ impl NodeBuilder {
         }
 
         let mut tcp_service = None;
-        let mut link_result = None;
+        let mut link_results = Vec::new();
         let result: Result<()> = async {
         let mut tcp_rxs = Vec::with_capacity(shard_count);
         let mut tcp_txs = Vec::new();
@@ -738,6 +775,7 @@ impl NodeBuilder {
                         worker_occupancy,
                         shard_stats_tx,
                         wall_anchor,
+                        local_rtp_v1,
                     );
                     Ok(pulsebeam_runtime::rt::ManagedService::new(shard, udp_sock))
                 };
@@ -775,20 +813,45 @@ impl NodeBuilder {
             view_writers,
         );
         controller.set_ownership_mode(ownership_mode);
+        controller.set_data_profile(self.data_profile);
         #[cfg(feature = "sim")]
         if let Some(peer) = self.sim_ownership_peer.as_ref() {
             controller.set_sim_ownership_peer(peer.clone());
         }
         controller.set_links(links, frame_ports, clock_origin);
+        if let Some(node) = relay_node {
+            controller.set_link_node(node);
+        }
+        enum SocketHost {
+            Legacy(crate::link::host::Host),
+            Wan(crate::link::wan_host::Service),
+        }
+        let mut hosts = Vec::new();
         if let Some(address) = self.link_listen {
             let (host, installs) = crate::link::host::Host::bind(address, clock_origin).await.context("binding Link UDP")?;
             controller.set_link_host(installs, relay_node.unwrap_or_else(crate::log::RelayNode::ephemeral));
+            hosts.push(SocketHost::Legacy(host));
+        }
+        for peer in self.provisioned_peers {
+            let provisioner = if peer.fabric_wan {
+                let (host, provisioner) = crate::link::wan_host::Service::bind(peer.listen, clock_origin).await.context("binding nonfragmenting Fabric WAN UDP")?;
+                hosts.push(SocketHost::Wan(host));
+                Some(provisioner)
+            } else {
+                None
+            };
+            controller.add_provisioned_peer(peer, provisioner)?;
+        }
+        for host in hosts {
             let cancellation = shutdown.child_token();
             let node_shutdown = shutdown.clone();
             let (report, result) = pulsebeam_runtime::sync::oneshot::channel();
-            link_result = Some(result);
+            link_results.push(result);
             let task = async move {
-                let result = host.run(cancellation).await;
+                let result = match host {
+                    SocketHost::Legacy(host) => host.run(cancellation).await,
+                    SocketHost::Wan(host) => host.run(cancellation).await,
+                };
                 if result.is_err() { node_shutdown.cancel(); }
                 let _ = report.send(result);
             };
@@ -796,9 +859,6 @@ impl NodeBuilder {
             control_tasks.spawn_local(task);
             #[cfg(not(feature = "sim"))]
             control_tasks.spawn(task);
-        }
-        if let Some(peer) = self.provisioned_peer {
-            controller.set_provisioned_peer(peer)?;
         }
         controller.set_execution(shard_executor.migration_handle());
         controller.set_steering(steering);
@@ -898,7 +958,7 @@ impl NodeBuilder {
         result?;
         tcp_result?;
         data_result?;
-        if let Some(result) = link_result {
+        for result in link_results {
             result
                 .await
                 .context("Link host task stopped without reporting")?

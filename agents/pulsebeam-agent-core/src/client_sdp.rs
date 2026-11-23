@@ -132,6 +132,7 @@ pub struct MediaKey(pub String);
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Binding {
+    pub extmap_allow_mixed: bool,
     pub key: MediaKey,
     pub group: Option<MediaKey>,
     pub mid: String,

@@ -74,7 +74,9 @@ impl ShardUpdateApplication {
                     self.apply_lifecycle_op(execution, op);
                 }
                 for op in delta.lifecycle.iter().filter(|op| {
-                    !is_retire(op) && !matches!(op, ShardUpdateOp::InsertTrackRuntime { .. })
+                    !is_retire(op)
+                        && !is_fabric_binding(op)
+                        && !matches!(op, ShardUpdateOp::InsertTrackRuntime { .. })
                 }) {
                     self.apply_lifecycle_op(execution, op);
                 }
@@ -100,6 +102,9 @@ impl ShardUpdateApplication {
                 self.pending_update = Some(delta);
                 break;
             }
+            for op in delta.lifecycle.iter().filter(|op| is_fabric_binding(op)) {
+                self.apply_lifecycle_op(execution, op);
+            }
             for op in delta.lifecycle.iter().filter(|op| is_retire(op)) {
                 self.apply_lifecycle_op(execution, op);
             }
@@ -108,6 +113,57 @@ impl ShardUpdateApplication {
             // This fences lifecycle/plan cutoff, not delivery of observation effects.
             for binding in delta.cutoff_bindings.drain(..) {
                 binding.fence();
+            }
+            for sample in delta.source_anchors.drain(..) {
+                let _ = sample.result.send(execution.sample_publisher_anchor(
+                    sample.publisher,
+                    pulsebeam_runtime::time::Instant::now(),
+                ));
+            }
+            for install in delta.fabric_children.drain(..) {
+                let _ = install
+                    .result
+                    .send(execution.install_live_network_child(install.child, install.lifetime));
+            }
+            for install in delta.media_repair_children.drain(..) {
+                let _ = install
+                    .result
+                    .send(execution.install_media_repair_child(install.child, install.lifetime));
+            }
+            for observation in delta.publisher_observations.drain(..) {
+                execution.observe_publisher_data_expectation(observation);
+            }
+            for observation in delta.relay_observations.drain(..) {
+                execution.observe_relay_data_expectation(observation);
+            }
+            for expectation in delta.data_expectations.drain(..) {
+                let _ = expectation
+                    .result
+                    .send(execution.accept_network_data_expectation(expectation.notice));
+            }
+            for lookup in delta.repair_lookups.drain(..) {
+                execution.begin_peer_repair_lookup(lookup);
+            }
+            for handoff in delta.repair_handoffs.drain(..) {
+                execution.send_peer_repair(handoff);
+            }
+            for interest in delta.repair_unavailable.drain(..) {
+                execution.settle_unavailable_network_repair(interest);
+            }
+            for repair in delta.repair_children.drain(..) {
+                let _ = repair
+                    .result
+                    .send(execution.install_repair_network_child(repair.child, repair.lifetime));
+            }
+            for update in delta.publisher_sends.drain(..) {
+                let _ = update
+                    .result
+                    .send(execution.update_publisher_send(update.change));
+            }
+            for update in delta.fabric_relays.drain(..) {
+                let _ = update
+                    .result
+                    .send(execution.update_live_relay(update.change));
             }
             for ack in delta.cutoff_acks.drain(..) {
                 let _ = ack.send(());
@@ -145,6 +201,15 @@ impl ShardUpdateApplication {
         self.pending_update_lifecycle = false;
         self.pending_plan_index = 0;
     }
+}
+
+fn is_fabric_binding(op: &ShardUpdateOp) -> bool {
+    matches!(
+        op,
+        ShardUpdateOp::InstallShardFabricSource { .. }
+            | ShardUpdateOp::BindShardFabricDestination { .. }
+            | ShardUpdateOp::SetShardDataReceiver { .. }
+    )
 }
 
 fn is_retire(op: &ShardUpdateOp) -> bool {

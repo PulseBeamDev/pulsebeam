@@ -1288,7 +1288,6 @@ mod tests {
         let page: Vec<_> = (0..10)
             .map(|index| CatalogParticipantInfo {
                 id: format!("bench-{index}"),
-                data_recipient_id: None,
                 publications: if index == 1 {
                     vec![]
                 } else {

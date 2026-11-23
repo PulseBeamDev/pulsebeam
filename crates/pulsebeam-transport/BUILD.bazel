@@ -12,7 +12,7 @@ extract_cargo_lints(name = "lints", manifest = "Cargo.toml", workspace = "//:Car
 
 rust_library(
     name = "pulsebeam-transport",
-    crate_features = ["datagram"],
+    crate_features = ["datagram", "dtls-srtp"],
     crate_root = "src/lib.rs",
     srcs = glob(["src/**/*.rs"]),
     edition = crate_edition(),
@@ -31,7 +31,7 @@ rust_library(
     crate_name = "pulsebeam_transport",
     crate_root = "src/lib.rs",
     srcs = glob(["src/**/*.rs"]),
-    crate_features = ["datagram", "test-utils"],
+    crate_features = ["datagram", "dtls-srtp", "test-utils"],
     edition = crate_edition(),
     rustc_env_files = [":cargo_env"],
     lint_config = ":lints",
@@ -70,7 +70,11 @@ rust_library(
     rustc_env_files = [":cargo_env"],
     lint_config = ":lints",
     aliases = aliases(),
-    deps = crate_deps(["bytes", "is", "str0m"]) + ["//crates/pulsebeam-dtls:pulsebeam-dtls"],
+    deps = crate_deps(["bytes", "is", "str0m"]) + [
+        "//crates/pulsebeam-cc:pulsebeam-cc",
+        "//crates/pulsebeam-dtls:pulsebeam-dtls",
+        "//crates/pulsebeam-feedback:pulsebeam-feedback",
+    ],
 )
 
 rust_library(
@@ -84,7 +88,11 @@ rust_library(
     rustc_env_files = [":cargo_env"],
     lint_config = ":lints",
     aliases = aliases(),
-    deps = crate_deps(["bytes", "is", "str0m"]) + ["//crates/pulsebeam-dtls:test_utils"],
+    deps = crate_deps(["bytes", "is", "str0m"]) + [
+        "//crates/pulsebeam-cc:pulsebeam-cc",
+        "//crates/pulsebeam-dtls:test_utils",
+        "//crates/pulsebeam-feedback:pulsebeam-feedback",
+    ],
 )
 
 rust_test(

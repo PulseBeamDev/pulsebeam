@@ -7,6 +7,12 @@ pub(crate) struct Bound {
     local_addr: SocketAddr,
 }
 pub(crate) async fn bind(options: &BindOptions) -> io::Result<Bound> {
+    if options.nonfragmenting_max_datagram_bytes.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "portable UDP cannot enforce nonfragmenting sends",
+        ));
+    }
     if options.mode == Mode::Batch || options.local_addr.ip().is_unspecified() {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -94,6 +100,7 @@ impl Socket {
                 len,
                 stride: len.max(1),
                 received_at: ReceiveTime::now(),
+                ecn: None,
             });
         }
         Ok(())

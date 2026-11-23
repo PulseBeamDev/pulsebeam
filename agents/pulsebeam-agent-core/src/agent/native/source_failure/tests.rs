@@ -202,6 +202,7 @@ fn delivery_mismatch_fails_only_incompatible_receivers_and_revocation_keeps_the_
                     spec: Some(*spec),
                     source_revision: 1,
                     execution: None,
+                    data_v1: None,
                     source: Some(state::Track {
                         publication_id: "opaque-source".into(),
                         participant_id: "alice".into(),
@@ -282,6 +283,7 @@ fn accepted_missing_source_remains_waiting_without_a_failed_read() {
             rejection: None,
             value: Some(state::confirmed_state::Value::LogicalSubscription(
                 Box::new(state::LogicalSubscriptionState {
+                    data_v1: None,
                     spec: Some(*spec),
                     source_revision: 0,
                     execution: None,
@@ -323,6 +325,7 @@ fn resolved_source_description_does_not_claim_data_receiver_execution() {
                     spec: Some(*spec),
                     source_revision: 1,
                     execution: None,
+                    data_v1: None,
                     source: Some(state::Track {
                         publication_id: "opaque-data-track".into(),
                         participant_id: "alice".into(),

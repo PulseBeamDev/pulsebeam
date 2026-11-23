@@ -304,6 +304,7 @@ fn media_retirement_is_correlated_and_cannot_clear_replacement_facts() {
     let cached = |mid: &str| crate::rtc_preparation::PreparedRtp {
         binding: state::TrackBinding {
             transport: Some(state::track_binding::Transport::Rtp(state::RtpParameters {
+                extmap_allow_mixed: None,
                 mid: mid.into(),
                 ..Default::default()
             })),
@@ -558,7 +559,7 @@ fn active_control_declares_only_prepared_payloads_and_retries_the_exact_serializ
     };
     assert_eq!(actual, generation);
     assert_eq!(specification.negotiated_id, Some(1));
-    assert!(specification.ordered);
+    assert!(!specification.ordered);
     assert!(agent.next_effect_after_turn().is_none());
     agent
         .handle(HostEvent::DataChannel(DataChannelEvent::Prepared {
@@ -567,8 +568,8 @@ fn active_control_declares_only_prepared_payloads_and_retries_the_exact_serializ
             preparation: Ok(crate::PreparedDataChannel {
                 stream_id: 1,
                 negotiated: true,
-                ordered: false,
-                reliability: DataChannelReliability::MaxRetransmits(0),
+                ordered: true,
+                reliability: DataChannelReliability::Reliable,
                 association_max_channels: Some(2),
             }),
         }))
@@ -600,8 +601,11 @@ fn active_control_declares_only_prepared_payloads_and_retries_the_exact_serializ
     assert_eq!(actual, generation);
     assert_ne!(replacement, channel);
     assert_eq!(specification.negotiated_id, Some(1));
-    assert!(specification.ordered);
-    assert_eq!(specification.reliability, DataChannelReliability::Reliable);
+    assert!(!specification.ordered);
+    assert_eq!(
+        specification.reliability,
+        DataChannelReliability::MaxRetransmits(0)
+    );
     assert_eq!(agent.snapshot().generation, Some(generation));
     assert_eq!(
         agent.snapshot().connection,
@@ -615,8 +619,8 @@ fn active_control_declares_only_prepared_payloads_and_retries_the_exact_serializ
             preparation: Ok(crate::PreparedDataChannel {
                 stream_id: 1,
                 negotiated: true,
-                ordered: true,
-                reliability: DataChannelReliability::Reliable,
+                ordered: false,
+                reliability: DataChannelReliability::MaxRetransmits(0),
                 association_max_channels: Some(2),
             }),
         }))
@@ -634,8 +638,8 @@ fn active_control_declares_only_prepared_payloads_and_retries_the_exact_serializ
             preparation: Ok(crate::PreparedDataChannel {
                 stream_id: 1,
                 negotiated: true,
-                ordered: true,
-                reliability: DataChannelReliability::Reliable,
+                ordered: false,
+                reliability: DataChannelReliability::MaxRetransmits(0),
                 association_max_channels: Some(2),
             }),
         }))
@@ -664,6 +668,15 @@ fn active_control_declares_only_prepared_payloads_and_retries_the_exact_serializ
         panic!("publication")
     };
     assert_eq!(declaration.track_id, publisher.topic);
+    let Some(state::publication_spec::Kind::Data(data)) = &declaration.kind else {
+        panic!("DATA publication")
+    };
+    assert!(matches!(
+        data.binding
+            .as_ref()
+            .and_then(|binding| binding.transport.as_ref()),
+        Some(state::track_binding::Transport::SctpDataV1(_))
+    ));
     agent
         .handle(HostEvent::DataChannel(DataChannelEvent::SendFailed {
             generation,
@@ -723,6 +736,7 @@ fn active_control_declares_only_prepared_payloads_and_retries_the_exact_serializ
             state::resource_key::Key::Owned(*reference),
             desired.revision,
             state::confirmed_state::Value::Owned(Box::new(state::LiveResource {
+                data_v1_source: Some(3),
                 spec: Some(spec.as_ref().clone()),
                 participant: Some(state::Participant {
                     participant_id: "p1".into(),
@@ -744,7 +758,8 @@ fn active_control_declares_only_prepared_payloads_and_retries_the_exact_serializ
             })),
         )],
     );
-    assert!(!agent.topics.has_channel(generation, channel));
+    assert!(agent.desired.topics.publishers.is_empty());
+    assert!(agent.next_data_v1_effect().is_none());
     assert!(agent.snapshot.terminal_failure.is_none());
     assert!(agent.next_effect_after_turn().is_none());
     agent
@@ -799,6 +814,7 @@ fn active_control_declares_only_prepared_payloads_and_retries_the_exact_serializ
         DataChannelEvent::Message {
             generation,
             channel,
+            binary: true,
             payload: vec![0xff],
         },
         DataChannelEvent::Sent {
@@ -1405,6 +1421,7 @@ fn logical_offer_selects_exact_identity_without_discovery_and_gates_pending_disa
             &selector,
             state::TrackKind::Video,
             Some(state::resource_settings::Receive::Video(Default::default())),
+            None,
         );
         spec.settings.as_mut().unwrap().enabled = Some(enabled);
         spec
@@ -1455,6 +1472,7 @@ fn logical_offer_selects_exact_identity_without_discovery_and_gates_pending_disa
                 revision,
                 state::confirmed_state::Value::LogicalSubscription(Box::new(
                     state::LogicalSubscriptionState {
+                        data_v1: None,
                         spec: Some(spec(enabled)),
                         source_revision: if enabled { 1 } else { 2 },
                         source: enabled.then(|| track.clone()),

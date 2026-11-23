@@ -63,6 +63,9 @@ fn expired_or_superseded_round_cannot_apply_a_delayed_complete_image() {
     assert!(sender.needs_image(first));
     sender.set_image(now, vec![1, 2]);
     let old = sender.respond(now, first).next().unwrap();
+    sender.invalidate();
+    assert!(sender.respond(now, first).next().is_none());
+    assert!(!sender.needs_image(first));
     let later = now + DEADLINE;
     assert!(reader.pull(later).is_none());
     assert!(receive(&mut reader, later, &old).is_none());
@@ -79,6 +82,11 @@ fn expired_or_superseded_round_cannot_apply_a_delayed_complete_image() {
 
 #[test]
 fn invalid_lengths_and_conflicting_duplicates_do_not_produce_an_image() {
+    assert!(matches!(
+        Frame::decode(&WAN_IMAGE_CHANGED),
+        Some(Frame::WanImageChanged)
+    ));
+    assert!(Frame::decode(&[VERSION, WAN_IMAGE_CHANGED[1], 0]).is_none());
     let now = Instant::now();
     let mut reader = Reader::default();
     let mut sender = Sender::default();

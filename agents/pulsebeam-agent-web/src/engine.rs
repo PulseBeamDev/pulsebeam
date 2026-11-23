@@ -2,6 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::rc::Rc;
+use std::time::Duration;
 
 use futures_channel::oneshot;
 
@@ -135,14 +136,19 @@ impl Driver {
         self.control.agent.borrow().snapshot().clone()
     }
 
+    #[cfg(test)]
     pub(crate) fn turn(&mut self, input: Input) -> Turn {
+        self.turn_at(input, Duration::ZERO)
+    }
+
+    fn turn_at(&mut self, input: Input, now: Duration) -> Turn {
         let source = match &input {
             Input::Command(_) => TurnErrorSource::Command,
             Input::Event(_) => TurnErrorSource::HostEvent,
         };
         let error = match input {
             Input::Command(command) => self.control.agent.borrow_mut().command(command),
-            Input::Event(event) => self.control.agent.borrow_mut().handle(event),
+            Input::Event(event) => self.control.agent.borrow_mut().handle_at(event, now),
         }
         .err()
         .map(|error| TurnError { source, error });
@@ -169,6 +175,7 @@ impl Driver {
         target: DataSendTarget,
         payload: Vec<u8>,
         options: Option<agent_core::ffi::DataSendOptions>,
+        now: Duration,
     ) -> (Result<agent_core::OperationId, AgentError>, Turn) {
         let result = (|| {
             let mut agent = self.control.agent.borrow_mut();
@@ -191,7 +198,7 @@ impl Driver {
                     }
                 }
             };
-            agent.send_data_with_options(spec, payload, options)
+            agent.send_data_with_options_at(spec, payload, options, now)
         })();
         let turn = self.finish_turn(None);
         (result, turn)
@@ -285,6 +292,7 @@ impl Driver {
 }
 
 pub(crate) trait Host {
+    fn monotonic_time(&self) -> Duration;
     fn publish_turn(&self, turn: &Turn);
     fn execute_effect(&self, effect: Effect);
     fn host_failed(&self, failure: &Failure);
@@ -647,7 +655,7 @@ pub(crate) struct Actor<H: Host> {
     closed: bool,
     last_snapshot: Option<Snapshot>,
     data_sends: BTreeMap<agent_core::OperationId, DataSendCompletion>,
-    core_wake: Option<TimerId>,
+    core_wakes: VecDeque<TimerId>,
 }
 
 impl<H: Host> Actor<H> {
@@ -665,7 +673,7 @@ impl<H: Host> Actor<H> {
             closed: false,
             last_snapshot: None,
             data_sends: BTreeMap::new(),
-            core_wake: None,
+            core_wakes: VecDeque::new(),
         })
     }
 
@@ -714,9 +722,10 @@ impl<H: Host> Actor<H> {
             self.flush_core();
             return Err("topic publication binding was replaced".to_owned());
         }
-        let turn = self
-            .driver
-            .turn(Input::Command(AgentCommand::SendTopic(send)));
+        let turn = self.driver.turn_at(
+            Input::Command(AgentCommand::SendTopic(send)),
+            self.host.monotonic_time(),
+        );
         let result = turn
             .error
             .as_ref()
@@ -745,7 +754,7 @@ impl<H: Host> Actor<H> {
             return;
         }
 
-        let turn = self.driver.turn(input);
+        let turn = self.driver.turn_at(input, self.host.monotonic_time());
         self.publish_turn(turn);
     }
 
@@ -816,11 +825,13 @@ impl<H: Host> Actor<H> {
         for effect in turn.effects.drain(..) {
             match effect {
                 Effect::Timer(TimerEffect::Schedule { timer, after }) if after.is_zero() => {
-                    self.core_wake = Some(timer);
+                    if !self.core_wakes.contains(&timer) {
+                        self.core_wakes.push_back(timer);
+                    }
                 }
                 Effect::Timer(TimerEffect::Cancel { timer }) => {
-                    if self.core_wake == Some(timer) {
-                        self.core_wake = None;
+                    if let Some(index) = self.core_wakes.iter().position(|id| *id == timer) {
+                        self.core_wakes.remove(index);
                     } else {
                         self.host
                             .execute_effect(Effect::Timer(TimerEffect::Cancel { timer }));
@@ -839,7 +850,7 @@ impl<H: Host> Actor<H> {
     }
 
     fn wake_core(&mut self) -> bool {
-        if let Some(timer) = self.core_wake.take() {
+        if let Some(timer) = self.core_wakes.pop_front() {
             self.event(HostEvent::Timer(TimerEvent::Fired { timer }));
             true
         } else {
@@ -866,7 +877,7 @@ impl<H: Host> Actor<H> {
         self.driver.control.accepting.set(false);
         self.closed = true;
         self.running = false;
-        self.core_wake = None;
+        self.core_wakes.clear();
         self.finalize_catalog_watches();
         for (_, completion) in std::mem::take(&mut self.data_sends) {
             let _ = completion.send(Err(DataSendError::Closed));
@@ -921,7 +932,9 @@ impl<H: Host> Actor<H> {
                 options,
                 completion,
             } => {
-                let (result, turn) = self.driver.send_data(target, payload, options);
+                let (result, turn) =
+                    self.driver
+                        .send_data(target, payload, options, self.host.monotonic_time());
                 match result {
                     Ok(ticket) => {
                         self.data_sends.insert(ticket, completion);
@@ -983,7 +996,7 @@ impl<H: Host> Actor<H> {
 #[cfg(any(test, target_arch = "wasm32"))]
 async fn run_actor<H: Host>(mut actor: Actor<H>, message_rx: mpsc::Receiver<Message>) -> Actor<H> {
     loop {
-        if actor.wake_core() && actor.core_wake.is_some() {
+        if actor.wake_core() && !actor.core_wakes.is_empty() {
             // A rearmed wake must not monopolize the actor or the executor.
             let mut yielded = false;
             std::future::poll_fn(|cx| {
@@ -1101,6 +1114,10 @@ mod tests {
     }
 
     impl Host for FakeHost {
+        fn monotonic_time(&self) -> std::time::Duration {
+            std::time::Duration::ZERO
+        }
+
         fn publish_turn(&self, turn: &super::Turn) {
             self.turns.borrow_mut().push(format!(
                 "{}:{}:{:?}",
@@ -1158,6 +1175,13 @@ mod tests {
     fn retry_timer() -> (agent_core::TimerId, agent_core::Generation) {
         let mut driver = Driver::new(config()).unwrap();
         let turn = driver.turn(Input::Command(AgentCommand::Join("room".into())));
+        failed_offer_timer(&mut driver, turn)
+    }
+
+    fn failed_offer_timer(
+        driver: &mut Driver,
+        turn: super::Turn,
+    ) -> (agent_core::TimerId, agent_core::Generation) {
         let Effect::Rtc(RtcEffect::CreateOffer { generation, .. }) = turn.effects[0] else {
             panic!("expected offer");
         };
@@ -1408,6 +1432,7 @@ mod tests {
             actor.event(HostEvent::DataChannel(DataChannelEvent::Message {
                 generation,
                 channel,
+                binary: true,
                 payload: codec::encode_server(&wire::ServerStateBatch {
                     initial_complete: true,
                     records: vec![wire::ServerStateRecord {
@@ -1470,6 +1495,7 @@ mod tests {
                 .handle(HostEvent::DataChannel(DataChannelEvent::Message {
                     generation,
                     channel,
+                    binary: true,
                     payload: codec::encode_server(&wire::ServerStateBatch {
                         catalog_records: vec![wire::CatalogServerRecord {
                             response: Some(wire::catalog_server_record::Response::Error(
@@ -1626,7 +1652,14 @@ mod tests {
     fn zero_timer_is_actor_owned_cancelled_and_fired_once() {
         use agent_core::TimerEffect;
         use std::time::Duration;
-        let (timer, generation) = retry_timer();
+        let mut driver = Driver::new(config()).unwrap();
+        let turn = driver.turn(Input::Command(AgentCommand::Join("room".into())));
+        let (timer, generation) = failed_offer_timer(&mut driver, turn);
+        let retry = driver.turn(Input::Event(HostEvent::Timer(
+            agent_core::TimerEvent::Fired { timer },
+        )));
+        let (other, _) = failed_offer_timer(&mut driver, retry);
+        assert_ne!(timer, other);
         let mut actor = Actor::new(config(), FakeHost::default()).unwrap();
         let publish = |actor: &mut Actor<FakeHost>, effects| {
             actor.publish_turn(super::Turn {
@@ -1648,11 +1681,23 @@ mod tests {
             actor.host.effect_events(),
             vec![Effect::Rtc(RtcEffect::Close { generation })]
         );
-        assert_eq!(actor.core_wake, Some(timer));
+        publish(
+            &mut actor,
+            vec![Effect::Timer(TimerEffect::Schedule {
+                timer: other,
+                after: Duration::ZERO,
+            })],
+        );
+        assert_eq!(
+            actor.core_wakes.iter().copied().collect::<Vec<_>>(),
+            [timer, other]
+        );
         publish(
             &mut actor,
             vec![Effect::Timer(TimerEffect::Cancel { timer })],
         );
+        assert_eq!(actor.core_wakes.front(), Some(&other));
+        assert!(actor.wake_core());
         assert!(!actor.wake_core());
         assert_eq!(
             actor.host.effect_events(),

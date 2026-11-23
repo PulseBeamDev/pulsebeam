@@ -257,6 +257,10 @@ async fn serve(mut stream: TcpStream, root: &Path, relays: &Mutex<Relays>) -> io
         return respond_relay(&mut stream, result, method).await;
     }
     if let Some(path) = target.strip_prefix("/__test/rtp-relay/") {
+        if let Some(id) = path.strip_suffix("/peaks").and_then(|id| id.parse().ok()) {
+            let result = relays.lock().await.peaks(id).await;
+            return respond_relay(&mut stream, result, method).await;
+        }
         let keys = path.split_once('?').and_then(|(path, query)| {
             let (id, ssrc) = path.split_once('/')?;
             let extension = query.strip_prefix("extension=")?.parse::<u8>().ok()?;

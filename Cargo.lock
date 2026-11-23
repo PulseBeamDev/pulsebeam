@@ -3768,6 +3768,7 @@ dependencies = [
  "pulsebeam-proto",
  "pulsebeam-queue",
  "pulsebeam-rtc",
+ "pulsebeam-rtc-simulation",
  "pulsebeam-runtime",
  "pulsebeam-server",
  "pulsebeam-steer",

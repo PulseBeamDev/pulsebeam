@@ -155,11 +155,12 @@ pub enum TrackResourceError {
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum DataEvent {
     Message {
-        captured_at: Option<crate::ffi::CaptureTimestamp>,
         participant_id: String,
         publication_id: String,
         sequence: u64,
         data: Vec<u8>,
+        #[uniffi(default = None)]
+        captured_at: Option<crate::ffi::CaptureTimestamp>,
     },
     Discontinuity {
         participant_id: String,
@@ -1649,6 +1650,31 @@ impl TrackResources {
         update
     }
 
+    pub(crate) fn receive_data_v1(
+        &mut self,
+        subscriber: &TopicSubscriber,
+        publication_id: &str,
+        unit: crate::data_v1::AssembledUnit,
+    ) -> Vec<u64> {
+        let event = DataEvent::Message {
+            participant_id: subscriber.participant_id.clone(),
+            publication_id: publication_id.to_owned(),
+            sequence: unit.unit_seq,
+            data: unit.bytes,
+            captured_at: unit.captured_at,
+        };
+        self.receivers
+            .iter_mut()
+            .filter(|(_, receiver)| {
+                receiver.failure.is_none() && receiver.subscriber == *subscriber
+            })
+            .map(|(owner, receiver)| {
+                receiver.push(event.clone());
+                owner.id()
+            })
+            .collect()
+    }
+
     /// Feed only notifications already validated and deduplicated by the topic transport.
     pub fn notify(&mut self, notification: &TopicNotification) -> ReceiveUpdate {
         let mut update = ReceiveUpdate::default();
@@ -1663,11 +1689,11 @@ impl TrackResources {
                         && receiver.subscriber.mode == message.mode =>
                 {
                     receiver.push(DataEvent::Message {
-                        captured_at: message.captured_at,
                         participant_id: message.participant_id.clone(),
                         publication_id: message.publication_id.clone(),
                         sequence: message.sequence,
                         data: message.payload.clone(),
+                        captured_at: None,
                     });
                 }
                 TopicNotification::RecoveryGap { subscriber, .. }

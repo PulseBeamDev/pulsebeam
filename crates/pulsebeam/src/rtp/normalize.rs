@@ -36,6 +36,18 @@ pub struct StreamFacts {
     pub temporal_only: Option<bool>,
 }
 
+impl StreamFacts {
+    pub(crate) fn from_structure(structure: &TemplateDependencyStructure) -> Self {
+        Self {
+            decode_targets: Some(structure.decode_target_count),
+            decode_target_heights: Some(decode_target_heights(structure)),
+            temporal_only: Some(
+                structure.spatial_layer_count() == 1 && structure.resolutions.is_empty(),
+            ),
+        }
+    }
+}
+
 fn decode_target_heights(structure: &TemplateDependencyStructure) -> [u16; MAX_LADDER_TARGETS] {
     let mut heights = [0; MAX_LADDER_TARGETS];
     for (dt, height) in heights.iter_mut().enumerate() {
@@ -209,7 +221,7 @@ impl StreamNormalizer {
         }
     }
 
-    fn learn_vla_index(&mut self, pkt: &RtpPacket) {
+    pub(crate) fn learn_vla_index(&mut self, pkt: &RtpPacket) {
         if let Some(vla) = pkt.ext_vals.video_layers_allocation() {
             self.vla_index = Some(vla.current_simulcast_stream_index);
         }
@@ -293,14 +305,11 @@ impl StreamNormalizer {
                 if stale {
                     return Some(StreamFacts::default());
                 }
-                Some(StreamFacts {
-                    decode_targets: self.dd.structure().map(|s| s.decode_target_count),
-                    decode_target_heights: self.dd.structure().map(decode_target_heights),
-                    temporal_only: self
-                        .dd
+                Some(
+                    self.dd
                         .structure()
-                        .map(|s| s.spatial_layer_count() == 1 && s.resolutions.is_empty()),
-                })
+                        .map_or_else(StreamFacts::default, StreamFacts::from_structure),
+                )
             }
             Err(error) => {
                 *parse_error = Some(error);

@@ -148,19 +148,67 @@ pub enum PlayoutDelay {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
-pub enum TopicMode {
-    Latest,
-    Lossy,
-    Ordered,
-}
-
+/// Delivery policy for the negotiated Fabric DATA binding.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, uniffi::Enum)]
 pub enum DataDelivery {
     #[default]
     Reliable,
     Unreliable,
     Latest,
+}
+
+/// A source clock reference, not a claim that the clock is globally synchronized.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct CaptureClock {
+    pub id: String,
+    pub epoch: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct CaptureTimestamp {
+    pub clock: CaptureClock,
+    pub nanos: i64,
+    #[uniffi(default = None)]
+    pub uncertainty_ns: Option<u32>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, uniffi::Record)]
+pub struct DataPublishOptions {
+    /// Omission selects Reliable.
+    #[uniffi(default = None)]
+    pub delivery: Option<DataDelivery>,
+    #[uniffi(default = None)]
+    pub capture_clock: Option<CaptureClock>,
+}
+
+impl DataPublishOptions {
+    pub fn delivery_mode(&self) -> pulsebeam_proto::data_endpoint::Delivery {
+        use pulsebeam_proto::data_endpoint::Delivery;
+        match self.delivery.unwrap_or_default() {
+            DataDelivery::Reliable => Delivery::Reliable,
+            DataDelivery::Unreliable => Delivery::Unreliable,
+            DataDelivery::Latest => Delivery::Latest,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, uniffi::Record)]
+pub struct DataSubscribeOptions {
+    #[uniffi(default = None)]
+    pub delivery: Option<DataDelivery>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, uniffi::Record)]
+pub struct DataSendOptions {
+    #[uniffi(default = None)]
+    pub captured_at: Option<CaptureTimestamp>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum TopicMode {
+    Latest,
+    Lossy,
+    Ordered,
 }
 
 impl From<DataDelivery> for crate::TopicMode {
@@ -171,39 +219,6 @@ impl From<DataDelivery> for crate::TopicMode {
             DataDelivery::Latest => Self::Latest,
         }
     }
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, uniffi::Record)]
-pub struct DataPublishOptions {
-    #[uniffi(default = None)]
-    pub delivery: Option<DataDelivery>,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, uniffi::Record)]
-pub struct DataSubscribeOptions {
-    #[uniffi(default = None)]
-    pub delivery: Option<DataDelivery>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
-pub enum CaptureClock {
-    Publication,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Record)]
-pub struct CaptureTimestamp {
-    pub clock: CaptureClock,
-    pub nanoseconds: i64,
-    #[uniffi(default = None)]
-    pub uncertainty_nanoseconds: Option<u32>,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, uniffi::Record)]
-pub struct DataSendOptions {
-    #[uniffi(default = None)]
-    pub captured_at: Option<CaptureTimestamp>,
-    #[uniffi(default = None)]
-    pub recipients: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
@@ -620,6 +635,42 @@ pub enum TopicNotification {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum ReliableDelivery {
+    Confirmed,
+    Failed,
+    Unknown,
+}
+
+impl From<crate::data_v1::TerminalDelivery> for ReliableDelivery {
+    fn from(value: crate::data_v1::TerminalDelivery) -> Self {
+        match value {
+            crate::data_v1::TerminalDelivery::Confirmed => Self::Confirmed,
+            crate::data_v1::TerminalDelivery::Failed => Self::Failed,
+            crate::data_v1::TerminalDelivery::Unknown => Self::Unknown,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum ReliablePublishEvent {
+    LocallyAdmitted {
+        send: u64,
+        unit_seq: u64,
+    },
+    SourceAdmitted {
+        unit_seq: u64,
+    },
+    AdmissionUnknown {
+        unit_seq: u64,
+    },
+    Delivery {
+        unit_seq: u64,
+        branch: u64,
+        outcome: ReliableDelivery,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum Notification {
     ConnectionChanged {
@@ -640,6 +691,12 @@ pub enum Notification {
     DataSendFinished {
         send: u64,
         error: Option<ErrorInfo>,
+    },
+    ReliableData {
+        track_id: String,
+        generation: u64,
+        source: u64,
+        event: ReliablePublishEvent,
     },
     Topic {
         notification: TopicNotification,
@@ -755,7 +812,6 @@ pub enum TopicFailure {
     SequenceExhausted { name: String },
     MalformedMessage,
     InvalidControl,
-    InvalidRecipients,
     UnknownChannel,
 }
 
@@ -775,7 +831,6 @@ impl From<model::TopicError> for TopicFailure {
             model::TopicError::SequenceExhausted(name) => Self::SequenceExhausted { name },
             model::TopicError::MalformedMessage => Self::MalformedMessage,
             model::TopicError::InvalidControl => Self::InvalidControl,
-            model::TopicError::InvalidRecipients => Self::InvalidRecipients,
             model::TopicError::UnknownChannel => Self::UnknownChannel,
         }
     }
@@ -1345,6 +1400,17 @@ impl From<model::Notification> for Notification {
                 send: send.get(),
                 error: error.map(|error| ErrorInfo::from(&error)),
             },
+            model::Notification::ReliableData {
+                track_id,
+                generation,
+                source,
+                event,
+            } => Self::ReliableData {
+                track_id,
+                generation: generation.get(),
+                source,
+                event,
+            },
             model::Notification::Topic(notification) => Self::Topic {
                 notification: notification.into(),
             },
@@ -1396,6 +1462,17 @@ mod tests {
     use core::fmt::Debug;
 
     use super::*;
+
+    #[test]
+    fn data_publish_options_resolve_to_the_negotiated_delivery_modes() {
+        use pulsebeam_proto::data_endpoint::Delivery;
+        let mut options = DataPublishOptions::default();
+        assert_eq!(options.delivery_mode(), Delivery::Reliable);
+        options.delivery = Some(DataDelivery::Unreliable);
+        assert_eq!(options.delivery_mode(), Delivery::Unreliable);
+        options.delivery = Some(DataDelivery::Latest);
+        assert_eq!(options.delivery_mode(), Delivery::Latest);
+    }
 
     fn config() -> AgentConfig {
         AgentConfig {

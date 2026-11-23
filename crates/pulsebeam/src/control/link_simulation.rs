@@ -4,14 +4,16 @@
     reason = "simulation fixture helpers fail immediately on invalid setup or missing progress"
 )]
 
+#[path = "link_simulation/fabric.rs"]
+mod fabric;
+
 use super::*;
 use crate::clock::WallAnchor;
 use crate::link::{HostHealth, host::Host};
-use crate::participant::{RoutedTrackPacket, TrackPacket};
-use crate::route::{MediaDelivery, RouteId};
+use crate::participant::reverse::ReversePacket;
+use crate::route::RouteId;
 use crate::shard::core::ShardCore;
 use crate::shard_update::{ShardUpdateOp, TrackRouteAction, TrackRuntime};
-use crate::track::DataLane;
 use pulsebeam_link::{
     LinkError, LinkRx, LinkTime, NetworkClass, NetworkId, NetworkPeer, PeerRole, SecretCredential,
     SendErrorKind,
@@ -84,13 +86,10 @@ async fn side(
 }
 
 fn payload(packet: &ShardFrame) -> &[u8] {
-    let ShardFrame::Media { payload, .. } = packet else {
-        panic!("expected media frame");
+    let ShardFrame::Reverse { packet, .. } = packet else {
+        panic!("expected reverse frame");
     };
-    let TrackPacket::Data { bytes, .. } = &payload.packet else {
-        panic!("expected data publication");
-    };
-    bytes
+    packet.wire()
 }
 
 #[test]
@@ -148,7 +147,7 @@ fn udp_host_fanout_saturation_and_cutoffs_preserve_delivery_boundaries() {
                 }
                 assert!(connected);
                 let track = crate::entity::ConnectionId::from_bytes([8; 16])
-                    .fixture_publication(crate::entity::TrackKind::Data, "fanout");
+                    .fixture_publication(crate::entity::TrackKind::Video, "fanout");
                 let mut destinations = Vec::new();
                 let mut shards = Vec::new();
                 for index in 0..2 {
@@ -173,14 +172,14 @@ fn udp_host_fanout_saturation_and_cutoffs_preserve_delivery_boundaries() {
                         1,
                         ShardUpdateOp::InstallRoute {
                             address,
-                            action: TrackRouteAction::Forward {
+                            action: TrackRouteAction::Reverse {
                                 publication_id: track,
                             },
                         },
                     );
                     b.install_after(
                         address,
-                        TrackRouteAction::Forward {
+                        TrackRouteAction::Reverse {
                             publication_id: track,
                         },
                         None,
@@ -202,7 +201,7 @@ fn udp_host_fanout_saturation_and_cutoffs_preserve_delivery_boundaries() {
                 assert!(
                     published
                         .iter()
-                        .all(|destination| destination.kind == crate::link::ReceiveKind::Forward)
+                        .all(|destination| destination.kind == crate::link::ReceiveKind::Reverse)
                 );
                 let receive = b.bind_receive(bid, destinations.clone()).unwrap();
                 let source = ShardId::new(0);
@@ -211,9 +210,18 @@ fn udp_host_fanout_saturation_and_cutoffs_preserve_delivery_boundaries() {
                     plan: Some(TrackPlan::default()),
                 };
                 assert!(a.prepare_plan(source, &mut plan).is_empty());
-                let (binding, mut plan) = a.bind_send(source, track, aid, receive.address).unwrap();
+                let (binding, mut plan) =
+                    a.bind_reverse(source, track, aid, receive.address).unwrap();
                 assert!(a.prepare_plan(source, &mut plan).is_empty());
-                let tx = plan.plan.as_ref().unwrap().compiled_network[0].tx.clone();
+                let tx = plan
+                    .plan
+                    .as_ref()
+                    .unwrap()
+                    .compiled_network_reverse
+                    .as_ref()
+                    .unwrap()
+                    .tx
+                    .clone();
                 let (mut source_writer, updates) = crate::shard_update::new_shard_update(source);
                 let mut source_core = ShardCore::new(
                     source,
@@ -232,22 +240,14 @@ fn udp_host_fanout_saturation_and_cutoffs_preserve_delivery_boundaries() {
                 source_writer.stage_plans(1, vec![plan]);
                 assert_eq!(source_writer.publish(), Some(1));
                 assert_eq!(source_core.apply_updates(64), 1);
-                let frame = |bytes: &'static [u8]| ShardFrame::Media {
-                    delivery: MediaDelivery {
-                        address: destinations[0],
-                        playout_ntp32: 7,
-                    },
-                    payload: RoutedTrackPacket {
-                        publication_id: track,
-                        packet: TrackPacket::Data {
-                            filter_recipients: false,
-                            target: None,
-                            lane: DataLane::Lossy,
-                            bytes: bytes::Bytes::from_static(bytes),
-                        },
-                    },
+                let frame = |ssrc: u32| ShardFrame::Reverse {
+                    address: destinations[0],
+                    packet: ReversePacket::keyframe(
+                        crate::track::SourceEncoding::Ssrc(ssrc.into()),
+                        crate::media::KeyframeRequestKind::Pli,
+                    ),
                 };
-                tx.try_send(frame(b"first"), LinkTime::from_nanos(u64::MAX))
+                tx.try_send(frame(1), LinkTime::from_nanos(u64::MAX))
                     .unwrap();
                 assert_eq!(received(&b, bid, 1).await.received, 1);
                 let mut first = Vec::new();
@@ -256,7 +256,7 @@ fn udp_host_fanout_saturation_and_cutoffs_preserve_delivery_boundaries() {
                 assert_eq!(receivers[1].try_recv_batch(&mut second, 8), 1);
                 assert_eq!(first[0].tag, crate::link::delivery_tag(destinations[0]));
                 assert_eq!(second[0].tag, crate::link::delivery_tag(destinations[1]));
-                assert_eq!(payload(&first[0].packet), b"first");
+                assert_eq!(payload(&first[0].packet), &[1, 1, 2, 0, 0, 0, 1]);
                 assert_eq!(
                     payload(&first[0].packet).as_ptr(),
                     payload(&second[0].packet).as_ptr()
@@ -275,7 +275,7 @@ fn udp_host_fanout_saturation_and_cutoffs_preserve_delivery_boundaries() {
                     .unwrap();
                 let mut full = false;
                 for _ in 0..4096 {
-                    match local.try_send(frame(b"local"), LinkTime::from_nanos(u64::MAX)) {
+                    match local.try_send(frame(2), LinkTime::from_nanos(u64::MAX)) {
                         Ok(()) => {}
                         Err(error) if error.kind == SendErrorKind::Full => {
                             full = true;
@@ -285,7 +285,7 @@ fn udp_host_fanout_saturation_and_cutoffs_preserve_delivery_boundaries() {
                     }
                 }
                 assert!(full);
-                tx.try_send(frame(b"queued"), LinkTime::from_nanos(u64::MAX))
+                tx.try_send(frame(3), LinkTime::from_nanos(u64::MAX))
                     .unwrap();
                 assert_eq!(received(&b, bid, 2).await.local_full, 1);
                 let (writer, core) = &mut shards[1];
@@ -306,11 +306,11 @@ fn udp_host_fanout_saturation_and_cutoffs_preserve_delivery_boundaries() {
                 first.clear();
                 assert!(receivers[0].try_recv_batch(&mut first, 4096) > 0);
                 first.clear();
-                tx.try_send(frame(b"survives"), LinkTime::from_nanos(u64::MAX))
+                tx.try_send(frame(4), LinkTime::from_nanos(u64::MAX))
                     .unwrap();
                 assert_eq!(received(&b, bid, 3).await.stale, 0);
                 assert_eq!(receivers[0].try_recv_batch(&mut first, 8), 1);
-                assert_eq!(payload(&first[0].packet), b"survives");
+                assert_eq!(payload(&first[0].packet), &[1, 1, 2, 0, 0, 0, 4]);
                 assert_eq!(receivers[1].try_recv_batch(&mut second, 8), 0);
 
                 let (writer, core) = &mut shards[0];
@@ -326,7 +326,7 @@ fn udp_host_fanout_saturation_and_cutoffs_preserve_delivery_boundaries() {
                 assert_eq!(writer.publish(), Some(2));
                 assert_eq!(core.apply_updates(64), 1);
                 b.reap();
-                tx.try_send(frame(b"retired"), LinkTime::from_nanos(u64::MAX))
+                tx.try_send(frame(5), LinkTime::from_nanos(u64::MAX))
                     .unwrap();
                 assert_eq!(received(&b, bid, 4).await.stale, 1);
                 first.clear();
@@ -352,13 +352,13 @@ fn udp_host_fanout_saturation_and_cutoffs_preserve_delivery_boundaries() {
                 assert!(a.prepare_plan(source, &mut clear).is_empty());
                 source_writer.stage_plans(2, vec![clear]);
                 a.retire_bindings_after(vec![binding], source_writer.stage_cutoff(2));
-                tx.try_send(frame(b"fenced"), LinkTime::from_nanos(u64::MAX))
+                tx.try_send(frame(6), LinkTime::from_nanos(u64::MAX))
                     .unwrap();
                 assert_eq!(source_writer.publish(), Some(2));
                 assert_eq!(source_core.apply_updates(64), 1);
                 a.reap();
                 assert_eq!(
-                    tx.try_send(frame(b"stale"), LinkTime::from_nanos(u64::MAX))
+                    tx.try_send(frame(7), LinkTime::from_nanos(u64::MAX))
                         .unwrap_err()
                         .kind,
                     SendErrorKind::Stale

@@ -1,9 +1,9 @@
 use super::*;
 use pulsebeam_agent_native::agent_core::{
-    AgentError, DataEvent, ResourceCommand, ResourceResult, TopicPublisher, TopicSubscriber,
-    TrackResourceError, TrackSelector, TrackSpec,
+    AgentError, DataEvent, ResourceCommand, ResourceResult, TopicPublisher, TrackResourceError,
+    TrackSelector, TrackSpec, ffi::PublicationExecution,
 };
-use pulsebeam_agent_native::{Agent, Error};
+use pulsebeam_agent_native::{Agent, DataPublication, Error};
 
 const BURST: u8 = 4;
 const WARMUP_SENDS: u8 = 50;
@@ -12,6 +12,7 @@ pub(super) struct DataLane {
     delivery: Delivery,
     topic: String,
     publisher: Agent,
+    publication: DataPublication,
     receiver: Agent,
     participant_id: String,
     source_room: String,
@@ -84,29 +85,6 @@ impl DataLane {
         handles: &PlanHandles,
     ) -> Result<Self> {
         let topic = format!("history-{}", delivery.name());
-        handles["anchor"].shared.pending_ops.lock().unwrap().push(
-            PendingDriverOp::DeclarePublishTopic(topic.clone(), delivery.mode()),
-        );
-        // The excluded-self cursor is a distinct scoped intent from the delivery cursor.
-        handles["continuing"]
-            .shared
-            .pending_ops
-            .lock()
-            .unwrap()
-            .push(PendingDriverOp::DeclareSubscribeTopic(vec![
-                TopicSubscriber {
-                    room: handles["anchor"].room_name.to_owned(),
-                    participant_id: handles["anchor"].endpoint.clone(),
-                    topic: topic.clone(),
-                    mode: delivery.mode(),
-                },
-                TopicSubscriber {
-                    room: handles["continuing"].room_name.to_owned(),
-                    participant_id: handles["continuing"].endpoint.clone(),
-                    topic: topic.clone(),
-                    mode: delivery.mode(),
-                },
-            ]));
         let publisher = application_agent(state, handles, "anchor").await?;
         let receiver = application_agent(state, handles, "continuing").await?;
         let participant_id = publisher
@@ -117,10 +95,12 @@ impl DataLane {
             .snapshot()
             .participant_id
             .context("excluded data receiver external identity")?;
+        let publication = publisher.data(topic.clone(), delivery.mode())?.publish()?;
         let mut lane = Self {
             delivery,
             topic,
             publisher,
+            publication,
             receiver,
             participant_id,
             source_room: handles["anchor"].room_name.to_owned(),
@@ -138,42 +118,11 @@ impl DataLane {
         // with bounded, explicitly supplied warmup values before fault claims.
         tokio::time::timeout(Duration::from_secs(5), async {
             for attempt in 0..WARMUP_SENDS {
-                let source_ready =
-                    lane.publisher
-                        .snapshot()
-                        .topics
-                        .publishers
-                        .iter()
-                        .any(|status| {
-                            status.registration
-                                == TopicPublisher {
-                                    topic: lane.topic.clone(),
-                                    mode: delivery.mode(),
-                                }
-                                && status.channel.is_some()
-                                && status.publication_id.is_some()
-                        });
-                let receiver_ready =
-                    lane.receiver
-                        .snapshot()
-                        .topics
-                        .subscribers
-                        .iter()
-                        .any(|status| {
-                            status.registration
-                                == TopicSubscriber {
-                                    room: lane.source_room.clone(),
-                                    participant_id: lane.participant_id.clone(),
-                                    topic: lane.topic.clone(),
-                                    mode: delivery.mode(),
-                                }
-                                && status.channel.is_some()
-                        });
-                if source_ready && receiver_ready {
+                if lane.publication.state().execution == PublicationExecution::Installed {
                     lane.publish(255, attempt).await?;
                 }
                 state.wait(handles, Duration::from_millis(100)).await?;
-                lane.drain().await?;
+                lane.drain(handles).await?;
                 if lane
                     .received
                     .iter()
@@ -186,8 +135,7 @@ impl DataLane {
         })
         .await
         .context("topic did not establish actual payload service")??;
-        // Topic registration replaces the native transport. Establish fresh
-        // current-generation video before calling the later held path unrelated.
+        // Establish current-generation video alongside DATA before holding the other path.
         let publisher_generation = lane.publisher.snapshot().generation;
         let receiver_generation = lane.receiver.snapshot().generation;
         let mut baseline = None;
@@ -223,42 +171,43 @@ impl DataLane {
             }
         })
         .await
-        .context(
-            "logical continuing video did not establish after topic transport replacement",
-        )??;
+        .context("logical continuing video did not establish alongside DATA")??;
         Ok(lane)
     }
 
     async fn publish(&mut self, tag: u8, offset: u8) -> Result<()> {
         let payload = self.payload(tag, offset);
-        self.supplied.insert(payload.clone(), tag);
-        self.publisher
-            .send_topic(pulsebeam_agent_native::agent_core::TopicSend {
-                publisher: TopicPublisher {
-                    topic: self.topic.clone(),
-                    mode: self.delivery.mode(),
-                },
-                payload,
-            })
-            .await?;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match self.publication.send(payload.clone()).await {
+                    Ok(()) => break,
+                    Err(Error::Core(AgentError::InvalidTopic(
+                        pulsebeam_agent_native::agent_core::TopicError::SendQueueFull(_),
+                    ))) => tokio::time::sleep(Duration::from_millis(10)).await,
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .context("DATA admission queue did not drain")??;
+        self.supplied.insert(payload, tag);
         Ok(())
     }
 
-    async fn drain(&mut self) -> Result<()> {
-        let track = self
-            .publisher
-            .snapshot()
-            .topics
-            .publishers
-            .iter()
-            .find(|status| {
-                status.registration
-                    == TopicPublisher {
+    async fn drain(&mut self, handles: &PlanHandles) -> Result<()> {
+        let track = observation(&handles["continuing"]).and_then(|value| {
+            value
+                .data_catalog
+                .get(&(
+                    self.participant_id.clone(),
+                    TopicPublisher {
                         topic: self.topic.clone(),
                         mode: self.delivery.mode(),
-                    }
-            })
-            .and_then(|status| status.publication_id.clone());
+                    },
+                ))
+                .cloned()
+        });
         for _ in 0..64 {
             let ResourceResult::Event { event } = self
                 .receiver
@@ -308,11 +257,6 @@ impl DataLane {
                             self.last.is_none_or(|last| sequence > last),
                             "latest data regressed"
                         ),
-                        Delivery::Ordered => ensure!(
-                            self.last
-                                .is_none_or(|last| last.checked_add(1) == Some(sequence)),
-                            "ordered payload skipped without a gap"
-                        ),
                         Delivery::Lossy => {}
                     }
                     if self.delivery != Delivery::Lossy {
@@ -320,37 +264,11 @@ impl DataLane {
                     }
                     self.received.insert(data);
                 }
-                DataEvent::Discontinuity {
-                    participant_id,
-                    publication_id,
-                    ..
-                } => {
-                    ensure!(
-                        self.delivery != Delivery::Ordered
-                            && participant_id == self.participant_id
-                            && Some(&publication_id) == track.as_ref(),
-                        "invalid data discontinuity"
-                    );
-                    self.last = None;
-                    self.sequences.clear();
+                DataEvent::Gap { .. } => {
+                    anyhow::bail!("unexpected DATA gap in a latest or lossy lane")
                 }
-                DataEvent::Gap {
-                    participant_id,
-                    publication_id,
-                    from,
-                    to,
-                } => {
-                    ensure!(
-                        self.delivery == Delivery::Ordered
-                            && participant_id == self.participant_id
-                            && Some(&publication_id) == track.as_ref()
-                            && to > from
-                            && self
-                                .last
-                                .is_none_or(|last| last.checked_add(1) == Some(from)),
-                        "invalid ordered gap"
-                    );
-                    self.last = Some(to - 1);
+                DataEvent::Discontinuity { .. } => {
+                    anyhow::bail!("unexpected DATA source change in a fixed-source history")
                 }
             }
         }
@@ -369,12 +287,11 @@ impl DataLane {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 state.clients_safe(handles)?;
-                self.drain().await?;
+                self.drain(handles).await?;
                 let delivered = |offset| self.received.contains(&self.payload(tag, offset));
                 let complete = match self.delivery {
                     Delivery::Latest => delivered(BURST - 1),
                     Delivery::Lossy => (0..BURST).any(delivered),
-                    Delivery::Ordered => (0..BURST).all(delivered),
                 };
                 if complete {
                     return Ok::<_, anyhow::Error>(());

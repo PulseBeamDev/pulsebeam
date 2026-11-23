@@ -16,15 +16,35 @@ pub struct Observation {
     first_value: Option<Vec<u8>>,
 }
 
+#[derive(Clone, Copy, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RtpPeaks {
+    browser_to_sfu: usize,
+    sfu_to_browser: usize,
+}
+
 #[derive(Default)]
 struct Observations {
     extension: Option<u8>,
     by_ssrc: HashMap<u32, Observation>,
+    peaks: RtpPeaks,
 }
 
 impl Observations {
-    fn record(&mut self, packet: &[u8]) -> Result<(), &'static str> {
-        if let Some(extension) = self.extension
+    fn record(&mut self, packet: &[u8], from_sfu: bool) -> Result<(), &'static str> {
+        if let [first, second, ..] = packet
+            && first >> 6 == 2
+            && !(64..=95).contains(&(second & 127))
+        {
+            let peak = if from_sfu {
+                &mut self.peaks.sfu_to_browser
+            } else {
+                &mut self.peaks.browser_to_sfu
+            };
+            *peak = (*peak).max(packet.len());
+        }
+        if from_sfu
+            && let Some(extension) = self.extension
             && let Some((ssrc, value)) = inspect_rtp(packet, extension)?
         {
             let observation = self.by_ssrc.entry(ssrc).or_default();
@@ -90,12 +110,17 @@ impl Relays {
                             captured
                                 .lock()
                                 .await
-                                .record(packet)
+                                .record(packet, true)
                                 .map_err(io::Error::other)?;
                             socket.send_to(packet, browser).await?;
                         }
                     } else if browser.is_none_or(|peer| peer == source) {
                         browser = Some(source);
+                        captured
+                            .lock()
+                            .await
+                            .record(packet, false)
+                            .map_err(io::Error::other)?;
                         socket.send_to(packet, destination).await?;
                     }
                 }
@@ -116,7 +141,7 @@ impl Relays {
         )?)
     }
 
-    pub async fn observation(&self, id: usize, ssrc: u32, extension: u8) -> io::Result<Vec<u8>> {
+    async fn healthy(&self, id: usize) -> io::Result<&Relay> {
         let relay = self
             .entries
             .get(id)
@@ -124,6 +149,16 @@ impl Relays {
         if let Some(error) = relay.error.lock().await.as_ref() {
             return Err(io::Error::other(error.clone()));
         }
+        Ok(relay)
+    }
+
+    pub async fn peaks(&self, id: usize) -> io::Result<Vec<u8>> {
+        let relay = self.healthy(id).await?;
+        Ok(serde_json::to_vec(&relay.observations.lock().await.peaks)?)
+    }
+
+    pub async fn observation(&self, id: usize, ssrc: u32, extension: u8) -> io::Result<Vec<u8>> {
+        let relay = self.healthy(id).await?;
         let observation = relay
             .observations
             .lock()
@@ -261,10 +296,13 @@ mod tests {
         let mut packet = vec![0x90, 96, 0, 1, 0, 0, 0, 0, 0, 0, 0, 42];
         packet.extend([0xbe, 0xde, 0, 1, 0x72, 0, 0xa0, 10]);
         let mut observations = super::Observations::default();
-        observations.record(&packet).unwrap();
+        observations.record(&packet, false).unwrap();
         assert!(observations.by_ssrc.is_empty());
+        assert_eq!(observations.peaks.browser_to_sfu, packet.len());
+        assert_eq!(observations.peaks.sfu_to_browser, 0);
         assert_eq!(observations.observation(42, 7).unwrap().packets, 0);
-        observations.record(&packet).unwrap();
+        observations.record(&packet, true).unwrap();
+        assert_eq!(observations.peaks.sfu_to_browser, packet.len());
         let measured = observations.observation(42, 7).unwrap();
         assert_eq!(measured.packets, 1);
         assert_eq!(measured.with_extension, 1);

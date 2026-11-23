@@ -555,8 +555,12 @@ impl Control {
         self.update(|core| core.command(command))
     }
 
-    pub(super) fn handle(&self, event: HostEvent) -> Result<(), agent_core::AgentError> {
-        self.update(|core| core.handle(event))
+    pub(super) fn handle_at(
+        &self,
+        event: HostEvent,
+        now: Duration,
+    ) -> Result<(), agent_core::AgentError> {
+        self.update(|core| core.handle_at(event, now))
     }
 
     pub(super) fn resource(
@@ -721,6 +725,7 @@ impl Control {
         expected_join: u64,
         data: Vec<u8>,
         options: Option<agent_core::ffi::DataSendOptions>,
+        now: std::time::Duration,
     ) -> Result<OperationId, agent_core::AgentError> {
         self.with(|core| {
             let state = agent_core::ffi::AgentState::from(core.snapshot());
@@ -728,13 +733,14 @@ impl Control {
                 return Err(agent_core::TrackResourceError::NotConnected.into());
             }
             let publication = core.data_publication_state(owner)?;
-            core.send_data_with_options(
+            core.send_data_with_options_at(
                 agent_core::TrackSpec::Data {
                     track_id: publication.track_id,
                     delivery: publication.delivery.into(),
                 },
                 data,
                 options,
+                now,
             )
         })
     }

@@ -101,6 +101,7 @@ pub(super) fn prepared_rtp_binding(
         })
         .collect::<Result<Vec<_>, Error>>()?;
     let rtp = wire::RtpParameters {
+        extmap_allow_mixed: Some(binding.extmap_allow_mixed),
         mid: binding.mid.clone(),
         codec: Some(wire::RtpCodecParameters {
             payload_type: Some(u32::from(binding.codec.payload_type)),

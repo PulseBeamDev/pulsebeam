@@ -9,6 +9,141 @@ fn cross_shard_video_room() -> super::common::Room {
 }
 
 #[test]
+fn whole_source_fabric_h264_reaches_native_decoder() {
+    prove_whole_source_fabric_h264(2);
+}
+
+#[test]
+fn whole_source_fabric_h264_reaches_local_native_decoder() {
+    prove_whole_source_fabric_h264(1);
+}
+
+fn prove_whole_source_fabric_h264(shards: usize) {
+    let layer = QualityVideoLayer::P720;
+    let dimensions = (1280, 720);
+    LocalNodeSim::new()
+        .with_shards(shards)
+        .with_room(
+            Room::new("fabric-h264")
+                .with_participant(
+                    Participant::quality_publisher_at("source", QualityVideoSource::One, layer)
+                        .marker_only()
+                        .suppress_natural_keyframe_repeats()
+                        .speaking_at(-30)
+                        .with_native_pcm_audio(),
+                )
+                .with_participant(
+                    Participant::subscriber("viewer")
+                        .starts_disconnected()
+                        .with_native_decoded_video()
+                        .hearing(1)
+                        .with_native_decoded_audio(),
+                ),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Start the publisher before the viewer joins",
+                duration: Duration::from_secs(2),
+            },
+            Step::Reconnect {
+                description: "Join after the initial publisher keyframe",
+                participant: "viewer",
+            },
+            Step::Run {
+                description: "Request refresh and forward whole H264 through Fabric",
+                duration: Duration::from_secs(6),
+            },
+            Step::CheckKeyframeRequestsAtLeast {
+                description: "The publisher receives the constrained Fabric refresh",
+                participant: "source",
+                min: 1,
+            },
+            Step::CheckNativeDecodedVideo {
+                description: "Native decoder renders the authenticated DD-free whole-source stream",
+                participant: "viewer",
+                dimensions,
+                min_fresh_frames: 20,
+            },
+            Step::CheckNativeAudioDecoded {
+                description: "The same publisher's Opus encoding also reaches the Native decoder",
+                participant: "viewer",
+                min_samples: 4_800,
+                min_receivers: 1,
+                max_silence: None,
+            },
+        ]);
+    let counter = pulsebeam::sim_metrics::routing_counter;
+    assert!(counter("fabric_rtp_enqueued") > 0);
+    if shards > 1 {
+        assert!(counter("fabric_rtp_opus_shard_enqueued") > 0);
+        assert!(counter("fabric_rtp_h264_shard_enqueued") > 0);
+        assert!(counter("fabric_rtp_shard_refresh") > 0);
+    } else {
+        assert!(counter("fabric_rtp_h264_local_enqueued") > 0);
+        assert_eq!(counter("fabric_rtp_shard_enqueued"), 0);
+    }
+    assert_eq!(counter("fabric_rtp_ingress_oversize"), 0);
+    let submitted = pulsebeam::sim_metrics::fabric_udp_submission_peak();
+    assert!(
+        (1..=1_216).contains(&submitted),
+        "protected Fabric RTP sent on the receiver UDP path: {submitted}"
+    );
+}
+
+#[test]
+fn selected_fabric_simulcast_reaches_local_native_decoder() {
+    prove_selected_fabric_simulcast(1);
+}
+
+#[test]
+fn selected_fabric_simulcast_reaches_cross_shard_native_decoder() {
+    prove_selected_fabric_simulcast(2);
+}
+
+fn prove_selected_fabric_simulcast(shards: usize) {
+    LocalNodeSim::new()
+        .with_shards(shards)
+        .with_link(LinkProfile::fiber())
+        .with_room(
+            Room::new("fabric-simulcast")
+                .with_participant(
+                    Participant::publisher("source", &["q", "h", "f"]).with_temporal_dd(1),
+                )
+                .with_participant(Participant::subscriber("viewer").with_native_decoded_video()),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Discover the Native simulcast publication",
+                duration: Duration::from_secs(1),
+            },
+            Step::SubscribeAll {
+                description: "Require the 180p encoding, not the higher rungs",
+                participant: "viewer",
+                heights: &[180],
+            },
+            Step::Run {
+                description: "Allow qualification and decode on the selected source",
+                duration: Duration::from_secs(4),
+            },
+            Step::CheckNativeDecodedVideo {
+                description: "Native decoder renders the selected encoding",
+                participant: "viewer",
+                dimensions: (320, 180),
+                min_fresh_frames: 20,
+            },
+        ]);
+    let counter = pulsebeam::sim_metrics::routing_counter;
+    if shards > 1 {
+        assert!(counter("fabric_rtp_h264_shard_enqueued") > 0);
+    } else {
+        assert!(counter("fabric_rtp_h264_local_enqueued") > 0);
+        assert_eq!(counter("fabric_rtp_shard_enqueued"), 0);
+    }
+    let submitted = pulsebeam::sim_metrics::fabric_udp_submission_peak();
+    assert!((1..=1_216).contains(&submitted));
+}
+
+#[test]
 fn every_quality_layer_has_explicit_decoded_reference_facts_test() {
     for layer in [
         QualityVideoLayer::P180,
@@ -539,7 +674,17 @@ fn a_pli_recovers_decoding_without_natural_keyframe_repeats_test() {
 /// The fixture never fabricates a dependency descriptor or reference schedule.
 #[test]
 fn dependency_descriptor_stream_is_forwarded_decodably_test() {
+    prove_fabric_l1t3(1);
+}
+
+#[test]
+fn dependency_descriptor_stream_is_forwarded_decodably_across_shards_test() {
+    prove_fabric_l1t3(2);
+}
+
+fn prove_fabric_l1t3(shards: usize) {
     LocalNodeSim::new()
+        .with_shards(shards)
         .with_room(
             Room::new("room1")
                 .with_participant(Participant::publisher("alice", &["q"]).with_temporal_dd(3))
@@ -558,6 +703,15 @@ fn dependency_descriptor_stream_is_forwarded_decodably_test() {
                     .require_native_temporal_indices(&[0, 1, 2]),
             },
         ]);
+    let counter = if shards == 1 {
+        "fabric_rtp_h264_local_enqueued"
+    } else {
+        "fabric_rtp_h264_shard_enqueued"
+    };
+    assert!(
+        pulsebeam::sim_metrics::routing_counter(counter) > 0,
+        "L1T3 decoder proof must use Fabric at this placement"
+    );
 }
 
 /// A single scalable (DD) encoding keeps delivering frames through a downlink
@@ -710,16 +864,13 @@ fn dd_publisher_streams_to_a_marker_only_subscriber_test() {
         ]);
 }
 
-/// Mixed room: a legacy marker-only publisher (no DD) and a DD-capable subscriber.
-/// With no ingress DD the SFU forwards via the marker/deep-inspection path; the
-/// subscriber's DD support is simply unused. Asserts the legacy path is unaffected
-/// by DD being negotiated on the receive side.
+/// A DD-capable subscriber can receive a whole source without ingress DD.
 #[test]
-fn marker_only_publisher_streams_to_a_dd_subscriber_test() {
+fn dd_free_whole_source_streams_to_a_dd_subscriber_test() {
     LocalNodeSim::new()
         .with_room(
             Room::new("room1")
-                .with_participant(Participant::publisher("alice", &["q", "h", "f"]).marker_only())
+                .with_participant(Participant::single_publisher("alice").marker_only())
                 .with_participant(Participant::subscriber("bob")),
         )
         .run(vec![
@@ -728,7 +879,7 @@ fn marker_only_publisher_streams_to_a_dd_subscriber_test() {
                 duration: Duration::from_secs(10),
             },
             Step::CheckVideoQuality {
-                description: "Bob decodes the legacy stream end to end",
+                description: "Bob decodes the DD-free whole source end to end",
                 participant: "bob",
                 quality: VideoQuality::min_frames(150).allow_gaps(3),
             },
@@ -826,28 +977,6 @@ fn same_receiver_encoded_and_native_decoded_video_test() {
             Participant::subscriber("charlie").with_encoded_and_native_decoded_video(),
         ))
         .run(plan);
-}
-
-#[test]
-fn marker_only_simulcast_reaches_native_decoded_video_test() {
-    LocalNodeSim::new()
-        .with_room(
-            Room::new("room1")
-                .with_participant(Participant::publisher("alice", &["q", "h", "f"]).marker_only())
-                .with_participant(Participant::subscriber("bob").with_native_decoded_video()),
-        )
-        .run(vec![
-            Step::Run {
-                description: "A marker-only Alice publishes to a native-decoded DD-capable Bob",
-                duration: Duration::from_secs(10),
-            },
-            Step::CheckNativeDecodedVideo {
-                description: "Native decoder delivers fresh changing 720p pixels and advancing stats",
-                participant: "bob",
-                dimensions: (1280, 720),
-                min_fresh_frames: 150,
-            },
-        ]);
 }
 
 #[test]

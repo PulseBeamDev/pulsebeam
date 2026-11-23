@@ -1,0 +1,208 @@
+diff --git a/src/api/mod.rs b/src/api/mod.rs
+--- a/src/api/mod.rs
++++ b/src/api/mod.rs
+@@ -515,6 +515,10 @@
+     /// as the association is still viable.
+     OnError(ErrorKind, String),
+ 
++    /// A configured stream exceeded its receive budget. The stream is fenced
++    /// until the caller replaces or removes the budget after reset.
++    OnReceiveBudgetExceeded(StreamId),
++
+     /// Generated when the amount of data buffered to be sent falls to or below the threshold set
+     /// when calling [`DcSctpSocket::set_buffered_amount_low_threshold`].
+     OnBufferedAmountLow(StreamId),
+diff --git a/src/ffi.rs b/src/ffi.rs
+--- a/src/ffi.rs
++++ b/src/ffi.rs
+@@ -576,6 +576,12 @@
+                 error_reason: error_reason.to_string(),
+                 ..Default::default()
+             },
++            DcSctpSocketEvent::OnReceiveBudgetExceeded(stream_id) => bridge::Event {
++                event_type: bridge::EventType::OnError,
++                error_kind: crate::api::ErrorKind::ResourceExhaustion.into(),
++                error_reason: format!("Receive budget exceeded on stream {stream_id}"),
++                ..Default::default()
++            },
+             DcSctpSocketEvent::OnBufferedAmountLow(stream_id) => bridge::Event {
+                 event_type: bridge::EventType::OnBufferedAmountLow,
+                 stream_id: stream_id.0,
+diff --git a/src/rx/reassembly_queue.rs b/src/rx/reassembly_queue.rs
+--- a/src/rx/reassembly_queue.rs
++++ b/src/rx/reassembly_queue.rs
+@@ -125,6 +125,21 @@
+         });
+     }
+ 
++    pub fn discard_ready_for_stream(&mut self, stream: StreamId) {
++        self.reassembled_messages.retain(|message| message.stream_id != stream);
++    }
++
++    pub fn partial_payload_for_stream(&self, stream: StreamId) -> usize {
++        let deferred = self.deferred_reset_streams.as_ref().map_or(0, |reset| {
++            reset.deferred_operations.iter().filter_map(|op| match op {
++                DeferredOperation::Data(_, data) if data.stream_key.id() == stream
++                    && !(data.is_beginning && data.is_end) => Some(data.payload.len()),
++                _ => None,
++            }).sum::<usize>()
++        });
++        self.streams.buffered_payload_for_stream(stream).saturating_add(deferred)
++    }
++
+     pub fn queued_bytes(&self) -> usize {
+         let ready_messages_bytes: usize =
+             self.reassembled_messages.iter().map(|m| m.payload.len()).sum();
+diff --git a/src/rx/reassembly_streams.rs b/src/rx/reassembly_streams.rs
+--- a/src/rx/reassembly_streams.rs
++++ b/src/rx/reassembly_streams.rs
+@@ -59,6 +59,8 @@
+     /// Returns the number of bytes currently buffered in the unassembled streams.
+     fn queued_bytes(&self) -> usize;
+ 
++    fn buffered_payload_for_stream(&self, stream: StreamId) -> usize;
++
+     fn get_handover_readiness(&self) -> HandoverReadiness;
+     fn add_to_handover_state(&self, state: &mut SocketHandoverState);
+     fn restore_from_state(&mut self, state: &SocketHandoverState);
+diff --git a/src/rx/traditional_reassembly_streams.rs b/src/rx/traditional_reassembly_streams.rs
+--- a/src/rx/traditional_reassembly_streams.rs
++++ b/src/rx/traditional_reassembly_streams.rs
+@@ -137,6 +137,12 @@
+         self.queued_bytes
+     }
+ 
++    fn buffered_payload_for_stream(&self, stream: StreamId) -> usize {
++        let ordered = self.ordered.get(&stream).map_or(0, |s| s.intervals.total_bytes());
++        let unordered = self.unordered.get(&stream).map_or(0, |s| s.intervals.total_bytes());
++        ordered.saturating_add(unordered)
++    }
++
+     fn get_handover_readiness(&self) -> HandoverReadiness {
+         let ordered_has_unassembled = self.ordered.values().any(|s| s.has_unassembled_chunks());
+         let unordered_has_unassembled = self.unordered.values().any(|s| s.has_unassembled_chunks());
+diff --git a/src/rx/interleaved_reassembly_streams.rs b/src/rx/interleaved_reassembly_streams.rs
+--- a/src/rx/interleaved_reassembly_streams.rs
++++ b/src/rx/interleaved_reassembly_streams.rs
+@@ -282,6 +282,12 @@
+         self.queued_bytes
+     }
+ 
++    fn buffered_payload_for_stream(&self, stream: StreamId) -> usize {
++        let ordered = self.ordered.get(&stream).map_or(0, |s| s.intervals.total_bytes());
++        let unordered = self.unordered.get(&stream).map_or(0, |s| s.intervals.total_bytes());
++        ordered.saturating_add(unordered)
++    }
++
+     fn get_handover_readiness(&self) -> HandoverReadiness {
+         let has_ordered_chunks = self.ordered.values().any(|s| !s.intervals.is_empty());
+         let has_unordered_chunks = self.unordered.values().any(|s| !s.intervals.is_empty());
+diff --git a/src/socket/context.rs b/src/socket/context.rs
+--- a/src/socket/context.rs
++++ b/src/socket/context.rs
+@@ -18,6 +18,7 @@
+ use crate::api::SctpImplementation;
+ use crate::api::SocketEvent;
+ use crate::api::SocketTime;
++use crate::api::StreamId;
+ use crate::packet::chunk::Chunk;
+ use crate::packet::sctp_packet::SctpPacketBuilder;
+ use crate::socket::State;
+@@ -26,6 +27,8 @@
+ use crate::tx::send_queue::SendQueue;
+ use std::cell::RefCell;
+ use std::cmp::min;
++use std::collections::HashMap;
++use std::num::NonZeroUsize;
+ use std::rc::Rc;
+ use std::time::Duration;
+ 
+@@ -61,7 +64,13 @@
+     }
+ }
+ 
++pub(crate) struct ReceiveBudget {
++    pub limit: NonZeroUsize,
++    pub exceeded: bool,
++}
++
+ pub(crate) struct Context {
++    pub receive_budgets: HashMap<StreamId, ReceiveBudget>,
+     pub options: Options,
+     pub events: Rc<RefCell<dyn EventSink>>,
+     pub send_queue: SendQueue,
+diff --git a/src/socket/data.rs b/src/socket/data.rs
+--- a/src/socket/data.rs
++++ b/src/socket/data.rs
+@@ -79,6 +79,23 @@
+         return;
+     }
+     if tcb.data_tracker.observe(now, tsn, false) {
++        let stream = data.stream_key.id();
++        if let Some(budget) = ctx.receive_budgets.get_mut(&stream) {
++            if budget.exceeded {
++                return;
++            }
++            let pending = if data.is_beginning && data.is_end {
++                0
++            } else {
++                tcb.reassembly_queue.partial_payload_for_stream(stream)
++            };
++            if data.payload.len() > budget.limit.get().saturating_sub(pending) {
++                budget.exceeded = true;
++                tcb.reassembly_queue.discard_ready_for_stream(stream);
++                ctx.events.borrow_mut().add(SocketEvent::OnReceiveBudgetExceeded(stream));
++                return;
++            }
++        }
+         tcb.reassembly_queue.add(tsn, data);
+     }
+ }
+diff --git a/src/socket/mod.rs b/src/socket/mod.rs
+--- a/src/socket/mod.rs
++++ b/src/socket/mod.rs
+@@ -139,6 +139,7 @@
+             }
+             SocketEvent::OnConnected() => info!("OnConnected"),
+             SocketEvent::OnError(kind, ref e) => info!("OnError: {:?}, {}", kind, e),
++            SocketEvent::OnReceiveBudgetExceeded(stream) => info!("OnReceiveBudgetExceeded: {}", stream),
+             SocketEvent::OnBufferedAmountLow(e) => info!("OnBufferedAmountLow: {}", e),
+             SocketEvent::OnTotalBufferedAmountLow() => info!("OnTotalBufferedAmountLow"),
+             SocketEvent::OnLifecycleMessageFullySent(ref id) => {
+@@ -217,6 +218,7 @@
+             Rc::new(RefCell::new(LoggingEvents::new(events, name.into(), Rc::clone(&now))));
+         let sqe = Rc::clone(&events);
+         let ctx = Context {
++            receive_budgets: Default::default(),
+             options: options.clone(),
+             events,
+             send_queue: SendQueue::new(options.mtu, options, sqe),
+@@ -244,6 +246,17 @@
+         Socket { name: name.into(), now, state: State::Closed, ctx }
+     }
+ 
++    /// Limits complete message length and retained partial payload on one receive stream.
++    /// Set before enabling the stream and remove only after closing and resetting it.
++    /// Ambiguous traditional unordered fragments share the same partial payload budget.
++    pub fn set_receive_budget(&mut self, stream: StreamId, limit: Option<std::num::NonZeroUsize>) {
++        if let Some(limit) = limit {
++            self.ctx.receive_budgets.insert(stream, context::ReceiveBudget { limit, exceeded: false });
++        } else {
++            self.ctx.receive_budgets.remove(&stream);
++        }
++    }
++
+     fn handle_abort(&mut self, chunk: AbortChunk) {
+         if self.state.tcb().is_none() {
+             // From <https://datatracker.ietf.org/doc/html/rfc9260#section-3.3.7>:
+diff --git a/src/socket/stream_reset.rs b/src/socket/stream_reset.rs
+--- a/src/socket/stream_reset.rs
++++ b/src/socket/stream_reset.rs
+@@ -386,6 +386,7 @@
+         let send_queue =
+             SendQueue::new(options.mtu, &options, Rc::clone(&events) as Rc<RefCell<dyn EventSink>>);
+         let context = Context {
++            receive_budgets: Default::default(),
+             options,
+             events: Rc::clone(&events) as Rc<RefCell<dyn EventSink>>,
+             send_queue,

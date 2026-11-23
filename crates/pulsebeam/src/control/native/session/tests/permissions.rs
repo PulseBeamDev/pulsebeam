@@ -2,7 +2,7 @@ use super::*;
 use crate::control::native::{PreparedResource, ReceiverPreparation, ResolvedSource};
 use crate::entity::{ConnectionId, ParticipantId, RoomId, TrackKind};
 use crate::participant::policy::ResourceObservation;
-use crate::track::{DataLane, TrackMeta};
+use crate::track::TrackMeta;
 use pulsebeam_core::auth::grants::{Action, Grant, GrantSet, TrackKind as GrantKind};
 
 fn permissions(
@@ -17,7 +17,11 @@ fn permissions(
                 vec!["room".into()],
                 vec![action],
                 participant.map(str::to_owned),
-                Some(GrantKind::Data),
+                Some(if action == Action::Subscribe {
+                    GrantKind::Audio
+                } else {
+                    GrantKind::Data
+                }),
                 label.map(str::to_owned),
             )
             .unwrap(),
@@ -159,27 +163,12 @@ fn reduced_permissions_fence_pending_and_installed_resources_before_absence() {
 fn subscriptions_require_resolved_filters_but_no_discovery_projection() {
     let connection = ConnectionId::new();
     let id = connection.fixture_publication_at(
-        TrackKind::Data,
+        TrackKind::Audio,
         "allowed",
         std::num::NonZeroU64::new(1).unwrap(),
     );
-    let spec = |id: crate::entity::PublicationKey| wire::ResourceSpec {
-        settings: Some(wire::ResourceSettings {
-            enabled: Some(true),
-            receive: None,
-        }),
-        declaration: Some(wire::resource_spec::Declaration::Subscription(
-            wire::SubscriptionSpec {
-                publication_id: id.as_str(),
-                kind: wire::TrackKind::Data as i32,
-                source_room: "room".into(),
-                binding: Some(wire::TrackBinding {
-                    transport: Some(wire::track_binding::Transport::Sctp(wire::SctpParameters {
-                        stream_id: Some(1),
-                    })),
-                }),
-            },
-        )),
+    let spec = |id: crate::entity::PublicationKey| {
+        crate::control::native::fixture::audio_receiver(id, "room")
     };
     for (external, label, allowed) in [
         ("publisher", "allowed", true),
@@ -196,30 +185,32 @@ fn subscriptions_require_resolved_filters_but_no_discovery_projection() {
             .unwrap();
         assert!(settle_sweep(&mut model).is_empty());
         let id = connection.fixture_publication_at(
-            TrackKind::Data,
+            TrackKind::Audio,
             label,
             std::num::NonZeroU64::new(1).unwrap(),
         );
         input(&mut model, vec![present(1, 1, spec(id))]).unwrap();
         let work = model.take_preparation().unwrap().unwrap();
-        let track = Track::data_publication(
-            TrackMeta {
-                room: crate::entity::ProjectRoomKey::fixture(RoomId::new("room").unwrap()),
-                id,
-                origin: ParticipantId::new(external).unwrap(),
-                connection_id: connection,
-                track_id: Some(crate::entity::TrackId::new(&label).unwrap()),
-            },
-            DataLane::Ordered,
-        );
+        let track = crate::control::native::fixture::audio_track(TrackMeta {
+            room: crate::entity::ProjectRoomKey::fixture(RoomId::new("room").unwrap()),
+            id,
+            origin: ParticipantId::new(external).unwrap(),
+            connection_id: connection,
+            track_id: Some(crate::entity::TrackId::new(&label).unwrap()),
+        });
         let publisher = ParticipantId::new(external).unwrap();
         let command = model
-            .prepare_execution(&work, 100, None, |_| {
-                Some(ResolvedSource {
-                    track: &track,
-                    publisher: &publisher,
-                })
-            })
+            .prepare_execution(
+                &work,
+                100,
+                Some(&crate::control::rtp::capabilities()),
+                |_| {
+                    Some(ResolvedSource {
+                        track: &track,
+                        publisher: &publisher,
+                    })
+                },
+            )
             .unwrap()
             .unwrap();
         if allowed {

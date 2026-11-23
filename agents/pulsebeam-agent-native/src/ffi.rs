@@ -482,10 +482,6 @@ impl CatalogParticipant {
         self.entry.id.clone()
     }
 
-    pub fn data_recipient_id(&self) -> Option<String> {
-        self.entry.data_recipient_id.clone()
-    }
-
     pub fn tracks(&self) -> Vec<core_ffi::CatalogPublicationInfo> {
         self.entry.publications.clone()
     }

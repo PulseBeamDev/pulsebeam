@@ -64,6 +64,17 @@
     }
   };
   const synchronize = async () => {
+    await wait(
+      sender,
+      (snapshot) =>
+        snapshot.topics.publishers.some(
+          (publisher) =>
+            publisher.name === "chat" &&
+            publisher.connected &&
+            typeof publisher.publicationId === "string",
+        ),
+      "installed lossy publisher",
+    );
     const nonce = ++probe;
     const deadline = Date.now() + 20000;
     // Lossy admission is not subscription readiness; observe real application traffic.

@@ -52,6 +52,10 @@ pub(crate) mod shard_update;
 pub mod sim_metrics;
 pub mod track;
 
+#[cfg(all(test, feature = "transport-conformance"))]
+#[path = "../../pulsebeam-rtc/tests/support/mod.rs"]
+mod stock_rtc;
+
 #[cfg(test)]
 #[ctor::ctor(unsafe)]
 fn init() {

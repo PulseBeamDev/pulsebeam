@@ -118,6 +118,7 @@ impl StateProtocolHandler {
     pub(in crate::control) fn service<'a>(
         &mut self,
         unix_now: u64,
+        branches: &super::DataBranchIds,
         source: impl Fn(PublicationKey) -> Option<ResolvedSource<'a>>,
         source_in_room: impl Fn(&str, PublicationKey) -> Option<ResolvedSource<'a>>,
         lookup_source: impl Fn(
@@ -171,7 +172,7 @@ impl StateProtocolHandler {
             }
         }
         self.model
-            .refresh_source_lookups(FACT_BUDGET, unix_now, &lookup_source)?;
+            .refresh_source_lookups(FACT_BUDGET, unix_now, branches, &lookup_source)?;
         self.model.service_source_waits_in_room(
             unix_now,
             pulsebeam_runtime::time::Instant::now(),

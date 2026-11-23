@@ -114,6 +114,7 @@ pub struct SentPacketId(pub u64);
 pub struct SentObservation {
     pub sent_id: SentPacketId,
     pub space: SpaceId,
+    pub packet: PacketId,
     pub committed_at: Duration,
     pub transport_bytes: u32,
     pub tag: u64,
@@ -240,6 +241,7 @@ struct SpaceHistory {
     index_capacity: usize,
     last_report_generation: Option<(Epoch, i64)>,
     latest_commit_at: Option<Duration>,
+    in_flight: usize,
     terminal: bool,
 }
 
@@ -257,6 +259,12 @@ enum Readiness {
 }
 
 impl SpaceHistory {
+    fn remove_in_flight(&mut self, sequence: u64, id: SentPacketId) {
+        if self.by_sequence.get(&sequence) == Some(&id) {
+            self.in_flight = self.in_flight.saturating_sub(1);
+        }
+    }
+
     fn readiness(&self, space: SpaceId, retention: Duration) -> Readiness {
         if self.terminal {
             match self.latest_commit_at {
@@ -647,6 +655,7 @@ impl Sender {
                     index_capacity,
                     last_report_generation: None,
                     latest_commit_at: None,
+                    in_flight: 0,
                     terminal: false,
                 },
             );
@@ -686,6 +695,7 @@ impl Sender {
             state.newest_sequence = state.newest_sequence.max(packet_sequence);
         }
         state.by_sequence.insert(identity.packet.0, sent_id);
+        state.in_flight = state.in_flight.saturating_add(1);
         state.latest_commit_at = Some(
             state
                 .latest_commit_at
@@ -789,6 +799,12 @@ impl Sender {
         Ok(())
     }
 
+    pub fn source_has_in_flight(&self, space: SpaceId) -> bool {
+        self.spaces
+            .get(&space)
+            .is_some_and(|source| source.in_flight != 0)
+    }
+
     pub fn retire_source(&mut self, space: SpaceId) {
         let Some(source) = self.spaces.get_mut(&space) else {
             return;
@@ -842,7 +858,12 @@ impl Sender {
             if let Some(source) = self.spaces.get_mut(&entry.space) {
                 source.last_report_generation = None;
                 source.highest_acked_sequence = None;
-                source.by_sequence.remove(&entry.packet_sequence);
+                if entry.in_flight && self.active_epoch != Some(entry.path_epoch) {
+                    source.remove_in_flight(entry.packet_sequence, entry.id);
+                }
+                if source.by_sequence.get(&entry.packet_sequence) == Some(&entry.id) {
+                    source.by_sequence.remove(&entry.packet_sequence);
+                }
             }
             if !entry.acknowledgment.is_terminal() && self.active_epoch != Some(entry.path_epoch) {
                 entry.acknowledgment = Acknowledgment::Retired;

@@ -1,13 +1,15 @@
 use std::collections::VecDeque;
 
 use super::worker::ShardEvent;
-use crate::entity::{ConnectionId, ParticipantId, ProjectRoomKey};
+use crate::entity::{ConnectionId, ParticipantId};
 use crate::keys::ParticipantHandle;
 use crate::keys::TrackHandle;
 use crate::participant::TrackPacket;
-use crate::participant::event::ParticipantSink;
+#[cfg(test)]
+use crate::participant::event::FabricPublication;
+use crate::participant::event::{FabricDataPosition, FabricSubscriberFeedback, ParticipantSink};
 use crate::participant::reverse::ReversePacket;
-use crate::track::{SelectionPolicy, Track, TrackMeta, TrackSelector};
+use crate::track::{Track, TrackMeta};
 
 /// The shard-local binding of the participant emitting into the pipeline.
 ///
@@ -19,7 +21,6 @@ pub(crate) struct ParticipantBinding {
     pub participant_id: ParticipantId,
     pub connection_id: ConnectionId,
     pub handle: ParticipantHandle,
-    pub joined_room: Option<ProjectRoomKey>,
 }
 
 pub enum ParticipantEvent {
@@ -56,15 +57,58 @@ pub enum ParticipantLifecycleEvent {
 }
 
 pub enum ShardInternalEvent {
+    FabricSubscriberFeedback {
+        destination: ParticipantHandle,
+        feedback: FabricSubscriberFeedback,
+    },
+    StageFabricReceiver {
+        receiver: ParticipantHandle,
+        work: crate::control::native::Preparation,
+    },
+    StageLocalRtpReceiver {
+        receiver: ParticipantHandle,
+        reference: u64,
+    },
+    StageFabricPublisher {
+        publisher: ParticipantHandle,
+        work: crate::control::native::Preparation,
+        publication: crate::entity::PublicationKey,
+    },
+    FenceFabricSource {
+        publisher: ParticipantHandle,
+        source: crate::shard::router::FabricSourceHandle,
+    },
+    FabricRefresh {
+        destination: ParticipantHandle,
+        branch: crate::shard::router::FabricLocalBranch,
+    },
     ReverseRequested {
         stream: TrackHandle,
         packet: ReversePacket,
     },
 }
 
+pub(super) enum QueuedPublication {
+    Legacy(TrackHandle, TrackPacket),
+    #[cfg(test)]
+    Fabric {
+        publisher: ParticipantHandle,
+        publication: FabricPublication,
+    },
+    FabricData {
+        publisher: ParticipantHandle,
+        publication: FabricDataPosition,
+    },
+    FabricMedia {
+        publisher: ParticipantHandle,
+        source: crate::shard::router::FabricSourceHandle,
+        input: crate::rtp::fabric_ingress::MediaIngress,
+    },
+}
+
 pub(crate) struct EventPipeline {
     participant_events: VecDeque<ParticipantEvent>,
-    track_queue: VecDeque<(TrackHandle, TrackPacket)>,
+    track_queue: VecDeque<QueuedPublication>,
     shard_events: VecDeque<ShardEvent>,
     packet_capacity: usize,
 }
@@ -84,16 +128,26 @@ impl EventPipeline {
             id: who.participant_id,
             connection_id: who.connection_id,
             key: who.handle,
-            joined_room: who.joined_room,
             pipeline: self,
+            runtime: None,
         }
+    }
+
+    pub(super) fn polling_sink<'a>(
+        &'a mut self,
+        who: ParticipantBinding,
+        runtime: &'a mut super::router::ShardRuntime,
+    ) -> PipelineSinkRef<'a> {
+        let mut sink = self.participant_sink(who);
+        sink.runtime = Some(runtime);
+        sink
     }
 
     pub fn pop_participant_event(&mut self) -> Option<ParticipantEvent> {
         self.participant_events.pop_front()
     }
 
-    fn push_packet(&mut self, packet: (TrackHandle, TrackPacket)) -> bool {
+    fn push_packet(&mut self, packet: QueuedPublication) -> bool {
         if self.track_queue.len() >= self.packet_capacity {
             metrics::counter!("routing_drop", "lane" => "packet", "stage" => "pipeline", "origin" => "local").increment(1);
             #[cfg(feature = "sim")]
@@ -104,12 +158,77 @@ impl EventPipeline {
         true
     }
 
+    pub(super) fn push_relay_data_expectation(
+        &mut self,
+        expectation: crate::route::fabric::relay::RelayExpectation,
+    ) {
+        if self.shard_events.len() < self.packet_capacity {
+            self.shard_events
+                .push_back(ShardEvent::RelayDataExpectation(expectation));
+        }
+    }
+
+    pub(super) fn push_publisher_data_expectation(
+        &mut self,
+        expectation: crate::route::fabric::PublisherExpectation,
+    ) {
+        if self.shard_events.len() < self.packet_capacity {
+            self.push_shard_event(ShardEvent::PublisherDataExpectation(expectation));
+        }
+    }
+
+    pub(super) fn push_network_data_repair(
+        &mut self,
+        event: crate::route::fabric::network_repair::InterestEvent,
+    ) {
+        if self.shard_events.len() < self.packet_capacity {
+            self.push_shard_event(ShardEvent::NetworkDataRepair(Box::new(event)));
+        }
+    }
+
+    pub(super) fn push_network_media_repair(
+        &mut self,
+        interest: crate::route::fabric::network_repair::MediaInterest,
+    ) {
+        if self.shard_events.len() < self.packet_capacity {
+            self.push_shard_event(ShardEvent::NetworkMediaRepair(Box::new(interest)));
+        }
+    }
+
+    pub(super) fn request_fabric_refresh(
+        &mut self,
+        destination: ParticipantHandle,
+        branch: crate::shard::router::FabricLocalBranch,
+    ) {
+        if self.participant_events.len() < self.packet_capacity {
+            self.participant_events
+                .push_back(ParticipantEvent::Internal(
+                    ShardInternalEvent::FabricRefresh {
+                        destination,
+                        branch,
+                    },
+                ));
+        }
+    }
+
     pub fn push_shard_event(&mut self, ev: ShardEvent) {
         self.shard_events.push_back(ev);
     }
 
-    pub fn pop_packet(&mut self) -> Option<(TrackHandle, TrackPacket)> {
+    pub(super) fn pop_publication(&mut self) -> Option<QueuedPublication> {
         self.track_queue.pop_front()
+    }
+
+    #[cfg(test)]
+    fn pop_packet(&mut self) -> Option<(TrackHandle, TrackPacket)> {
+        match self.pop_publication()? {
+            QueuedPublication::Legacy(key, packet) => Some((key, packet)),
+            QueuedPublication::Fabric { .. }
+            | QueuedPublication::FabricData { .. }
+            | QueuedPublication::FabricMedia { .. } => {
+                panic!("expected a legacy track packet")
+            }
+        }
     }
 
     pub fn pop_shard_event(&mut self) -> Option<ShardEvent> {
@@ -127,8 +246,8 @@ pub struct PipelineSinkRef<'a> {
     id: ParticipantId,
     connection_id: ConnectionId,
     key: ParticipantHandle,
-    joined_room: Option<ProjectRoomKey>,
     pipeline: &'a mut EventPipeline,
+    runtime: Option<&'a mut super::router::ShardRuntime>,
 }
 
 impl<'a> ParticipantSink for PipelineSinkRef<'a> {
@@ -247,48 +366,15 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
     }
 
     #[inline]
-    fn subscribe_tracks(&mut self, selector: TrackSelector, selection: SelectionPolicy) {
-        let Some(room) = self.joined_room else {
-            return;
-        };
-        self.pipeline
-            .participant_events
-            .push_back(ParticipantEvent::Control(
-                ShardEvent::TrackSubscriptionAdded {
-                    room_id: room,
-                    subscriber: self.id,
-                    connection_id: self.connection_id,
-                    selector,
-                    selection,
-                },
-            ));
+    fn request_fabric_refresh(&mut self, branch: crate::shard::router::FabricLocalBranch) {
+        self.pipeline.request_fabric_refresh(self.key, branch);
     }
 
-    fn unsubscribe_tracks(&mut self, selector: TrackSelector) {
-        let Some(room) = self.joined_room else {
-            return;
-        };
-        self.pipeline
-            .participant_events
-            .push_back(ParticipantEvent::Control(
-                ShardEvent::TrackSubscriptionRemoved {
-                    room_id: room,
-                    subscriber: self.id,
-                    connection_id: self.connection_id,
-                    selector,
-                },
-            ));
-    }
-
-    #[inline]
     fn request_reverse(&mut self, stream: TrackHandle, packet: ReversePacket) {
         self.pipeline
             .participant_events
             .push_back(ParticipantEvent::Internal(
-                ShardInternalEvent::ReverseRequested {
-                    stream,
-                    packet: packet.with_requester(self.connection_id),
-                },
+                ShardInternalEvent::ReverseRequested { stream, packet },
             ));
     }
 
@@ -320,7 +406,128 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
         let Some(key) = fanout else {
             return;
         };
-        self.pipeline.push_packet((key, packet));
+        self.pipeline
+            .push_packet(QueuedPublication::Legacy(key, packet));
+    }
+
+    #[cfg(test)]
+    fn publish_fabric_packet(&mut self, publication: FabricPublication) {
+        self.pipeline.push_packet(QueuedPublication::Fabric {
+            publisher: self.key,
+            publication,
+        });
+    }
+
+    fn publish_fabric_data(
+        &mut self,
+        source: super::router::FabricSourceHandle,
+        installation: pulsebeam_rtc::DataChannelInstallation,
+        bytes: &[u8],
+        now: pulsebeam_runtime::time::Instant,
+        stamp: u32,
+    ) -> Result<(), crate::participant::data_fabric::Error> {
+        let (publisher, fanout) = self
+            .runtime
+            .as_deref_mut()
+            .and_then(|runtime| runtime.data_publisher_mut(source, self.key, installation))
+            .ok_or(crate::participant::data_fabric::Error::Fenced)?;
+        let publication = publisher.publish(fanout, bytes, now, stamp)?;
+        self.pipeline.push_packet(QueuedPublication::FabricData {
+            publisher: self.key,
+            publication,
+        });
+        Ok(())
+    }
+
+    fn settle_fabric_original_unavailable(
+        &mut self,
+        source: super::router::FabricSourceHandle,
+        installation: pulsebeam_rtc::DataChannelInstallation,
+        demand: pulsebeam_proto::data_control::OriginalDemand,
+        now: pulsebeam_runtime::time::Instant,
+    ) {
+        if let Some((publisher, fanout)) = self
+            .runtime
+            .as_deref_mut()
+            .and_then(|runtime| runtime.data_publisher_mut(source, self.key, installation))
+        {
+            publisher.original_unavailable(fanout, demand, now);
+        }
+    }
+
+    fn publish_fabric_media(
+        &mut self,
+        source: crate::shard::router::FabricSourceHandle,
+        input: crate::rtp::fabric_ingress::MediaIngress,
+    ) {
+        self.pipeline.push_packet(QueuedPublication::FabricMedia {
+            publisher: self.key,
+            source,
+            input,
+        });
+    }
+
+    fn observe_fabric_subscriber(&mut self, feedback: FabricSubscriberFeedback) {
+        if self.pipeline.participant_events.len() >= self.pipeline.packet_capacity {
+            return;
+        }
+        self.pipeline
+            .participant_events
+            .push_back(ParticipantEvent::Internal(
+                ShardInternalEvent::FabricSubscriberFeedback {
+                    destination: self.key,
+                    feedback,
+                },
+            ));
+    }
+
+    fn stage_fabric_receiver(&mut self, work: crate::control::native::Preparation) {
+        self.pipeline
+            .participant_events
+            .push_back(ParticipantEvent::Internal(
+                ShardInternalEvent::StageFabricReceiver {
+                    receiver: self.key,
+                    work,
+                },
+            ));
+    }
+
+    fn stage_local_rtp_receiver(&mut self, reference: u64) {
+        self.pipeline
+            .participant_events
+            .push_back(ParticipantEvent::Internal(
+                ShardInternalEvent::StageLocalRtpReceiver {
+                    receiver: self.key,
+                    reference,
+                },
+            ));
+    }
+
+    fn stage_fabric_publisher(
+        &mut self,
+        work: crate::control::native::Preparation,
+        publication: crate::entity::PublicationKey,
+    ) {
+        self.pipeline
+            .participant_events
+            .push_back(ParticipantEvent::Internal(
+                ShardInternalEvent::StageFabricPublisher {
+                    publisher: self.key,
+                    work,
+                    publication,
+                },
+            ));
+    }
+
+    fn fence_fabric_source(&mut self, source: crate::shard::router::FabricSourceHandle) {
+        self.pipeline
+            .participant_events
+            .push_back(ParticipantEvent::Internal(
+                ShardInternalEvent::FenceFabricSource {
+                    publisher: self.key,
+                    source,
+                },
+            ));
     }
 }
 
@@ -329,17 +536,13 @@ mod tests {
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See crates/pulsebeam/docs/thread-per-core.md.
     use super::*;
-    use crate::entity::RoomId;
     use crate::rtp::RtpPacket;
-    use crate::track::DataLane;
 
     fn identity() -> ParticipantBinding {
-        let room = RoomId::new("room").unwrap();
         ParticipantBinding {
             participant_id: crate::entity::fixture_participant_id(),
             connection_id: ConnectionId::new(),
             handle: ParticipantHandle::default(),
-            joined_room: Some(ProjectRoomKey::fixture(room)),
         }
     }
 
@@ -350,36 +553,12 @@ mod tests {
         let who = identity();
 
         let mut sink = pipeline.participant_sink(who);
-        sink.publish_track_packet(
-            Some(TrackHandle::default()),
-            TrackPacket::Rtp(RtpPacket::default()),
-        );
-        sink.publish_track_packet(
-            Some(TrackHandle::default()),
-            TrackPacket::Rtp(RtpPacket::default()),
-        );
-        sink.publish_track_packet(
-            Some(TrackHandle::default()),
-            TrackPacket::Data {
-                filter_recipients: false,
-                target: None,
-                lane: DataLane::Latest,
-                bytes: vec![1].into(),
-            },
-        );
+        sink.publish_track_packet(Some(TrackHandle::default()), RtpPacket::default());
         sink.exit();
 
         assert!(
             pipeline.pop_packet().is_some(),
             "RTP went to the track queue"
-        );
-        assert!(
-            pipeline.pop_packet().is_some(),
-            "RTP stayed in the track queue"
-        );
-        assert!(
-            pipeline.pop_packet().is_some(),
-            "data stayed in the packet pipeline"
         );
         assert!(
             pipeline.pop_participant_event().is_some(),
@@ -408,91 +587,24 @@ mod tests {
         ));
     }
 
-    /// Queues drain in the order they were filled. Media is a sequence, and reordering it here
-    /// would be indistinguishable from reordering on the wire.
     #[test]
-    fn a_queue_preserves_order() {
-        let mut pipeline = EventPipeline::with_capacity(4);
-        let who = identity();
-        let mut sink = pipeline.participant_sink(who);
-        for n in 0..3u8 {
+    fn the_rtp_packet_queue_is_bounded_and_preserves_order() {
+        let mut pipeline = EventPipeline::with_capacity(2);
+        let key = TrackHandle::default();
+        let mut sink = pipeline.participant_sink(identity());
+        for seq in 1..=3u64 {
             sink.publish_track_packet(
-                Some(TrackHandle::default()),
-                TrackPacket::Data {
-                    filter_recipients: false,
-                    target: None,
-                    lane: DataLane::Latest,
-                    bytes: vec![n].into(),
+                Some(key),
+                RtpPacket {
+                    seq_no: seq.into(),
+                    ..Default::default()
                 },
             );
         }
-
-        let drained: Vec<Vec<u8>> = std::iter::from_fn(|| pipeline.pop_packet())
-            .map(|event| match event.1 {
-                TrackPacket::Data { bytes, .. } => bytes.to_vec(),
-                _ => unreachable!(),
-            })
+        let drained: Vec<_> = std::iter::from_fn(|| pipeline.pop_packet())
+            .map(|(_, packet)| *packet.seq_no)
             .collect();
-        assert_eq!(drained, vec![vec![0], vec![1], vec![2]]);
-    }
-
-    #[test]
-    fn the_generic_packet_pipeline_is_bounded_for_both_data_lanes() {
-        let mut pipeline = EventPipeline::with_capacity(2);
-        let who = identity();
-        let key = TrackHandle::default();
-        let mut sink = pipeline.participant_sink(who);
-        sink.publish_track_packet(
-            Some(key),
-            TrackPacket::Data {
-                filter_recipients: false,
-                target: None,
-                lane: DataLane::Latest,
-                bytes: vec![1].into(),
-            },
-        );
-        sink.publish_track_packet(
-            Some(key),
-            TrackPacket::Data {
-                filter_recipients: false,
-                target: None,
-                lane: DataLane::Ordered,
-                bytes: vec![2].into(),
-            },
-        );
-        sink.publish_track_packet(
-            Some(key),
-            TrackPacket::Data {
-                filter_recipients: false,
-                target: None,
-                lane: DataLane::Latest,
-                bytes: vec![3].into(),
-            },
-        );
-        #[allow(
-            clippy::drop_non_drop,
-            reason = "end the mutable pipeline borrow before inspection"
-        )]
-        drop(sink);
-
-        assert!(matches!(
-            pipeline.pop_packet().unwrap().1,
-            TrackPacket::Data {
-                lane: DataLane::Latest,
-                ..
-            }
-        ));
-        assert!(matches!(
-            pipeline.pop_packet().unwrap().1,
-            TrackPacket::Data {
-                lane: DataLane::Ordered,
-                ..
-            }
-        ));
-        assert!(
-            pipeline.pop_packet().is_none(),
-            "the fixed packet capacity must be enforced"
-        );
+        assert_eq!(drained, vec![1, 2]);
     }
 
     /// `has_pending` decides whether the shard loops again, so it has to agree with every queue.
@@ -512,10 +624,9 @@ mod tests {
         assert!(pipeline.pop_shard_event().is_some());
         assert!(!pipeline.has_pending());
 
-        pipeline.participant_sink(who).publish_track_packet(
-            Some(TrackHandle::default()),
-            TrackPacket::Rtp(RtpPacket::default()),
-        );
+        pipeline
+            .participant_sink(who)
+            .publish_track_packet(Some(TrackHandle::default()), RtpPacket::default());
         assert!(pipeline.has_pending(), "so is a track packet");
         assert!(pipeline.pop_packet().is_some());
         assert!(!pipeline.has_pending(), "and draining it clears the flag");

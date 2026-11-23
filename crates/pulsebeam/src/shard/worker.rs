@@ -205,6 +205,17 @@ pub(crate) enum ShardFrame {
         delivery: MediaDelivery,
         payload: MediaPayload,
     },
+    Fabric(crate::route::fabric::ShardOffer),
+    FabricDataExpectation(crate::route::fabric::ShardDataExpectation),
+    FabricDataReceipt(crate::route::fabric::ShardDataReceipt),
+    FabricDataRepair(crate::route::fabric::ShardDataRepair),
+    FabricDataRepairImage(crate::route::fabric::ShardDataRepairImage),
+    FabricRefresh(crate::route::fabric::ShardBinding),
+    FabricImage(crate::route::fabric::local::OwnedPacket),
+    FabricWanImage {
+        ingress: pulsebeam_link::FabricIngress,
+        image: crate::route::fabric::NetworkPacket,
+    },
     Reverse {
         address: crate::route::NodeRouteAddress,
         packet: crate::participant::reverse::ReversePacket,
@@ -225,6 +236,17 @@ pub(crate) type ShardEventMessage = (ShardId, ShardEvent);
 /// canonical state and publishes the resulting execution image.
 #[derive(Debug)]
 pub(crate) enum ShardEvent {
+    LocalFabricRtpSourceReady {
+        meta: crate::track::TrackMeta,
+        encoding: crate::route::fabric::RtpSourceEncoding,
+        incarnation: std::num::NonZeroU64,
+        emission: crate::route::fabric::local::Emission,
+    },
+    ShardDataReceiverReady(crate::route::fabric::ShardDataReady),
+    RelayDataExpectation(crate::route::fabric::relay::RelayExpectation),
+    PublisherDataExpectation(crate::route::fabric::PublisherExpectation),
+    NetworkDataRepair(Box<crate::route::fabric::network_repair::InterestEvent>),
+    NetworkMediaRepair(Box<crate::route::fabric::network_repair::MediaInterest>),
     TransportAuthenticated {
         source: std::net::SocketAddr,
         destination: std::net::SocketAddr,
@@ -261,18 +283,13 @@ pub(crate) enum ShardEvent {
         connection_id: crate::entity::ConnectionId,
         reference: u64,
     },
+    #[cfg(test)]
     TrackSubscriptionAdded {
         room_id: crate::entity::ProjectRoomKey,
         subscriber: ParticipantId,
         connection_id: crate::entity::ConnectionId,
         selector: crate::track::TrackSelector,
         selection: crate::track::SelectionPolicy,
-    },
-    TrackSubscriptionRemoved {
-        room_id: crate::entity::ProjectRoomKey,
-        subscriber: ParticipantId,
-        connection_id: crate::entity::ConnectionId,
-        selector: crate::track::TrackSelector,
     },
     TrackPublished(Track),
     TrackUnpublished(crate::track::TrackMeta),
@@ -321,11 +338,38 @@ pub(crate) fn send_link_frame(
         ShardFrame::Ingress { batch, .. } => {
             (batch.received_at.monotonic, Some(batch.received_at.wall))
         }
-        ShardFrame::Media { payload, .. } => match &payload.packet {
-            crate::participant::TrackPacket::Rtp(packet) => (packet.arrival_ts, None),
-            crate::participant::TrackPacket::Data { .. } => (Instant::now(), None),
-        },
-        ShardFrame::Reverse { .. } => (Instant::now(), None),
+        ShardFrame::Media { payload, .. } => (payload.packet.arrival_ts, None),
+        ShardFrame::Fabric(offer) => (offer.arrival, None),
+        ShardFrame::FabricDataExpectation(notice) => {
+            if tx.local_delivery_tag()
+                != Some(crate::link::delivery_tag(notice.binding.destination))
+            {
+                return false;
+            }
+            (Instant::now(), None)
+        }
+        ShardFrame::FabricDataRepair(repair) => {
+            if tx.local_delivery_tag() != Some(shard_tag(repair.binding.origin)) {
+                return false;
+            }
+            (Instant::now(), None)
+        }
+        ShardFrame::FabricDataRepairImage(image) => {
+            if tx.local_delivery_tag()
+                != Some(crate::link::delivery_tag(image.repair.binding.destination))
+            {
+                return false;
+            }
+            (Instant::now(), None)
+        }
+        ShardFrame::FabricDataReceipt(receipt) => {
+            if tx.local_delivery_tag() != Some(shard_tag(receipt.binding.origin)) {
+                return false;
+            }
+            (Instant::now(), None)
+        }
+        ShardFrame::FabricImage(_) | ShardFrame::FabricWanImage { .. } => return false,
+        ShardFrame::Reverse { .. } | ShardFrame::FabricRefresh(_) => (Instant::now(), None),
     };
     let received_at = pulsebeam_link::ReceiveTime {
         monotonic: pulsebeam_link::LinkTime::from_nanos(
@@ -340,6 +384,58 @@ pub(crate) fn send_link_frame(
         pulsebeam_link::LinkTime::from_nanos(u64::MAX),
     )
     .is_ok()
+}
+
+pub(super) fn bind_received_frame(
+    shard: ShardId,
+    received: &mut pulsebeam_link::Received<ShardFrame>,
+) -> bool {
+    let tagged_route =
+        || crate::link::delivery_address(received.tag).filter(|address| address.shard() == shard);
+    match &mut received.packet {
+        ShardFrame::Media { delivery, .. } => {
+            let Some(address) = tagged_route() else {
+                return false;
+            };
+            delivery.address = address;
+            true
+        }
+        ShardFrame::Fabric(offer) => tagged_route() == Some(offer.binding.destination),
+        ShardFrame::FabricDataExpectation(notice) => {
+            tagged_route() == Some(notice.binding.destination)
+        }
+        ShardFrame::FabricDataRepair(repair) => {
+            repair.binding.origin == shard
+                && repair.binding.destination.shard() != shard
+                && received.tag == shard_tag(shard)
+        }
+        ShardFrame::FabricDataRepairImage(image) => {
+            tagged_route() == Some(image.repair.binding.destination)
+        }
+        ShardFrame::FabricDataReceipt(receipt) => {
+            receipt.binding.origin == shard
+                && receipt.binding.destination.shard() != shard
+                && received.tag == shard_tag(shard)
+        }
+        ShardFrame::FabricRefresh(binding) => {
+            binding.origin == shard
+                && binding.destination.shard() != shard
+                && received.tag == shard_tag(shard)
+        }
+        ShardFrame::FabricImage(_) | ShardFrame::FabricWanImage { .. } => false,
+        ShardFrame::Reverse { address, .. } => {
+            let Some(destination) = tagged_route() else {
+                return false;
+            };
+            *address = destination;
+            true
+        }
+        ShardFrame::Ingress { .. } => true,
+    }
+}
+
+fn shard_tag(shard: ShardId) -> pulsebeam_link::DeliveryTag {
+    pulsebeam_link::DeliveryTag::from_raw(u64::try_from(shard.index()).unwrap_or(u64::MAX))
 }
 
 impl IngressTransport for LinkTransport {
@@ -478,9 +574,11 @@ impl ShardWorker {
         metrics: Arc<ShardMetrics>,
         stats_tx: Option<mailbox::Sender<Box<ShardStatsReport>>>,
         wall: WallAnchor,
+        local_rtp_v1: bool,
     ) -> Self {
         let shard_count = frame_txs.len();
-        let core = ShardCore::new(shard_id, max_gso_segments, shard_count, wall, update_rx);
+        let core = ShardCore::new(shard_id, max_gso_segments, shard_count, wall, update_rx)
+            .with_local_rtp_v1(local_rtp_v1);
         let router = LinkTransport {
             shard_id,
             frame_txs,
@@ -616,26 +714,32 @@ impl ShardWorker {
             .frame_rx
             .try_recv_batch(&mut self.frame_batch, SHARD_FRAME_BUDGET);
         for mut received in self.frame_batch.drain(..) {
-            match &mut received.packet {
-                ShardFrame::Media { delivery, .. } => {
-                    let Some(address) = crate::link::delivery_address(received.tag) else {
-                        continue;
-                    };
-                    if address.shard() != self.router.shard_id {
-                        continue;
-                    }
-                    delivery.address = address;
+            let mut deliver_fabric = |ingress, image| {
+                if let Some(address) = crate::link::delivery_address(received.tag)
+                    .filter(|address| address.shard() == self.router.shard_id)
+                    && let Some(arrival) = self.router.clock_origin.checked_add(
+                        Duration::from_nanos(received.received_at.monotonic.as_nanos()),
+                    )
+                {
+                    self.core
+                        .on_network_fabric(address, ingress, now, arrival, image);
                 }
-                ShardFrame::Reverse { address, .. } => {
-                    let Some(destination) = crate::link::delivery_address(received.tag) else {
-                        continue;
-                    };
-                    if destination.shard() != self.router.shard_id {
-                        continue;
+            };
+            match received.packet {
+                ShardFrame::FabricImage(packet) => {
+                    if let Some(ingress) = received.fabric {
+                        deliver_fabric(ingress, packet.into());
                     }
-                    *address = destination;
+                    continue;
                 }
-                ShardFrame::Ingress { .. } => {}
+                ShardFrame::FabricWanImage { ingress, image } => {
+                    deliver_fabric(ingress, image);
+                    continue;
+                }
+                packet => received.packet = packet,
+            }
+            if !bind_received_frame(self.router.shard_id, &mut received) {
+                continue;
             }
             let at = if matches!(&received.packet, ShardFrame::Media { .. }) {
                 self.router
@@ -682,21 +786,21 @@ impl ShardWorker {
 
         if self
             .core
-            .poll_and_flush_dirty(udp_socket, SHARD_PARTICIPANT_BUDGET)
+            .poll_and_flush_dirty(udp_socket, SHARD_PARTICIPANT_BUDGET, &self.router)
             == SHARD_PARTICIPANT_BUDGET
         {
             self.tick_budget_hit("participants");
         }
         if self
             .core
-            .flush_stream_buffers(&self.router, SHARD_PIPELINE_BUDGET)
+            .flush_stream_buffers(Instant::now(), SHARD_PIPELINE_BUDGET)
             == SHARD_PIPELINE_BUDGET
         {
             self.tick_budget_hit("pipeline");
         }
         if self
             .core
-            .poll_and_flush_dirty(udp_socket, SHARD_PARTICIPANT_BUDGET)
+            .poll_and_flush_dirty(udp_socket, SHARD_PARTICIPANT_BUDGET, &self.router)
             == SHARD_PARTICIPANT_BUDGET
         {
             self.tick_budget_hit("participants");
@@ -813,6 +917,7 @@ mod tests {
             destination: "127.0.0.1:2000".parse().unwrap(),
             payload: &payload,
             received_at: net::ReceiveTime::now(),
+            ecn: None,
         };
         for _ in 0..=net::UDP_MAX_GSO_SEGMENTS {
             append_owned_udp(&mut out, net::UdpMode::Batch, datagram);

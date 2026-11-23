@@ -240,7 +240,7 @@ fn unreliable_data_does_not_cross_rooms_test() {
 /// `CheckDataSequence` asserts the exact delivered sequence, so a leak from the other room shows
 /// up as an extra element rather than having to be excluded by name.
 #[test]
-fn reliable_data_does_not_cross_rooms_test() {
+fn latest_data_does_not_cross_rooms_test() {
     LocalNodeSim::new()
         .with_room(
             Room::new("room-alpha")
@@ -254,42 +254,42 @@ fn reliable_data_does_not_cross_rooms_test() {
         )
         .run(vec![
             Step::DeclarePublishTopic {
-                mode: TopicMode::Ordered,
-                description: "Alpha declares the ordered topic",
+                mode: TopicMode::Latest,
+                description: "Alpha declares the latest topic",
                 participant: "alpha_pub",
                 topic: "shared_name",
             },
             Step::DeclarePublishTopic {
-                mode: TopicMode::Ordered,
-                description: "Beta declares an ordered topic of the same name",
+                mode: TopicMode::Latest,
+                description: "Beta declares an latest topic of the same name",
                 participant: "beta_pub",
                 topic: "shared_name",
             },
             Step::DeclareSubscribeTopic {
-                mode: TopicMode::Ordered,
+                mode: TopicMode::Latest,
                 description: "Alpha subscribes",
                 participant: "alpha_sub",
                 topic: "shared_name",
             },
             Step::DeclareSubscribeTopic {
-                mode: TopicMode::Ordered,
+                mode: TopicMode::Latest,
                 description: "Beta subscribes",
                 participant: "beta_sub",
                 topic: "shared_name",
             },
             Step::Run {
-                description: "Open the ordered channels",
+                description: "Open the latest channels",
                 duration: Duration::from_millis(500),
             },
             Step::PublishData {
-                mode: TopicMode::Ordered,
+                mode: TopicMode::Latest,
                 description: "Alpha sends",
                 participant: "alpha_pub",
                 topic: "shared_name",
                 data: b"alpha-1",
             },
             Step::PublishData {
-                mode: TopicMode::Ordered,
+                mode: TopicMode::Latest,
                 description: "Beta sends",
                 participant: "beta_pub",
                 topic: "shared_name",

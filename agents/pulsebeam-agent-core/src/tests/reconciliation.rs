@@ -241,82 +241,46 @@ fn released_preparation_cannot_install_or_serialize_its_late_success() {
         "no replacement or retry loop"
     );
 }
-
 #[test]
-fn registration_churn_does_not_reduce_ordered_payload_operations() {
+fn registration_churn_does_not_reduce_admitted_units() {
     let (mut agent, generation, _, publication) =
-        native_connection::connected_publisher(TopicMode::Ordered);
-    let send = |bytes: &[u8]| {
-        AgentCommand::SendTopic(TopicSend {
-            publisher: publisher("state", TopicMode::Ordered),
-            payload: bytes.to_vec(),
-        })
+        native_connection::connected_publisher(TopicMode::Lossy);
+    let spec = TrackSpec::Data {
+        track_id: "state".into(),
+        delivery: TopicMode::Lossy,
     };
-    agent.command(send(b"first")).unwrap();
-    agent.command(send(b"second")).unwrap();
-    let Some(Effect::DataChannel(DataChannelEffect::Send {
-        operation,
-        channel,
-        payload,
-        ..
-    })) = agent.next_effect()
-    else {
-        panic!("first payload operation")
-    };
+    agent.send_data(spec, vec![7; 1025]).unwrap();
+    let (operation, channel, bytes) = next_data_record(&mut agent);
     assert_eq!(channel, publication.channel);
-    let Some(TopicBody::Message(first)) = TopicFrame::decode_bounded(&payload).unwrap().body else {
-        panic!("first message")
-    };
-    assert_eq!(first.payload, b"first");
-    agent
-        .command(AgentCommand::ReplaceDesired(DesiredState {
-            revision: 2,
-            connected: true,
-            ..Default::default()
-        }))
-        .unwrap();
-    let timer = wake(&mut agent);
-    assert!(matches!(
-        agent.command(send(b"not-registered")),
-        Err(AgentError::InvalidTopic(
-            TopicError::PublisherNotRegistered(_)
-        ))
-    ));
-    agent
-        .command(AgentCommand::ReplaceDesired(DesiredState {
-            revision: 3,
-            connected: true,
-            topics: TopicRegistrations {
-                publishers: vec![publisher("state", TopicMode::Ordered)],
-                subscribers: Vec::new(),
-            },
-            ..Default::default()
-        }))
-        .unwrap();
+    let first = pulsebeam_proto::data_record::Record::decode(&bytes, None).unwrap();
+    assert_eq!(first.bytes(), vec![7; 1024]);
+    for (revision, publishers) in [
+        (2, Vec::new()),
+        (3, vec![publisher("state", TopicMode::Lossy)]),
+    ] {
+        agent
+            .command(AgentCommand::ReplaceDesired(DesiredState {
+                revision,
+                connected: true,
+                topics: TopicRegistrations {
+                    publishers,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }))
+            .unwrap();
+    }
     acknowledge_send(&mut agent, generation, channel, operation);
-    let Some(Effect::DataChannel(DataChannelEffect::Send {
-        operation,
-        channel: next,
-        payload,
-        ..
-    })) = agent.next_effect()
-    else {
-        panic!("second payload operation")
-    };
+    let (operation, next, bytes) = next_data_record(&mut agent);
     assert_eq!(next, channel);
-    let Some(TopicBody::Message(second)) = TopicFrame::decode_bounded(&payload).unwrap().body
-    else {
-        panic!("second message")
-    };
-    assert_eq!(second.payload, b"second");
-    assert_eq!(second.sequence, first.sequence + 1);
+    let second = pulsebeam_proto::data_record::Record::decode(&bytes, None).unwrap();
+    assert_eq!(second.bytes(), [7]);
+    assert_eq!(second.header().unit_seq, first.header().unit_seq);
+    assert_eq!(second.header().index, 1);
     acknowledge_send(&mut agent, generation, channel, operation);
-    fire(&mut agent, timer);
     assert!(
-        agent.next_effect().is_none(),
-        "registration target is unchanged, with no control or physical work"
+        agent
+            .next_effect_after_turn()
+            .is_none_or(|effect| matches!(effect, Effect::Timer(TimerEffect::Cancel { .. })))
     );
-    assert_eq!(agent.snapshot().topics.accepted_sends, 2);
-    assert_eq!(agent.snapshot().topics.dropped_sends, 1);
-    assert_eq!(agent.snapshot().topics.publishers[0].accepted_history, 2);
 }

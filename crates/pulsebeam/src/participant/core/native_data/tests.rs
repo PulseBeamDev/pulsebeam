@@ -161,7 +161,7 @@ pub(in crate::participant::core) fn participant_with_capabilities(
     let capabilities = capabilities.unwrap_or_else(crate::control::rtp::capabilities);
     crate::control::rtp::initialize(&mut rtc.connection, &capabilities).unwrap();
     resources.signaling_channel = Some(SignalingChannel::compile(
-        &DataTrackIntent::native_signaling_config(),
+        &crate::participant::signaling::native_signaling_config(),
     ));
     let mut config = ConnectionConfig {
         scope: crate::entity::ProjectRoomKey::fixture(entity::RoomId::new("native-data").unwrap())
@@ -169,8 +169,6 @@ pub(in crate::participant::core) fn participant_with_capabilities(
         participant_id: crate::entity::fixture_participant_id(),
         connection_id: entity::ConnectionId::new(),
         profile: SignalingProtocol::State,
-        allow_topic_channels: false,
-        topic_publications: Default::default(),
         authorization_expiry: Some(
             pulsebeam_core::auth::AuthorizationExpiry::from_unix_seconds(expiry),
         ),
@@ -190,11 +188,12 @@ pub(in crate::participant::core) fn participant_with_capabilities(
         signaling,
         sources: BTreeMap::new(),
     };
+    participant.signaling.enable_data_v1();
     participant.handle_event(
         Instant::now(),
         Event::DataChannel(DataChannelEvent::Opened {
             channel: ChannelId::from_value(0),
-            config: DataTrackIntent::native_signaling_config(),
+            config: crate::participant::signaling::native_signaling_config(),
         }),
         &mut MockParticipantSink::new(),
     );
@@ -212,10 +211,15 @@ fn declaration() -> wire::ResourceSpec {
             wire::PublicationSpec {
                 track_id: "camera-updates".into(),
                 kind: Some(wire::publication_spec::Kind::Data(wire::DataPublication {
-                    delivery: wire::DataDelivery::Ordered as i32,
+                    delivery: wire::DataDelivery::Latest as i32,
                     binding: Some(wire::TrackBinding {
-                        transport: Some(wire::track_binding::Transport::Sctp(
-                            wire::SctpParameters { stream_id: Some(1) },
+                        transport: Some(wire::track_binding::Transport::SctpDataV1(
+                            wire::SctpDataV1Parameters {
+                                stream_id: Some(1),
+                                version: u32::from(pulsebeam_proto::data_endpoint::DATA_V1),
+                                channel_incarnation: 1,
+                                delivery: wire::DataV1Delivery::Latest as i32,
+                            },
                         )),
                     }),
                 })),
@@ -246,9 +250,9 @@ fn retain_publication(
         work.reference,
         DataPublication {
             channel,
+            fabric: None,
             lane: DataLane::Ordered,
             state: DataPublicationState::Pending(entity::TrackId::new("camera-updates").unwrap()),
-            fanout: None,
             enabled: false,
             opened: false,
             installation,
@@ -343,10 +347,62 @@ pub(in crate::participant::core) fn confirmations_for(
 }
 
 #[test]
+fn data_v1_publisher_does_not_stage_or_acknowledge_a_pending_sctp_installation() {
+    let mut participant = participant();
+    participant.signaling.enable_data_v1();
+    let mut sink = MockParticipantSink::new();
+    let mut spec = declaration();
+    let Some(resource_spec::Declaration::Publication(publication)) = &mut spec.declaration else {
+        panic!("publication")
+    };
+    let Some(wire::publication_spec::Kind::Data(data)) = &mut publication.kind else {
+        panic!("DATA publication")
+    };
+    let parameters = wire::SctpDataV1Parameters {
+        stream_id: Some(1),
+        version: u32::from(pulsebeam_proto::data_endpoint::DATA_V1),
+        channel_incarnation: 7,
+        delivery: wire::DataV1Delivery::Latest as i32,
+    };
+    data.delivery = wire::DataDelivery::Latest as i32;
+    data.binding = Some(wire::TrackBinding {
+        transport: Some(wire::track_binding::Transport::SctpDataV1(parameters)),
+    });
+
+    participant.handle_native_signaling(
+        &frame(1, wire::desired_state::Value::Present(Box::new(spec))),
+        &mut sink,
+    );
+    let pending = participant.native_data.publications.get(&1).unwrap();
+    assert_eq!(
+        participant
+            .transport
+            .data_channel_installation(pending.installation),
+        Some(pulsebeam_rtc::DataChannelInstallationState::Pending)
+    );
+
+    participant.native_data_opened(
+        ChannelId::from_value(1),
+        crate::participant::transport::fabric_data_config(parameters).unwrap(),
+        &mut sink,
+    );
+    assert!(sink.fabric_publications.is_empty());
+    assert!(sink.publish_track_calls.is_empty());
+    assert!(
+        confirmations(&mut participant)
+            .iter()
+            .all(|confirmed| !matches!(
+                confirmed.value,
+                Some(wire::confirmed_state::Value::Owned(_))
+            ))
+    );
+}
+
+#[test]
 fn reserved_channel_uses_control_contract_without_label_grammar() {
     let mut participant = participant();
     let mut sink = MockParticipantSink::new();
-    let mut config = DataTrackIntent::native_signaling_config();
+    let mut config = crate::participant::signaling::native_signaling_config();
     config.label = "opaque control channel".into();
     config.protocol = "opaque transport protocol".into();
     participant.negotiated.signaling_channel = Some(SignalingChannel::compile(&config));
@@ -382,31 +438,27 @@ fn declaration_without_a_usable_binding_is_not_invented_execution() {
         let mut participant = participant();
         let mut sink = MockParticipantSink::new();
         let mut spec = declaration();
-        if invalid_spec {
-            let Some(resource_spec::Declaration::Publication(publication)) =
-                spec.declaration.as_mut()
-            else {
-                panic!("publication");
-            };
-            let Some(wire::publication_spec::Kind::Data(data)) = publication.kind.as_mut() else {
-                panic!("data");
-            };
-            data.binding = None;
-        }
+        let Some(resource_spec::Declaration::Publication(publication)) = spec.declaration.as_mut()
+        else {
+            panic!("publication");
+        };
+        let Some(wire::publication_spec::Kind::Data(data)) = publication.kind.as_mut() else {
+            panic!("data");
+        };
+        data.binding = (!invalid_spec).then_some(wire::TrackBinding {
+            transport: Some(wire::track_binding::Transport::Sctp(wire::SctpParameters {
+                stream_id: Some(1),
+            })),
+        });
         participant.handle_native_signaling(
             &frame(1, wire::desired_state::Value::Present(Box::new(spec))),
             &mut sink,
         );
-        assert_eq!(
-            participant.native_execution.sequence,
-            if invalid_spec { 0 } else { 1 }
-        );
+        assert_eq!(participant.native_execution.sequence, 0);
         assert!(participant.native_execution.pending.is_empty());
         assert!(participant.disconnect_reason.is_none());
         assert!(participant.native_data.publications.is_empty());
         assert!(participant.native_data.channels.is_empty());
-        assert!(participant.native_data.tracks.is_empty());
-        assert!(participant.native_data.fanouts.is_empty());
         assert!(participant.native_data.deadlines.is_empty());
         assert!(sink.publish_track_calls.is_empty());
         let values = confirmations(&mut participant);
@@ -417,7 +469,7 @@ fn declaration_without_a_usable_binding_is_not_invented_execution() {
             if invalid_spec {
                 wire::FailureCode::InvalidConfiguration
             } else {
-                wire::FailureCode::Incompatible
+                wire::FailureCode::Unsupported
             } as i32
         );
         assert!(matches!(
@@ -671,7 +723,6 @@ fn repeated_retirement_keeps_the_receipt_and_does_not_erase_a_reused_channel_ind
     assert!(!pending.opened && !pending.retiring && pending.preparation.is_some());
     assert!(pending.admitted().is_none());
     pending.opened = true;
-    assert!(participant.native_data.tracks.is_empty());
     let reference = NonZeroU64::new(work.reference).unwrap();
     let (publication, first) = participant.admit_native_data(reference).unwrap();
     assert!(first);
@@ -679,69 +730,11 @@ fn repeated_retirement_keeps_the_receipt_and_does_not_erase_a_reused_channel_ind
     let admitted = publication.admitted().unwrap();
     let track = Track::data_publication(admitted.meta.clone(), publication.lane);
     assert_eq!(track.publication_label().as_deref(), Some("camera-updates"));
-    assert!(track.requires_reverse_route());
+    assert!(!track.requires_reverse_route());
     let id = track.id();
     let (publication, first) = participant.admit_native_data(reference).unwrap();
     assert!(!first);
     assert_eq!(publication.admitted().unwrap().meta.id, id);
-    use pulsebeam_proto::prelude::Message;
-    let mut handles = slotmap::SlotMap::<TrackHandle, ()>::with_key();
-    let handle = handles.insert(());
-    participant.native_data.bind_source(id, handle);
-    let message = |source| {
-        TopicFrame {
-            recipient_connections: None,
-            repair_target: Default::default(),
-            body: Some(pulsebeam_proto::topic::topic_frame::Body::Message(
-                pulsebeam_proto::topic::TopicMessage {
-                    captured_at: None,
-                    publication_id: source,
-                    sequence: 0,
-                    payload: vec![42],
-                },
-            )),
-        }
-        .encode_to_vec()
-    };
-    participant.native_data_message(channel, &message("foreign".into()), &mut sink);
-    assert!(sink.publish_track_packet_calls.is_empty());
-    participant.native_data_message(channel, &message(id.as_str()), &mut sink);
-    assert_eq!(sink.publish_track_packet_calls, vec![handle]);
-    let probe = |source| {
-        TopicFrame {
-            recipient_connections: None,
-            repair_target: Default::default(),
-            body: Some(pulsebeam_proto::topic::topic_frame::Body::Probe(
-                pulsebeam_proto::topic::TopicProbe {
-                    requester: Default::default(),
-                    publication_id: source,
-                    from_sequence: 0,
-                    live: true,
-                },
-            )),
-        }
-        .encode_to_vec()
-    };
-    participant.native_data_message(channel, &probe(id.as_str()), &mut sink);
-    assert_eq!(sink.publish_track_packet_calls, vec![handle]);
-    let requester = crate::entity::ConnectionId::new();
-    let request = |source| ReversePacket::reliable_control(probe(source)).with_requester(requester);
-    participant.on_reverse(handle, request("foreign".into()));
-    participant.on_reverse(handle, ReversePacket::reliable_control(probe(id.as_str())));
-    assert!(
-        participant
-            .transport
-            .apply_next_mutation(Instant::now(), |_| true)
-            .is_none()
-    );
-    participant.on_reverse(handle, request(id.as_str()));
-    assert!(matches!(
-        participant
-            .transport
-            .apply_next_mutation(Instant::now(), |_| true),
-        Some(AppliedMutation::ControlNotWritten)
-    ));
-    participant.on_reverse(handle, request(id.as_str()));
     let sequence = participant.native_execution.sequence;
     assert!(!participant.native_callback_fenced(1));
     participant.fence_native_resource(1);
@@ -778,16 +771,6 @@ fn repeated_retirement_keeps_the_receipt_and_does_not_erase_a_reused_channel_ind
     participant.pump(&mut sink);
     assert_eq!(participant.native_execution.sequence, sequence + 1);
     assert!(participant.native_execution.pending.is_empty());
-    assert!(participant.native_data.fanouts.is_empty());
-    participant.on_reverse(handle, request(id.as_str()));
-    assert!(
-        participant
-            .transport
-            .apply_next_mutation(Instant::now(), |_| true)
-            .is_none()
-    );
-    participant.native_data_message(channel, &message(id.as_str()), &mut sink);
-    assert_eq!(sink.publish_track_packet_calls, vec![handle]);
     assert!(participant.native_data.publications[&1].retiring);
     assert!(participant.current_native_preparation(work).is_none());
     let sequence = participant.native_execution.sequence;
@@ -827,20 +810,15 @@ fn repeated_retirement_keeps_the_receipt_and_does_not_erase_a_reused_channel_ind
     assert!(
         participant
             .transport
-            .enqueue_mutation(TransportMutation::Data {
-                channel,
-                bytes: probe(id.as_str()),
-                required: true
+            .enqueue_mutation(TransportMutation::Keyframe {
+                mid: Mid::from("fenced"),
+                encoding: SourceEncoding::Rid(None),
+                kind: KeyframeRequestKind::Pli,
             })
     );
     participant.authorization_expiry =
         Some(pulsebeam_core::auth::AuthorizationExpiry::from_unix_seconds(unix_now()));
     assert!(!participant.apply_one_rtc_mutation(Instant::now()));
     assert!(participant.disconnect_reason.is_none());
-    assert!(
-        participant
-            .transport
-            .apply_next_mutation(Instant::now(), |_| true)
-            .is_none()
-    );
+    assert!(participant.transport.apply_next_mutation().is_none());
 }

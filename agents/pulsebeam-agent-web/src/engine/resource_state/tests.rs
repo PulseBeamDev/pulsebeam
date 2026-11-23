@@ -161,6 +161,10 @@ fn named_resources_project_their_own_prejoin_configuration() {
 struct TestHost;
 
 impl super::super::Host for TestHost {
+    fn monotonic_time(&self) -> std::time::Duration {
+        std::time::Duration::ZERO
+    }
+
     fn publish_turn(&self, _: &super::super::Turn) {}
     fn execute_effect(&self, _: agent_core::Effect) {}
     fn host_failed(&self, _: &agent_core::Failure) {}

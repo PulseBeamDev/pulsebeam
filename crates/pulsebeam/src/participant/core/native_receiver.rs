@@ -14,12 +14,11 @@ use std::{
 };
 
 mod rtp;
-#[cfg(test)]
-mod tests;
-
 #[derive(Default)]
 pub(super) struct NativeReceivers {
     pub(super) receivers: BTreeMap<u64, Receiver>,
+    reliable_owners: BTreeMap<u64, u64>,
+    reliable_branches: BTreeMap<crate::shard::router::FabricLocalBranch, u64>,
     sources: BTreeMap<[u8; 16], Source>,
     source_refs: BTreeSet<([u8; 16], u64)>,
     received: BTreeSet<(u64, u64)>,
@@ -31,6 +30,9 @@ pub(super) struct NativeReceivers {
 
 pub(super) struct Receiver {
     transport: ReceiveTransport,
+    fabric: Option<Box<crate::control::native::FabricDataReceiver>>,
+    fabric_branch: Option<crate::shard::router::FabricLocalBranch>,
+    reliable_owner: Option<u64>,
     source: PublicationKey,
     source_room: crate::entity::ProjectRoomKey,
     source_id: String,
@@ -46,6 +48,10 @@ pub(super) struct Receiver {
 }
 
 impl Receiver {
+    fn installed(&self) -> bool {
+        self.opened && (self.fabric.is_none() || self.fabric_branch.is_some())
+    }
+
     fn execution(
         &self,
         enabled: bool,
@@ -108,7 +114,7 @@ impl NativeReceivers {
         self.receivers
             .get(&reference)
             .map(|receiver| crate::participant::policy::ReceiverBinding {
-                available: receiver.opened && !receiver.retiring,
+                available: receiver.installed() && !receiver.retiring,
                 rtp: match &receiver.transport {
                     ReceiveTransport::Rtp(rtp) => Some((rtp.kind, rtp.supports_playout_delay)),
                     ReceiveTransport::Sctp { .. } => None,
@@ -123,15 +129,48 @@ impl NativeReceivers {
         self.receivers.get(&reference)?.installation
     }
 
-    pub(super) fn deadline(&self) -> Option<Instant> {
-        self.deadlines.first().map(|(deadline, _)| *deadline)
+    pub(super) fn staging_fabric_installation(
+        &self,
+        installation: pulsebeam_rtc::DataChannelInstallation,
+    ) -> bool {
+        self.channels
+            .get(&installation.channel())
+            .and_then(|reference| self.receivers.get(reference))
+            .is_some_and(|receiver| {
+                receiver.installation == Some(installation)
+                    && receiver.opened
+                    && !receiver.retiring
+                    && receiver.fabric.is_some()
+                    && receiver.fabric_branch.is_none()
+                    && receiver.preparation.is_some()
+            })
     }
 
-    pub(super) fn can_write(&self, channel: crate::media::ChannelId) -> bool {
+    pub(super) fn fabric_can_write(
+        &self,
+        installation: pulsebeam_rtc::DataChannelInstallation,
+    ) -> bool {
         self.channels
-            .get(&channel)
+            .get(&installation.channel())
             .and_then(|reference| self.receivers.get(reference))
-            .is_some_and(|receiver| self.receiver_ready(receiver))
+            .is_some_and(|receiver| {
+                receiver.installation == Some(installation)
+                    && receiver.fabric_branch.is_some()
+                    && self.receiver_ready(receiver)
+            })
+    }
+
+    pub(super) fn pending_fabric_room(
+        &self,
+        reference: u64,
+    ) -> Option<crate::entity::ProjectRoomKey> {
+        let receiver = self.receivers.get(&reference)?;
+        (receiver.fabric.is_some() && receiver.fabric_branch.is_none() && receiver.opened)
+            .then_some(receiver.source_room)
+    }
+
+    pub(super) fn deadline(&self) -> Option<Instant> {
+        self.deadlines.first().map(|(deadline, _)| *deadline)
     }
 
     pub(super) fn owns_mid(&self, mid: Mid) -> bool {
@@ -175,7 +214,7 @@ impl NativeReceivers {
     fn receiver_ready(&self, receiver: &Receiver) -> bool {
         receiver.enabled
             && !receiver.failed
-            && receiver.opened
+            && receiver.installed()
             && !receiver.retiring
             && self
                 .sources
@@ -216,6 +255,14 @@ impl NativeReceivers {
 
     fn remove_receiver(&mut self, reference: u64) -> Option<Receiver> {
         let receiver = self.receivers.remove(&reference)?;
+        if let Some(owned) = receiver.reliable_owner {
+            if self.reliable_owners.get(&owned) == Some(&reference) {
+                self.reliable_owners.remove(&owned);
+            }
+            if let Some(branch) = receiver.fabric_branch {
+                self.reliable_branches.remove(&branch);
+            }
+        }
         match &receiver.transport {
             ReceiveTransport::Sctp { channel, .. } => {
                 if self.channels.get(channel) == Some(&reference) {
@@ -365,7 +412,7 @@ impl Connection {
 
     pub(in crate::participant::core) fn advance_native_source(
         &mut self,
-        _events: &mut impl ParticipantSink,
+        events: &mut impl ParticipantSink,
     ) -> bool {
         let Some(id) = self.native_receivers.source_work.pop_front() else {
             return false;
@@ -397,7 +444,7 @@ impl Connection {
             return true;
         };
         source.cursor = reference;
-        let (handle, retired) = (source.handle, source.retired);
+        let (handle, retired, bound) = (source.handle, source.retired, source.bound);
         self.native_receivers.source_work.push_back(id);
         if retired {
             self.native_resource_ended(reference);
@@ -406,13 +453,26 @@ impl Connection {
         let Some(receiver) = self.native_receivers.receivers.get_mut(&reference) else {
             return true;
         };
+        if receiver.fabric.is_some() && receiver.fabric_branch.is_none() {
+            if receiver.opened
+                && bound
+                && handle.is_some()
+                && let Some((work, policy)) = &receiver.preparation
+                && policy.enabled
+            {
+                events.stage_fabric_receiver(*work);
+            }
+            return true;
+        }
         if let Some(previous) = receiver.handle {
             self.native_receivers
                 .received
                 .remove(&(previous.data().as_ffi(), reference));
         }
         receiver.handle = handle;
-        if let Some(handle) = handle {
+        if let Some(handle) = handle
+            && receiver.fabric.is_none()
+        {
             self.native_receivers
                 .received
                 .insert((handle.data().as_ffi(), reference));
@@ -425,6 +485,9 @@ impl Connection {
         if self.apply_native_receiver_gate(reference, ready).is_err() {
             self.disconnect(DisconnectReason::SignalingOutput);
             return true;
+        }
+        if ready && self.local_rtp_receiver(reference).is_some() {
+            events.stage_local_rtp_receiver(reference);
         }
         self.record_native_resource_observation(
             crate::participant::policy::ResourceObservation::Receiver {
@@ -497,8 +560,8 @@ impl Connection {
             self.complete_native_preparation(work, Err(ExecutionFailureKind::Retired.into()));
             return;
         }
-        let mut transport = match self.prepare_native_receiver_transport(transport) {
-            Ok(transport) => transport,
+        let (mut transport, fabric) = match self.prepare_native_receiver_transport(transport) {
+            Ok(prepared) => prepared,
             Err(code) => {
                 self.complete_native_preparation(
                     work,
@@ -547,10 +610,17 @@ impl Connection {
             None
         };
         let opened = match &mut transport {
-            ReceiveTransport::Sctp { channel, lane } => self
-                .transport
-                .open_native_data(*channel, *lane)
-                .map(|installation| (false, Some(installation))),
+            ReceiveTransport::Sctp { channel, lane } => if let Some(fabric) = &fabric {
+                self.transport
+                    .install_fabric_data(fabric.parameters)
+                    .map_err(|reason| match reason {
+                        pulsebeam_rtc::WriteError::WouldBlock => ExecutionFailureKind::Capacity,
+                        _ => ExecutionFailureKind::Conflict,
+                    })
+            } else {
+                self.transport.open_native_data(*channel, *lane)
+            }
+            .map(|installation| (false, Some(installation))),
             ReceiveTransport::Rtp(rtp) => rtp
                 .install(&mut self.transport)
                 .map(|()| (true, None))
@@ -618,6 +688,9 @@ impl Connection {
                 enabled: false,
                 failed: false,
                 transport,
+                fabric,
+                fabric_branch: None,
+                reliable_owner: None,
                 opened,
                 installation,
                 retiring: false,
@@ -645,15 +718,35 @@ impl Connection {
     fn prepare_native_receiver_transport(
         &self,
         plan: ReceivePlan,
-    ) -> Result<ReceiveTransport, ExecutionFailureKind> {
+    ) -> Result<
+        (
+            ReceiveTransport,
+            Option<Box<crate::control::native::FabricDataReceiver>>,
+        ),
+        ExecutionFailureKind,
+    > {
         match plan {
-            ReceivePlan::Sctp { channel, lane } => {
+            ReceivePlan::FabricData(fabric) => {
+                use pulsebeam_proto::data_endpoint::{Delivery, Format};
+                let Some(channel) =
+                    crate::participant::transport::fabric_data_config(fabric.parameters)
+                        .and_then(|config| config.id)
+                else {
+                    return Err(ExecutionFailureKind::Invalid);
+                };
                 if self.native_data.channels.contains_key(&channel)
                     || self.native_receivers.channels.contains_key(&channel)
+                    || self.fabric_data.contains_key(&channel)
                 {
                     return Err(ExecutionFailureKind::Conflict);
                 }
-                Ok(ReceiveTransport::Sctp { channel, lane })
+                let lane = match fabric.parameters.format().map(Format::delivery) {
+                    Some(Delivery::Unreliable) => DataLane::Lossy,
+                    Some(Delivery::Latest) => DataLane::Latest,
+                    Some(Delivery::Reliable) => DataLane::Ordered,
+                    _ => return Err(ExecutionFailureKind::Invalid),
+                };
+                Ok((ReceiveTransport::Sctp { channel, lane }, Some(fabric)))
             }
             ReceivePlan::Rtp(configuration) => {
                 let receiver = rtp::RtpReceiver::new(*configuration);
@@ -663,7 +756,7 @@ impl Connection {
                 if self.native_receivers.mids.contains_key(&receiver.mid()) {
                     return Err(ExecutionFailureKind::Conflict);
                 }
-                Ok(ReceiveTransport::Rtp(Box::new(receiver)))
+                Ok((ReceiveTransport::Rtp(Box::new(receiver)), None))
             }
         }
     }
@@ -692,7 +785,18 @@ impl Connection {
         let Some((channel, lane)) = receiver.transport.data() else {
             return;
         };
-        if config != crate::participant::transport::native_data_config(channel, lane) {
+        let expected = if let Some(fabric) = &receiver.fabric {
+            crate::participant::transport::fabric_data_config(fabric.parameters).filter(|_| {
+                receiver
+                    .installation
+                    .is_some_and(|installation| self.transport.supports_fabric_data(installation))
+            })
+        } else {
+            Some(crate::participant::transport::native_data_config(
+                channel, lane,
+            ))
+        };
+        if Some(config) != expected {
             if receiver.preparation.is_some() {
                 self.fail_native_receiver(reference, ExecutionFailureKind::Conflict);
             } else {
@@ -701,6 +805,18 @@ impl Connection {
             return;
         }
         receiver.opened = true;
+        if receiver.fabric.is_some() {
+            let Some((work, policy)) = &receiver.preparation else {
+                return;
+            };
+            let (work, enabled, source, room) =
+                (*work, policy.enabled, receiver.source, receiver.source_room);
+            if enabled && self.native_preparation_time(work).is_some() {
+                events.set_owned_subscription(reference, room, source, true);
+                self.native_receivers.queue_source(*source.as_bytes());
+            }
+            return;
+        }
         if let Some(deadline) = receiver.deadline.take() {
             self.native_receivers
                 .deadlines
@@ -717,6 +833,220 @@ impl Connection {
         self.evaluate_native_preparations(events);
     }
 
+    pub(crate) fn wake_fabric_receiver(&mut self, publication: crate::entity::PublicationKey) {
+        self.native_receivers.queue_source(*publication.as_bytes());
+    }
+
+    pub(crate) fn prepared_native_fabric_receiver(
+        &self,
+        work: Preparation,
+    ) -> Option<data_fabric::ReceiverStage> {
+        self.native_preparation_time(work)?;
+        let receiver = self.native_receivers.receivers.get(&work.reference)?;
+        let (reserved, policy) = receiver.preparation.as_ref()?;
+        if *reserved != work
+            || !policy.enabled
+            || !receiver.opened
+            || receiver.retiring
+            || receiver.fabric_branch.is_some()
+        {
+            return None;
+        }
+        let fabric = receiver.fabric.as_ref()?;
+        let source = self
+            .native_receivers
+            .sources
+            .get(receiver.source.as_bytes())?;
+        if source.retired
+            || !source.bound
+            || source.handle.is_none()
+            || source.track.fabric_data_source() != Some(fabric.endpoint.source)
+        {
+            return None;
+        }
+        let installation = receiver
+            .installation
+            .filter(|installation| self.transport.supports_fabric_data(*installation))?;
+        Some(data_fabric::ReceiverStage {
+            source: receiver.source,
+            endpoint: fabric.endpoint,
+            prepared: data_fabric::PreparedSctp::from_negotiation(fabric.parameters, installation)?,
+        })
+    }
+
+    pub(crate) fn complete_native_fabric_receiver(
+        &mut self,
+        work: Preparation,
+        branch: Option<crate::shard::router::FabricLocalBranch>,
+        events: &mut impl ParticipantSink,
+    ) -> bool {
+        if self.prepared_native_fabric_receiver(work).is_none() {
+            return false;
+        }
+        let reference = work.reference;
+        let Some(receiver) = self.native_receivers.receivers.get_mut(&reference) else {
+            return false;
+        };
+        let room = receiver.source_room;
+        let Some(branch) = branch else {
+            events.unsubscribe_owned(reference, room);
+            self.fail_native_receiver(reference, ExecutionFailureKind::Conflict);
+            return false;
+        };
+        receiver.fabric_branch = Some(branch);
+        let Some((work, policy)) = receiver.preparation.take() else {
+            return false;
+        };
+        if let Some(deadline) = receiver.deadline.take() {
+            self.native_receivers
+                .deadlines
+                .remove(&(deadline, reference));
+        }
+        self.record_native_receiver_binding(reference);
+        self.commit_native_receiver(work, policy, events);
+        let Some(receiver) = self
+            .native_receivers
+            .receivers
+            .get_mut(&reference)
+            .filter(|receiver| receiver.enabled)
+        else {
+            events.unsubscribe_owned(reference, room);
+            self.fail_native_receiver(reference, ExecutionFailureKind::Conflict);
+            return false;
+        };
+        if receiver
+            .fabric
+            .as_ref()
+            .and_then(|fabric| fabric.parameters.format())
+            .is_some_and(|format| {
+                format.delivery() == pulsebeam_proto::data_endpoint::Delivery::Reliable
+            })
+        {
+            let owned = work.owned();
+            receiver.reliable_owner = Some(owned);
+            self.native_receivers
+                .reliable_owners
+                .insert(owned, reference);
+            self.native_receivers
+                .reliable_branches
+                .insert(branch, owned);
+        }
+        true
+    }
+
+    pub(crate) fn reliable_subscriber_branch(
+        &self,
+        branch: crate::shard::router::FabricLocalBranch,
+    ) -> Option<data_fabric::SubscriberLease> {
+        let owned = self.native_receivers.reliable_branches.get(&branch)?;
+        self.reliable_subscriber_lease(*owned)
+            .filter(|lease| lease.branch == branch)
+    }
+
+    pub(crate) fn reliable_subscriber_lease(
+        &self,
+        owned: u64,
+    ) -> Option<data_fabric::SubscriberLease> {
+        if !self.fabric_io_authorized() {
+            return None;
+        }
+        let reference = self.native_receivers.reliable_owners.get(&owned)?;
+        let receiver = self.native_receivers.receivers.get(reference)?;
+        if !self.native_receivers.receiver_ready(receiver) {
+            return None;
+        }
+        let installation = receiver
+            .installation
+            .filter(|lease| self.transport.supports_fabric_data(*lease))?;
+        let branch = receiver.fabric_branch?;
+        let Some(super::FabricDataLease::Output(output)) =
+            self.fabric_data.get(&installation.channel())
+        else {
+            return None;
+        };
+        if output.installation != installation
+            || output.branch != branch
+            || receiver.reliable_owner != Some(owned)
+        {
+            return None;
+        }
+        Some(data_fabric::SubscriberLease {
+            owned,
+            branch,
+            endpoint: receiver.fabric.as_ref()?.endpoint,
+        })
+    }
+
+    pub(super) fn ready_fabric_receiver_fid(&self, mid: Mid, primary: u32) -> Option<[u32; 2]> {
+        let receiver = self
+            .native_receivers
+            .receivers
+            .get(self.native_receivers.mids.get(&mid)?)?;
+        let ReceiveTransport::Rtp(rtp) = &receiver.transport else {
+            return None;
+        };
+        if *rtp.ssrc() != primary || !self.native_receivers.receiver_ready(receiver) {
+            return None;
+        }
+        // The client selects this exact FID in its Native receive binding.
+        rtp.fid()
+    }
+
+    pub(super) fn stage_allocated_rtp_receivers(&self, events: &mut impl ParticipantSink) {
+        for (&reference, receiver) in &self.native_receivers.receivers {
+            if self
+                .ready_rtp_binding(receiver)
+                .is_some_and(|(_, _, _, profile)| {
+                    matches!(
+                        profile,
+                        pulsebeam_core::fabric::Profile::H264
+                            | pulsebeam_core::fabric::Profile::Av1
+                    )
+                })
+            {
+                events.stage_local_rtp_receiver(reference);
+            }
+        }
+    }
+
+    pub(crate) fn local_rtp_receiver(
+        &self,
+        reference: u64,
+    ) -> Option<(TrackHandle, Mid, u32, pulsebeam_core::fabric::Profile)> {
+        self.ready_rtp_binding(self.native_receivers.receivers.get(&reference)?)
+    }
+
+    pub(crate) fn ready_rtp_bindings_for(
+        &self,
+        track: TrackHandle,
+    ) -> impl Iterator<Item = (Mid, u32, pulsebeam_core::fabric::Profile)> + '_ {
+        self.native_receivers
+            .receivers
+            .values()
+            .filter_map(move |receiver| {
+                let (current, mid, primary, profile) = self.ready_rtp_binding(receiver)?;
+                (current == track).then_some((mid, primary, profile))
+            })
+    }
+
+    fn ready_rtp_binding(
+        &self,
+        receiver: &Receiver,
+    ) -> Option<(TrackHandle, Mid, u32, pulsebeam_core::fabric::Profile)> {
+        if !self.native_receivers.receiver_ready(receiver) {
+            return None;
+        }
+        let ReceiveTransport::Rtp(rtp) = &receiver.transport else {
+            return None;
+        };
+        Some((
+            receiver.handle?,
+            rtp.mid(),
+            rtp.ssrc().into(),
+            rtp.fabric_profile?,
+        ))
+    }
+
     fn apply_native_receiver_gate(
         &mut self,
         reference: u64,
@@ -726,11 +1056,7 @@ impl Connection {
             return Ok(());
         };
         match &receiver.transport {
-            ReceiveTransport::Sctp { channel, .. } => {
-                if !active {
-                    self.transport.discard_channel_mutations(*channel);
-                }
-            }
+            ReceiveTransport::Sctp { .. } => {}
             ReceiveTransport::Rtp(rtp) => {
                 if !active {
                     self.stream_writer.discard_mid(rtp.mid());
@@ -767,7 +1093,7 @@ impl Connection {
         let Some(receiver) = self.native_receivers.receivers.get(&reference) else {
             return;
         };
-        if !receiver.opened || receiver.retiring {
+        if !receiver.installed() || receiver.retiring {
             self.complete_native_preparation(work, Err(ExecutionFailureKind::Conflict.into()));
             return;
         }
@@ -830,7 +1156,9 @@ impl Connection {
                 .remove(&(previous.data().as_ffi(), reference));
         }
         receiver.handle = handle;
-        if let Some(handle) = handle {
+        if let Some(handle) = handle
+            && receiver.fabric.is_none()
+        {
             self.native_receivers
                 .received
                 .insert((handle.data().as_ffi(), reference));
@@ -841,6 +1169,9 @@ impl Connection {
             receiver.source,
             enabled && !receiver.failed,
         );
+        if ready && self.local_rtp_receiver(reference).is_some() {
+            events.stage_local_rtp_receiver(reference);
+        }
         self.record_native_preparation(work, Ok(ResourceExecution::Receiver(execution)), now);
     }
 
@@ -895,11 +1226,20 @@ impl Connection {
         match &receiver.transport {
             ReceiveTransport::Sctp { .. } => {
                 if let Some(installation) = receiver.installation {
+                    let channel = installation.channel();
+                    if self
+                        .fabric_data
+                        .get(&channel)
+                        .is_some_and(|lease| lease.installation() == installation)
+                    {
+                        self.fabric_data.remove(&channel);
+                    }
                     self.transport
                         .cancel_data_channel_installation(installation);
                 }
             }
             ReceiveTransport::Rtp(rtp) => {
+                self.media_egress.remove(&rtp.mid());
                 self.stream_writer.discard_mid(rtp.mid());
                 if rtp.video_options.is_some() {
                     self.downstream.video.remove_owned_slot(rtp.mid());
@@ -1001,88 +1341,6 @@ impl Connection {
         self.record_native_resource_observation(
             crate::participant::policy::ResourceObservation::Released { binding: reference },
         );
-    }
-
-    pub(super) fn native_receiver_message(
-        &mut self,
-        reference: u64,
-        bytes: &[u8],
-        events: &mut impl ParticipantSink,
-    ) {
-        let Some(receiver) = self.native_receivers.receivers.get(&reference) else {
-            return;
-        };
-        if !receiver
-            .transport
-            .data()
-            .is_some_and(|(_, lane)| lane == DataLane::Ordered)
-            || !self.native_receivers.receiver_ready(receiver)
-        {
-            return;
-        }
-        let Ok(frame) = TopicFrame::decode_bounded(bytes) else {
-            return;
-        };
-        if frame.requester().is_some_and(<[u8]>::is_empty)
-            && frame.publication_id() == Some(receiver.source_id.as_str())
-            && let Some(handle) = receiver.handle
-        {
-            events.request_reverse(handle, ReversePacket::reliable_control(bytes.to_vec()));
-        }
-    }
-
-    pub(in crate::participant::core) fn native_data_delivery(
-        &mut self,
-        handle: TrackHandle,
-        lane: DataLane,
-        bytes: &[u8],
-    ) {
-        if self.native_receivers.received.is_empty()
-            || self.disconnect_reason.is_some()
-            || self
-                .authorization_expiry
-                .is_none_or(|expiry| expiry.is_expired_at(unix_now()))
-        {
-            return;
-        }
-        let Ok(frame) = TopicFrame::decode_bounded(bytes) else {
-            return;
-        };
-        if !frame.is_publisher_output() {
-            return;
-        }
-        let required = lane == DataLane::Ordered
-            && !matches!(
-                frame.body,
-                Some(pulsebeam_proto::topic::topic_frame::Body::Message(_))
-            );
-        let key = handle.data().as_ffi();
-        let mut failed = false;
-        for (_, reference) in self
-            .native_receivers
-            .received
-            .range((Included((key, 0)), Included((key, u64::MAX))))
-        {
-            let Some(receiver) = self.native_receivers.receivers.get(reference) else {
-                continue;
-            };
-            let Some((channel, received_lane)) = receiver.transport.data() else {
-                continue;
-            };
-            if received_lane == lane
-                && self.native_receivers.receiver_ready(receiver)
-                && frame.publication_id() == Some(receiver.source_id.as_str())
-            {
-                failed |= !self.transport.enqueue_mutation(TransportMutation::Data {
-                    channel,
-                    bytes: bytes.to_vec(),
-                    required,
-                }) && required;
-            }
-        }
-        if failed {
-            self.disconnect(DisconnectReason::SignalingOutput);
-        }
     }
 
     pub(in crate::participant::core) fn native_rtp_delivery(

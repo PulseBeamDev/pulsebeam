@@ -1,7 +1,21 @@
-use pulsebeam_rtc::{DataChannelConfig, DataMessage, DataReliability, RtcConnection};
+use pulsebeam_rtc::{
+    DataChannelConfig, DataChannelPriority, DataMessage, DataReliability, RtcConnection,
+};
 use pulsebeam_runtime::time::Instant;
 
 use crate::media::ChannelId;
+
+pub(crate) fn native_signaling_config() -> DataChannelConfig {
+    DataChannelConfig {
+        id: Some(ChannelId::from_value(0)),
+        label: "v1/sys/signaling".into(),
+        protocol: "".into(),
+        ordered: true,
+        reliability: DataReliability::Reliable,
+        priority: DataChannelPriority::LOW,
+        negotiated: true,
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct SignalingChannel {
@@ -134,12 +148,9 @@ mod tests {
 
     #[test]
     fn channel_designation_uses_compiled_fields_without_constraining_priority() {
-        use crate::track::DataTrackIntent;
-        use pulsebeam_rtc::DataChannelPriority;
-
         let zero = ChannelId::from_value(0);
         let other = ChannelId::from_value(2);
-        let expected = DataTrackIntent::native_signaling_config();
+        let expected = native_signaling_config();
         let channel = SignalingChannel::compile(&expected);
         assert!(channel.designates(zero));
         assert!(!channel.designates(other));

@@ -15,7 +15,7 @@ workspace = true
 [features]
 default = ["datagram"]
 datagram = ["dep:pulsebeam-cc", "dep:pulsebeam-feedback", "dep:noq-proto", "dep:rustls", "dep:rcgen", "dep:sha2"]
-dtls-srtp = ["dep:is", "dep:str0m"]
+dtls-srtp = ["dep:is", "dep:str0m", "dep:pulsebeam-cc", "dep:pulsebeam-feedback"]
 test-utils = ["pulsebeam-dtls/test-utils"]
 
 [dependencies]

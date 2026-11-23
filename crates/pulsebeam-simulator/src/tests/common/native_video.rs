@@ -228,10 +228,12 @@ impl NativeDecodedVideoLog {
             Playback::DesktopUpdates => super::harness::MAX_TIME_TO_FIRST_FRAME,
         };
         let last = receiver.last_received.context("no decoded arrival")?;
+        let age = now.checked_duration_since(last);
         ensure!(
-            now.checked_duration_since(last)
-                .is_some_and(|age| age <= max_age),
-            "native playback is stale or in the future"
+            age.is_some_and(|age| age <= max_age),
+            "native {:?} playback is stale or in the future: age {age:?}, limit {max_age:?}, last RTP {:?}",
+            expected.content,
+            receiver.last_rtp,
         );
         if matches!(expected.content, Playback::Camera) {
             // Unlike an implicit initial baseline, an explicit playback window

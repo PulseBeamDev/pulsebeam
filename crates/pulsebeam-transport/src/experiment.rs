@@ -111,9 +111,11 @@ impl QuicOnly {
                     }
                 }
                 Output::ApplicationData(bytes) => {
-                    match wire::decode(bytes).map_err(|_| Error::Codec)? {
+                    match wire::decode_for(bytes, false).map_err(|_| Error::Codec)? {
                         wire::Frame::Data { payload, .. } => receive(payload),
-                        wire::Frame::Feedback { .. } => return Err(Error::Codec),
+                        wire::Frame::Feedback { .. } | wire::Frame::Capability(_) => {
+                            return Err(Error::Codec);
+                        }
                     }
                 }
                 Output::Timeout(_) => {

@@ -465,7 +465,7 @@ mod tests {
     }
 
     #[test]
-    fn automatic_dtls_prefers_13_aes_128_gcm_and_aead_srtp() {
+    fn automatic_dtls_prefers_13_aes_256_gcm_and_aead_srtp() {
         let mut pair = connect(DtlsVersion::Dtls13);
         assert_eq!(
             pair.client.protocol_version(),
@@ -477,7 +477,7 @@ mod tests {
         );
         assert_eq!(
             server_hello_cipher_suite(&pair.server_packets),
-            Some(0x1301)
+            Some(0x1302)
         );
         assert!(matches!(
             pair.profile,

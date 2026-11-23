@@ -87,7 +87,20 @@ fn fault_target(index: u8) -> &'static str {
 
 impl Transition {
     fn bind(&mut self, handles: &PlanHandles) -> Result<()> {
-        let media = observed_media(handles)?;
+        let mut media = observed_media(handles)?;
+        // Remote watches can still show a retired publication when the same
+        // participant identity is admitted on a new connection.
+        let already_bound = self
+            .bindings
+            .iter()
+            .flat_map(|binding| {
+                binding
+                    .expected
+                    .publications()
+                    .map(|publication| publication.id)
+            })
+            .collect::<BTreeSet<_>>();
+        media.retain(|publication| !already_bound.contains(&publication.id));
         for (name, handle) in handles.iter().filter(|(_, h)| h.present) {
             let Some(observed) = observation(handle) else {
                 continue;
@@ -514,16 +527,19 @@ async fn execute_inner(
                 handle.send_command(ParticipantCmd::Reconnect);
                 if !state.holds.contains_key(&(*i + 1)) {
                     state.admitted(handles, who, previous).await?;
-                    let id = handles[who]
-                        .participant_id()
-                        .context("admitted publisher")?;
+                    let bound = state
+                        .bindings
+                        .iter()
+                        .find(|binding| binding.name == who && binding.retired.is_none())
+                        .context("admitted publisher binding")?;
+                    let fresh_id = bound
+                        .expected
+                        .publication_id(pulsebeam::entity::TrackKind::Video, "video")
+                        .as_str();
                     tokio::time::timeout(Duration::from_secs(5), async {
-                        while !observation(&handles["viewer"]).is_some_and(|o| {
-                            o.snapshot
-                                .publications
-                                .values()
-                                .any(|p| p.participant_id == id)
-                        }) {
+                        while !observation(&handles["viewer"])
+                            .is_some_and(|o| o.snapshot.publications.contains_key(&fresh_id))
+                        {
                             state.wait(handles, Duration::from_millis(10)).await?;
                         }
                         Ok::<_, anyhow::Error>(())

@@ -1,15 +1,15 @@
 //! Real dual-stack UDP and isolated ICE-TCP SDK/application witnesses.
 use super::*;
+use crate::control::native::DataProfile;
 use anyhow::{anyhow, bail, ensure};
 use pulsebeam_agent_native::agent_core::{
-    AgentConfig, ConnectionState, DesiredState, Generation, Notification, TopicMessage, TopicMode,
-    TopicNotification, TopicPublisher, TopicRegistrations, TopicSend, TopicSubscriber,
+    AgentConfig, ConnectionState, DataEvent, DataUpdate, Generation, TopicMode,
+    ffi::PublicationExecution,
 };
 use pulsebeam_agent_native::{
-    Agent, AgentEvent, AsyncHttpClient, Config, Host, NativeStatistics, ObservationStream,
-    StreamUpdate,
+    Agent, AsyncHttpClient, Config, DataPublication, DataReceiver, Host, NativeStatistics,
 };
-use pulsebeam_runtime::sync::watch;
+use pulsebeam_runtime::{sync::watch, time::Instant};
 use serde_json::{Value, json};
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -17,6 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const CONNECT: Duration = Duration::from_secs(30);
 const DELIVERY: Duration = Duration::from_secs(30);
 const CLEANUP: Duration = Duration::from_secs(10);
+const PROTECTED_UDP_CEILING: u16 = 1_216;
 const ROOM: &str = "dual-stack-transport";
 const TOPIC: &str = "dual-stack-probe";
 const A_TO_B: &[u8] = b"application-owned IPv4 to IPv6 probe";
@@ -33,6 +34,47 @@ impl Protocol {
         match self {
             Self::Udp => "udp",
             Self::Tcp => "tcp",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DataWitness {
+    LiveUdp { cross_shard: bool },
+    ReliableUdp { cross_shard: bool },
+    LiveTcp,
+}
+
+impl DataWitness {
+    fn needs_migration(self) -> bool {
+        matches!(self, Self::LiveUdp { cross_shard: false } | Self::LiveTcp)
+    }
+
+    fn crosses_shards(self) -> bool {
+        matches!(
+            self,
+            Self::LiveUdp { cross_shard: true } | Self::ReliableUdp { cross_shard: true }
+        )
+    }
+
+    fn protocol(self) -> Protocol {
+        match self {
+            Self::LiveUdp { .. } | Self::ReliableUdp { .. } => Protocol::Udp,
+            Self::LiveTcp => Protocol::Tcp,
+        }
+    }
+
+    fn topic_mode(self) -> TopicMode {
+        match self {
+            Self::LiveUdp { .. } | Self::LiveTcp => TopicMode::Latest,
+            Self::ReliableUdp { .. } => TopicMode::Ordered,
+        }
+    }
+
+    fn profile(self) -> DataProfile {
+        match self {
+            Self::LiveUdp { .. } | Self::LiveTcp => DataProfile::FabricLive,
+            Self::ReliableUdp { .. } => DataProfile::FabricReliable,
         }
     }
 }
@@ -55,10 +97,11 @@ impl Family {
     }
 }
 
-// Only candidate facts survive the HTTP interception. Never retain credentials/SDP.
+// Retain candidate addresses and the logical shard, never credentials or SDP.
 #[derive(Clone, Debug)]
 struct AnswerEvidence {
     candidates: Vec<SocketAddr>,
+    shard: Option<ShardId>,
 }
 
 fn constrain_answer(
@@ -112,14 +155,19 @@ fn constrain_answer(
             "actual server answer lacks required candidate {required}"
         );
     }
-    Ok((filtered.join("\r\n"), AnswerEvidence { candidates }))
+    let shard = answer
+        .lines()
+        .filter_map(|line| line.strip_prefix("a=ice-ufrag:"))
+        .find_map(crate::control::ufrag::IceUfrag::decode)
+        .map(|ufrag| ufrag.node_address().shard());
+    Ok((filtered.join("\r\n"), AnswerEvidence { candidates, shard }))
 }
 
 struct FamilyHttp {
     client: reqwest::Client,
     family: Family,
     port: u16,
-    protocol: Protocol,
+    witness: DataWitness,
     answer: watch::Sender<Option<AnswerEvidence>>,
 }
 impl AsyncHttpClient for FamilyHttp {
@@ -141,12 +189,29 @@ impl AsyncHttpClient for FamilyHttp {
             }
             let (parts, body) = response.into_parts();
             let mut body: Value = serde_json::from_slice(&body)?;
+            if body.get("data_version").and_then(Value::as_u64)
+                != Some(u64::from(pulsebeam_proto::data_endpoint::DATA_V1))
+            {
+                return Err("native conformance requires DATA_V1 negotiation".into());
+            }
+            let deliveries = body
+                .get("data_delivery")
+                .and_then(Value::as_array)
+                .context("native DATA delivery advertisement missing")?;
+            let ordered = deliveries
+                .iter()
+                .any(|mode| mode.as_str() == Some("ORDERED"));
+            if ordered != (self.witness.topic_mode() == TopicMode::Ordered) {
+                return Err(
+                    "native DATA advertisement does not match the conformance profile".into(),
+                );
+            }
             let answer = body
                 .get("answer")
                 .and_then(Value::as_str)
                 .context("native HTTP answer missing")?;
             let (filtered, evidence) =
-                constrain_answer(answer, self.family, self.port, self.protocol)?;
+                constrain_answer(answer, self.family, self.port, self.witness.protocol())?;
             *body
                 .get_mut("answer")
                 .context("native HTTP answer missing")? = Value::String(filtered);
@@ -263,27 +328,69 @@ fn selected_pair(
     })
 }
 
-fn publisher() -> TopicPublisher {
-    TopicPublisher {
-        topic: TOPIC.into(),
-        mode: TopicMode::Latest,
-    }
+struct DataLeg {
+    sender: DataPublication,
+    receiver: DataReceiver,
 }
 
-fn desired(remote_participant: &str) -> DesiredState {
-    DesiredState {
-        revision: 1,
-        connected: true,
-        topics: TopicRegistrations {
-            publishers: vec![publisher()],
-            subscribers: vec![TopicSubscriber {
-                room: ROOM.into(),
-                participant_id: remote_participant.into(),
-                topic: TOPIC.into(),
-                mode: TopicMode::Latest,
-            }],
-        },
-        ..Default::default()
+impl DataLeg {
+    fn open(agent: &Agent, remote: &str, topic: &str, mode: TopicMode) -> Result<Self> {
+        Ok(Self {
+            sender: agent.data(topic.into(), mode)?.publish()?,
+            receiver: agent
+                .room(ROOM.into())?
+                .participant(remote.into())?
+                .data(topic.into(), mode)?
+                .subscribe()?,
+        })
+    }
+
+    async fn ready(&self) -> Result<()> {
+        pulsebeam_runtime::try_join!(
+            async {
+                let updates = self
+                    .sender
+                    .updates()
+                    .map_err(|_| anyhow!("DATA publisher observer limit"))?;
+                while let Some(state) = updates
+                    .next()
+                    .map_err(|_| anyhow!("concurrent DATA publisher observation"))?
+                    .await
+                {
+                    ensure!(
+                        state.error.is_none() && state.execution_error.is_none(),
+                        "DATA publisher was rejected: {state:?}"
+                    );
+                    if state.execution == PublicationExecution::Installed {
+                        return Ok(());
+                    }
+                }
+                bail!("DATA publisher closed before installation");
+            },
+            async {
+                let updates = self
+                    .receiver
+                    .updates()
+                    .map_err(|_| anyhow!("DATA receiver observer limit"))?;
+                while let Some(state) = updates
+                    .next()
+                    .map_err(|_| anyhow!("concurrent DATA receiver observation"))?
+                    .await
+                {
+                    ensure!(
+                        state.error.is_none()
+                            && state.execution_error.is_none()
+                            && state.terminal_error.is_none(),
+                        "DATA receiver was rejected: {state:?}"
+                    );
+                    if state.execution == PublicationExecution::Installed {
+                        return Ok(());
+                    }
+                }
+                bail!("DATA receiver closed before installation");
+            }
+        )?;
+        Ok(())
     }
 }
 
@@ -310,25 +417,7 @@ async fn ready(
                 "SDK generation changed during delivery"
             );
         }
-        let topics_ready = snapshot.topics.publishers.iter().any(|status| {
-            status.registration == publisher()
-                && status.channel.is_some()
-                && status.publication_id.is_some()
-        }) && snapshot.topics.subscribers.iter().any(|status| {
-            status.registration.topic == TOPIC && status.channel.is_some() && status.publishers >= 1
-        });
-        tracing::info!(?protocol, %remote, connection = ?snapshot.connection, topics_ready,
-            has_statistics = statistics.borrow().is_some(), "qualification readiness");
         if snapshot.connection == ConnectionState::Connected
-            && topics_ready
-            && let (Some(generation), Some(stats)) =
-                (snapshot.generation, statistics.borrow().as_ref())
-            && let Err(error) = selected_pair(stats, generation.get(), remote, protocol)
-        {
-            tracing::info!(?error, ?protocol, %remote, "waiting for qualified selected pair");
-        }
-        if snapshot.connection == ConnectionState::Connected
-            && topics_ready
             && let (Some(generation), Some(stats)) =
                 (snapshot.generation, statistics.borrow().as_ref())
             && let Ok(pair) = selected_pair(stats, generation.get(), remote, protocol)
@@ -343,14 +432,19 @@ async fn ready(
     }
 }
 
-fn recipient_payload(message: Option<&TopicMessage>, sender: &str, expected: &[u8]) -> Result<()> {
-    let message = message.context("missing recipient application payload")?;
+fn recipient_payload(event: &DataEvent, sender: &str, expected: &[u8]) -> Result<()> {
+    let DataEvent::Message {
+        participant_id,
+        publication_id,
+        data,
+        ..
+    } = event
+    else {
+        bail!("expected a complete DATA unit");
+    };
     ensure!(
-        message.participant_id == sender
-            && message.topic == TOPIC
-            && message.mode == TopicMode::Latest
-            && message.payload == expected,
-        "recipient application sender/topic/payload mismatch"
+        participant_id == sender && !publication_id.is_empty() && data == expected,
+        "recipient application sender/publication/payload mismatch"
     );
     Ok(())
 }
@@ -375,35 +469,16 @@ fn retired(connection: &ConnectionState, has_statistics: bool) -> Result<()> {
     Ok(())
 }
 
-async fn received(
-    events: &ObservationStream<AgentEvent>,
-    sender: &str,
-    expected: &[u8],
-) -> Result<()> {
-    loop {
-        match events.next().await {
-            StreamUpdate::Value(AgentEvent::Core(Notification::Topic(
-                TopicNotification::Message(message),
-            ))) => {
-                recipient_payload(Some(&message), sender, expected)?;
-                tracing::info!(
-                    "EXERCISED recipient application payload, {} bytes",
-                    expected.len()
-                );
-                return Ok(());
-            }
-            StreamUpdate::Value(AgentEvent::Core(Notification::Topic(
-                TopicNotification::SendDropped { .. } | TopicNotification::ChannelFailed { .. },
-            )))
-            | StreamUpdate::Value(AgentEvent::RuntimeFailed(_)) => {
-                bail!("SDK topic/runtime failed during delivery")
-            }
-            StreamUpdate::Lagged { .. } | StreamUpdate::Closed => {
-                bail!("recipient application observation lost")
-            }
-            _ => {}
-        }
-    }
+async fn received(receiver: &DataReceiver, sender: &str, expected: &[u8]) -> Result<()> {
+    let DataUpdate::Event { event } = receiver.next().await? else {
+        bail!("DATA receiver closed before delivery");
+    };
+    recipient_payload(&event, sender, expected)?;
+    tracing::info!(
+        bytes = expected.len(),
+        "EXERCISED recipient application DATA unit"
+    );
+    Ok(())
 }
 
 fn config(endpoint: &str, participant: &str) -> Result<Config> {
@@ -432,117 +507,164 @@ async fn witness(
     a: &Agent,
     b: &Agent,
     port: u16,
-    protocol: Protocol,
-    migration: &pulsebeam_runtime::rt::MigrationHandle,
+    candidate: DataWitness,
+    migration: Option<&pulsebeam_runtime::rt::MigrationHandle>,
 ) -> Result<()> {
-    let events_a = a.events();
-    let events_b = b.events();
-    let (pair_a, pair_b) = pulsebeam_runtime::time::timeout(CONNECT, async {
-        pulsebeam_runtime::try_join!(a.replace_desired(desired("v6")), b.replace_desired(desired("v4")))?;
+    let protocol = candidate.protocol();
+    let mode = candidate.topic_mode();
+    let started = Instant::now();
+    let (pair_a, pair_b, sender_a, sender_b) = pulsebeam_runtime::time::timeout(CONNECT, async {
+        pulsebeam_runtime::try_join!(a.connect(), b.connect())?;
         a.join(ROOM.to_owned())?;
         b.join(ROOM.to_owned())?;
-        pulsebeam_runtime::try_join!(ready(a, Family::V4.address(port), None, protocol), ready(b, Family::V6.address(port), None, protocol))
-    }).await.context("FAILED: 30s dual-stack connection/topic/selected-pair evidence deadline; require IPv4/IPv6 loopback and compatible native candidates")??;
+        let (pair_a, pair_b) = pulsebeam_runtime::try_join!(
+            ready(a, Family::V4.address(port), None, protocol),
+            ready(b, Family::V6.address(port), None, protocol),
+        )?;
+        let sender_a = a
+            .snapshot()
+            .participant_id
+            .context("IPv4 participant ID missing")?;
+        let sender_b = b
+            .snapshot()
+            .participant_id
+            .context("IPv6 participant ID missing")?;
+        anyhow::Ok((pair_a, pair_b, sender_a, sender_b))
+    })
+    .await
+    .context("dual-stack connection or selected-pair deadline")??;
+    let data_a = DataLeg::open(a, &sender_b, TOPIC, mode)?;
+    let data_b = DataLeg::open(b, &sender_a, TOPIC, mode)?;
+    let remaining = CONNECT.saturating_sub(Instant::now().saturating_duration_since(started));
+    pulsebeam_runtime::time::timeout(remaining, async {
+        pulsebeam_runtime::try_join!(data_a.ready(), data_b.ready())
+    }).await.with_context(|| {
+        let pub_a = data_a.sender.state();
+        let pub_b = data_b.sender.state();
+        let sub_a = data_a.receiver.state();
+        let sub_b = data_b.receiver.state();
+        format!(
+            "{mode:?} DATA installation deadline: IPv4 publisher={:?}/{:?} subscriber={:?}/{:?}/{:?}; IPv6 publisher={:?}/{:?} subscriber={:?}/{:?}/{:?}",
+            pub_a.admission, pub_a.execution, sub_a.source_status, sub_a.admission, sub_a.execution,
+            pub_b.admission, pub_b.execution, sub_b.source_status, sub_b.admission, sub_b.execution,
+        )
+    })??;
     tracing::info!(
         ?protocol,
-        "EXERCISED both selected families and public topic readiness"
+        ?mode,
+        "EXERCISED both selected families and owned DATA readiness"
     );
-    let sender_a = a
-        .snapshot()
-        .participant_id
-        .context("IPv4 participant ID missing")?;
-    let sender_b = b
-        .snapshot()
-        .participant_id
-        .context("IPv6 participant ID missing")?;
     pulsebeam_runtime::time::timeout(DELIVERY, async {
         pulsebeam_runtime::try_join!(
-            a.send_topic(TopicSend {
-                publisher: publisher(),
-                payload: A_TO_B.to_vec()
-            }),
-            b.send_topic(TopicSend {
-                publisher: publisher(),
-                payload: B_TO_A.to_vec()
-            }),
+            data_a.sender.send(A_TO_B.to_vec()),
+            data_b.sender.send(B_TO_A.to_vec()),
         )?;
         pulsebeam_runtime::try_join!(
-            received(&events_b, &sender_a, A_TO_B),
-            received(&events_a, &sender_b, B_TO_A)
+            received(&data_b.receiver, &sender_a, A_TO_B),
+            received(&data_a.receiver, &sender_b, B_TO_A)
         )?;
         tracing::info!("EXERCISED both recipient application payloads");
-        let during_a = b"IPv4 application delivery during shard handoff";
-        let during_b = b"IPv6 application delivery during shard handoff";
+        let lossy = if matches!(candidate, DataWitness::LiveUdp { .. }) {
+            const LOSSY_TOPIC: &str = "dual-stack-lossy";
+            let leg_a = DataLeg::open(a, &sender_b, LOSSY_TOPIC, TopicMode::Lossy)?;
+            let leg_b = DataLeg::open(b, &sender_a, LOSSY_TOPIC, TopicMode::Lossy)?;
+            tracing::info!("waiting for both Lossy DATA routes before migration");
+            pulsebeam_runtime::try_join!(
+                async { leg_a.ready().await.context("IPv4 Lossy DATA route") },
+                async { leg_b.ready().await.context("IPv6 Lossy DATA route") },
+            )?;
+            Some((leg_a, leg_b))
+        } else {
+            None
+        };
+        if let Some(migration) = migration {
+            let during_a = b"IPv4 application delivery during shard handoff";
+            let during_b = b"IPv6 application delivery during shard handoff";
+            pulsebeam_runtime::try_join!(
+                async {
+                    tracing::info!(
+                        ?protocol,
+                        service = 0,
+                        destination = 1,
+                        "requesting managed-shard move"
+                    );
+                    migration
+                        .move_service(0, 1)
+                        .await
+                        .context("first managed-shard move")?;
+                    tracing::info!(
+                        ?protocol,
+                        service = 0,
+                        destination = 1,
+                        "completed managed-shard move"
+                    );
+                    migration
+                        .move_service(1, 0)
+                        .await
+                        .context("second managed-shard move")?;
+                    tracing::info!(
+                        ?protocol,
+                        service = 1,
+                        destination = 0,
+                        "completed managed-shard move"
+                    );
+                    anyhow::Ok(())
+                },
+                async {
+                    data_a.sender.send(during_a.to_vec()).await?;
+                    received(&data_b.receiver, &sender_a, during_a).await?;
+                    tracing::info!(?protocol, "EXERCISED IPv4-to-IPv6 delivery during handoff");
+                    anyhow::Ok(())
+                },
+                async {
+                    data_b.sender.send(during_b.to_vec()).await?;
+                    received(&data_a.receiver, &sender_b, during_b).await?;
+                    tracing::info!(?protocol, "EXERCISED IPv6-to-IPv4 delivery during handoff");
+                    anyhow::Ok(())
+                },
+            )?;
+        }
+        let max_a = [0x5a; pulsebeam_proto::data_record::FRAGMENT_BYTES];
+        let max_b = [0xa5; pulsebeam_proto::data_record::FRAGMENT_BYTES];
+        let (after_a, after_b): (&[u8], &[u8]) = match protocol {
+            Protocol::Udp => (&max_a, &max_b),
+            Protocol::Tcp => (
+                b"IPv4 application delivery after completed shard move",
+                b"IPv6 application delivery after completed shard move",
+            ),
+        };
         pulsebeam_runtime::try_join!(
-            async {
-                tracing::info!(
-                    ?protocol,
-                    service = 0,
-                    destination = 1,
-                    "requesting managed-shard move"
-                );
-                migration
-                    .move_service(0, 1)
-                    .await
-                    .context("first managed-shard move")?;
-                tracing::info!(
-                    ?protocol,
-                    service = 0,
-                    destination = 1,
-                    "completed managed-shard move"
-                );
-                migration
-                    .move_service(1, 0)
-                    .await
-                    .context("second managed-shard move")?;
-                tracing::info!(
-                    ?protocol,
-                    service = 1,
-                    destination = 0,
-                    "completed managed-shard move"
-                );
-                anyhow::Ok(())
-            },
-            async {
-                a.send_topic(TopicSend {
-                    publisher: publisher(),
-                    payload: during_a.to_vec(),
-                })
-                .await?;
-                received(&events_b, &sender_a, during_a).await?;
-                tracing::info!(?protocol, "EXERCISED IPv4-to-IPv6 delivery during handoff");
-                anyhow::Ok(())
-            },
-            async {
-                b.send_topic(TopicSend {
-                    publisher: publisher(),
-                    payload: during_b.to_vec(),
-                })
-                .await?;
-                received(&events_a, &sender_b, during_b).await?;
-                tracing::info!(?protocol, "EXERCISED IPv6-to-IPv4 delivery during handoff");
-                anyhow::Ok(())
-            },
-        )?;
-        let after_a = b"IPv4 application delivery after completed shard move";
-        let after_b = b"IPv6 application delivery after completed shard move";
-        pulsebeam_runtime::try_join!(
-            a.send_topic(TopicSend {
-                publisher: publisher(),
-                payload: after_a.to_vec()
-            }),
-            b.send_topic(TopicSend {
-                publisher: publisher(),
-                payload: after_b.to_vec()
-            }),
+            data_a.sender.send(after_a.to_vec()),
+            data_b.sender.send(after_b.to_vec()),
         )?;
         pulsebeam_runtime::try_join!(
-            received(&events_b, &sender_a, after_a),
-            received(&events_a, &sender_b, after_b)
+            received(&data_b.receiver, &sender_a, after_a),
+            received(&data_a.receiver, &sender_b, after_b)
         )?;
-        tracing::info!(
-            "EXERCISED two completed same-future adaptive moves and fresh delivery on both families"
-        );
+        if let Some((leg_a, leg_b)) = &lossy {
+            pulsebeam_runtime::try_join!(
+                leg_a.sender.send(max_a.to_vec()),
+                leg_b.sender.send(max_b.to_vec()),
+            )
+            .context("send maximum-fragment Lossy DATA")?;
+            pulsebeam_runtime::try_join!(
+                received(&leg_b.receiver, &sender_a, &max_a),
+                received(&leg_a.receiver, &sender_b, &max_b),
+            )
+            .context("receive maximum-fragment Lossy DATA")?;
+            tracing::info!("EXERCISED capped maximum-fragment Lossy DATA on both families");
+        }
+        if migration.is_some() {
+            tracing::info!(
+                "EXERCISED two completed same-future adaptive moves and fresh delivery on both families"
+            );
+        } else {
+            tracing::info!(
+                cross_shard = candidate.crosses_shards(),
+                ?mode,
+                "EXERCISED capped maximum-fragment DATA on the selected pair"
+            );
+        }
         pulsebeam_runtime::try_join!(
             ready(a, pair_a.remote, Some(&pair_a), protocol),
             ready(b, pair_b.remote, Some(&pair_b), protocol)
@@ -565,37 +687,52 @@ async fn witness(
     Ok(())
 }
 
-async fn run(protocol: Protocol) -> Result<()> {
+async fn run(candidate: DataWitness) -> Result<()> {
     use pulsebeam_core::auth::{
         DEVELOPMENT_API_KEY_ID, DEVELOPMENT_API_PUBLIC_KEY, DEVELOPMENT_PROJECT_ID,
         KeyRegistryEntry,
     };
-    let mut sockets = bind_udp_sockets("[::]:0".parse()?, None, 1, UdpMode::Batch)
+    let protocol = candidate.protocol();
+    let bind = |addr| {
+        let mut options = pulsebeam_udp::BindOptions::new(addr);
+        options.reuse_port = true;
+        options.max_datagram_bytes = pulsebeam_udp::MAX_DATAGRAM_BYTES;
+        if protocol == Protocol::Udp {
+            options.nonfragmenting_max_datagram_bytes =
+                std::num::NonZeroU16::new(PROTECTED_UDP_CEILING);
+        }
+        pulsebeam_udp::bind(options)
+    };
+    let first = bind(SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0))
         .await
-        .context(
-            "UNSUPPORTED: dual-stack IPv6 listener; enable IPv6 loopback on this Linux test host",
-        )?;
-    let port = sockets
-        .first()
-        .context("no owned UDP listener")?
-        .local_addr()
-        .port();
-    sockets.extend(
-        bind_udp_sockets(
-            SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), port),
-            None,
-            1,
-            UdpMode::Batch,
-        )
-        .await?,
-    );
+        .context("bind dual-stack UDP conformance listener with the required socket policy")?;
+    let port = first.local_addr().port();
+    let mut sockets = vec![first];
+    if candidate.needs_migration() || candidate.crosses_shards() {
+        sockets.push(
+            bind(SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), port))
+                .await
+                .context("bind second conformance listener with the same socket policy")?,
+        );
+    }
     let http = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = format!("http://{}", http.local_addr()?);
     let (control, runtime_control) = pulsebeam_runtime::sync::oneshot::channel();
-    let builder = NodeBuilder::new()
-        .data_threads(2)
-        .adaptive(1)
-        .with_runtime_control(control)
+    let mut builder = NodeBuilder::new()
+        .data_threads(if candidate.crosses_shards() {
+            1
+        } else {
+            sockets.len()
+        })
+        .adaptive(if candidate.crosses_shards() { 2 } else { 1 })
+        .room_partition_size(
+            if candidate.needs_migration() || candidate.crosses_shards() {
+                1
+            } else {
+                2
+            },
+        )
+        .round_robin_rooms()
         .local_addr(SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), port))
         .external_addrs(vec![Family::V4.address(port), Family::V6.address(port)])
         .rng(pulsebeam_runtime::rand::os_rng())
@@ -607,6 +744,13 @@ async fn run(protocol: Protocol) -> Result<()> {
                 public_key: *DEVELOPMENT_API_PUBLIC_KEY,
             }],
         )?);
+    builder.data_profile = candidate.profile();
+    let runtime_control = if candidate.needs_migration() {
+        builder = builder.with_runtime_control(control);
+        Some(runtime_control)
+    } else {
+        None
+    };
     let builder = match protocol {
         Protocol::Udp => builder.udp_only(),
         Protocol::Tcp => builder.tcp_only(),
@@ -633,7 +777,7 @@ async fn run(protocol: Protocol) -> Result<()> {
                         client: reqwest::Client::new(),
                         family,
                         port,
-                        protocol,
+                        witness: candidate,
                         answer,
                     })),
                 )
@@ -641,16 +785,18 @@ async fn run(protocol: Protocol) -> Result<()> {
                 agents.push(agent);
                 answers.push(evidence);
             }
-            runtime_control
-                .await
-                .context("adaptive runtime control missing")
+            let migration = match runtime_control {
+                Some(control) => Some(control.await.context("adaptive runtime control missing")?),
+                None => None,
+            };
+            anyhow::Ok(migration)
         })
         .await
         .context("FAILED: 30s owned SDK/node startup deadline")??;
         let a = agents.first().context("IPv4 agent missing")?;
         let b = agents.get(1).context("IPv6 agent missing")?;
         pulsebeam_runtime::select! {
-            result = witness(a, b, port, protocol, &migration) => result?,
+            result = witness(a, b, port, candidate, migration.as_ref()) => result?,
             result = &mut node => {
                 node_observed = true;
                 bail!("production node exited before qualification: {result:?}");
@@ -665,6 +811,20 @@ async fn run(protocol: Protocol) -> Result<()> {
                 evidence.candidates.contains(&Family::V4.address(port))
                     && evidence.candidates.contains(&Family::V6.address(port)),
                 "both actual answers must advertise both IP families"
+            );
+        }
+        if !candidate.needs_migration() {
+            let [a, b] = answers.as_slice() else {
+                bail!("expected both actual Native HTTP answers");
+            };
+            let shard = |answer: &watch::Receiver<Option<AnswerEvidence>>| {
+                answer.borrow().as_ref().and_then(|evidence| evidence.shard)
+            };
+            let a = shard(a).context("IPv4 answer missing the allocated transport shard")?;
+            let b = shard(b).context("IPv6 answer missing the allocated transport shard")?;
+            ensure!(
+                (a != b) == candidate.crosses_shards(),
+                "unexpected DATA placement: {a:?}, {b:?}"
             );
         }
         anyhow::Ok(())
@@ -721,14 +881,35 @@ async fn run(protocol: Protocol) -> Result<()> {
 #[pulsebeam_runtime::test(crate = "pulsebeam_runtime::__harness")]
 async fn concurrent_dual_stack_sdk_payloads() -> Result<()> {
     pulsebeam_runtime::task::LocalSet::new()
-        .run_until(run(Protocol::Udp))
+        .run_until(run(DataWitness::LiveUdp { cross_shard: false }))
+        .await
+}
+
+#[pulsebeam_runtime::test(crate = "pulsebeam_runtime::__harness")]
+async fn cross_shard_dual_stack_latest_and_lossy_sdk_payloads() -> Result<()> {
+    pulsebeam_runtime::task::LocalSet::new()
+        .run_until(run(DataWitness::LiveUdp { cross_shard: true }))
+        .await
+}
+
+#[pulsebeam_runtime::test(crate = "pulsebeam_runtime::__harness")]
+async fn same_shard_dual_stack_ordered_sdk_payloads() -> Result<()> {
+    pulsebeam_runtime::task::LocalSet::new()
+        .run_until(run(DataWitness::ReliableUdp { cross_shard: false }))
+        .await
+}
+
+#[pulsebeam_runtime::test(crate = "pulsebeam_runtime::__harness")]
+async fn cross_shard_dual_stack_ordered_sdk_payloads() -> Result<()> {
+    pulsebeam_runtime::task::LocalSet::new()
+        .run_until(run(DataWitness::ReliableUdp { cross_shard: true }))
         .await
 }
 
 #[pulsebeam_runtime::test(crate = "pulsebeam_runtime::__harness")]
 async fn concurrent_dual_stack_tcp_sdk_payloads() -> Result<()> {
     pulsebeam_runtime::task::LocalSet::new()
-        .run_until(run(Protocol::Tcp))
+        .run_until(run(DataWitness::LiveTcp))
         .await
 }
 
@@ -756,30 +937,30 @@ fn answer_evidence_rejects_missing_family_and_preserves_non_candidates() -> Resu
 
 #[test]
 fn qualification_rejects_missing_payload_sequential_peers_and_unretired_graphs() -> Result<()> {
+    let gap = DataEvent::Gap {
+        participant_id: "v4".into(),
+        publication_id: "publication".into(),
+        from: 0,
+        to: 1,
+    };
     ensure!(
-        recipient_payload(None, "v4", A_TO_B).is_err(),
-        "connection without payload qualified"
+        recipient_payload(&gap, "v4", A_TO_B).is_err(),
+        "gap without a complete DATA unit qualified"
     );
-    let mut message = TopicMessage {
-        captured_at: None,
-        room: ROOM.into(),
-        topic: TOPIC.into(),
-        mode: TopicMode::Latest,
+    let message = DataEvent::Message {
         publication_id: "publication".into(),
         sequence: 0,
         participant_id: "v4".into(),
-        payload: A_TO_B.to_vec(),
+        data: A_TO_B.to_vec(),
+        captured_at: None,
     };
-    recipient_payload(Some(&message), "v4", A_TO_B)?;
-    message.participant_id = "wrong-sender".into();
+    recipient_payload(&message, "v4", A_TO_B)?;
     ensure!(
-        recipient_payload(Some(&message), "v4", A_TO_B).is_err(),
+        recipient_payload(&message, "v6", A_TO_B).is_err(),
         "wrong sender qualified"
     );
-    message.participant_id = "v4".into();
-    message.payload = B_TO_A.to_vec();
     ensure!(
-        recipient_payload(Some(&message), "v4", A_TO_B).is_err(),
+        recipient_payload(&message, "v4", B_TO_A).is_err(),
         "wrong payload qualified"
     );
     live_generation(&ConnectionState::Connected, Some(1), 1)?;

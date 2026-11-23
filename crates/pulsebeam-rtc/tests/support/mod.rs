@@ -11,7 +11,7 @@
 )]
 
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     net::SocketAddr,
     sync::{Arc, OnceLock},
     time::{Duration, Instant},
@@ -30,7 +30,46 @@ pub struct MediaFixture {
     pub sender_mid: String,
 }
 
+#[derive(Clone, Copy)]
+pub enum LoopbackMedia {
+    Opus,
+    OpusPublisher,
+    H264,
+    FilteredH264,
+    H264Publisher,
+    Av1,
+    Av1Publisher,
+}
+
+#[derive(Clone, Copy)]
+struct LoopbackEndpoint {
+    server: SocketAddr,
+    publish: bool,
+}
+
 type PacingProfileReader = fn(&RtcConnection) -> (u64, u64);
+
+pub struct AuthenticatedVideoSample {
+    pub sequence: u16,
+    pub timestamp: u32,
+    pub is_repair: bool,
+    pub marker: bool,
+    pub codec_bytes: usize,
+    pub protected_udp_bytes: usize,
+    pub descriptor: Option<Vec<u8>>,
+    pub payload_type: u8,
+    pub primary_payload_type: u8,
+    pub repair_payload_type: Option<u8>,
+    pub extension_profile: Option<u16>,
+    pub allow_mixed_extensions: bool,
+    pub extension_lengths: Vec<(u8, usize)>,
+}
+
+#[derive(Default)]
+struct AuthenticatedVideoCapture {
+    pending_wire_sizes: BTreeMap<(u32, u16), usize>,
+    samples: Vec<AuthenticatedVideoSample>,
+}
 
 pub struct PeerFixture<M = MediaFixture> {
     media: M,
@@ -53,7 +92,12 @@ pub struct PeerFixture<M = MediaFixture> {
     start: Instant,
     source_timestamp: u32,
     headers: VecDeque<FixtureRtpHeader>,
+    udp_payload_peaks: [usize; 2],
+    udp_srtcp_peaks: [usize; 2],
+    bounded_udp: Option<BoundedUdpPath>,
     transmit_observations: Option<VecDeque<(Instant, pulsebeam_rtc::TransmitKind)>>,
+    refuse_handoff: Option<u16>,
+    lose_after_handoff: Option<u16>,
     idle_observations: Option<VecDeque<(Instant, Option<Instant>)>>,
     extension_ids: FixtureExtensionIds,
     last_video_wire_header: Option<(u32, u16)>,
@@ -66,6 +110,7 @@ pub struct PeerFixture<M = MediaFixture> {
     drop_source_after: Option<usize>,
     lost_source: Option<(u32, u16, u8)>,
     pub source_repair_packets: usize,
+    authenticated_video: Option<AuthenticatedVideoCapture>,
     pub receiver_report: Option<pulsebeam_rtc::ReceiverReport>,
     network: DeterministicNetwork,
     native_target: Option<fn(&RtcConnection) -> Duration>,
@@ -370,6 +415,20 @@ impl PeerFixture {
     }
 
     pub fn connected_with_feedback(feedback: pulsebeam_rtc::PacketFeedbackKind) -> Self {
+        Self::connect_media_with_feedback(feedback, MediaKind::Audio)
+    }
+
+    pub fn connected_video_with_rfc8888() -> Self {
+        Self::connect_media_with_feedback(
+            pulsebeam_rtc::PacketFeedbackKind::Rfc8888,
+            MediaKind::Video,
+        )
+    }
+
+    fn connect_media_with_feedback(
+        feedback: pulsebeam_rtc::PacketFeedbackKind,
+        media: MediaKind,
+    ) -> Self {
         let trial = match feedback {
             pulsebeam_rtc::PacketFeedbackKind::TransportWide => "Disabled",
             pulsebeam_rtc::PacketFeedbackKind::Rfc8888 => "Enabled,offer:true",
@@ -382,9 +441,12 @@ impl PeerFixture {
             None,
             None,
             1,
-            MediaKind::Audio,
+            media,
             Self::default_start(),
             Some(trials),
+            None,
+            None,
+            default_accept,
             |senders| MediaFixture {
                 sender_mid: senders[0].mid.to_string(),
             },
@@ -456,6 +518,65 @@ impl PeerFixture {
         Self::connected_with(FixtureTransport::Udp, None, true)
     }
 
+    pub fn connected_bounded_udp_datachannels(max_payload: usize) -> Self {
+        Self::new_with(FixtureTransport::Udp, None, true, 1, MediaKind::Audio)
+            .with_bounded_udp(max_payload)
+            .await_connected()
+    }
+
+    pub fn connected_with_media_crypto(crypto: CryptoOptions) -> Self {
+        Self::build_with_trials(
+            FixtureTransport::Udp,
+            None,
+            None,
+            1,
+            MediaKind::Audio,
+            Self::default_start(),
+            None,
+            Some(crypto),
+            None,
+            default_accept,
+            |senders| MediaFixture {
+                sender_mid: senders[0].mid.to_string(),
+            },
+        )
+        .await_connected()
+    }
+
+    pub fn bounded_data_with_loopback(local: SocketAddr) -> Self {
+        Self::build_with_trials(
+            FixtureTransport::Udp,
+            None,
+            Some(DataChannelConfiguration::default()),
+            0,
+            MediaKind::Audio,
+            Self::default_start(),
+            None,
+            None,
+            Some(LoopbackEndpoint {
+                server: local,
+                publish: false,
+            }),
+            default_accept,
+            |_| MediaFixture {
+                sender_mid: String::new(),
+            },
+        )
+        .with_bounded_udp(1_216)
+        .await_connected()
+    }
+
+    pub fn into_native_data_endpoint(
+        mut self,
+    ) -> (RtcConnection, NativeMediaEndpoint, DataChannel) {
+        let channel = self
+            .peer_channel
+            .take()
+            .expect("opened Native data channel");
+        let (connection, endpoint) = self.into_native_media_endpoint();
+        (connection, endpoint, channel)
+    }
+
     pub fn connected_tcp_datachannels() -> Self {
         Self::connected_with(FixtureTransport::Tcp, None, true)
     }
@@ -487,25 +608,97 @@ impl PeerFixture {
         )
     }
 
-    pub fn connected_video_dd() -> Self {
-        let mut fixture = Self::build(
+    pub fn connected_bounded_video_dd(max_payload: usize) -> Self {
+        Self::new_with(FixtureTransport::Udp, None, false, 1, MediaKind::VideoDd)
+            .with_bounded_udp(max_payload)
+            .await_connected()
+    }
+
+    pub fn bounded_media_with_loopback(
+        local: SocketAddr,
+        media: LoopbackMedia,
+        accept: impl FnOnce(ConnectionConfig, SdpOffer, Instant) -> pulsebeam_rtc::AcceptedConnection,
+    ) -> Self {
+        let publish = matches!(
+            media,
+            LoopbackMedia::OpusPublisher
+                | LoopbackMedia::H264Publisher
+                | LoopbackMedia::Av1Publisher
+        );
+        let media = match media {
+            LoopbackMedia::Opus | LoopbackMedia::OpusPublisher => MediaKind::Audio,
+            LoopbackMedia::H264 | LoopbackMedia::H264Publisher => MediaKind::Video,
+            LoopbackMedia::FilteredH264 => MediaKind::VideoDd,
+            LoopbackMedia::Av1 | LoopbackMedia::Av1Publisher => MediaKind::Av1,
+        };
+        let trials = (!matches!(media, MediaKind::VideoDd)).then(|| {
+            FieldTrials::parse("WebRTC-RFC8888CongestionControlFeedback/Enabled,offer:true/")
+                .expect("pinned native feedback trial")
+        });
+        Self::build_with_trials(
             FixtureTransport::Udp,
             None,
             None,
             1,
-            MediaKind::VideoDd,
-            Self::default_start(),
+            media,
+            Instant::now(),
+            trials,
+            None,
+            Some(LoopbackEndpoint {
+                server: local,
+                publish,
+            }),
+            accept,
             |senders| MediaFixture {
-                sender_mid: senders[0].mid.to_string(),
+                sender_mid: senders
+                    .first()
+                    .map_or_else(String::new, |sender| sender.mid.to_string()),
             },
-        );
-        for _ in 0..2_000 {
-            let _ = fixture.step();
-            if fixture.peer_connected && fixture.connection_connected {
-                return fixture;
-            }
-        }
-        panic!("native DD peer did not connect");
+        )
+        .with_bounded_udp(1_216)
+        .await_connected()
+    }
+
+    pub fn into_native_media_endpoint(self) -> (RtcConnection, NativeMediaEndpoint) {
+        let local = self.socket.local_address();
+        let local = SocketAddr::new(local.ip(), local.port());
+        let [a, b] = self
+            .bounded_udp
+            .expect("bounded UDP path")
+            .pair
+            .expect("selected pair");
+        let remote = if a == local {
+            b
+        } else {
+            assert_eq!(b, local);
+            a
+        };
+        (
+            self.connection,
+            NativeMediaEndpoint {
+                peer: self.peer,
+                audio_source: self.audio_source,
+                video_source: self.video_source,
+                video_sink: self.video_sink,
+                audio_sink: self.audio_sink,
+                network: self.network_adapter,
+                socket: self.socket,
+                _factory: self._factory,
+                _client: self._client,
+                _server: self._server,
+                world: self.world,
+                remote,
+                dd_id: self.extension_ids.dependency_descriptor,
+            },
+        )
+    }
+
+    fn with_bounded_udp(mut self, max_payload: usize) -> Self {
+        self.bounded_udp = Some(BoundedUdpPath {
+            max_payload,
+            pair: None,
+        });
+        self
     }
 
     pub fn connected_video() -> Self {
@@ -547,21 +740,24 @@ impl PeerFixture {
         media: MediaKind,
         start: Instant,
     ) -> Self {
-        let mut fixture =
-            Self::new_with_start(transport, limits, datachannels, sender_count, media, start);
+        Self::new_with_start(transport, limits, datachannels, sender_count, media, start)
+            .await_connected()
+    }
+
+    fn await_connected(mut self) -> Self {
         for _ in 0..2_000 {
-            let _ = fixture.step();
-            if fixture.peer_connected && fixture.connection_connected {
-                return fixture;
+            let _ = self.step();
+            if self.peer_connected && self.connection_connected {
+                return self;
             }
         }
         panic!(
             "standards peer did not connect: native={}, rtc={}, streams={}, stats={:?}, descriptions={:?}",
-            fixture.peer_connected,
-            fixture.connection_connected,
-            fixture.tcp_streams.len(),
-            fixture.connection.stats(),
-            fixture.peer.descriptions(),
+            self.peer_connected,
+            self.connection_connected,
+            self.tcp_streams.len(),
+            self.connection.stats(),
+            self.peer.descriptions(),
         );
     }
 
@@ -626,13 +822,16 @@ impl<M> PeerFixture<M> {
             media,
             start,
             None,
+            None,
+            None,
+            default_accept,
             media_state,
         )
     }
 
     #[allow(
         clippy::too_many_arguments,
-        reason = "the controlled peer constructor keeps per-peer trial selection explicit alongside its existing fixture inputs"
+        reason = "the controlled peer constructor keeps per-peer trial and crypto choices explicit alongside fixture inputs"
     )]
     fn build_with_trials(
         transport: FixtureTransport,
@@ -642,6 +841,9 @@ impl<M> PeerFixture<M> {
         media: MediaKind,
         start: Instant,
         trials: Option<FieldTrials>,
+        crypto: Option<CryptoOptions>,
+        loopback: Option<LoopbackEndpoint>,
+        accept: impl FnOnce(ConnectionConfig, SdpOffer, Instant) -> pulsebeam_rtc::AcceptedConnection,
         media_state: impl FnOnce(&[pulsebeam_rtc::SenderInfo]) -> M,
     ) -> Self {
         assert!(sender_count <= 128);
@@ -652,17 +854,28 @@ impl<M> PeerFixture<M> {
             .controlled
             .create_network()
             .expect("controlled network");
+        let (client_ip, server_addr) = if let Some(endpoint) = loopback {
+            let host = if endpoint.publish { 3 } else { 2 };
+            ([127, 0, 0, host].into(), endpoint.server)
+        } else {
+            (
+                "192.0.2.1".parse().expect("fixture endpoint IP"),
+                "192.0.2.2:41000".parse().expect("fixture server address"),
+            )
+        };
         let client = network
-            .register_endpoint("192.0.2.1".parse().expect("fixture endpoint IP"))
+            .register_endpoint(client_ip)
             .expect("fixture endpoint IP");
         let server = network
-            .register_endpoint("192.0.2.2".parse().expect("fixture endpoint IP"))
+            .register_endpoint(server_addr.ip())
             .expect("fixture endpoint IP");
         let socket = server
-            .bind_udp(41000)
+            .bind_udp(server_addr.port())
             .expect("controlled server UDP socket");
         let video_dd = matches!(media, MediaKind::VideoDd);
-        let video_input = if video_dd {
+        let video_input = if matches!(media, MediaKind::Av1) {
+            EncodedVideoInput::new_for_format(VideoCodecFormat::new("AV1"))
+        } else if video_dd {
             EncodedVideoInput::new_l1t3([64, 128, 255])
         } else {
             EncodedVideoInput::new()
@@ -703,15 +916,19 @@ impl<M> PeerFixture<M> {
         if let Some(trials) = trials {
             dependencies = dependencies.field_trials(trials);
         }
+        let mut config: RtcConfiguration = PeerConfiguration {
+            always_negotiate_data_channels: datachannels.is_some(),
+            ..PeerConfiguration::default()
+        }
+        .into();
+        if let Some(crypto) = crypto {
+            config.options.crypto_options = crypto;
+        } else if video_dd || (rfc8888 && (loopback.is_some() || matches!(media, MediaKind::Video)))
+        {
+            config.options.crypto_options = CryptoOptions::prefer_gcm();
+        }
         let peer = factory
-            .create_peer_connection_with_dependencies(
-                PeerConfiguration {
-                    always_negotiate_data_channels: datachannels.is_some(),
-                    ..PeerConfiguration::default()
-                }
-                .into(),
-                dependencies,
-            )
+            .create_peer_connection_with_dependencies(config, dependencies)
             .expect("controlled native peer");
         if !matches!(media, MediaKind::Audio) {
             // Sustain VBR source bursts before PulseBeam admission and pacing.
@@ -734,10 +951,13 @@ impl<M> PeerFixture<M> {
                     let transceiver = peer
                         .add_audio_transceiver(
                             &track,
-                            if mixed {
-                                RtpTransceiverDirection::ReceiveOnly
-                            } else {
-                                RtpTransceiverDirection::SendReceive
+                            match loopback {
+                                Some(endpoint) if endpoint.publish => {
+                                    RtpTransceiverDirection::SendOnly
+                                }
+                                Some(_) => RtpTransceiverDirection::ReceiveOnly,
+                                None if mixed => RtpTransceiverDirection::ReceiveOnly,
+                                None => RtpTransceiverDirection::SendReceive,
                             },
                         )
                         .expect("native audio transceiver");
@@ -761,7 +981,7 @@ impl<M> PeerFixture<M> {
                     }
                     transceiver
                 }
-                (MediaKind::Video | MediaKind::VideoDd, _)
+                (MediaKind::Video | MediaKind::VideoDd | MediaKind::Av1, _)
                 | (MediaKind::VideoPublisherAudioSubscriber, 0) => {
                     let source = video_input
                         .create_source(&factory)
@@ -772,10 +992,13 @@ impl<M> PeerFixture<M> {
                     let transceiver = peer
                         .add_video_transceiver(
                             &track,
-                            if mixed {
-                                RtpTransceiverDirection::SendOnly
-                            } else {
-                                RtpTransceiverDirection::SendReceive
+                            match loopback {
+                                Some(endpoint) if endpoint.publish => {
+                                    RtpTransceiverDirection::SendOnly
+                                }
+                                Some(_) => RtpTransceiverDirection::ReceiveOnly,
+                                None if mixed => RtpTransceiverDirection::SendOnly,
+                                None => RtpTransceiverDirection::SendReceive,
                             },
                         )
                         .expect("native video transceiver");
@@ -869,14 +1092,7 @@ impl<M> PeerFixture<M> {
             config.limits = limits;
         }
         let now = world.monotonic_now();
-        let mut accepted = RtcConnection::accept(
-            config,
-            SdpOffer::new(offer.sdp),
-            now,
-            std::time::UNIX_EPOCH + Duration::from_secs(1),
-            ConnectionEntropy::new([11; 32]),
-        )
-        .expect("RTC accepts actual native offer");
+        let mut accepted = accept(config, SdpOffer::new(offer.sdp), now);
         if let Some(config) = datachannels.filter(|config| config.negotiated) {
             assert_eq!(config.id, Some(0));
             assert!(config.ordered);
@@ -919,7 +1135,7 @@ impl<M> PeerFixture<M> {
             })
             .expect("native remote description"),
         );
-        if video_dd {
+        if video_dd && loopback.is_none() {
             let sender = transceivers[0].sender();
             let mut parameters = sender.parameters().expect("native sender parameters");
             parameters.encodings[0].scalability_mode = Some("L1T3".into());
@@ -927,7 +1143,9 @@ impl<M> PeerFixture<M> {
                 .set_parameters(parameters)
                 .expect("native L1T3 configuration");
         }
-        let audio_sink = audio_source.as_ref().map(|_| {
+        let audio_sink = (audio_source.is_some()
+            && loopback.is_none_or(|endpoint| !endpoint.publish))
+        .then(|| {
             transceivers[0]
                 .receiver()
                 .attach_encoded_audio_sink()
@@ -990,7 +1208,12 @@ impl<M> PeerFixture<M> {
             world,
             source_timestamp: 0,
             headers: VecDeque::new(),
+            udp_payload_peaks: [0; 2],
+            udp_srtcp_peaks: [0; 2],
+            bounded_udp: None,
             transmit_observations: None,
+            refuse_handoff: None,
+            lose_after_handoff: None,
             idle_observations: None,
             extension_ids,
             last_video_wire_header: None,
@@ -1005,6 +1228,7 @@ impl<M> PeerFixture<M> {
             drop_source_after: None,
             lost_source: None,
             source_repair_packets: 0,
+            authenticated_video: None,
             receiver_report: None,
             network: DeterministicNetwork::default(),
             native_target: None,
@@ -1154,27 +1378,7 @@ impl<M> PeerFixture<M> {
     }
 
     pub fn publisher_stats(&self) -> RtcStatsReport {
-        let sender = self
-            .peer
-            .video_senders()
-            .expect("native publisher senders")
-            .into_iter()
-            .next()
-            .expect("native video publisher");
-        let request = self
-            .peer
-            .request_sender_stats(&sender)
-            .expect("native publisher stats request");
-        for _ in 0..2_000 {
-            self.world.pump();
-            while let Some(event) = self.peer.try_next_event() {
-                if let PeerConnectionEvent::Stats(snapshot) = event {
-                    assert_eq!(snapshot.operation_id, request);
-                    return snapshot.report;
-                }
-            }
-        }
-        panic!("native publisher stats stalled");
+        publisher_stats(&self.peer, &self.world)
     }
 
     pub fn receive_source_sequence(&mut self, sequence: u16) -> RtpPacket {
@@ -1305,6 +1509,73 @@ impl<M> PeerFixture<M> {
         panic!("native publisher did not emit RTP");
     }
 
+    pub fn configure_handoff_losses(&mut self, refused: u16, lost: u16) {
+        self.refuse_handoff = Some(refused);
+        self.lose_next_handoff(lost);
+    }
+
+    pub fn lose_next_handoff(&mut self, sequence: u16) {
+        self.lose_after_handoff = Some(sequence);
+    }
+
+    pub fn handoff_losses_consumed(&self) -> bool {
+        self.refuse_handoff.is_none() && self.lose_after_handoff.is_none()
+    }
+
+    /// Returns and clears the native-to-edge and edge-to-native UDP payload peaks.
+    pub fn take_udp_payload_peaks(&mut self) -> [usize; 2] {
+        std::mem::take(&mut self.udp_payload_peaks)
+    }
+
+    /// Returns and clears the native-to-edge and edge-to-native SRTCP UDP peaks.
+    pub fn take_udp_srtcp_peaks(&mut self) -> [usize; 2] {
+        std::mem::take(&mut self.udp_srtcp_peaks)
+    }
+
+    pub fn native_sctp_dtls_parameters(&self) -> (Option<i32>, Option<i32>) {
+        let info = self
+            .peer
+            .sctp_transport()
+            .expect("native SCTP transport")
+            .dtls_transport()
+            .expect("native SCTP is bound to DTLS")
+            .information();
+        assert_eq!(info.state(), DtlsTransportState::Connected);
+        assert!(
+            info.remote_certificate_data()
+                .is_some_and(|chain| !chain.is_empty())
+        );
+        (info.tls_version(), info.ssl_cipher_suite())
+    }
+
+    pub fn installed_answer_fid(&self, mid: &str) -> [u32; 2] {
+        let answer = self
+            .peer
+            .descriptions()
+            .expect("native descriptions")
+            .current_remote
+            .expect("native installed the RTC answer");
+        answer_fid(&answer.sdp, mid)
+    }
+
+    pub fn native_media_srtp_profile(&self, mid: &str) -> Option<i32> {
+        self.native_media_dtls_parameters(mid).1
+    }
+
+    pub fn native_media_dtls_parameters(&self, mid: &str) -> (Option<i32>, Option<i32>) {
+        let info = self
+            .peer
+            .dtls_transport_by_mid(mid.as_bytes())
+            .expect("native media transport bound to the negotiated MID")
+            .information();
+        assert_eq!(info.state(), DtlsTransportState::Connected);
+        assert!(
+            info.remote_certificate_data()
+                .is_some_and(|chain| !chain.is_empty())
+        );
+        (info.tls_version(), info.srtp_cipher_suite())
+    }
+
     pub fn record_transmits(&mut self) {
         self.transmit_observations = Some(VecDeque::new());
     }
@@ -1327,6 +1598,90 @@ impl<M> PeerFixture<M> {
             .expect("recording")
             .drain(..)
             .collect()
+    }
+
+    fn push_stock_h264_keyframe(&mut self, layered: bool) {
+        push_stock_h264_keyframe(
+            &self.world,
+            self.video_source
+                .as_ref()
+                .expect("configured native video source"),
+            layered,
+        );
+    }
+
+    pub fn send_stock_h264_keyframe_source(&mut self) -> Vec<RtpPacket> {
+        self.collect_stock_h264_keyframe(true)
+    }
+
+    pub fn send_stock_h264_keyframe_with_sizes(&mut self) -> Vec<(RtpPacket, usize)> {
+        self.authenticated_video = Some(AuthenticatedVideoCapture::default());
+        let packets = self.collect_stock_h264_keyframe(false);
+        let samples = self
+            .authenticated_video
+            .take()
+            .expect("wire capture")
+            .samples;
+        packets
+            .into_iter()
+            .map(|packet| {
+                let sample = samples
+                    .iter()
+                    .find(|sample| {
+                        !sample.is_repair
+                            && sample.sequence == packet.header.sequence
+                            && sample.timestamp == packet.header.timestamp
+                    })
+                    .expect("authenticated source datagram");
+                assert!(sample.descriptor.is_none());
+                (packet, sample.protected_udp_bytes)
+            })
+            .collect()
+    }
+
+    fn collect_stock_h264_keyframe(&mut self, layered: bool) -> Vec<RtpPacket> {
+        self.push_stock_h264_keyframe(layered);
+        let mut packets = Vec::<RtpPacket>::new();
+        for _ in 0..2_000 {
+            let Some(PeerEvent::Inbound(packet)) = self.step() else {
+                continue;
+            };
+            if let Some(first) = packets.first() {
+                assert_eq!(packet.header.timestamp, first.header.timestamp);
+            }
+            let last = packet.header.marker;
+            packets.push(packet);
+            if last {
+                assert!(
+                    packets.len() >= 3,
+                    "stock keyframe includes a middle fragment"
+                );
+                return packets;
+            }
+        }
+        panic!("stock keyframe did not complete");
+    }
+
+    pub fn send_stock_h264_keyframe_with_repair(
+        &mut self,
+        layered: bool,
+    ) -> Vec<AuthenticatedVideoSample> {
+        self.authenticated_video = Some(AuthenticatedVideoCapture::default());
+        self.drop_source_packet_after(1);
+        self.push_stock_h264_keyframe(layered);
+        for _ in 0..2_000 {
+            let _ = self.step();
+            let samples = self
+                .authenticated_video
+                .as_ref()
+                .expect("capturing authenticated RTP");
+            if samples.samples.iter().any(|sample| sample.is_repair)
+                && samples.samples.iter().any(|sample| sample.marker)
+            {
+                return self.authenticated_video.take().expect("capture").samples;
+            }
+        }
+        panic!("stock native keyframe did not finish with its repair");
     }
 
     pub fn send_fragmented_video_source(&mut self, temporal_index: Option<u8>) -> Vec<RtpPacket> {
@@ -1572,6 +1927,19 @@ impl<M> PeerFixture<M> {
             return None;
         }
         if let Some(packet) = self.network_adapter.next_packet() {
+            if let Some(guard) = self.bounded_udp.as_mut() {
+                assert!(
+                    matches!(packet.kind, OutboundKind::Udp),
+                    "native TCP fallback"
+                );
+                guard.check(
+                    [
+                        SocketAddr::new(packet.source.ip(), packet.source.port()),
+                        SocketAddr::new(packet.destination.ip(), packet.destination.port()),
+                    ],
+                    &packet.payload,
+                );
+            }
             match packet.kind {
                 OutboundKind::TcpConnect => {
                     self.tcp_streams.push(FixtureTcpStream {
@@ -1627,8 +1995,11 @@ impl<M> PeerFixture<M> {
         }
         if let Some(packet) = self.socket.try_receive() {
             let bytes = &packet.payload;
-            let rtcp = bytes.first().is_some_and(|byte| byte >> 6 == 2)
-                && bytes.get(1).is_some_and(|byte| (192..=223).contains(byte));
+            self.udp_payload_peaks[0] = self.udp_payload_peaks[0].max(bytes.len());
+            let rtcp = is_srtcp(bytes);
+            if rtcp {
+                self.udp_srtcp_peaks[0] = self.udp_srtcp_peaks[0].max(bytes.len());
+            }
             if bytes.len() >= 12 && !rtcp && bytes[0] >> 6 == 2 && bytes[0] & 0x20 == 0 {
                 let payload_type = bytes[1] & 127;
                 let ssrc =
@@ -1642,6 +2013,11 @@ impl<M> PeerFixture<M> {
                     return None;
                 }
                 self.drop_source_after = self.drop_source_after.map(|remaining| remaining - 1);
+                if let Some(capture) = self.authenticated_video.as_mut() {
+                    capture
+                        .pending_wire_sizes
+                        .insert((ssrc, sequence), bytes.len());
+                }
                 if self
                     .lost_source
                     .is_some_and(|(primary, _, pt)| ssrc != primary && payload_type != pt)
@@ -1726,7 +2102,65 @@ impl<M> PeerFixture<M> {
         }
         let mut connection_wakeup = None;
         if !self.connection_idle {
-            let output = self.connection.poll(self.at());
+            let now = self.at();
+            let output = if let Some(capture) = &mut self.authenticated_video {
+                self.connection.poll_with_rtp_observer(
+                    now,
+                    &mut |packet: pulsebeam_rtc::AuthenticatedRtp<'_>| {
+                        let header = packet.wire_header();
+                        if packet.primary_codec.name.as_ref() != "h264"
+                            || packet.wire_payload().is_empty()
+                        {
+                            return;
+                        }
+                        let (sequence, payload) = if packet.is_repair {
+                            let [high, low, payload @ ..] = packet.wire_payload() else {
+                                return;
+                            };
+                            if payload.is_empty() {
+                                return;
+                            }
+                            (u16::from_be_bytes([*high, *low]), payload)
+                        } else {
+                            (header.sequence, packet.wire_payload())
+                        };
+                        let descriptor = packet.wire_extensions().find_map(|(id, value)| {
+                            packet
+                                .receive_extensions
+                                .iter()
+                                .any(|extension| {
+                                    extension.id == id
+                                        && extension.uri.as_ref() == pulsebeam_core::dd::URI
+                                })
+                                .then(|| value.to_vec())
+                        });
+                        let protected_udp_bytes = capture
+                            .pending_wire_sizes
+                            .remove(&(header.ssrc, header.sequence))
+                            .expect("authenticated RTP matches a protected UDP datagram");
+                        capture.samples.push(AuthenticatedVideoSample {
+                            sequence,
+                            timestamp: header.timestamp,
+                            is_repair: packet.is_repair,
+                            marker: header.marker,
+                            codec_bytes: payload.len(),
+                            protected_udp_bytes,
+                            descriptor,
+                            payload_type: header.payload_type,
+                            primary_payload_type: packet.primary_payload_type(),
+                            repair_payload_type: packet.repair_payload_type,
+                            extension_profile: packet.extension_profile(),
+                            allow_mixed_extensions: packet.allow_mixed_extensions,
+                            extension_lengths: packet
+                                .wire_extensions()
+                                .map(|(id, value)| (id, value.len()))
+                                .collect(),
+                        });
+                    },
+                )
+            } else {
+                self.connection.poll(now)
+            };
             if let Some(read) = self.pacing_profile {
                 let (rate, epoch) = read(&self.connection);
                 if self.network.pacing_trace.last().is_none_or(
@@ -1742,6 +2176,29 @@ impl<M> PeerFixture<M> {
                     ));
                 }
             }
+            let output = match output {
+                ConnectionOutput::Handoff { id, transmit, .. } => {
+                    let sequence = match transmit.kind {
+                        pulsebeam_rtc::TransmitKind::Original { .. } => {
+                            fixture_rtp_header(&transmit.payload, self.extension_ids)
+                                .map(|header| header.sequence_number)
+                        }
+                        _ => None,
+                    };
+                    let refused = sequence.is_some() && sequence == self.refuse_handoff;
+                    assert!(self.connection.resolve_handoff(id, !refused));
+                    if refused {
+                        self.refuse_handoff = None;
+                        return None;
+                    }
+                    if sequence.is_some() && sequence == self.lose_after_handoff {
+                        self.lose_after_handoff = None;
+                        return None;
+                    }
+                    ConnectionOutput::Transmit(transmit)
+                }
+                other => other,
+            };
             match output {
                 ConnectionOutput::Transmit(transmit) => {
                     let at = self.at();
@@ -1752,8 +2209,19 @@ impl<M> PeerFixture<M> {
                         observations.push_back((at, transmit.kind));
                     }
                     let (destination, payload) = match transmit.target {
-                        TransmitTarget::Udp { remote, .. } => (remote, transmit.payload.as_ref()),
+                        TransmitTarget::Udp { local, remote, .. } => {
+                            if let Some(guard) = self.bounded_udp.as_mut() {
+                                guard.check([remote, local], &transmit.payload);
+                            }
+                            let bytes = transmit.payload.as_ref();
+                            self.udp_payload_peaks[1] = self.udp_payload_peaks[1].max(bytes.len());
+                            if is_srtcp(bytes) {
+                                self.udp_srtcp_peaks[1] = self.udp_srtcp_peaks[1].max(bytes.len());
+                            }
+                            (remote, bytes)
+                        }
                         TransmitTarget::IceTcp { local, remote } => {
+                            assert!(self.bounded_udp.is_none(), "edge TCP fallback");
                             let stream = self
                                 .tcp_streams
                                 .iter()
@@ -1931,11 +2399,13 @@ enum MediaKind {
     Audio,
     Video,
     VideoDd,
+    Av1,
     VideoPublisherAudioSubscriber,
 }
 
 #[derive(Clone, Debug)]
 pub struct FixtureRtpHeader {
+    pub wire_bytes: usize,
     pub ssrc: u32,
     pub sequence_number: u16,
     pub timestamp: u32,
@@ -2014,6 +2484,7 @@ fn fixture_rtp_header(bytes: &[u8], ids: FixtureExtensionIds) -> Option<FixtureR
         }
     }
     Some(FixtureRtpHeader {
+        wire_bytes: bytes.len(),
         padding: bytes[0] & 0x20 != 0,
         marker: bytes[1] & 0x80 != 0,
         ssrc: u32::from_be_bytes(bytes[8..12].try_into().ok()?),
@@ -2275,6 +2746,464 @@ pub enum FixtureDataEvent {
 pub enum FixtureCoexistenceEvent {
     Rtp(Vec<u8>),
     Data { binary: bool, payload: Vec<u8> },
+}
+
+fn default_accept(
+    config: ConnectionConfig,
+    offer: SdpOffer,
+    now: Instant,
+) -> pulsebeam_rtc::AcceptedConnection {
+    RtcConnection::accept(
+        config,
+        offer,
+        now,
+        std::time::UNIX_EPOCH + Duration::from_secs(1),
+        ConnectionEntropy::new([11; 32]),
+    )
+    .expect("RTC accepts actual native offer")
+}
+
+pub fn stock_h264_keyframe_720p(world: &SimulationWorld, layered: bool) -> NativeH264AccessUnit {
+    stock_h264_fixture_for_encoding(
+        world,
+        NativeH264FixtureEncoding {
+            width: 1280,
+            height: 720,
+            bitrate_kbps: 1000,
+        },
+        if layered { 3 } else { 1 },
+        1,
+    )
+    .expect("stock encoding")
+    .into_iter()
+    .find(|unit| unit.keyframe)
+    .expect("stock keyframe")
+}
+
+fn push_stock_h264_keyframe(world: &SimulationWorld, source: &EncodedVideoSource, layered: bool) {
+    let unit = stock_h264_keyframe_720p(world, layered);
+    world.advance_to(world.controlled.now() + Duration::from_micros(1));
+    source
+        .push_encoded(EncodedVideoAccessUnit {
+            data: unit.data,
+            width: unit.width,
+            height: unit.height,
+            timestamp_us: i64::try_from(world.controlled.now().as_micros())
+                .expect("bounded native capture clock"),
+            key_frame: true,
+            qp: None,
+            metadata: EncodedVideoMetadata {
+                codec: EncodedVideoCodec::H264 {
+                    base_layer_sync: layered && unit.base_layer_sync,
+                },
+                simulcast_index: None,
+                spatial_index: None,
+                temporal_index: if layered { unit.temporal_index } else { None },
+                end_of_picture: true,
+            },
+        })
+        .expect("native stock H264 access unit");
+}
+
+fn publisher_stats(peer: &PeerConnection, world: &SimulationWorld) -> RtcStatsReport {
+    let sender = peer
+        .video_senders()
+        .expect("native publisher senders")
+        .into_iter()
+        .next()
+        .expect("native video publisher");
+    let request = peer
+        .request_sender_stats(&sender)
+        .expect("native publisher stats request");
+    collect_stats(peer, world, request)
+}
+
+fn collect_stats(
+    peer: &PeerConnection,
+    world: &SimulationWorld,
+    request: OperationId,
+) -> RtcStatsReport {
+    for _ in 0..2_000 {
+        world.pump();
+        while let Some(event) = peer.try_next_event() {
+            if let PeerConnectionEvent::Stats(snapshot) = event {
+                assert_eq!(snapshot.operation_id, request);
+                return snapshot.report;
+            }
+        }
+    }
+    panic!("native media stats stalled");
+}
+
+pub struct NativeMediaEndpoint {
+    peer: PeerConnection,
+    audio_source: Option<EncodedAudioSource>,
+    video_source: Option<EncodedVideoSource>,
+    video_sink: Option<EncodedVideoSink>,
+    audio_sink: Option<EncodedAudioSink>,
+    network: ControlledSimulatedNetwork,
+    socket: SimulatedUdpSocket,
+    _factory: PeerConnectionFactory,
+    _client: NetworkEndpoint,
+    _server: NetworkEndpoint,
+    world: std::rc::Rc<SimulationWorld>,
+    pub remote: SocketAddr,
+    pub dd_id: Option<u8>,
+}
+
+impl NativeMediaEndpoint {
+    fn video_receiver(&self) -> RtpReceiver {
+        let transceivers = self.peer.transceivers().expect("Native transceivers");
+        let [video] = transceivers.as_slice() else {
+            panic!("one Native video transceiver");
+        };
+        video.receiver()
+    }
+
+    pub fn request_video_refresh(&self) {
+        self.video_receiver()
+            .request_keyframe()
+            .expect("request a Native receiver keyframe");
+    }
+
+    pub fn subscriber_refresh_counts(&self, ssrc: u32) -> (u32, u32) {
+        let request = self
+            .peer
+            .request_receiver_stats(&self.video_receiver())
+            .expect("Native subscriber stats request");
+        collect_stats(&self.peer, &self.world, request)
+            .of_class(RtcStatsClass::InboundRtpStreamStats)
+            .into_iter()
+            .find_map(|entry| match entry.values() {
+                RtcStatsValues::InboundRtpStreamStats(value) if value.ssrc == Some(ssrc) => {
+                    Some((value.pli_count.unwrap_or(0), value.fir_count.unwrap_or(0)))
+                }
+                _ => None,
+            })
+            .expect("refresh counters for the stock subscriber")
+    }
+
+    pub fn publisher_pli_count(&self, ssrc: u32) -> u32 {
+        publisher_stats(&self.peer, &self.world)
+            .of_class(RtcStatsClass::OutboundRtpStreamStats)
+            .into_iter()
+            .find_map(|entry| match entry.values() {
+                RtcStatsValues::OutboundRtpStreamStats(value) if value.ssrc == Some(ssrc) => {
+                    Some(value.pli_count.unwrap_or(0))
+                }
+                _ => None,
+            })
+            .expect("authenticated feedback counter for the stock publisher")
+    }
+
+    pub fn push_opus(&self, data: Vec<u8>, timestamp: u32) {
+        self.audio_source
+            .as_ref()
+            .expect("Native Opus publisher")
+            .push_opus_at(
+                &OpusInputFrame {
+                    data,
+                    rtp_timestamp: timestamp,
+                    samples_per_channel: 960,
+                },
+                self.world.controlled.now(),
+            )
+            .expect("stock Opus access unit");
+    }
+
+    pub fn push_stock_av1(&self) {
+        let data = stock_av1_keyframe(&self.world).expect("stock libaom keyframe");
+        self.world
+            .advance_to(self.world.controlled.now() + Duration::from_micros(1));
+        self.video_source
+            .as_ref()
+            .expect("configured native AV1 source")
+            .push_encoded(EncodedVideoAccessUnit {
+                data,
+                width: 1280,
+                height: 720,
+                timestamp_us: i64::try_from(self.world.controlled.now().as_micros())
+                    .expect("bounded native capture clock"),
+                key_frame: true,
+                qp: None,
+                metadata: EncodedVideoMetadata {
+                    codec: EncodedVideoCodec::Av1,
+                    simulcast_index: None,
+                    spatial_index: None,
+                    temporal_index: None,
+                    end_of_picture: true,
+                },
+            })
+            .expect("native stock AV1 access unit");
+    }
+
+    pub fn push_stock_h264(&self) {
+        push_stock_h264_keyframe(
+            &self.world,
+            self.video_source.as_ref().expect("Native H.264 publisher"),
+            false,
+        );
+    }
+
+    pub fn deliver(&self, payload: &[u8]) {
+        self.socket
+            .send_to(
+                NetworkAddress::new(self.remote.ip(), self.remote.port())
+                    .expect("selected peer UDP"),
+                payload.to_vec(),
+            )
+            .expect("deliver the original protected UDP bytes to Native");
+    }
+
+    pub fn step(&self, now: Instant, mut feedback: impl FnMut(&[u8])) {
+        self.world.advance_clock_to(now);
+        for _ in 0..64 {
+            let Some(packet) = self.network.next_packet() else {
+                break;
+            };
+            assert!(matches!(packet.kind, OutboundKind::Udp));
+            self.network
+                .deliver(packet.id)
+                .expect("controlled UDP feedback");
+        }
+        while let Some(packet) = self.socket.try_receive() {
+            assert_eq!(
+                SocketAddr::new(packet.source.ip(), packet.source.port()),
+                self.remote
+            );
+            feedback(&packet.payload);
+        }
+    }
+
+    pub fn try_next_video(&self) -> Option<EncodedReceivedVideoFrame> {
+        self.video_sink
+            .as_ref()
+            .expect("Native video receiver")
+            .try_next_frame()
+    }
+
+    pub fn try_next_audio(&self) -> Option<EncodedAudioFrame> {
+        self.audio_sink
+            .as_ref()
+            .expect("Native audio receiver")
+            .try_next_frame()
+    }
+}
+
+fn mono_opus() -> SdpAudioFormat {
+    let mut format = SdpAudioFormat::new(b"opus".to_vec(), 48_000, 2);
+    format.parameters.insert(b"stereo".to_vec(), b"0".to_vec());
+    format
+}
+
+pub fn maximum_data_record() -> [u8; 1_155] {
+    let mut record = [0; 1_155];
+    record[..22].copy_from_slice(&[
+        0x50, 0x44, 1, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 1, 4, 0, 0, 0, 4, 0,
+    ]);
+    record[22..30].copy_from_slice(&(-50_i64).to_be_bytes());
+    record[34] = 96;
+    record[35..131].fill(0xc0);
+    record[131..].fill(0xa3);
+    record
+}
+
+pub fn stock_opus_packet() -> Vec<u8> {
+    let env = Environment::builder().build().expect("encoder environment");
+    let factory = AudioEncoderFactory::builtin().expect("stock encoder factory");
+    let encoder = factory
+        .create(
+            &env,
+            &mono_opus(),
+            &AudioEncoderOptions {
+                payload_type: 111,
+                codec_pair_id: None,
+            },
+        )
+        .expect("stock Opus encoder")
+        .expect("mono Opus support");
+    let pcm: Vec<i16> = (0..480)
+        .map(|i| if i / 24 % 2 == 0 { 8192 } else { -8192 })
+        .collect();
+    let first = encoder.encode(0, &pcm).expect("first 10ms");
+    assert!(first.bytes.is_empty());
+    let second = encoder.encode(480, &pcm).expect("second 10ms");
+    assert!(!second.bytes.is_empty());
+    second.bytes
+}
+
+pub fn assert_decoded_stock_opus(payload: Vec<u8>, timestamp: u32) {
+    let env = Environment::builder().build().expect("decoder environment");
+    let factory = AudioDecoderFactory::builtin_opus().expect("stock decoder factory");
+    let decoder = factory
+        .create(&env, &mono_opus())
+        .expect("stock Opus decoder")
+        .expect("mono Opus support");
+    assert_eq!((decoder.sample_rate_hz(), decoder.channels()), (48_000, 1));
+    let packet = decoder
+        .parse_payload(payload, timestamp)
+        .expect("received Opus packet");
+    let [packet] = packet.as_slice() else {
+        panic!("one decoded frame for this Opus packet");
+    };
+    assert_eq!(packet.timestamp, timestamp);
+    let frame = packet.frame.as_ref().expect("decodable Opus frame");
+    let decoded = frame
+        .decode()
+        .expect("Opus decode")
+        .expect("decoded Opus PCM");
+    assert_eq!(decoded.samples.len(), 960);
+    assert!(
+        decoded
+            .samples
+            .iter()
+            .any(|sample| sample.unsigned_abs() > 512)
+    );
+}
+
+pub fn answer_fid(answer: &str, mid: &str) -> [u32; 2] {
+    let mid = format!("a=mid:{mid}");
+    let mut fid = answer
+        .lines()
+        .skip_while(|line| *line != mid)
+        .skip(1)
+        .take_while(|line| !line.starts_with("m="))
+        .filter_map(|line| line.strip_prefix("a=ssrc-group:FID "));
+    let group = fid.next().expect("installed answer signals FID");
+    assert!(fid.next().is_none(), "one FID pair for {mid}");
+    let (primary, repair) = group.split_once(' ').expect("FID pair");
+    [
+        primary.parse().expect("primary SSRC"),
+        repair.parse().expect("repair SSRC"),
+    ]
+}
+
+pub fn assert_decoded_stock_keyframe(frame: &EncodedReceivedVideoFrame) {
+    assert_decoded_keyframe(frame, "H264", 4); // Native kVideoCodecH264.
+}
+
+pub fn assert_decoded_stock_av1_keyframe(frame: &EncodedReceivedVideoFrame) {
+    assert_decoded_keyframe(frame, "AV1", 3); // Native kVideoCodecAV1.
+}
+
+fn assert_decoded_keyframe(frame: &EncodedReceivedVideoFrame, name: &str, codec_type: i32) {
+    struct Picture {
+        size: [i32; 2],
+        timestamp: u32,
+        nonconstant_luma: bool,
+    }
+
+    struct DecoderOutput(std::sync::mpsc::Sender<Picture>);
+
+    impl DecoderOutput {
+        fn capture(&self, frame: &mut RawVideoFrame) {
+            let luma = frame
+                .buffer()
+                .plane(RawVideoPlaneKind::Y)
+                .expect("decoded luma plane");
+            self.0
+                .send(Picture {
+                    size: [frame.width(), frame.height()],
+                    timestamp: frame.metadata().rtp_timestamp,
+                    nonconstant_luma: matches!(&luma.samples, RawVideoSamples::U8(samples)
+                    if samples.windows(2).any(|pair| pair[0] != pair[1])),
+                })
+                .expect("capture decoded picture");
+        }
+    }
+
+    impl DecodedImageCallbackProvider for DecoderOutput {
+        fn decoded(&self, frame: &mut RawVideoFrame) -> i32 {
+            self.capture(frame);
+            0
+        }
+        fn decoded_with_time(&self, frame: &mut RawVideoFrame, _: i64) -> i32 {
+            self.capture(frame);
+            0
+        }
+        fn decoded_with_metadata(&self, frame: &mut RawVideoFrame, _: Option<i32>, _: Option<u8>) {
+            self.capture(frame);
+        }
+    }
+
+    assert!(
+        frame.key_frame
+            && frame
+                .mime_type
+                .eq_ignore_ascii_case(&format!("video/{name}"))
+    );
+    let environment = Environment::builder().build().expect("decoder environment");
+    let factory = VideoDecoderFactoryHandle::builtin().expect("stock decoder factory");
+    let (output, pictures) = std::sync::mpsc::channel();
+    let callback = DecodedImageCallbackSink::new(DecoderOutput(output));
+    let mut decoder = factory
+        .create_decoder(&environment, &SdpVideoFormat::new(name))
+        .expect("create fresh stock decoder");
+    let mut settings = OwnedVideoDecoderSettings::default();
+    let mut fields = settings.fields();
+    fields.codec_type = codec_type;
+    fields.number_of_cores = 1;
+    fields.max_render_width = 1280;
+    fields.max_render_height = 720;
+    settings.set_fields(fields).expect("stock decoder settings");
+    assert!(decoder.configure(&settings));
+    assert_eq!(decoder.register_callback(Some(&callback)), 0);
+
+    let mut image = EncodedImage::default();
+    image.set_buffer(&EncodedVideoBuffer::from_bytes(&frame.data));
+    let mut metadata = image.metadata();
+    metadata.width = 1280;
+    metadata.height = 720;
+    metadata.rtp_timestamp = frame.rtp_timestamp;
+    metadata.frame_type = EncodedImageFrameType::Key;
+    image
+        .set_metadata(&metadata)
+        .expect("reassembled keyframe metadata");
+    let status = decoder
+        .decode_with_missing_frames(&image, false, 0)
+        .expect("decode reassembled keyframe");
+    assert!(
+        status >= 0,
+        "stock decoder rejected the reassembled keyframe: {status}"
+    );
+    let picture = pictures
+        .try_recv()
+        .expect("fresh decoder must output a picture");
+    assert_eq!(picture.size, [1280, 720]);
+    assert_eq!(picture.timestamp, frame.rtp_timestamp);
+    assert!(picture.nonconstant_luma);
+    assert_eq!(decoder.release(), 0);
+}
+
+fn is_srtcp(bytes: &[u8]) -> bool {
+    bytes.first().is_some_and(|byte| byte >> 6 == 2)
+        && bytes.get(1).is_some_and(|byte| (192..=223).contains(byte))
+}
+
+struct BoundedUdpPath {
+    max_payload: usize,
+    pair: Option<[SocketAddr; 2]>,
+}
+
+impl BoundedUdpPath {
+    fn check(&mut self, mut pair: [SocketAddr; 2], payload: &[u8]) {
+        assert!(
+            (1..=self.max_payload).contains(&payload.len()),
+            "UDP payload {} exceeds fixture limit {} on {pair:?}",
+            payload.len(),
+            self.max_payload,
+        );
+        // Connectivity checks may probe other candidates. Protected datagrams
+        // must use the same endpoints in either direction.
+        if payload.get(4..8) != Some(&[0x21, 0x12, 0xa4, 0x42][..]) {
+            pair.sort_unstable();
+            assert_eq!(
+                *self.pair.get_or_insert(pair),
+                pair,
+                "protected UDP pair changed"
+            );
+        }
+    }
 }
 
 #[derive(Clone, Copy)]

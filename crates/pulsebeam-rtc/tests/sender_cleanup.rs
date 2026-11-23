@@ -8,7 +8,7 @@
 
 mod support;
 
-use pulsebeam_rtc::{MediaPayloadBitrate, TransmitKind};
+use pulsebeam_rtc::{BoundedRtp, MediaPayloadBitrate, MediaScope, TransmitKind};
 use std::time::Duration;
 use support::{NetworkPolicy, PeerFixture, RtpImpairment, rtp_write};
 
@@ -20,6 +20,69 @@ fn write_frame(fixture: &mut PeerFixture, packets: &[pulsebeam_rtc::RtpPacket], 
                 first + u64::try_from(index).expect("test packet index fits u64"),
             ))
             .expect("write original fragment");
+    }
+}
+
+#[test]
+fn native_nack_repairs_accepted_loss_but_not_sender_holes() {
+    let mut fixture = PeerFixture::connected_video();
+    let warmup = fixture.send_fragmented_video_source(None);
+    write_frame(&mut fixture, &warmup, 1000);
+    fixture.receive_video_frame();
+    let first = 1000 + u64::try_from(warmup.len()).unwrap();
+    let primary_ssrc = fixture.receive_video_wire_header().ssrc;
+    let packets = fixture.send_fragmented_video_source(None);
+    assert!(packets.len() >= 3);
+    let refused = first;
+    let lost = first + 1;
+    fixture.configure_handoff_losses(
+        u16::try_from(refused).unwrap(),
+        u16::try_from(lost).unwrap(),
+    );
+    fixture.take_video_wire_packets();
+    let mid = fixture.sender_mid.clone();
+    let base_timestamp = packets[0].header.timestamp;
+    let scope = MediaScope::new(std::num::NonZeroU128::MIN);
+    for (offset, packet) in packets.into_iter().enumerate() {
+        let offset = u64::try_from(offset).unwrap();
+        let index = first + offset + u64::from(offset >= 2);
+        let mut write = rtp_write(packet, index);
+        // Identify originals by the observed protected RTX header, whose
+        // timestamp is retained even though its wire sequence is independent.
+        write.timestamp = base_timestamp.wrapping_add(u32::try_from(index - first).unwrap());
+        fixture
+            .connection
+            .write_rtp_bounded(
+                fixture.at(),
+                &mid,
+                None,
+                write,
+                BoundedRtp {
+                    max_wire_bytes: 1500,
+                    max_primary_wire_bytes: None,
+                    clock: None,
+                    scope: Some(scope),
+                    replace_queued: false,
+                },
+            )
+            .unwrap();
+    }
+    fixture.drive_for(Duration::from_millis(700));
+    assert!(fixture.handoff_losses_consumed());
+    let repairs = fixture
+        .take_video_wire_packets()
+        .into_iter()
+        .filter(|header| !header.padding && header.ssrc != primary_ssrc)
+        .collect::<Vec<_>>();
+    assert!(
+        !repairs.is_empty(),
+        "native NACK must recover the accepted packet"
+    );
+    for repair in &repairs {
+        assert_eq!(
+            repair.timestamp,
+            base_timestamp.wrapping_add(u32::try_from(lost - first).unwrap())
+        );
     }
 }
 

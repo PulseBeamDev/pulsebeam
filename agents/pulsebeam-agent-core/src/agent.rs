@@ -14,17 +14,24 @@ use crate::{
     DataChannelReliability, DataChannelSpec, DesiredState, Effect, Failure, FailureClass,
     Generation, HostEvent, HttpEffect, HttpEvent, HttpHeader, HttpMethod, HttpRequest,
     HttpResponse, MediaSlot, Notification, OfferResources, OperationId, RtcEffect, RtcEvent,
-    SlotBinding, Snapshot, TimerEffect, TimerEvent, TimerId, TopicDropReason, TopicError,
-    TopicSend, ValidationError,
+    SlotBinding, Snapshot, TimerEffect, TimerEvent, TimerId, TopicError, TopicSend,
+    ValidationError,
     id::IdGenerator,
     signaling::{self, SignalingError},
-    topic::Topics,
 };
 
 const CONTENT_TYPE: &str = "Content-Type";
 const JSON_CONTENT_TYPE: &str = "application/json";
 const SIGNAL_RETRY_DELAY: Duration = Duration::from_millis(100);
 const MAX_EARLY_SIGNALING_MESSAGES: usize = 64;
+const DATA_ADMISSION_WINDOW: Duration = Duration::from_secs(10);
+
+struct PendingDataSend {
+    value: TopicSend,
+    options: crate::ffi::DataSendOptions,
+    join_revision: u64,
+    timer: TimerId,
+}
 pub(crate) const MAX_ORPHANED_CREATES: usize = 32;
 
 macro_rules! agent_log {
@@ -147,6 +154,7 @@ struct Session {
     pending_renewal: Option<native::Renewal>,
     authorization_revision: u64,
     signaling_terminal: bool,
+    reliable_data_enabled: bool,
     signaling_channel: ChannelId,
     data_preparations: BTreeMap<ChannelId, Result<crate::PreparedDataChannel, String>>,
     capabilities: crate::BootstrapCapabilities,
@@ -193,6 +201,7 @@ struct NativeResponse {
     connection_id: String,
     rtp_capabilities: pulsebeam_proto::state::RtpCapabilities,
     data_delivery: Vec<serde_json::Value>,
+    data_version: Option<u32>,
     room_id: Option<String>,
     participant_id: String,
     answer: String,
@@ -243,6 +252,7 @@ struct PendingSignal {
     generation: Generation,
     channel: ChannelId,
     payload: Vec<u8>,
+    retryable: bool,
     retrying: bool,
 }
 
@@ -275,12 +285,13 @@ pub struct Agent {
     retry_attempts: u8,
     pending_signal: Option<PendingSignal>,
     signal_retry: Option<TimerId>,
-    topic_probe: Option<TimerId>,
+    data_now: Duration,
+    data_expiry: Option<(TimerId, Duration)>,
     reconciliation_wake: Option<TimerId>,
     intent_dirty: bool,
     closing: Option<Closing>,
     orphaned_creates: BTreeMap<OperationId, Credential>,
-    topics: Topics,
+    pending_data_sends: BTreeMap<OperationId, PendingDataSend>,
 }
 
 impl Agent {
@@ -309,12 +320,13 @@ impl Agent {
             retry_attempts: 0,
             pending_signal: None,
             signal_retry: None,
-            topic_probe: None,
+            data_now: Duration::ZERO,
+            data_expiry: None,
             reconciliation_wake: None,
             intent_dirty: false,
             closing: None,
             orphaned_creates: BTreeMap::new(),
-            topics: Topics::default(),
+            pending_data_sends: BTreeMap::new(),
         })
     }
 
@@ -345,16 +357,9 @@ impl Agent {
                 self.reconnect();
                 Ok(())
             }
-            AgentCommand::SendTopic(send) => self
-                .topics
-                .send(
-                    send,
-                    &mut self.ids,
-                    &mut self.effects,
-                    &mut self.snapshot,
-                    &mut self.notifications,
-                )
-                .map_err(AgentError::from),
+            AgentCommand::SendTopic(send) => {
+                Err(TopicError::PublisherUnavailable(send.publisher.topic).into())
+            }
         };
         let flushed = self.flush_notifications();
         let result = result.and(flushed);
@@ -370,6 +375,12 @@ impl Agent {
     }
 
     pub fn handle(&mut self, event: HostEvent) -> Result<(), AgentError> {
+        self.handle_at(event, self.data_now)
+    }
+
+    /// Handle a host event with elapsed time from the host's monotonic clock.
+    pub fn handle_at(&mut self, event: HostEvent, now: Duration) -> Result<(), AgentError> {
+        self.data_now = self.data_now.max(now);
         let result = match event {
             HostEvent::Rtc(event) => self.handle_rtc(event),
             HostEvent::Http(event) => self.handle_http(event),
@@ -402,80 +413,77 @@ impl Agent {
         spec: crate::TrackSpec,
         payload: Vec<u8>,
     ) -> Result<OperationId, AgentError> {
-        self.send_data_at(spec, payload, None)
+        self.send_data_at(spec, payload, self.data_now)
     }
 
+    /// Admit a send using the same host monotonic clock as [`Self::handle_at`].
     pub fn send_data_at(
         &mut self,
         spec: crate::TrackSpec,
         payload: Vec<u8>,
-        captured_at: Option<crate::ffi::CaptureTimestamp>,
+        now: Duration,
     ) -> Result<OperationId, AgentError> {
-        self.send_data_to(spec, payload, captured_at, None)
+        self.send_data_with_options_at(spec, payload, None, now)
     }
 
-    pub fn send_data_with_options(
+    pub fn send_data_with_options_at(
         &mut self,
         spec: crate::TrackSpec,
         payload: Vec<u8>,
         options: Option<crate::ffi::DataSendOptions>,
+        now: Duration,
     ) -> Result<OperationId, AgentError> {
-        use pulsebeam_proto::topic::{MAX_RECIPIENT_CONNECTIONS, parse_data_recipient_id};
+        self.data_now = self.data_now.max(now);
         let options = options.unwrap_or_default();
-        let recipients = if let Some(refs) = options.recipients {
-            if refs.is_empty() || refs.len() > MAX_RECIPIENT_CONNECTIONS {
-                return Err(crate::TopicError::InvalidRecipients.into());
-            }
-            Some(
-                refs.iter()
-                    .map(|id| parse_data_recipient_id(id))
-                    .collect::<Option<Vec<_>>>()
-                    .ok_or(crate::TopicError::InvalidRecipients)?,
-            )
-        } else {
-            None
-        };
-        self.send_data_to(spec, payload, options.captured_at, recipients)
-    }
-
-    pub(crate) fn send_data_to(
-        &mut self,
-        spec: crate::TrackSpec,
-        payload: Vec<u8>,
-        captured_at: Option<crate::ffi::CaptureTimestamp>,
-        recipients: Option<Vec<[u8; 16]>>,
-    ) -> Result<OperationId, AgentError> {
-        let recipients = if let Some(mut ids) = recipients {
-            if ids.is_empty() || ids.len() > pulsebeam_proto::topic::MAX_RECIPIENT_CONNECTIONS {
-                return Err(crate::TopicError::InvalidRecipients.into());
-            }
-            ids.sort_unstable();
-            ids.dedup();
-            Some(ids.into_iter().flatten().collect())
-        } else {
-            None
-        };
         if let Some(failure) = &self.snapshot.terminal_failure {
             return Err(AgentError::OperationFailed(failure.into()));
         }
         if !self.desired.connected {
             return Err(crate::TrackResourceError::NotConnected.into());
         }
-        let send = crate::TopicSend {
-            publisher: spec.publisher()?,
-            payload,
-        };
-        self.topics.validate_data_send(&send)?;
+        let publisher = spec.publisher()?;
+        if payload.len() > crate::MAX_TOPIC_PAYLOAD_BYTES {
+            return Err(TopicError::PayloadTooLarge {
+                actual: payload.len(),
+                maximum: crate::MAX_TOPIC_PAYLOAD_BYTES,
+            }
+            .into());
+        }
+        let connecting = self.active.is_none();
+        if connecting
+            && self
+                .pending_data_sends
+                .values()
+                .filter(|pending| pending.value.publisher == publisher)
+                .count()
+                >= crate::TOPIC_SEND_QUEUE_CAPACITY
+        {
+            return Err(TopicError::SendQueueFull(publisher.topic).into());
+        }
         self.resource_command(crate::ResourceCommand::RetainProducer { spec })?;
-        let ticket = self.topics.begin_data_send(
-            send,
-            captured_at,
-            recipients,
-            &mut self.ids,
-            &mut self.effects,
-        );
+        let send = self.ids.operation();
+        if connecting {
+            let timer = self.ids.timer();
+            self.pending_data_sends.insert(
+                send,
+                PendingDataSend {
+                    value: TopicSend { publisher, payload },
+                    options,
+                    join_revision: self.snapshot.join_revision,
+                    timer,
+                },
+            );
+            self.effects.push_back(Effect::Timer(TimerEffect::Schedule {
+                timer,
+                after: DATA_ADMISSION_WINDOW,
+            }));
+        } else {
+            self.admit_data_v1(send, &publisher, payload, options)?;
+            self.notifications
+                .push_back(Notification::DataSendFinished { send, error: None });
+        }
         self.flush_notifications()?;
-        Ok(ticket)
+        Ok(send)
     }
 
     pub fn resource(
@@ -749,7 +757,154 @@ impl Agent {
     }
 
     pub fn next_effect(&mut self) -> Option<Effect> {
-        self.effects.pop_front()
+        self.effects
+            .pop_front()
+            .or_else(|| self.next_data_v1_effect())
+    }
+
+    fn data_v1_sender(
+        &mut self,
+        publisher: &crate::TopicPublisher,
+    ) -> Option<&mut crate::data_v1::SendChannel> {
+        let resource = crate::native_state::Resource::Publication {
+            kind: pulsebeam_proto::state::TrackKind::Data,
+            track_id: publisher.topic.clone(),
+        };
+        let active = self
+            .active
+            .as_mut()
+            .filter(|session| !session.signaling_terminal && session.capabilities.data_v1)?;
+        let live = active.state.eligible(&resource)?;
+        let channel = *active.payload_resources.get(&resource)?;
+        let prepared = active.data_preparations.get(&channel)?.as_ref().ok()?;
+        let physical = active.payloads.get_mut(&channel)?;
+        if !matches!(&physical.registration, crate::TopicChannel::Publisher(current) if current == publisher)
+        {
+            return None;
+        }
+        let control = if active.reliable_data_enabled {
+            active
+                .state
+                .reference(&resource)
+                .and_then(core::num::NonZeroU64::new)
+                .map(|owned| (owned, active.signaling_channel))
+        } else {
+            None
+        };
+        physical.data_v1_publisher(active.generation, channel, live, prepared, control)
+    }
+
+    fn admit_data_v1(
+        &mut self,
+        send: OperationId,
+        publisher: &crate::TopicPublisher,
+        payload: Vec<u8>,
+        options: crate::ffi::DataSendOptions,
+    ) -> Result<(), AgentError> {
+        use crate::data_v1::Error;
+        let unavailable = || TopicError::PublisherUnavailable(publisher.topic.clone());
+        let now = self.data_now;
+        let generation = self
+            .active
+            .as_ref()
+            .map(|active| active.generation)
+            .ok_or_else(unavailable)?;
+        let sender = self.data_v1_sender(publisher).ok_or_else(unavailable)?;
+        let unit_seq = sender
+            .admit(payload, options, now)
+            .map_err(|error| match error {
+                Error::Capacity => TopicError::SendQueueFull(publisher.topic.clone()),
+                Error::Exhausted => TopicError::SequenceExhausted(publisher.topic.clone()),
+                _ => unavailable(),
+            })?;
+        if let Some(source) = sender.reliable_source() {
+            self.notifications.push_back(Notification::ReliableData {
+                track_id: publisher.topic.clone(),
+                generation,
+                source: source.get(),
+                event: crate::ffi::ReliablePublishEvent::LocallyAdmitted {
+                    send: send.get(),
+                    unit_seq,
+                },
+            });
+        }
+        Ok(())
+    }
+
+    fn progress_pending_data_sends(&mut self) {
+        use crate::DataSendFailure;
+        let pending = core::mem::take(&mut self.pending_data_sends);
+        for (send, entry) in pending {
+            let error = if !self.desired.connected {
+                Some(DataSendFailure::Disconnected)
+            } else if let Some(failure) = &self.snapshot.terminal_failure {
+                Some(DataSendFailure::TerminalFailure {
+                    error: failure.into(),
+                })
+            } else if entry.join_revision != self.snapshot.join_revision {
+                Some(DataSendFailure::TransportReplaced)
+            } else if self.data_v1_sender(&entry.value.publisher).is_some() {
+                self.admit_data_v1(
+                    send,
+                    &entry.value.publisher,
+                    entry.value.payload,
+                    entry.options,
+                )
+                .err()
+                .map(|error| match error {
+                    AgentError::InvalidTopic(TopicError::SendQueueFull(_)) => {
+                        DataSendFailure::QueueFull
+                    }
+                    AgentError::InvalidTopic(TopicError::SequenceExhausted(_)) => {
+                        DataSendFailure::SequenceExhausted
+                    }
+                    _ => DataSendFailure::ChannelFailed,
+                })
+            } else {
+                self.pending_data_sends.insert(send, entry);
+                continue;
+            };
+            self.finish_pending_data_send(send, entry.timer, error);
+        }
+    }
+
+    fn finish_pending_data_send(
+        &mut self,
+        send: OperationId,
+        timer: TimerId,
+        error: Option<crate::DataSendFailure>,
+    ) {
+        self.effects
+            .push_back(Effect::Timer(TimerEffect::Cancel { timer }));
+        self.notifications
+            .push_back(Notification::DataSendFinished { send, error });
+    }
+
+    fn next_data_v1_effect(&mut self) -> Option<Effect> {
+        let active = self.active.as_mut()?;
+        for physical in active.payloads.values_mut() {
+            let current = !active.signaling_terminal
+                && active
+                    .state
+                    .eligible(&physical.resource)
+                    .is_some_and(|live| {
+                        physical.current_data_v1_publisher(active.generation, live)
+                    })
+                && matches!(&physical.registration, crate::TopicChannel::Publisher(publisher) if self.desired.topics.publishers.contains(publisher));
+            let Some(sender) = &mut physical.data_v1_sender else {
+                continue;
+            };
+            if !current {
+                continue;
+            }
+            if sender.deadline().is_some()
+                && let Ok(Some(effect)) = sender.next_effect(self.ids.operation(), self.data_now)
+            {
+                self.schedule_data_expiry();
+                return Some(Effect::DataChannel(effect));
+            }
+        }
+        None
     }
 
     #[cfg(test)]
@@ -844,57 +999,99 @@ impl Agent {
         control
     }
 
+    fn project_topic_bindings(&mut self) {
+        let session = self.active.as_ref().filter(|session| {
+            self.closing.is_none() && !session.signaling_terminal && session.capabilities.data_v1
+        });
+        let mut changed = false;
+        for status in &mut self.snapshot.topics.publishers {
+            let registration = &status.registration;
+            let ready = session.and_then(|session| {
+                let resource = crate::native_state::Resource::Publication {
+                    kind: pulsebeam_proto::state::TrackKind::Data,
+                    track_id: registration.topic.clone(),
+                };
+                let live = session.state.eligible(&resource)?;
+                let channel = *session.payload_resources.get(&resource)?;
+                let physical = session.payloads.get(&channel)?;
+                if !matches!(&physical.registration, crate::TopicChannel::Publisher(current) if current == registration) {
+                    return None;
+                }
+                let prepared = session.data_preparations.get(&channel)?.as_ref().ok()?;
+                let has_control = session.reliable_data_enabled
+                    && session.state.reference(&resource).is_some_and(|reference| reference != 0);
+                physical.prepared_publisher(session.generation, channel, live, prepared, has_control)?;
+                Some((channel, live.track.as_ref()?.publication_id.as_str()))
+            });
+            let channel = ready.map(|(channel, _)| channel);
+            let publication = ready.map(|(_, publication)| publication);
+            if status.channel != channel || status.publication_id.as_deref() != publication {
+                status.channel = channel;
+                status.publication_id = publication.map(String::from);
+                changed = true;
+            }
+        }
+        for status in &mut self.snapshot.topics.subscribers {
+            let channel = session.and_then(|session| {
+                let registration = &status.registration;
+                let resource = crate::native_state::Resource::LogicalData(crate::TrackSelector {
+                    room: registration.room.clone(),
+                    participant_id: registration.participant_id.clone(),
+                    track_id: registration.topic.clone(),
+                });
+                let channel = *session.payload_resources.get(&resource)?;
+                let physical = session.payloads.get(&channel)?;
+                (matches!(&physical.registration, crate::TopicChannel::Subscriber(current) if current == registration)
+                    && native::logical_payload_ready(session, &resource))
+                .then_some(channel)
+            });
+            if status.channel != channel {
+                status.channel = channel;
+                status.publishers = usize::from(channel.is_some());
+                changed = true;
+            }
+        }
+        if changed {
+            self.bump_snapshot();
+            self.notifications.push_back(Notification::SnapshotChanged);
+        }
+    }
+
     fn flush_notifications(&mut self) -> Result<(), AgentError> {
-        let result = self.flush_topic_notifications();
+        self.project_topic_bindings();
+        self.progress_pending_data_sends();
+        self.publish_notifications();
         // Failed notification processing must not retain stale input grants.
         self.reconcile_input_controls();
         self.reconcile_observation_controls();
-        result
+        if let Some(active) = &mut self.active {
+            for physical in active
+                .payloads
+                .values_mut()
+                .filter(|physical| physical.data_v1_sender.is_some())
+            {
+                let current = !active.signaling_terminal
+                    && active
+                        .state
+                        .eligible(&physical.resource)
+                        .is_some_and(|live| {
+                            physical.current_data_v1_publisher(active.generation, live)
+                        })
+                    && matches!(&physical.registration, crate::TopicChannel::Publisher(publisher) if self.desired.topics.publishers.contains(publisher));
+                physical.settle_data_sender(
+                    active.generation,
+                    self.data_now,
+                    !current,
+                    &mut self.published_notifications,
+                );
+            }
+        }
+        self.schedule_data_expiry();
+        Ok(())
     }
 
-    fn flush_topic_notifications(&mut self) -> Result<(), AgentError> {
-        self.topics.progress_data_sends(
-            self.desired.connected,
-            &mut self.ids,
-            &mut self.effects,
-            &mut self.snapshot,
-            &mut self.notifications,
-        );
-        let mut ready = BTreeSet::new();
+    fn publish_notifications(&mut self) {
         while let Some(notification) = self.notifications.pop_front() {
-            if let Notification::Topic(topic) = &notification {
-                if self.config.log_level.allows(log::Level::Warn) {
-                    match topic {
-                        crate::TopicNotification::SendDropped { publisher, reason } => {
-                            self.logs.write(
-                                log::Level::Warn,
-                                crate::topic::LOG_TARGET,
-                                format_args!(
-                                    "topic send dropped mode={:?} reason={reason:?}",
-                                    publisher.mode
-                                ),
-                            );
-                        }
-                        crate::TopicNotification::ChannelFailed { channel, .. } => {
-                            let direction = match channel {
-                                crate::TopicChannel::Publisher(_) => "publish",
-                                crate::TopicChannel::Subscriber(_) => "subscribe",
-                            };
-                            self.logs.write(
-                                log::Level::Warn,
-                                crate::topic::LOG_TARGET,
-                                format_args!("topic channel failed direction={direction}"),
-                            );
-                        }
-                        _ => {}
-                    }
-                }
-                let update = self.resources.notify(topic);
-                ready.extend(update.ready.into_iter().map(crate::TrackOwner::id));
-                if update.registrations_changed {
-                    self.refresh_resources()?;
-                }
-            }
             if matches!(notification, Notification::SnapshotChanged)
                 && self
                     .published_notifications
@@ -904,13 +1101,6 @@ impl Agent {
             }
             self.published_notifications.push_back(notification);
         }
-        if !ready.is_empty() {
-            self.published_notifications
-                .push_back(Notification::DataReady {
-                    owners: ready.into_iter().collect(),
-                });
-        }
-        Ok(())
     }
 
     fn reconcile_input_controls(&mut self) {
@@ -1096,8 +1286,7 @@ impl Agent {
             self.desired.audio.pinned.len(),
         );
         if topics_changed {
-            self.topics
-                .accept_registrations(&self.desired.topics, &mut self.snapshot);
+            crate::TopicSnapshot::publish(&self.desired.topics, &mut self.snapshot);
         }
         if intent_changed || topics_changed {
             self.intent_dirty = true;
@@ -1485,12 +1674,6 @@ impl Agent {
         self.pending_signal = None;
         self.cancel_signal_retry();
         self.cancel_reconciliation();
-        self.topics.unbind_generation(
-            generation,
-            TopicDropReason::TransportReplaced,
-            &mut self.snapshot,
-            &mut self.notifications,
-        );
     }
 
     fn offer_created(
@@ -1940,9 +2123,78 @@ impl Agent {
         Ok(())
     }
 
+    fn schedule_data_expiry(&mut self) {
+        let receipt = if self.pending_signal.is_none() && self.signal_retry.is_none() {
+            self.active
+                .as_ref()
+                .and_then(Session::reliable_subscriber_control_deadline)
+        } else {
+            None
+        };
+        let due = self
+            .active
+            .iter()
+            .flat_map(|session| session.payloads.values())
+            .filter(|physical| physical.state == native::PayloadState::Active)
+            .flat_map(|physical| {
+                [
+                    physical
+                        .data_v1_receiver
+                        .as_ref()
+                        .and_then(|receiver| receiver.assembly_deadline()),
+                    physical
+                        .data_v1_sender
+                        .as_ref()
+                        .and_then(|sender| sender.wake_deadline(self.data_now)),
+                ]
+                .into_iter()
+                .flatten()
+            })
+            .chain(receipt)
+            .min();
+        if self.data_expiry.map(|(_, deadline)| deadline) == due {
+            return;
+        }
+        if let Some((timer, _)) = self.data_expiry.take() {
+            self.effects
+                .push_back(Effect::Timer(TimerEffect::Cancel { timer }));
+        }
+        if let Some(deadline) = due {
+            let timer = self.ids.timer();
+            self.data_expiry = Some((timer, deadline));
+            self.effects.push_back(Effect::Timer(TimerEffect::Schedule {
+                timer,
+                after: deadline.saturating_sub(self.data_now),
+            }));
+        }
+    }
+
     fn handle_timer(&mut self, event: TimerEvent) -> Result<(), AgentError> {
         match event {
             TimerEvent::Fired { timer } => {
+                if let Some((pending, deadline)) = self.data_expiry
+                    && timer == pending
+                {
+                    self.data_expiry = None;
+                    self.data_now = self.data_now.max(deadline);
+                    if let Some(active) = &mut self.active {
+                        for physical in active.payloads.values_mut() {
+                            if let Some(receiver) = &mut physical.data_v1_receiver {
+                                receiver.expire(self.data_now);
+                            }
+                        }
+                    }
+                    if self.pending_signal.is_none()
+                        && self
+                            .active
+                            .as_ref()
+                            .and_then(Session::reliable_subscriber_control_deadline)
+                            .is_some_and(|ready| ready <= self.data_now)
+                    {
+                        self.reconcile_current();
+                    }
+                    return Ok(());
+                }
                 if self.credential_timer(timer) {
                     return Ok(());
                 }
@@ -1966,19 +2218,16 @@ impl Agent {
                 } else if self.signal_retry == Some(timer) {
                     self.signal_retry = None;
                     self.request_reconciliation();
-                } else if self.topic_probe == Some(timer) {
-                    self.topic_probe = None;
-                    if self.active.is_some() && self.desired.connected {
-                        self.topics
-                            .probe_remote_publishers(&mut self.ids, &mut self.effects);
-                    }
-                    self.schedule_topic_probe();
-                } else {
-                    self.topics.expire_data_send(
+                } else if let Some(send) = self
+                    .pending_data_sends
+                    .iter()
+                    .find_map(|(send, entry)| (entry.timer == timer).then_some(*send))
+                {
+                    self.pending_data_sends.remove(&send);
+                    self.finish_pending_data_send(
+                        send,
                         timer,
-                        &mut self.effects,
-                        &mut self.snapshot,
-                        &mut self.notifications,
+                        Some(crate::DataSendFailure::TimedOut),
                     );
                 }
             }
@@ -1987,6 +2236,27 @@ impl Agent {
     }
 
     fn handle_data_channel(&mut self, event: DataChannelEvent) -> Result<(), AgentError> {
+        if let DataChannelEvent::Sent {
+            generation,
+            channel,
+            ..
+        }
+        | DataChannelEvent::SendFailed {
+            generation,
+            channel,
+            ..
+        } = &event
+            && let Some(active) = self
+                .active
+                .as_mut()
+                .filter(|session| session.generation == *generation)
+            && let Some(physical) = active.payloads.get_mut(channel)
+        {
+            if let Some(sender) = &mut physical.data_v1_sender {
+                sender.handle(&event, self.data_now);
+            }
+            return Ok(());
+        }
         match event {
             DataChannelEvent::Prepared {
                 generation,
@@ -2068,7 +2338,6 @@ impl Agent {
                                     active.state.stage(physical.resource.clone(), None)?;
                                 }
                                 self.intent_dirty = true;
-                                self.topics.suspend_source(generation, channel);
                                 self.effects
                                     .push_back(Effect::Rtc(RtcEffect::CloseDataChannel {
                                         generation,
@@ -2128,16 +2397,6 @@ impl Agent {
                 channel,
                 reset_complete,
             } => {
-                let native_payload = self.active.as_ref().is_some_and(|active| {
-                    active.generation == generation && active.payloads.contains_key(&channel)
-                });
-                let logical_payload = self.active.as_ref().is_some_and(|active| {
-                    active.generation == generation
-                        && active
-                            .payloads
-                            .get(&channel)
-                            .is_some_and(|physical| physical.offer.is_some())
-                });
                 let signaling_closed = self.active.as_ref().is_some_and(|active| {
                     active.generation == generation && active.signaling_channel == channel
                 });
@@ -2155,6 +2414,14 @@ impl Agent {
                 {
                     active.data_preparations.remove(&channel);
                     if let Some(physical) = active.payloads.get_mut(&channel) {
+                        physical.data_v1_receiver = None;
+                        physical.settle_data_sender(
+                            generation,
+                            self.data_now,
+                            true,
+                            &mut self.notifications,
+                        );
+                        physical.data_v1_sender = None;
                         if physical.state == native::PayloadState::Active {
                             physical.restart = !active.state.retaining(&physical.resource);
                         }
@@ -2178,6 +2445,10 @@ impl Agent {
                                 active.state.stage(physical.resource.clone(), None)?;
                             }
                             self.intent_dirty = true;
+                        }
+                        if active.payload_resources.get(&physical.resource) != Some(&channel) {
+                            let resource = physical.resource.clone();
+                            native::release_payload(active, &resource, channel);
                         }
                     }
                     if active.signaling_channel == channel {
@@ -2208,51 +2479,18 @@ impl Agent {
                     && self.attempt.is_none()
                     && self.retry.is_none()
                 {
-                    self.topics.unbind_generation(
-                        generation,
-                        TopicDropReason::ChannelClosed,
-                        &mut self.snapshot,
-                        &mut self.notifications,
-                    );
                     self.start_attempt(AttemptMode::Replace);
-                } else if logical_payload {
-                    self.topics.detach_source(
-                        generation,
-                        channel,
-                        false,
-                        &mut self.snapshot,
-                        &mut self.notifications,
-                        &mut self.effects,
-                    );
-                } else {
-                    let topic_closed = self.topics.channel_closed(
-                        generation,
-                        channel,
-                        &mut self.effects,
-                        &mut self.snapshot,
-                        &mut self.notifications,
-                    );
-                    if topic_closed
-                        && !native_payload
-                        && self.desired.connected
-                        && self.attempt.is_none()
-                        && self.retry.is_none()
-                    {
-                        self.topics.unbind_generation(
-                            generation,
-                            TopicDropReason::TransportReplaced,
-                            &mut self.snapshot,
-                            &mut self.notifications,
-                        );
-                        self.start_attempt(AttemptMode::Replace);
-                    }
                 }
             }
             DataChannelEvent::Message {
                 generation,
                 channel,
+                binary,
                 payload,
             } => {
+                if !binary {
+                    return Ok(());
+                }
                 if let Some(attempt) = self.attempt.as_mut()
                     && attempt.generation == generation
                     && attempt
@@ -2274,18 +2512,31 @@ impl Agent {
                     return Ok(());
                 }
                 if active.signaling_channel != channel {
-                    if !self.topics.has_channel(generation, channel) {
+                    if let Some(physical) = active.payloads.get_mut(&channel) {
+                        if !active.signaling_terminal
+                            && physical.state == native::PayloadState::Active
+                            && let Some(receiver) = &mut physical.data_v1_receiver
+                            && let crate::TopicChannel::Subscriber(subscriber) =
+                                &physical.registration
+                            && let Some((offer, logical)) =
+                                active.state.logical_offer(&physical.resource)
+                            && physical.offer == Some(offer)
+                            && let Some(source) = &logical.source
+                            && let Ok(Some(unit)) =
+                                receiver.offer_binary(generation, channel, &payload, self.data_now)
+                        {
+                            let owners = self.resources.receive_data_v1(
+                                subscriber,
+                                &source.publication_id,
+                                unit,
+                            );
+                            if !owners.is_empty() {
+                                self.notifications
+                                    .push_back(Notification::DataReady { owners });
+                            }
+                        }
                         return Ok(());
                     }
-                    let _ = self.topics.handle_message(
-                        generation,
-                        channel,
-                        payload,
-                        &mut self.ids,
-                        &mut self.effects,
-                        &mut self.snapshot,
-                        &mut self.notifications,
-                    )?;
                     return Ok(());
                 }
                 if active.signaling_terminal {
@@ -2316,16 +2567,6 @@ impl Agent {
                     );
                     self.pending_signal = None;
                     self.request_reconciliation();
-                } else {
-                    let _ = self.topics.handle_sent(
-                        operation,
-                        generation,
-                        channel,
-                        &mut self.ids,
-                        &mut self.effects,
-                        &mut self.snapshot,
-                        &mut self.notifications,
-                    );
                 }
             }
             DataChannelEvent::SendFailed {
@@ -2339,20 +2580,14 @@ impl Agent {
                         && pending.generation == generation
                         && pending.channel == channel
                 }) {
-                    pending.retrying = true;
-                    self.notify_failure(Failure::transient(message));
-                    self.schedule_signal_retry();
-                } else {
-                    let _ = self.topics.handle_send_failed(
-                        operation,
-                        generation,
-                        channel,
-                        message,
-                        &mut self.ids,
-                        &mut self.effects,
-                        &mut self.snapshot,
-                        &mut self.notifications,
-                    );
+                    if pending.retryable {
+                        pending.retrying = true;
+                        self.notify_failure(Failure::transient(message));
+                        self.schedule_signal_retry();
+                    } else {
+                        self.pending_signal = None;
+                        self.request_reconciliation();
+                    }
                 }
             }
         }
@@ -2411,7 +2646,12 @@ impl Agent {
         self.snapshot.accepted_join_revision = Some(attempt.join_revision);
         let previous_generation = self.active.as_ref().map(|session| session.generation);
         self.joined_successor = None;
-        if let Some(previous) = self.active.replace(Session {
+        let reliable_data_enabled = candidate.capabilities.data_v1
+            && candidate
+                .capabilities
+                .data_delivery
+                .contains(&pulsebeam_proto::state::DataDelivery::Ordered);
+        if let Some(mut previous) = self.active.replace(Session {
             credential: candidate.credential,
             admission: admission.into_accepted_receipts(),
             generation: attempt.generation,
@@ -2435,12 +2675,21 @@ impl Agent {
             pending_renewal: None,
             authorization_revision: 0,
             signaling_terminal: false,
+            reliable_data_enabled,
             signaling_channel: resources.signaling_channel,
             data_preparations: attempt.data_preparations,
             capabilities: candidate.capabilities,
             media_preparation: attempt.media_preparation,
         }) && previous.generation != attempt.generation
         {
+            for physical in previous.payloads.values_mut() {
+                physical.settle_data_sender(
+                    previous.generation,
+                    self.data_now,
+                    true,
+                    &mut self.notifications,
+                );
+            }
             if let Some(renewal) = previous.pending_renewal {
                 self.cancel_credential_work(renewal);
             }
@@ -2466,14 +2715,6 @@ impl Agent {
             self.snapshot.room_id = active.room_id.clone();
             self.snapshot.authorization_expires_at = None;
             self.snapshot.accepted_credential_revision = Some(active.credential.revision);
-            self.topics.bind_native(
-                active.generation,
-                active.participant_id.clone(),
-                &mut self.snapshot,
-                &mut self.notifications,
-            );
-            self.topics
-                .probe_remote_publishers(&mut self.ids, &mut self.effects);
         }
         if let Some(revision) = self.snapshot.accepted_credential_revision {
             self.credential_accepted(revision);
@@ -2483,12 +2724,12 @@ impl Agent {
             self.handle_data_channel(DataChannelEvent::Message {
                 generation: attempt.generation,
                 channel: resources.signaling_channel,
+                binary: true,
                 payload,
             })?;
         }
         self.refresh_resources()?;
         self.request_reconciliation();
-        self.schedule_topic_probe();
         Ok(())
     }
 
@@ -2588,10 +2829,6 @@ impl Agent {
         }
         self.pending_signal = None;
         self.cancel_signal_retry();
-        if let Some(timer) = self.topic_probe.take() {
-            self.effects
-                .push_back(Effect::Timer(TimerEffect::Cancel { timer }));
-        }
         if let Some(active) = self.active.as_ref() {
             self.fence_signaling(active.generation);
         }
@@ -2753,12 +2990,6 @@ impl Agent {
             return;
         }
         self.reconcile_credentials();
-        self.topics.reconcile(
-            &self.desired.topics,
-            &mut self.snapshot,
-            &mut self.notifications,
-        );
-        self.schedule_topic_probe();
         let Some(active) = self
             .active
             .as_mut()
@@ -2809,30 +3040,74 @@ impl Agent {
                 }));
             return;
         }
-        let payload = match active.state.next_frame() {
-            Ok(Some(payload)) => payload,
-            Ok(None) => return,
+        let (payload, retryable) = match active.state.next_frame() {
+            Ok(Some(payload)) => (payload, true),
+            Ok(None) => match active.next_reliable_subscriber_control(self.data_now) {
+                Some(crate::data_v1::ReceiverReceipt::Send(control)) => {
+                    let Ok(payload) = pulsebeam_proto::state::codec::encode_data_control(&control)
+                    else {
+                        return;
+                    };
+                    (payload, false)
+                }
+                Some(crate::data_v1::ReceiverReceipt::Unconfirmed { unit_seq }) => {
+                    agent_log!(
+                        self,
+                        Debug,
+                        "Reliable DATA assembly receipt unconfirmed unit_seq={}",
+                        unit_seq
+                    );
+                    return;
+                }
+                None => return,
+            },
             Err(error) => {
                 self.fail_terminal(Failure::protocol(error.to_string()));
                 return;
             }
         };
+        let (generation, channel) = (active.generation, active.signaling_channel);
+        self.send_native_signal(generation, channel, payload, retryable);
+    }
+
+    fn send_native_signal(
+        &mut self,
+        generation: Generation,
+        channel: ChannelId,
+        payload: Vec<u8>,
+        retryable: bool,
+    ) {
         let operation = self.ids.operation();
+        let retained = if retryable {
+            payload.clone()
+        } else {
+            Vec::new()
+        };
         self.effects
             .push_back(Effect::DataChannel(DataChannelEffect::Send {
                 operation,
-                generation: active.generation,
-                channel: active.signaling_channel,
+                generation,
+                channel,
                 binary: true,
-                payload: payload.clone(),
+                payload,
             }));
         self.pending_signal = Some(PendingSignal {
             operation,
-            generation: active.generation,
-            channel: active.signaling_channel,
-            payload,
+            generation,
+            channel,
+            payload: retained,
+            retryable,
             retrying: false,
         });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn enable_reliable_data_fixture(&mut self) {
+        if let Some(active) = &mut self.active {
+            active.reliable_data_enabled = true;
+            self.intent_dirty = true;
+            self.request_reconciliation();
+        }
     }
 
     fn schedule_signal_retry(&mut self) {
@@ -2851,23 +3126,6 @@ impl Agent {
         self.effects.push_back(Effect::Timer(TimerEffect::Schedule {
             timer,
             after: SIGNAL_RETRY_DELAY,
-        }));
-    }
-
-    fn schedule_topic_probe(&mut self) {
-        if self.topic_probe.is_some()
-            || self.snapshot.terminal_failure.is_some()
-            || !self.desired.connected
-            || !self.topics.has_ordered_subscriptions()
-            || self.active.is_none()
-        {
-            return;
-        }
-        let timer = self.ids.timer();
-        self.topic_probe = Some(timer);
-        self.effects.push_back(Effect::Timer(TimerEffect::Schedule {
-            timer,
-            after: Duration::from_secs(2),
         }));
     }
 
@@ -2898,23 +3156,7 @@ impl Agent {
         }
         self.cancel_signal_retry();
         self.cancel_reconciliation();
-        if let Some(timer) = self.topic_probe.take() {
-            self.effects
-                .push_back(Effect::Timer(TimerEffect::Cancel { timer }));
-        }
         self.pending_signal = None;
-        if let Some(active) = self.active.as_ref() {
-            self.topics.unbind_generation(
-                active.generation,
-                TopicDropReason::ChannelClosed,
-                &mut self.snapshot,
-                &mut self.notifications,
-            );
-        }
-        if !self.desired.connected {
-            self.topics
-                .end_session(&mut self.snapshot, &mut self.notifications);
-        }
         let mut closing = Closing::default();
         if let Some(mut attempt) = self.attempt.take() {
             let _ = closing.generations.insert(attempt.generation);
@@ -2938,7 +3180,15 @@ impl Agent {
                 );
             }
         }
-        if let Some(active) = self.active.take() {
+        if let Some(mut active) = self.active.take() {
+            for physical in active.payloads.values_mut() {
+                physical.settle_data_sender(
+                    active.generation,
+                    self.data_now,
+                    true,
+                    &mut self.notifications,
+                );
+            }
             if let Some(renewal) = active.pending_renewal {
                 self.cancel_credential_work(renewal);
             }
@@ -3289,6 +3539,8 @@ fn parse_create_response(
             capabilities: crate::BootstrapCapabilities {
                 rtp: body.rtp_capabilities,
                 data_delivery,
+                data_v1: body.data_version
+                    == Some(u32::from(pulsebeam_proto::data_endpoint::DATA_V1)),
             },
             resource_uri: resource_uri.to_string(),
             room_id: body.room_id,

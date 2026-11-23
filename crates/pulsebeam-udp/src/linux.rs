@@ -5,7 +5,7 @@ use nix::{
     libc,
     sys::socket::{
         ControlMessage, ControlMessageOwned, MsgFlags, MultiHeaders, SockaddrStorage, recvmmsg,
-        recvmsg, sendmmsg, setsockopt, sockopt,
+        recvmsg, sendmmsg, sendmsg, setsockopt, sockopt,
     },
 };
 use std::{
@@ -34,6 +34,30 @@ pub(crate) async fn bind(options: &BindOptions) -> io::Result<Bound> {
     if options.local_addr.is_ipv6() {
         socket.set_only_v6(false)?;
     }
+    if options.nonfragmenting_max_datagram_bytes.is_some() {
+        // A dual-stack socket also transmits IPv4-mapped datagrams.
+        set_ip_option(
+            &socket,
+            libc::IPPROTO_IP,
+            libc::IP_MTU_DISCOVER,
+            libc::IP_PMTUDISC_DO,
+        )?;
+        if options.local_addr.is_ipv6() {
+            set_ip_option(
+                &socket,
+                libc::IPPROTO_IPV6,
+                libc::IPV6_MTU_DISCOVER,
+                libc::IP_PMTUDISC_DO,
+            )?;
+            set_ip_option(&socket, libc::IPPROTO_IPV6, libc::IPV6_DONTFRAG, 1)?;
+        }
+    }
+    if options.receive_ecn {
+        setsockopt(&socket, sockopt::IpRecvTos, &true)?;
+        if options.local_addr.is_ipv6() {
+            setsockopt(&socket, sockopt::Ipv6RecvTClass, &true)?;
+        }
+    }
     socket.set_nonblocking(true)?;
     if options.reuse_port {
         socket.set_reuse_port(true)?;
@@ -55,6 +79,31 @@ pub(crate) async fn bind(options: &BindOptions) -> io::Result<Bound> {
     Ok(Bound { socket, local_addr })
 }
 
+fn set_ip_option(
+    socket: &socket2::Socket,
+    level: libc::c_int,
+    option: libc::c_int,
+    mode: libc::c_int,
+) -> io::Result<()> {
+    let len = libc::socklen_t::try_from(std::mem::size_of_val(&mode))
+        .map_err(|_| invalid("unsupported path MTU option size"))?;
+    // SAFETY: the owned socket stays live for this call; the integer option
+    // is initialized and `len` describes exactly that integer.
+    let result = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            level,
+            option,
+            std::ptr::from_ref(&mode).cast(),
+            len,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 impl Bound {
     pub(crate) fn local_addr(&self) -> SocketAddr {
         self.local_addr
@@ -73,7 +122,7 @@ impl Bound {
             local_addr: self.local_addr,
             socket: tokio::io::unix::AsyncFd::try_new(self.socket)
                 .map_err(|error| error.into_parts().1)?,
-            recv_cmsg: cmsg_space!(i32, libc::in_pktinfo, libc::in6_pktinfo),
+            recv_cmsg: cmsg_space!(i32, libc::in_pktinfo, libc::in6_pktinfo, u8, i32),
             send_headers: SendHeaders(MultiHeaders::preallocate(BATCH_SIZE, None)),
             gso_headers: SendHeaders(MultiHeaders::preallocate(
                 BATCH_SIZE,
@@ -231,7 +280,13 @@ impl Socket {
             // storage reusable, but rebuild this bounded safe-API scratch.
             let mut headers = MultiHeaders::<SockaddrStorage>::preallocate(
                 self.caps.max_batch_messages,
-                Some(cmsg_space!(i32, libc::in_pktinfo, libc::in6_pktinfo)),
+                Some(cmsg_space!(
+                    i32,
+                    libc::in_pktinfo,
+                    libc::in6_pktinfo,
+                    u8,
+                    i32
+                )),
             );
             let mut slots = arena.bytes.chunks_exact_mut(arena.slot_size);
             let mut iovs: [[IoSliceMut<'_>; 1]; BATCH_SIZE] =
@@ -258,6 +313,50 @@ impl Socket {
                 }
             }
             Ok(())
+        })
+    }
+
+    pub(crate) fn send_ect0(&mut self, entry: &SendDatagram<'_>) -> SendReport {
+        let destination = match (self.local_addr, entry.destination) {
+            (SocketAddr::V6(_), SocketAddr::V4(addr)) => {
+                SocketAddr::new(IpAddr::V6(addr.ip().to_ipv6_mapped()), addr.port())
+            }
+            (_, addr) => addr,
+        };
+        let address = SockaddrStorage::from(destination);
+        let cmsg = if entry.destination.is_ipv4() {
+            ControlMessage::Ipv4Tos(&2)
+        } else {
+            ControlMessage::Ipv6TClass(&2)
+        };
+        submit_prefix(std::slice::from_ref(entry), 1, |_| {
+            let transmit = |socket: &socket2::Socket| {
+                sendmsg(
+                    socket.as_raw_fd(),
+                    &[IoSlice::new(entry.payload)],
+                    std::slice::from_ref(&cmsg),
+                    MsgFlags::MSG_DONTWAIT,
+                    Some(&address),
+                )
+                .map_err(io::Error::from)
+                .and_then(|bytes| {
+                    if bytes == entry.payload.len() {
+                        Ok(1)
+                    } else {
+                        Err(io::ErrorKind::WriteZero.into())
+                    }
+                })
+            };
+            let mut attempted = false;
+            let result = self.socket.try_io(tokio::io::Interest::WRITABLE, |socket| {
+                attempted = true;
+                transmit(socket)
+            });
+            if attempted {
+                result
+            } else {
+                transmit(self.socket.get_ref())
+            }
         })
     }
 
@@ -340,6 +439,7 @@ fn parse_received(
     let metadata = message.cmsgs().ok().and_then(|cmsgs| {
         let mut destination = None;
         let mut stride = None;
+        let mut ecn = None;
         let mut malformed = message.flags.contains(MsgFlags::MSG_CTRUNC);
         for cmsg in cmsgs {
             match cmsg {
@@ -363,6 +463,12 @@ fn parse_received(
                         scope,
                     ))));
                 }
+                ControlMessageOwned::Ipv4Tos(tos) => {
+                    ecn = Some(Ecn::from_traffic_class(tos));
+                }
+                ControlMessageOwned::Ipv6TClass(class) => {
+                    ecn = u8::try_from(class).ok().map(Ecn::from_traffic_class);
+                }
                 ControlMessageOwned::UdpGroSegments(segment) => {
                     if !gro || segment <= 0 || stride.is_some() {
                         malformed = true;
@@ -380,8 +486,9 @@ fn parse_received(
             max_datagram,
             malformed,
         )
+        .map(|(destination, stride)| (destination, stride, ecn))
     });
-    let Some((source, (destination, stride))) = source.zip(metadata) else {
+    let Some((source, (destination, stride, ecn))) = source.zip(metadata) else {
         counters.invalid_metadata_drops = counters.invalid_metadata_drops.saturating_add(1);
         return None;
     };
@@ -392,6 +499,7 @@ fn parse_received(
         stride,
         len: message.bytes,
         received_at,
+        ecn,
     })
 }
 

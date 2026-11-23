@@ -38,7 +38,6 @@ fn successor_receipt_updates_independently_of_grant_and_is_cleared_on_close() {
 
 #[test]
 fn missing_source_preparation_deadlines_expire_cancel_or_resolve_without_ending_the_source() {
-    use crate::control::native::{PreparedResource, ReceiverPreparation};
     use crate::entity::{ConnectionId, ParticipantId, RoomId, TrackKind};
     use crate::participant::policy::ResourceObservation;
     use crate::track::{DataLane, TrackMeta};
@@ -79,11 +78,7 @@ fn missing_source_preparation_deadlines_expire_cancel_or_resolve_without_ending_
                     publication_id: source.as_str(),
                     kind: wire::TrackKind::Data as i32,
                     source_room: "room".into(),
-                    binding: Some(wire::TrackBinding {
-                        transport: Some(wire::track_binding::Transport::Sctp(
-                            wire::SctpParameters { stream_id: Some(1) },
-                        )),
-                    }),
+                    binding: Some(crate::control::native::fixture::data_v1_binding(1)),
                 },
             )),
         };
@@ -275,43 +270,15 @@ fn missing_source_preparation_deadlines_expire_cancel_or_resolve_without_ending_
                             .is_none()
                     );
                 }
-                let command = model
-                    .prepare_execution(&work, 100, None, |_| {
-                        Some(super::super::ResolvedSource {
-                            track: &track,
-                            publisher: &publisher,
-                        })
-                    })
-                    .unwrap()
-                    .unwrap();
+                let before = model.retained_bytes;
                 assert!(matches!(
-                    command.into_action(),
-                    ExecutionAction::Prepare {
-                        resource: PreparedResource::Receiver(ReceiverPreparation::Ready(_)),
-                        ..
-                    }
+                    model.compile_execution(&work, None, |_| Some(super::super::ResolvedSource {
+                        track: &track,
+                        publisher: &publisher,
+                    })),
+                    Err(error) if error.code() == wire::FailureCode::Incompatible
                 ));
-                assert!(!matches!(
-                    model.rows[&Key::Owned(1)].value.value,
-                    Some(wire::confirmed_state::Value::Owned(_))
-                ));
-                if matches!(outcome, Outcome::SourceArrivesWithoutDiscovery) {
-                    assert!(
-                        model
-                            .rows
-                            .keys()
-                            .all(|key| !matches!(key, Key::Participant(_) | Key::Publication(_)))
-                    );
-                    let retained = model.rows[&Key::Owned(1)]
-                        .owned
-                        .as_ref()
-                        .unwrap()
-                        .receiver_source
-                        .as_ref()
-                        .unwrap();
-                    assert_eq!(retained.participant.participant_id, publisher.as_str());
-                    assert_eq!(retained.track, track_descriptor(&track).unwrap());
-                }
+                assert_eq!(model.retained_bytes, before);
             }
         }
         assert!(model.source_waits.is_empty());
@@ -356,6 +323,62 @@ fn publication(label: &str, enabled: bool) -> wire::ResourceSpec {
             },
         )),
     }
+}
+
+#[test]
+fn data_v1_publication_keeps_its_exact_transport_in_the_execution_plan() {
+    use crate::control::native::Publication;
+    let version = u32::from(pulsebeam_proto::data_endpoint::DATA_V1);
+    let parameters = wire::SctpDataV1Parameters {
+        stream_id: Some(1),
+        version,
+        channel_incarnation: u64::MAX,
+        delivery: wire::DataV1Delivery::Unreliable as i32,
+    };
+    let spec = |delivery: wire::DataDelivery| {
+        let mut spec = publication("events", true);
+        let Some(wire::resource_spec::Declaration::Publication(publication)) =
+            &mut spec.declaration
+        else {
+            panic!("publication")
+        };
+        let Some(wire::publication_spec::Kind::Data(data)) = &mut publication.kind else {
+            panic!("DATA publication")
+        };
+        data.delivery = delivery as i32;
+        data.binding = Some(wire::TrackBinding {
+            transport: Some(wire::track_binding::Transport::SctpDataV1(parameters)),
+        });
+        spec
+    };
+    let Some((Publication::Data(data), _)) =
+        crate::control::native::publication(&spec(wire::DataDelivery::Lossy), None).unwrap()
+    else {
+        panic!("DATA execution plan")
+    };
+    assert!(*data.parameters == parameters);
+    assert!(matches!(
+        crate::control::native::publication(&spec(wire::DataDelivery::Latest), None),
+        Err(wire::FailureCode::InvalidConfiguration)
+    ));
+
+    let mut session = session();
+    input(
+        &mut session,
+        vec![present(1, 1, spec(wire::DataDelivery::Lossy))],
+    )
+    .unwrap();
+    let work = session.take_preparation().unwrap().unwrap();
+    assert!(
+        matches!(session.compile_execution(&work, None, |_| None), Err(error)
+        if error.code() == wire::FailureCode::Unsupported)
+    );
+    session.data_v1_enabled = true;
+    assert!(
+        matches!(session.compile_execution(&work, None, |_| None).unwrap().into_action(),
+        ExecutionAction::Prepare { resource: crate::control::native::PreparedResource::Publication(Publication::Data(data)), .. }
+            if *data.parameters == parameters)
+    );
 }
 
 fn subscription(publication_id: &str) -> wire::ResourceSpec {
@@ -439,14 +462,21 @@ fn live(session: &NativeSession, work: &Preparation) -> wire::LiveResource {
     let Some(wire::resource_spec::Declaration::Publication(publication)) = &spec.declaration else {
         panic!("publication fixture")
     };
+    let mut track = source(work.reference, &publication.track_id);
+    if let Some(wire::publication_spec::Kind::Data(data)) = &publication.kind {
+        track.kind = Some(wire::track::Kind::Data(wire::DataTrack {
+            delivery: data.delivery,
+        }));
+    }
     wire::LiveResource {
+        data_v1_source: None,
         spec: Some(spec.clone()),
         participant: Some(wire::Participant {
             participant_id: "owner".into(),
 
             room_id: "room".into(),
         }),
-        track: Some(source(work.reference, &publication.track_id)),
+        track: Some(track),
         execution: if spec.settings.as_ref().unwrap().enabled == Some(true) {
             wire::ExecutionStatus::Installed
         } else {
@@ -1036,15 +1066,22 @@ fn execution_attempts_and_grants_fence_stale_work_and_expired_commits() {
 #[test]
 fn terminal_lifetimes_release_rows_queues_and_byte_funding_without_history() {
     let mut session = session();
+    session.enable_data_v1();
     drain(&mut session);
     let baseline = session.retained_bytes;
     for index in 0..512 {
         let reference = index * 2 + 1;
-        input(
-            &mut session,
-            vec![present(reference, reference, publication("topic", true))],
-        )
-        .unwrap();
+        let mut spec = publication("topic", true);
+        let Some(wire::resource_spec::Declaration::Publication(publisher)) = &mut spec.declaration
+        else {
+            unreachable!()
+        };
+        let Some(wire::publication_spec::Kind::Data(data)) = &mut publisher.kind else {
+            unreachable!()
+        };
+        data.delivery = wire::DataDelivery::Latest as i32;
+        data.binding = Some(crate::control::native::fixture::data_v1_binding(1));
+        input(&mut session, vec![present(reference, reference, spec)]).unwrap();
         let work = session.take_preparation().unwrap().unwrap();
         assert!(matches!(
             session
@@ -1172,7 +1209,8 @@ fn terminal_lifetimes_release_rows_queues_and_byte_funding_without_history() {
         } else {
             work
         };
-        let value = live(&session, &work);
+        let mut value = live(&session, &work);
+        value.data_v1_source = Some(reference);
         assert!(session.complete(work, Ok(value), 100).unwrap());
         drain(&mut session);
         input(&mut session, vec![absent(reference, reference + 1)]).unwrap();
@@ -1593,6 +1631,7 @@ fn data_projection_uses_actual_metadata_without_a_payload_format_or_activity_cla
         .unwrap();
         let work = session.take_preparation().unwrap().unwrap();
         let fact = crate::participant::policy::PublicationExecution {
+            data_v1_source: None,
             track: source,
             enabled: true,
             active: true,
@@ -1756,11 +1795,7 @@ fn receiver_response_projection_is_prepaid_and_survives_catalog_removal_until_cu
                 publication_id: track.publication_id.clone(),
                 kind: wire::TrackKind::Data as i32,
                 source_room: "room".into(),
-                binding: Some(wire::TrackBinding {
-                    transport: Some(wire::track_binding::Transport::Sctp(wire::SctpParameters {
-                        stream_id: Some(1),
-                    })),
-                }),
+                binding: Some(crate::control::native::fixture::data_v1_binding(1)),
             },
         )),
     };
@@ -2146,7 +2181,7 @@ fn denied_source_lookup_never_resolves_or_prepares_even_in_another_room() {
         assert!(model.rows[&Key::Owned(reference)].owned.is_none());
     }
     model
-        .refresh_source_lookups(32, 100, |_| {
+        .refresh_source_lookups(32, 100, &DataBranchIds::default(), |_| {
             panic!("denied lookup reached source resolution")
         })
         .unwrap();
@@ -2255,7 +2290,7 @@ fn source_lookup_is_owned_nonforwarding_and_updates_atomic_borrowed_descriptors(
             .any(|key| matches!(key, Key::Publication(_)))
     );
     model
-        .refresh_source_lookups(32, 100, |_| {
+        .refresh_source_lookups(32, 100, &DataBranchIds::default(), |_| {
             Some(super::super::ResolvedSource {
                 track: &first,
                 publisher: &publisher,
@@ -2307,7 +2342,7 @@ fn source_lookup_is_owned_nonforwarding_and_updates_atomic_borrowed_descriptors(
     let replacement_connection = ConnectionId::new();
     let replacement = data_track(replacement_connection);
     model
-        .refresh_source_lookups(32, 100, |_| {
+        .refresh_source_lookups(32, 100, &DataBranchIds::default(), |_| {
             Some(super::super::ResolvedSource {
                 track: &replacement,
                 publisher: &publisher,
@@ -2323,7 +2358,9 @@ fn source_lookup_is_owned_nonforwarding_and_updates_atomic_borrowed_descriptors(
         replacement.id().as_str()
     );
 
-    model.refresh_source_lookups(32, 100, |_| None).unwrap();
+    model
+        .refresh_source_lookups(32, 100, &DataBranchIds::default(), |_| None)
+        .unwrap();
     let state = &model.rows[&Key::Owned(51)].value;
     let Some(wire::confirmed_state::Value::SourceLookup(unpublished)) = &state.value else {
         panic!("unpublished lookup state")
@@ -2337,6 +2374,151 @@ fn source_lookup_is_owned_nonforwarding_and_updates_atomic_borrowed_descriptors(
 }
 
 #[test]
+fn fabric_receiver_offers_are_versioned_and_rotate_with_the_authenticated_source() {
+    use crate::entity::{ConnectionId, ParticipantId, RoomId, TrackId, TrackKind};
+    use crate::track::{DataLane, TrackMeta};
+    use std::num::NonZeroU64;
+
+    let mut model = session();
+    let publisher = ParticipantId::new("publisher").unwrap();
+    let room = RoomId::new("room").unwrap();
+    let connection = ConnectionId::new();
+    let meta = TrackMeta {
+        room: crate::entity::ProjectRoomKey::fixture(room),
+        id: connection.fixture_publication(TrackKind::Data, "cursor"),
+        origin: publisher,
+        connection_id: connection,
+        track_id: Some(TrackId::new("cursor").unwrap()),
+    };
+    let fabric = |source| {
+        Track::native_data_publication(meta.clone(), DataLane::Latest, NonZeroU64::new(source))
+    };
+    let first = fabric(10);
+    let legacy = fabric(0);
+    let subscription = wire::ResourceSpec {
+        settings: Some(wire::ResourceSettings {
+            enabled: Some(true),
+            receive: None,
+        }),
+        declaration: Some(wire::resource_spec::Declaration::LogicalSubscription(
+            wire::LogicalSubscriptionSpec {
+                data_version: Some(u32::from(pulsebeam_proto::data_endpoint::DATA_V1)),
+                source: Some(wire::LogicalSourceAddress {
+                    room: room.to_string(),
+                    participant_id: publisher.to_string(),
+                    kind: wire::TrackKind::Data as i32,
+                    track_id: "cursor".into(),
+                }),
+            },
+        )),
+    };
+    input(&mut model, vec![present(1, 1, subscription.clone())]).unwrap();
+    let branches = DataBranchIds::default();
+    let offer = |model: &mut NativeSession, track: &Track| {
+        model
+            .refresh_source_lookups(32, 100, &branches, |_| {
+                Some(super::super::ResolvedSource {
+                    track,
+                    publisher: &publisher,
+                })
+            })
+            .unwrap();
+        let Some(wire::confirmed_state::Value::LogicalSubscription(state)) =
+            &model.rows[&Key::Owned(1)].value.value
+        else {
+            panic!("logical subscription");
+        };
+        assert_eq!(state.source.is_some(), state.data_v1.is_some());
+        (
+            state.source_revision,
+            state
+                .data_v1
+                .as_ref()
+                .map(|offer| (offer.source, offer.branch)),
+        )
+    };
+    assert_eq!(offer(&mut model, &first), (0, None));
+    model.enable_data_v1();
+    let reliable =
+        Track::native_data_publication(meta.clone(), DataLane::Ordered, NonZeroU64::new(12));
+    assert_eq!(offer(&mut model, &reliable), (0, None));
+    assert_eq!(offer(&mut model, &legacy), (0, None));
+    assert_eq!(offer(&mut model, &first), (1, Some((10, 1))));
+    assert_eq!(offer(&mut model, &first), (1, Some((10, 1))));
+    assert_eq!(offer(&mut model, &fabric(11)), (2, Some((11, 2))));
+    assert_eq!(offer(&mut model, &legacy), (3, None));
+    assert_eq!(offer(&mut model, &first), (4, Some((10, 3))));
+    let mut other_subscriber = session();
+    other_subscriber.enable_data_v1();
+    input(&mut other_subscriber, vec![present(1, 1, subscription)]).unwrap();
+    assert_eq!(offer(&mut other_subscriber, &first), (1, Some((10, 4))));
+    assert_eq!(offer(&mut model, &first), (4, Some((10, 3))));
+
+    let parameters = wire::SctpDataV1Parameters {
+        stream_id: Some(2),
+        version: u32::from(pulsebeam_proto::data_endpoint::DATA_V1),
+        channel_incarnation: 19,
+        delivery: wire::DataV1Delivery::Latest as i32,
+    };
+    let report = wire::ClientStateBatch {
+        records: vec![wire::ClientStateRecord {
+            owned: 1,
+            desired: None,
+            execution: Some(wire::ExecutionReport {
+                revision: 2,
+                outcome: Some(wire::execution_report::Outcome::LogicalReceiver(
+                    wire::LogicalReceiverReport {
+                        source_revision: 4,
+                        outcome: Some(wire::logical_receiver_report::Outcome::Prepared(
+                            wire::TrackBinding {
+                                transport: Some(wire::track_binding::Transport::SctpDataV1(
+                                    parameters,
+                                )),
+                            },
+                        )),
+                    },
+                )),
+            }),
+        }],
+        ..Default::default()
+    };
+    assert!(
+        model
+            .receive_input(&codec::encode_client(&report).unwrap(), 100)
+            .unwrap()
+            .is_empty()
+    );
+    let work = model.take_preparation().unwrap().unwrap();
+    let stale = fabric(11);
+    assert!(
+        matches!(model.compile_execution(&work, None, |_| Some(super::super::ResolvedSource { track: &stale, publisher: &publisher })),
+        Err(error) if error.code() == wire::FailureCode::Incompatible)
+    );
+    use crate::control::native::{PreparedResource, ReceiveTransport, ReceiverPreparation};
+    let ExecutionAction::Prepare {
+        resource: PreparedResource::Receiver(ReceiverPreparation::Ready(plan)),
+        ..
+    } = model
+        .compile_execution(&work, None, |_| {
+            Some(super::super::ResolvedSource {
+                track: &first,
+                publisher: &publisher,
+            })
+        })
+        .unwrap()
+        .into_action()
+    else {
+        panic!("exact receiver preparation")
+    };
+    let ReceiveTransport::FabricData(fabric) = plan.transport else {
+        panic!("Fabric DATA receiver")
+    };
+    assert_eq!(fabric.parameters, parameters);
+    assert_eq!(fabric.endpoint.source.get(), 10);
+    assert_eq!(fabric.endpoint.branch.get(), 3);
+}
+
+#[test]
 fn logical_subscription_keeps_one_reservation_across_scoped_receiver_replacement() {
     use crate::entity::{ConnectionId, ParticipantId, RoomId, TrackId, TrackKind};
     use crate::track::{DataLane, TrackMeta};
@@ -2344,6 +2526,7 @@ fn logical_subscription_keeps_one_reservation_across_scoped_receiver_replacement
     use wire::confirmed_state::Value;
 
     let mut model = session();
+    model.enable_data_v1();
     let room = RoomId::new("source-room").unwrap();
     let publisher = ParticipantId::new("publisher").unwrap();
     let grant = Grant::new(
@@ -2371,6 +2554,7 @@ fn logical_subscription_keeps_one_reservation_across_scoped_receiver_replacement
         }),
         declaration: Some(wire::resource_spec::Declaration::LogicalSubscription(
             wire::LogicalSubscriptionSpec {
+                data_version: Some(u32::from(pulsebeam_proto::data_endpoint::DATA_V1)),
                 source: Some(wire::LogicalSourceAddress {
                     room: room.to_string(),
                     participant_id: publisher.to_string(),
@@ -2380,9 +2564,11 @@ fn logical_subscription_keeps_one_reservation_across_scoped_receiver_replacement
             },
         )),
     };
+    let source_ids = std::cell::Cell::new(0);
     let data_track = |label: &str| {
+        source_ids.set(source_ids.get() + 1);
         let connection = ConnectionId::new();
-        Track::data_publication(
+        Track::native_data_publication(
             TrackMeta {
                 room: crate::entity::ProjectRoomKey::fixture(room),
                 id: connection.fixture_publication(TrackKind::Data, label),
@@ -2390,7 +2576,8 @@ fn logical_subscription_keeps_one_reservation_across_scoped_receiver_replacement
                 connection_id: connection,
                 track_id: Some(TrackId::new(label).unwrap()),
             },
-            DataLane::Ordered,
+            DataLane::Latest,
+            std::num::NonZeroU64::new(source_ids.get()),
         )
     };
     let assert_state =
@@ -2411,9 +2598,10 @@ fn logical_subscription_keeps_one_reservation_across_scoped_receiver_replacement
                 source.map(|track| track.id().as_str()),
             );
         };
+    let branches = DataBranchIds::default();
     let offer = |model: &mut NativeSession, track| {
         model
-            .refresh_source_lookups(32, 100, |_| {
+            .refresh_source_lookups(32, 100, &branches, |_| {
                 Some(super::super::ResolvedSource {
                     track,
                     publisher: &publisher,
@@ -2462,13 +2650,7 @@ fn logical_subscription_keeps_one_reservation_across_scoped_receiver_replacement
                         wire::LogicalReceiverReport {
                             source_revision,
                             outcome: Some(wire::logical_receiver_report::Outcome::Prepared(
-                                wire::TrackBinding {
-                                    transport: Some(wire::track_binding::Transport::Sctp(
-                                        wire::SctpParameters {
-                                            stream_id: Some(stream_id),
-                                        },
-                                    )),
-                                },
+                                crate::control::native::fixture::data_v1_binding(stream_id),
                             )),
                         },
                     )),
@@ -2559,7 +2741,7 @@ fn logical_subscription_keeps_one_reservation_across_scoped_receiver_replacement
     assert!(matches!(&model.rows[&Key::Owned(1)].value.value,
         Some(Value::LogicalSubscription(state)) if matches!(&state.execution,
             Some(wire::logical_subscription_state::Execution::Installed(binding))
-                if matches!(&binding.transport, Some(wire::track_binding::Transport::Sctp(sctp)) if sctp.stream_id == Some(7))
+                if matches!(&binding.transport, Some(wire::track_binding::Transport::SctpDataV1(sctp)) if sctp.stream_id == Some(7))
         )
     ));
 
@@ -2718,11 +2900,16 @@ fn source_lookup_work_is_cursor_bounded_and_authorized_for_other_rooms() {
         .unwrap();
     }
     assert!(bounded.preparations.is_empty());
-    bounded.refresh_source_lookups(8, 100, |_| None).unwrap();
+    let branches = DataBranchIds::default();
+    bounded
+        .refresh_source_lookups(8, 100, &branches, |_| None)
+        .unwrap();
     assert!(bounded.lookup_refresh_pending());
     let mut turns = 1;
     while bounded.lookup_refresh_pending() {
-        bounded.refresh_source_lookups(8, 100, |_| None).unwrap();
+        bounded
+            .refresh_source_lookups(8, 100, &branches, |_| None)
+            .unwrap();
         turns += 1;
         assert!(turns <= 8, "lookup cursor failed to make bounded progress");
     }

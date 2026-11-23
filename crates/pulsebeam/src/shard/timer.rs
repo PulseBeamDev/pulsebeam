@@ -82,6 +82,10 @@ impl TimerWheel {
         }
     }
 
+    pub fn wake(&mut self, key: ParticipantHandle) {
+        self.schedule(key, self.last_now);
+    }
+
     pub fn schedule(&mut self, key: ParticipantHandle, deadline: Instant) {
         let (location, deadline_tick) = if deadline <= self.last_now {
             (DUE_LOCATION, self.current_tick)
@@ -478,6 +482,22 @@ mod tests {
             expired.push(entry);
         });
         assert_eq!(expired.len(), 1);
+    }
+
+    #[test]
+    fn handoff_wake_moves_a_scheduled_participant_to_the_due_list() {
+        let mut wheel = TimerWheel::new(16);
+        let key = keys(1)[0];
+        let now = wheel.epoch + Duration::from_millis(10);
+        wheel.drain_expired(now, |_| {});
+        wheel.schedule(key, now + Duration::from_millis(20));
+        wheel.wake(key);
+
+        assert_eq!(wheel.next_deadline(), Some(now));
+        let mut expired = Vec::new();
+        wheel.drain_expired(now, |key| expired.push(key));
+        assert_eq!(expired, vec![key]);
+        assert_eq!(wheel.next_deadline(), None);
     }
 
     #[test]

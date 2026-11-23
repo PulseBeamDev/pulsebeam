@@ -1,9 +1,42 @@
 use super::packet::TrackPacket;
 use super::reverse::ReversePacket;
-#[cfg(test)]
 use crate::entity::PublicationKey;
 use crate::keys::TrackHandle;
-use crate::track::{SelectionPolicy, Track, TrackMeta, TrackSelector};
+use crate::track::{Track, TrackMeta};
+
+#[cfg(test)]
+pub(crate) struct FabricPublication {
+    pub source: crate::shard::router::FabricSourceHandle,
+    pub arrival: pulsebeam_runtime::time::Instant,
+    pub sequence: u64,
+    pub packet: crate::route::fabric::local::OwnedPacket,
+    pub reliable: Option<super::data_fabric::ReliableAdmission>,
+}
+
+pub(crate) struct FabricDataPosition {
+    pub source: crate::shard::router::FabricSourceHandle,
+    pub installation: pulsebeam_rtc::DataChannelInstallation,
+    pub arrival: pulsebeam_runtime::time::Instant,
+    pub sequence: u64,
+    pub reliable: Option<super::data_fabric::ReliableAdmission>,
+}
+
+#[derive(Debug)]
+pub(crate) struct FabricSubscriberFeedback {
+    pub(crate) lease: super::data_fabric::SubscriberLease,
+    pub(crate) kind: FabricFeedbackKind,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum FabricFeedbackKind {
+    Propagation(
+        crate::route::fabric::local::DataExpectation,
+        crate::route::fabric::local::PropagationOutcome,
+    ),
+    Assembled(crate::route::fabric::local::DataExpectation),
+    Repair(crate::route::fabric::local::RepairRequest),
+    CancelRepair(crate::route::fabric::local::RepairRequest),
+}
 
 pub(crate) trait ParticipantSink {
     fn connected(
@@ -26,13 +59,43 @@ pub(crate) trait ParticipantSink {
         enabled: bool,
     );
     fn unsubscribe_owned(&mut self, reference: u64, source_room: crate::entity::ProjectRoomKey);
-    fn subscribe_tracks(&mut self, selector: TrackSelector, selection: SelectionPolicy);
-    fn unsubscribe_tracks(&mut self, selector: TrackSelector);
     fn request_reverse(&mut self, stream: TrackHandle, packet: ReversePacket);
+    fn request_fabric_refresh(&mut self, branch: crate::shard::router::FabricLocalBranch);
     fn renew_authorization(&mut self, token: String);
     fn exit(&mut self);
 
     fn publish_track_packet(&mut self, fanout: Option<TrackHandle>, packet: TrackPacket);
+    #[cfg(test)]
+    fn publish_fabric_packet(&mut self, publication: FabricPublication);
+    fn publish_fabric_data(
+        &mut self,
+        source: crate::shard::router::FabricSourceHandle,
+        installation: pulsebeam_rtc::DataChannelInstallation,
+        bytes: &[u8],
+        now: pulsebeam_runtime::time::Instant,
+        stamp: u32,
+    ) -> Result<(), super::data_fabric::Error>;
+    fn settle_fabric_original_unavailable(
+        &mut self,
+        source: crate::shard::router::FabricSourceHandle,
+        installation: pulsebeam_rtc::DataChannelInstallation,
+        demand: pulsebeam_proto::data_control::OriginalDemand,
+        now: pulsebeam_runtime::time::Instant,
+    );
+    fn publish_fabric_media(
+        &mut self,
+        source: crate::shard::router::FabricSourceHandle,
+        input: crate::rtp::fabric_ingress::MediaIngress,
+    );
+    fn fence_fabric_source(&mut self, source: crate::shard::router::FabricSourceHandle);
+    fn stage_fabric_receiver(&mut self, work: crate::control::native::Preparation);
+    fn stage_local_rtp_receiver(&mut self, reference: u64);
+    fn observe_fabric_subscriber(&mut self, feedback: FabricSubscriberFeedback);
+    fn stage_fabric_publisher(
+        &mut self,
+        work: crate::control::native::Preparation,
+        publication: PublicationKey,
+    );
 }
 
 #[cfg(test)]
@@ -58,6 +121,7 @@ pub mod test_utils {
         pub reverse_packets: Vec<ReversePacket>,
         pub exit_count: usize,
         pub publish_track_packet_calls: Vec<TrackHandle>,
+        pub fabric_publications: Vec<(crate::control::native::Preparation, PublicationKey)>,
     }
 
     impl MockParticipantSink {
@@ -114,9 +178,7 @@ pub mod test_utils {
             self.owned_unsubscribes.push(reference);
         }
 
-        fn subscribe_tracks(&mut self, _selector: TrackSelector, _selection: SelectionPolicy) {}
-
-        fn unsubscribe_tracks(&mut self, _selector: TrackSelector) {}
+        fn request_fabric_refresh(&mut self, _branch: crate::shard::router::FabricLocalBranch) {}
 
         fn request_reverse(&mut self, stream: TrackHandle, packet: ReversePacket) {
             self.reverse_requests.push(stream);
@@ -127,6 +189,57 @@ pub mod test_utils {
 
         fn exit(&mut self) {
             self.exit_count = self.exit_count.saturating_add(1);
+        }
+
+        fn publish_fabric_packet(&mut self, _publication: FabricPublication) {
+            panic!("Fabric publications need a shard-owned sink");
+        }
+
+        fn publish_fabric_data(
+            &mut self,
+            _source: crate::shard::router::FabricSourceHandle,
+            _installation: pulsebeam_rtc::DataChannelInstallation,
+            _bytes: &[u8],
+            _now: pulsebeam_runtime::time::Instant,
+            _stamp: u32,
+        ) -> Result<(), super::super::data_fabric::Error> {
+            panic!("Fabric DATA requires the shard publication sink");
+        }
+
+        fn settle_fabric_original_unavailable(
+            &mut self,
+            _source: crate::shard::router::FabricSourceHandle,
+            _installation: pulsebeam_rtc::DataChannelInstallation,
+            _demand: pulsebeam_proto::data_control::OriginalDemand,
+            _now: pulsebeam_runtime::time::Instant,
+        ) {
+            panic!("Fabric DATA requires the shard publication sink");
+        }
+
+        fn publish_fabric_media(
+            &mut self,
+            _source: crate::shard::router::FabricSourceHandle,
+            _input: crate::rtp::fabric_ingress::MediaIngress,
+        ) {
+            panic!("Fabric media requires the shard publication sink");
+        }
+
+        fn fence_fabric_source(&mut self, _source: crate::shard::router::FabricSourceHandle) {
+            panic!("Fabric publications need a shard-owned sink");
+        }
+
+        fn stage_fabric_receiver(&mut self, _work: crate::control::native::Preparation) {}
+
+        fn stage_local_rtp_receiver(&mut self, _reference: u64) {}
+
+        fn observe_fabric_subscriber(&mut self, _feedback: FabricSubscriberFeedback) {}
+
+        fn stage_fabric_publisher(
+            &mut self,
+            work: crate::control::native::Preparation,
+            publication: PublicationKey,
+        ) {
+            self.fabric_publications.push((work, publication));
         }
 
         fn publish_track_packet(&mut self, fanout: Option<TrackHandle>, _packet: TrackPacket) {

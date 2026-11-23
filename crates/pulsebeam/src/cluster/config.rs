@@ -10,7 +10,9 @@ use pulsebeam_link::{NetworkClass, NetworkPeer, PeerFingerprint, PeerRole, Secre
 use pulsebeam_membership::NodeId;
 use serde::Deserialize;
 
-/// Identities pinned for a single two-node ownership Link. Never reuse a DTLS
+const MAX_PROVISIONED_PEERS: usize = 16;
+
+/// Identities pinned for one ownership Link. Never reuse a DTLS
 /// private key across committed incarnations or between nodes.
 #[derive(Clone)]
 pub struct ProvisionedPeer {
@@ -18,6 +20,12 @@ pub struct ProvisionedPeer {
     pub local: (NodeId, NonZeroU64),
     pub remote: (NodeId, NonZeroU64),
     pub transport: NetworkPeer,
+    /// Explicit programmatic selection of the WAN carrier, with no fallback.
+    pub fabric_wan: bool,
+    /// Both pinned peers must support revision-1 Opus windows before enabling this.
+    pub wan_opus_source_budget: bool,
+    /// Explicitly allow WAN sources from this pinned upstream on this outgoing edge.
+    pub relay_from: Option<NodeId>,
     pub authority_epoch: [u8; 16],
     pub receipt_key: ApiSigningKey,
     pub peer_receipt_key: ApiPublicKey,
@@ -123,7 +131,7 @@ impl ServerConfig {
             advertise,
             seeds: seeds.into_iter().collect(),
             data_dir,
-            ownership_peer,
+            ownership_peers: ownership_peer.into_iter().collect(),
         };
         options.validate_topology()?;
         Ok(Some(options))
@@ -186,6 +194,9 @@ impl PeerConfig {
             authority_epoch,
             receipt_key,
             peer_receipt_key: self.peer_receipt_key,
+            fabric_wan: false,
+            wan_opus_source_budget: false,
+            relay_from: None,
             transport: NetworkPeer {
                 endpoint: self.peer_endpoint,
                 credential,
@@ -273,7 +284,7 @@ pub struct Options {
     pub advertise: SocketAddr,
     pub seeds: Vec<SocketAddr>,
     pub data_dir: PathBuf,
-    pub ownership_peer: Option<ProvisionedPeer>,
+    pub ownership_peers: Vec<ProvisionedPeer>,
 }
 
 impl Options {
@@ -288,7 +299,48 @@ impl Options {
                 "cluster.topology = 'single_node' requires identical loopback listen and advertise endpoints"
             );
         }
-        if let Some(peer) = &self.ownership_peer {
+        ensure!(
+            self.ownership_peers.len() <= MAX_PROVISIONED_PEERS,
+            "too many provisioned ownership peers"
+        );
+        let mut listeners = BTreeSet::new();
+        let mut endpoints = BTreeSet::new();
+        let mut nodes = BTreeSet::new();
+        let first = self.ownership_peers.first();
+        for peer in &self.ownership_peers {
+            ensure!(
+                !peer.wan_opus_source_budget || peer.fabric_wan,
+                "Opus source budgeting requires Fabric WAN"
+            );
+            if let Some(upstream) = peer.relay_from {
+                ensure!(
+                    peer.fabric_wan
+                        && upstream != peer.remote.0
+                        && self.ownership_peers.iter().any(|candidate| {
+                            candidate.remote.0 == upstream
+                                && candidate.fabric_wan
+                                && candidate.relay_from.is_none()
+                        }),
+                    "WAN transit requires a distinct pinned upstream without an export policy"
+                );
+            }
+            if let Some(first) = first {
+                ensure!(
+                    first.local == peer.local
+                        && first.authority_epoch == peer.authority_epoch
+                        && first.receipt_key.public_key() == peer.receipt_key.public_key(),
+                    "ownership peers must share the local identity and authority epoch"
+                );
+            }
+            if self.ownership_peers.len() > 1 {
+                ensure!(
+                    peer.fabric_wan
+                        && listeners.insert(peer.listen)
+                        && endpoints.insert(peer.transport.endpoint)
+                        && nodes.insert(peer.remote.0),
+                    "multiple ownership peers require distinct WAN listeners, endpoints and nodes"
+                );
+            }
             ensure!(
                 self.topology == Topology::MultiNode,
                 "[cluster.ownership_peer] requires multi_node topology"
@@ -302,6 +354,10 @@ impl Options {
                     && !peer.listen.ip().is_multicast()
                     && !matches!(peer.listen.ip(), IpAddr::V4(ip) if ip.is_broadcast()),
                 "ownership Link must listen on a fixed unicast or wildcard address"
+            );
+            ensure!(
+                !peer.fabric_wan || !peer.listen.ip().is_unspecified(),
+                "Fabric WAN requires a concrete local address and cannot use legacy Fabric carriage"
             );
             let remote = unique_endpoint(std::iter::once(peer.transport.endpoint))
                 .context("invalid ownership peer endpoint")?;
@@ -326,6 +382,10 @@ impl Options {
                 "peer and local receipt keys must differ"
             );
         }
+        ensure!(
+            listeners.is_disjoint(&endpoints),
+            "ownership listeners cannot also be peer endpoints"
+        );
         Ok(())
     }
 }

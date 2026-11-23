@@ -4,7 +4,8 @@ use std::{
 };
 
 use super::{
-    EgressUpdate, MediaEgress, QueuedMedia, RetainedKey, RetainedPacket, RetiringSender, Sender,
+    EgressUpdate, MediaEgress, QueuedMedia, RepairRequest, RetainedKey, RetainedPacket,
+    RetiringSender, Sender,
 };
 use crate::{
     AcceptError, MediaKind, RtpConfigurationError, RtpExtension, RtpWrite,
@@ -16,8 +17,8 @@ pub(super) use retirement::{RetirementReservation, retirement_bytes};
 
 pub(super) const RETIREMENT_BYTES: usize = size_of::<RetiringSender>();
 pub(super) const FIR_BYTES: usize = size_of::<(u32, u8)>();
-pub(super) const REPAIR_OWNER_BYTES: usize = size_of::<(u64, u64)>();
-pub(super) const REPAIR_INDEX_BYTES: usize = size_of::<(u64, RetainedKey)>();
+pub(super) const REPAIR_OWNER_BYTES: usize = size_of::<(u64, RepairRequest)>();
+pub(super) const REPAIR_INDEX_BYTES: usize = size_of::<(RepairRequest, RetainedKey)>();
 pub(super) const ISSUED_SSRC_BYTES: usize = size_of::<u32>();
 pub(super) const MID_GROUP_BYTES: usize = size_of::<(Box<str>, BTreeSet<u64>)>();
 pub(super) const RETAINED_PACKET_BYTES: usize = size_of::<(u16, RetainedPacket)>();
@@ -366,7 +367,7 @@ impl MediaEgress {
         true
     }
 
-    pub(super) fn release_repair_index(&mut self, request: u64) {
+    pub(super) fn release_repair_index(&mut self, request: RepairRequest) {
         if self.repair_requests.remove(&request).is_some() {
             self.runtime_bytes = self.runtime_bytes.saturating_sub(REPAIR_INDEX_BYTES);
         }

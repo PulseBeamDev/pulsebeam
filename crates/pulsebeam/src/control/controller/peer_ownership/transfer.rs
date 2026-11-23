@@ -12,6 +12,7 @@ const DEADLINE: Duration = Duration::from_secs(10);
 const VERSION: u8 = 1;
 const PULL: u8 = 1;
 const CHUNK: u8 = 2;
+pub(super) const WAN_IMAGE_CHANGED: [u8; 2] = [VERSION, 3];
 const HEADER: usize = 16;
 const CHUNK_BYTES: usize = CONTROL_FRAME_BYTES - HEADER;
 const WINDOW: usize = 8;
@@ -26,6 +27,7 @@ pub(super) struct Pull {
 pub(super) enum Frame<'a> {
     Pull(Pull),
     Chunk(Chunk<'a>),
+    WanImageChanged,
 }
 
 pub(super) struct Chunk<'a> {
@@ -43,6 +45,9 @@ impl<'a> Frame<'a> {
     pub(super) fn decode(input: &'a [u8]) -> Option<Self> {
         if input.first().copied()? != VERSION || input.len() > CONTROL_FRAME_BYTES {
             return None;
+        }
+        if input == WAN_IMAGE_CHANGED {
+            return Some(Self::WanImageChanged);
         }
         let round = NonZeroU64::new(u64::from_be_bytes(read_int(input, 2)?))?;
         match input.get(1).copied()? {
@@ -110,6 +115,11 @@ impl Sender {
         self.round = Some(pull.round);
         self.image = None;
         true
+    }
+
+    /// Withdraw buffered bytes without reopening a retired round.
+    pub(super) fn invalidate(&mut self) {
+        self.image = None;
     }
 
     pub(super) fn set_image(&mut self, now: Instant, bytes: Vec<u8>) {

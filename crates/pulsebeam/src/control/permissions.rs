@@ -113,35 +113,6 @@ impl ResourcePermissions {
         )
     }
 
-    pub(super) fn topic_publications(&self) -> crate::participant::policy::TopicPublications {
-        use crate::participant::policy::TopicPublications;
-        match self {
-            Self::Denied => TopicPublications::Denied,
-            #[cfg(test)]
-            Self::RoomBound => TopicPublications::All,
-            Self::Grants {
-                joined_room,
-                grants,
-            } => {
-                let Some(room) = joined_room else {
-                    return TopicPublications::Denied;
-                };
-                let mut labels = Vec::new();
-                for label in grants.publication_labels(room.as_str(), TrackKind::Data) {
-                    let Some(label) = label else {
-                        return TopicPublications::All;
-                    };
-                    labels.push(label.to_owned());
-                }
-                if labels.is_empty() {
-                    TopicPublications::Denied
-                } else {
-                    TopicPublications::Labels(labels)
-                }
-            }
-        }
-    }
-
     pub(super) fn has_subscription_kind_in_room(&self, room: &str, kind: TrackKind) -> bool {
         match self {
             Self::Denied => false,
@@ -155,7 +126,6 @@ impl ResourcePermissions {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::participant::policy::TopicPublications;
 
     #[test]
     fn explicit_room_grants_do_not_grant_presence_or_publication() {
@@ -176,10 +146,6 @@ mod tests {
             None,
             Some(TrackKind::Data),
             Some("chat")
-        ));
-        assert!(matches!(
-            listener.topic_publications(),
-            TopicPublications::Denied
         ));
         assert!(listener.allows_at_room(
             Action::Discover,

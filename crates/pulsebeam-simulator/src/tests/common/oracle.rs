@@ -4,7 +4,6 @@ use pulsebeam::entity::{ConnectionId, ParticipantId, PublicationKey, RoomId, Tra
 use pulsebeam_agent_native::agent_core::{
     ConnectionState, MediaKind, Publication, TopicRegistrations,
 };
-use pulsebeam_core::auth::DEVELOPMENT_PROJECT_ID;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Admission and public catalog descriptors bind opaque identities. Kind,
@@ -224,7 +223,8 @@ impl ApplicationStateOracle {
                 .cloned()
                 .collect::<BTreeSet<_>>()
                 == expected_video,
-            "video assignments differ from complete receive intent"
+            "video assignments differ from complete receive intent: expected {expected_video:?}, slots {:?}",
+            snapshot.video_mapping
         );
         check_mapping(
             &snapshot.audio_mapping,
@@ -273,71 +273,62 @@ impl ApplicationStateOracle {
                 "automatic audio assigned with automatic selection disabled"
             );
         }
-        let publishers = snapshot
-            .topics
-            .publishers
-            .iter()
-            .map(|status| &status.registration)
-            .collect::<Vec<_>>();
-        let subscribers = snapshot
-            .topics
-            .subscribers
-            .iter()
-            .map(|status| &status.registration)
-            .collect::<Vec<_>>();
+        use pulsebeam_agent_native::agent_core::ffi::PublicationExecution;
+
         ensure!(
-            publishers.len() == observer.topics.publishers.len()
-                && observer
-                    .topics
-                    .publishers
-                    .iter()
-                    .all(|registration| publishers
-                        .iter()
-                        .filter(|actual| **actual == registration)
-                        .count()
-                        == 1),
-            "topic publisher registrations differ from intent"
+            observation.data_publishers.keys().collect::<BTreeSet<_>>()
+                == observer.topics.publishers.iter().collect(),
+            "data publisher handles differ from intent"
         );
         ensure!(
-            subscribers.len() == observer.topics.subscribers.len()
-                && observer
-                    .topics
-                    .subscribers
-                    .iter()
-                    .all(|registration| subscribers
-                        .iter()
-                        .filter(|actual| **actual == registration)
-                        .count()
-                        == 1),
-            "topic subscriber registrations differ from intent"
+            observation.data_subscribers.keys().collect::<BTreeSet<_>>()
+                == observer.topics.subscribers.iter().collect(),
+            "data subscriber handles differ from intent"
         );
-        let mut data_ids = BTreeSet::new();
-        for publisher in &snapshot.topics.publishers {
-            let id = publisher
-                .publication_id
-                .as_ref()
-                .filter(|id| !id.is_empty())
-                .ok_or_else(|| anyhow::anyhow!("publisher has no public data binding"))?;
-            ensure!(data_ids.insert(id), "duplicate publisher data binding");
-        }
-        for subscriber in &snapshot.topics.subscribers {
-            let publishing = peers
-                .iter()
-                .filter(|peer| {
-                    peer.room == subscriber.registration.room
-                        && peer.external_id == subscriber.registration.participant_id
-                        && peer.topics.publishers.iter().any(|publisher| {
-                            publisher.topic == subscriber.registration.topic
-                                && publisher.mode == subscriber.registration.mode
-                        })
-                })
-                .collect::<Vec<_>>();
-            let required = publishing.iter().filter(|peer| peer.required).count();
+        for (publisher, state) in &observation.data_publishers {
             ensure!(
-                (required..=publishing.len()).contains(&subscriber.publishers),
-                "subscriber bindings differ from declared room publishers: required={required}, allowed={}, actual={}",
-                publishing.len(),
-                subscriber.publishers
+                state.execution == PublicationExecution::Installed
+                    && state.track_id == publisher.topic
+                    && state.delivery == publisher.mode.into(),
+                "data publisher {publisher:?} is not installed as declared: {state:?}"
+            );
+        }
+        for (subscriber, state) in &observation.data_subscribers {
+            ensure!(
+                state.selector.room == subscriber.room
+                    && state.selector.participant_id == subscriber.participant_id
+                    && state.selector.track_id == subscriber.topic
+                    && state.delivery == subscriber.mode.into(),
+                "wrong DATA subscription selector for {subscriber:?}: {state:?}"
+            );
+            let registration = pulsebeam_agent_native::agent_core::TopicPublisher {
+                topic: subscriber.topic.clone(),
+                mode: subscriber.mode,
+            };
+            let peer = peers.iter().find(|peer| {
+                peer.room == subscriber.room
+                    && peer.external_id == subscriber.participant_id
+                    && peer.topics.publishers.contains(&registration)
+            });
+            let catalog_id = peer.and_then(|peer| {
+                observation
+                    .data_catalog
+                    .get(&(peer.external_id.clone(), registration))
+            });
+            if peer.is_some_and(|peer| peer.required) {
+                ensure!(
+                    catalog_id.is_some() && state.execution == PublicationExecution::Installed,
+                    "data source not installed for {subscriber:?}: {state:?}"
+                );
+            }
+            ensure!(
+                state
+                    .source_track_id
+                    .as_ref()
+                    .is_none_or(|id| Some(id) == catalog_id)
+                    && (state.execution != PublicationExecution::Installed
+                        || state.source_track_id.is_some()),
+                "wrong data binding for {subscriber:?}: {state:?}"
             );
         }
         Ok(())

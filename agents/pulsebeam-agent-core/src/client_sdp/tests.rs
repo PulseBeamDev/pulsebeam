@@ -1040,6 +1040,8 @@ fn local_sender_preparation_commits_exact_identities_without_runtime_observation
     assert!(ctx.bindings().is_none());
     let candidate = ctx.prepare(&prepared, &[request("v", true, true)]).unwrap();
     assert!(candidate.answer().contains("a=extmap-allow-mixed\r\n"));
+    assert!(candidate.bindings().publications[0].extmap_allow_mixed);
+    assert!(candidate.bindings().receptions[0].extmap_allow_mixed);
     assert!(candidate.bindings().publications[0].complete());
     let abandoned = candidate.bindings().clone();
     ctx.finish(candidate.id(), ApplyOutcome::NotApplied)

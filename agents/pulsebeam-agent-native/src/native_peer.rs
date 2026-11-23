@@ -215,15 +215,18 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
         }
         let mut session = native_media::session(runtime, config.audio_input, config.video_input)?;
         #[cfg(not(feature = "transport-conformance"))]
-        let peer = session.create_peer(rtc::PeerConfiguration::default())?;
+        let mut peer_config: rtc::RtcConfiguration = rtc::PeerConfiguration::default().into();
         #[cfg(feature = "transport-conformance")]
-        let peer = {
+        let mut peer_config = {
             session.set_factory_options(rtc::FactoryOptions {
                 ignored_network_adapters: rtc::NetworkAdapterMask::NONE,
                 ..Default::default()
             })?;
-            session.create_peer_with_configuration(crate::qualification_network::configuration())?
+            crate::qualification_network::configuration()
         };
+        // Prefer the full GCM tag used by Fabric WAN while preserving stock fallback.
+        peer_config.options.crypto_options = rtc::CryptoOptions::prefer_gcm();
+        let peer = session.create_peer_with_configuration(peer_config)?;
         // Fund a normal three-rung video start without imposing a bitrate
         // floor. Subsequent native congestion feedback remains authoritative.
         session.set_peer_bitrate(peer, None, Some(1_500_000), None)?;
@@ -882,6 +885,7 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
                         Some(agent_core::DataChannelEvent::Message {
                             generation: self.generation,
                             channel,
+                            binary: message.kind == rtc::DataChannelMessageKind::Binary,
                             payload: message.bytes,
                         })
                     }

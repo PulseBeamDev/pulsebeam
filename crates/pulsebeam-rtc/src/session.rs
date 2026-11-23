@@ -69,13 +69,18 @@ pub enum CodecProfile {
         packetization_mode: u8,
         level_asymmetry_allowed: bool,
     },
+    Av1 {
+        profile: u8,
+        level_idx: u8,
+        tier: u8,
+    },
 }
 
 impl CodecProfile {
     pub const fn kind(self) -> MediaKind {
         match self {
             Self::Opus => MediaKind::Audio,
-            Self::H264 { .. } => MediaKind::Video,
+            Self::H264 { .. } | Self::Av1 { .. } => MediaKind::Video,
         }
     }
 }

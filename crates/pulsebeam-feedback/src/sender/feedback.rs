@@ -947,6 +947,10 @@ impl Sender {
         if entry.in_flight {
             entry.in_flight = false;
             let wire_len = entry.wire_len as u64;
+            let (space, sequence) = (entry.space, entry.packet_sequence);
+            if let Some(source) = self.spaces.get_mut(&space) {
+                source.remove_in_flight(sequence, sent_id);
+            }
             self.bytes_in_flight = self.bytes_in_flight.saturating_sub(wire_len);
             self.inputs.bytes_in_flight = self.bytes_in_flight;
         }
@@ -1021,6 +1025,7 @@ impl Sender {
         let sample = SentObservation {
             sent_id,
             space: entry.space,
+            packet: PacketId(entry.packet_sequence),
             committed_at: entry.committed_at,
             transport_bytes: u32::try_from(entry.wire_len).unwrap_or(u32::MAX),
             tag: entry.tag,

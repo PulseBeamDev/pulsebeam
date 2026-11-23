@@ -3,7 +3,7 @@
 pub use pulsebeam_webrtc_sys::*;
 mod h264_fixture;
 pub use h264_fixture::{
-    NativeH264AccessUnit, NativeH264FixtureEncoding, stock_h264_fixture,
+    NativeH264AccessUnit, NativeH264FixtureEncoding, stock_av1_keyframe, stock_h264_fixture,
     stock_h264_fixture_for_encoding, stock_h264_solid_fixture,
 };
 

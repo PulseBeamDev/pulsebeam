@@ -43,8 +43,16 @@ pub struct RejectedData {
 #[non_exhaustive]
 pub enum Output {
     Transmit(Transmit),
+    /// A protected media datagram whose send must be resolved by the caller.
+    Handoff {
+        id: u64,
+        scope: Option<crate::MediaScope>,
+        transmit: Transmit,
+    },
     Event(Event),
-    Idle { next_wakeup: Option<Instant> },
+    Idle {
+        next_wakeup: Option<Instant>,
+    },
     Closed(CloseReason),
 }
 
@@ -76,6 +84,10 @@ pub enum Event {
     },
     KeyframeRequested {
         ssrc: u32,
+    },
+    /// Authenticated refresh request for a previously submitted scoped sender.
+    ScopedKeyframeRequested {
+        scope: crate::MediaScope,
     },
     BandwidthEstimate(MediaPayloadBitrate),
     DataChannel(DataChannelEvent),
@@ -184,6 +196,8 @@ pub enum WriteError {
     UnknownDataChannel(DataChannelId),
     #[error("invalid RTP write or extension value")]
     InvalidRtp,
+    #[error("protected primary or negotiated RTX exceeds the RTP leg size limit")]
+    RtpTooLarge,
     #[error("RTP index exceeds the SRTP key lifetime")]
     IndexExhausted,
     #[error("operation is invalid in the current state")]

@@ -116,6 +116,7 @@ impl NativeAudioReceiver {
         };
         validation::validate_spec(&spec)
             .map_err(|error| anyhow::anyhow!("actual Native receive spec: {error:?}"))?;
+        assert_opus_gcm(&peer.peer, &media.mid)?;
         let sink = transceiver.receiver().attach_encoded_audio_sink()?;
         peer.desire(30, 30, Some(spec.clone()));
         let mut receiver = Self {
@@ -172,24 +173,37 @@ impl NativeAudioReceiver {
         .await
     }
 
-    pub(super) fn frames(&self, minimum: usize) -> anyhow::Result<()> {
+    pub(super) fn frames(
+        &self,
+        minimum: usize,
+    ) -> anyhow::Result<pulsebeam_rtc_simulation::EncodedAudioFrame> {
+        self.frames_with_payload(minimum, super::SILENCE_OPUS)
+    }
+
+    pub(super) fn frames_with_payload(
+        &self,
+        minimum: usize,
+        payload: &[u8],
+    ) -> anyhow::Result<pulsebeam_rtc_simulation::EncodedAudioFrame> {
         let mut count = 0;
+        let mut first = None;
         while let Some(frame) = self.sink.try_next_frame() {
             anyhow::ensure!(
-                frame.data == [0xf8, 0xff, 0xfe]
+                frame.data == payload
                     && frame.ssrc == self.ssrc
                     && frame.samples_per_channel == 960
                     && frame.audio_level_dbov == Some(127)
                     && frame.voice_activity == Some(false),
                 "real Native receive payload/SSRC/Opus facts"
             );
+            first.get_or_insert(frame);
             count += 1;
         }
         anyhow::ensure!(
             count >= minimum,
             "Native RTP received only {count} frames, expected at least {minimum}"
         );
-        Ok(())
+        first.context("first authenticated Native Opus frame")
     }
 
     pub(super) async fn absent(

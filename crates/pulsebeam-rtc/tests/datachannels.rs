@@ -98,7 +98,8 @@ fn queued_control_reply_reaches_peer_during_bounded_graceful_close() {
 
 #[test]
 fn local_and_remote_channels_preserve_messages_and_close() {
-    let mut fixture = PeerFixture::connected_datachannels();
+    const FABRIC_UDP_LIMIT: usize = 1216;
+    let mut fixture = PeerFixture::connected_bounded_udp_datachannels(FABRIC_UDP_LIMIT);
 
     let mut remote = None;
     let mut peer_opened = false;
@@ -119,6 +120,31 @@ fn local_and_remote_channels_preserve_messages_and_close() {
         } if channel == remote && bytes.as_ref() == b"from peer"
     ));
 
+    let setup_peaks = fixture.take_udp_payload_peaks();
+    assert!(
+        setup_peaks
+            .into_iter()
+            .all(|bytes| (1..=FABRIC_UDP_LIMIT).contains(&bytes)),
+        "protected channel setup peaks: {setup_peaks:?}"
+    );
+
+    // A maximum DATA record with capture time, uncertainty, and opaque DD.
+    let smallest = [0x11; 22];
+    let largest = support::maximum_data_record();
+    let multi_packet = [7; 8_000];
+    for payload in [&smallest[..], &largest[..], &multi_packet[..]] {
+        fixture.peer_send(true, payload);
+    }
+    for expected in [&smallest[..], &largest[..], &multi_packet[..]] {
+        assert!(matches!(
+            fixture.next_data_event(),
+            FixtureDataEvent::ConnectionMessage {
+                channel,
+                message: DataMessage::Binary(ref bytes),
+            } if channel == remote && bytes.as_ref() == expected
+        ));
+    }
+
     fixture
         .connection
         .open_data_channel(
@@ -133,21 +159,37 @@ fn local_and_remote_channels_preserve_messages_and_close() {
             break channel;
         }
     };
-    fixture
-        .connection
-        .send_data(
-            fixture.at(),
-            local,
-            DataMessage::Binary(Bytes::from(vec![7; 8_000])),
-        )
-        .expect("send channel message");
-    loop {
-        if let FixtureDataEvent::PeerMessage { binary, payload } = fixture.next_data_event() {
-            assert!(binary);
-            assert_eq!(payload, vec![7; 8_000]);
-            break;
+    for expected in [&largest[..], &multi_packet[..]] {
+        fixture
+            .connection
+            .send_data(
+                fixture.at(),
+                local,
+                DataMessage::Binary(Bytes::copy_from_slice(expected)),
+            )
+            .expect("send channel message");
+        loop {
+            if let FixtureDataEvent::PeerMessage { binary, payload } = fixture.next_data_event() {
+                assert!(binary);
+                assert_eq!(payload, expected);
+                break;
+            }
         }
     }
+    let [native_to_edge, edge_to_native] = fixture.take_udp_payload_peaks();
+    for (direction, cap) in [
+        ("native-to-edge", native_to_edge),
+        ("edge-to-native", edge_to_native),
+    ] {
+        assert!(
+            (1_210..=FABRIC_UDP_LIMIT).contains(&cap),
+            "{direction} protected UDP peak during bundled or fragmented writes: {cap}"
+        );
+    }
+    assert_eq!(
+        fixture.native_sctp_dtls_parameters(),
+        (Some(0xfefc), Some(0x1302))
+    );
 
     fixture
         .connection
@@ -164,6 +206,12 @@ fn local_and_remote_channels_preserve_messages_and_close() {
     }
     assert_eq!(local_closed, 1);
     assert_eq!(peer_closed, 1);
+    assert!(
+        fixture
+            .take_udp_payload_peaks()
+            .into_iter()
+            .all(|bytes| bytes <= FABRIC_UDP_LIMIT)
+    );
 }
 
 #[test]

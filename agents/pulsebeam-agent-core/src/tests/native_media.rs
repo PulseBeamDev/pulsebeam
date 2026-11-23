@@ -51,6 +51,7 @@ impl Target {
             self.desired.revision,
             state::confirmed_state::Value::LogicalSubscription(Box::new(
                 state::LogicalSubscriptionState {
+                    data_v1: None,
                     spec: Some(self.spec().clone()),
                     source_revision: revision,
                     source,
@@ -81,6 +82,7 @@ impl Target {
             state::resource_key::Key::Owned(self.reference),
             self.desired.revision,
             state::confirmed_state::Value::Owned(alloc::boxed::Box::new(state::LiveResource {
+                data_v1_source: None,
                 spec: Some(self.spec().clone()),
                 participant: Some(participant),
                 track: Some(track),
@@ -519,6 +521,7 @@ fn connected_with_tracks(
         .handle(HostEvent::DataChannel(DataChannelEvent::Message {
             generation,
             channel,
+            binary: true,
             payload: codec::encode_server(&state::ServerStateBatch {
                 records: Vec::new(),
                 initial_complete: true,

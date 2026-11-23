@@ -67,11 +67,11 @@ impl Service {
         #[cfg(feature = "sim")]
         anyhow::ensure!(
             options.topology == Topology::SingleNode
-                || (options.ownership_peer.is_some() && options.seeds.is_empty()),
+                || (!options.ownership_peers.is_empty() && options.seeds.is_empty()),
             "multi-node simulation requires provisioned ownership and no gossip seeds"
         );
         let data_dir = options.data_dir.clone();
-        let expected = options.ownership_peer.as_ref().map(|peer| peer.local);
+        let expected = options.ownership_peers.first().map(|peer| peer.local);
         let identity = pulsebeam_runtime::task::spawn_blocking(move || match expected {
             Some(expected) => identity::Identity::allocate_provisioned(&data_dir, expected),
             None => identity::Identity::allocate(&data_dir),
@@ -255,7 +255,7 @@ mod tests {
                 advertise: listen,
                 seeds: vec![seed],
                 data_dir: dir.path().to_owned(),
-                ownership_peer: None,
+                ownership_peers: Vec::new(),
             };
             let socket = ProbeSocket {
                 inner: socket,
