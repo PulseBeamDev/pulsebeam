@@ -162,7 +162,9 @@ agent.getSnapshot();
 // @ts-expect-error Agent-wide participant lookup is not room-pinned.
 agent.participant("alice");
 
-const binary = agent.data("chat", "ordered");
+// @ts-expect-error Delivery belongs on the publication or subscription.
+agent.data("chat", "ordered");
+const binary = agent.data("chat");
 // @ts-expect-error Sending requires an owned publication.
 binary.send(new Uint8Array([0, 255]));
 // @ts-expect-error Reception requires a pinned remote subscription.
@@ -173,9 +175,9 @@ participant.tracks;
 // @ts-expect-error Logical references do not expose their reconciliation host.
 participant.catalog;
 const participantId: string = participant.id();
-const remoteBinary = participant.data("chat", "ordered");
+const remoteBinary = participant.data("chat");
 const dataPublication: DataPublication = binary.publish();
-const dataSubscription: DataSubscription<"ordered"> = remoteBinary.subscribe();
+const dataSubscription: DataSubscription = remoteBinary.subscribe();
 const dataPublicationState: DataPublicationState = dataPublication.state();
 const dataSubscriptionState: DataSubscriptionState = dataSubscription.state();
 const dataPublicationUpdates: DataPublicationUpdates =
@@ -187,8 +189,7 @@ const nextPublicationState: Promise<DataPublicationState | undefined> =
 const nextSubscriptionState: Promise<DataSubscriptionState | undefined> =
   dataSubscriptionUpdates.next();
 const dataSend: Promise<void> = dataPublication.send(new Uint8Array([0, 255]));
-const subscriptionNext: Promise<DataUpdate<"ordered">> =
-  dataSubscription.next();
+const subscriptionNext: Promise<DataUpdate> = dataSubscription.next();
 const publicationTyped: NoAny<ReturnType<typeof binary.publish>> = true;
 const subscriptionTyped: NoAny<ReturnType<typeof remoteBinary.subscribe>> =
   true;
@@ -227,26 +228,23 @@ void [
 // @ts-expect-error Reception is created synchronously with subscribe.
 remoteBinary.receive();
 const remoteReceiver = remoteBinary.subscribe();
-const next: Promise<DataUpdate<"ordered">> = remoteReceiver.next();
+const next: Promise<DataUpdate> = remoteReceiver.next();
 await remoteReceiver.close();
 void [next, participantId];
-// @ts-expect-error Data delivery is explicit.
-agent.data("chat");
 // @ts-expect-error Binary payloads do not have an implicit string codec.
 dataPublication.send("text");
 // @ts-expect-error Remote data handles are receive-only.
 remoteBinary.send(new Uint8Array());
 // @ts-expect-error Explicit next/close cursors replace automatic iterators.
 binary.events();
-declare const orderedEvent: DataEvent<"ordered">;
+declare const orderedEvent: DataEvent;
 if (orderedEvent.type === "message") {
   const sequence: bigint = orderedEvent.sequence;
   const payload: Uint8Array = orderedEvent.data;
   void [sequence, payload];
 } else {
-  const from: bigint = orderedEvent.from;
-  const to: bigint = orderedEvent.to;
-  void [from, to];
+  const previous: string = orderedEvent.previousPublicationId;
+  void previous;
 }
 
 declare const videoMediaTrack: MediaStreamTrack;

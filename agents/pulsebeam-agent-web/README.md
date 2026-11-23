@@ -38,11 +38,11 @@ Replace the Agent to change endpoint or participant identity.
 ```ts
 const camera = agent.video("camera");
 const microphone = agent.audio("microphone");
-const chat = agent.data("chat", "ordered");
+const chat = agent.data("chat");
 const room = agent.room("conference-42");
 const participant = room.participant("alice");
 const remoteCamera = participant.video("camera");
-const remoteChat = participant.data("chat", "ordered");
+const remoteChat = participant.data("chat");
 ```
 
 Lookup is inert and returns logical handles pinned to the supplied application
@@ -157,29 +157,30 @@ const reading = (async () => {
     const update = await messages.next();
     if (update.type === "closed") return;
     const event = update.event;
-    if (event.type === "gap") {
-      showGap(event.from, event.to);
-    } else {
-      handleBytes(event.data);
-    }
+    if (event.type === "message") handleBytes(event.data);
   }
 })();
 await publication.send(new TextEncoder().encode("hello"));
 ```
 
-`showGap` and `handleBytes` are application handlers. Handle processing failures
+`handleBytes` is an application handler. Handle processing failures
 on `reading`. Close the publication with `await publication.close()` when sending
 ends. To stop reception, call `await messages.close()`, then await the
 reading task. Closing one receiver does not close other receivers or their Agent.
 There is no implicit JSON codec, automatic iterator, or callback subscription.
 
-Delivery modes are `latest` (current value), `lossy` (available live messages),
-and `ordered` (ordered messages with explicit gaps). Message events include
-`trackId`, `participantId`, `sequence`, and `data`; gaps include `trackId`,
-`participantId`, `from`, and `to`. Sequence and gap positions are `bigint`.
-Physical publication replacement can change IDs and sequence spaces. Transport
-is live and finite, not durable storage. Accepted sends are not delivery
-acknowledgments.
+`publish()` and `subscribe()` default to `DataDelivery.Reliable`. Use
+`{ delivery: DataDelivery.Unreliable }` for available live messages or
+`{ delivery: DataDelivery.Latest }` for current values. The subscription mode
+must match the exact source. Each message identifies its publication and
+participant, and has a `bigint` sequence and binary data. Source replacement may
+produce a discontinuity; an unrecoverable Reliable gap rejects `next()` and
+ends only that subscription. Read one event at a time.
+
+`send(bytes, { recipients })` accepts server-issued `dataRecipientId` values
+from the catalog. Recipients must already be authorized subscribers. Omit the
+list to address all current authorized subscribers. A successful send is local
+admission, not a receipt. Transport is live and finite, not durable storage.
 
 ## Observe state and release ownership
 
@@ -212,7 +213,7 @@ Run from a build-ready repository root:
 Direct JavaScript tests exercise production data, catalog, immutable-state, and
 local-resource modules without a DOM. Typed consumers check public and generated
 contracts. Deterministic native/SFU simulation owns delivery, identity,
-publication replacement, ordered loss and gaps, and late-subscription proof.
+publication replacement, Reliable continuity loss, and late-subscription proof.
 
 Pinned-Node artifact tests instantiate emitted WASM and exercise initialization,
 resource ownership, cancellation, validation, and generation fences. Their

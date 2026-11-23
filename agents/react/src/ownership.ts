@@ -1,5 +1,9 @@
 import { useLayoutEffect } from "react";
-import type { DataEvent, Delivery, RemoteDataTrack } from "@pulsebeam/web";
+import type {
+  DataEvent,
+  DataSubscribeOptions,
+  RemoteDataTrack,
+} from "@pulsebeam/web";
 import { useCommittedRef } from "./committed-ref.js";
 import { useSubscribe } from "./hooks.js";
 import type {
@@ -8,18 +12,15 @@ import type {
 } from "./sources.js";
 export type PublicationSource = PublishableVideoSource | PublishableAudioSource;
 
-export interface DataProps<D extends Delivery = Delivery> {
-  readonly track: RemoteDataTrack<D>;
-  readonly onEvent: (event: DataEvent<D>) => void | Promise<void>;
+export interface DataProps {
+  readonly track: RemoteDataTrack;
+  readonly options?: DataSubscribeOptions;
+  readonly onEvent: (event: DataEvent) => void | Promise<void>;
   readonly onError?: (error: unknown) => void;
 }
-export function Data<D extends Delivery>({
-  track,
-  onEvent,
-  onError,
-}: DataProps<D>): null {
+export function Data({ track, options, onEvent, onError }: DataProps): null {
   const callbacks = useCommittedRef({ onEvent, onError });
-  const receiver = useSubscribe(track);
+  const receiver = useSubscribe(track, options);
   useLayoutEffect(() => {
     if (!receiver) return;
     let active = true;

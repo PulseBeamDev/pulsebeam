@@ -240,7 +240,7 @@ test("data subscription close awaits retired and current runtime cleanup", async
   };
   activate(runtime("old", 1n, release));
   const receiver = registry
-    .remote(track.data("messages", "ordered"), {
+    .remote("messages", {
       room: "room",
       participantId: "alice",
     })

@@ -4,7 +4,7 @@ import { sessionKey } from "./session-key.js";
 import { useObservation } from "./observation.js";
 
 export { usePublish, useSubscribe, useWatch } from "./hooks.js";
-export { WatchStatus, CatalogDelivery } from "@pulsebeam/web";
+export { WatchStatus, CatalogDelivery, DataDelivery } from "@pulsebeam/web";
 export type {
   Agent,
   AgentConfig,
@@ -15,7 +15,9 @@ export type {
   AgentLogging,
   ConnectionState,
   DataEvent,
-  DataGap,
+  DataDiscontinuity,
+  DataPublishOptions,
+  DataSubscribeOptions,
   DataMessage,
   DataUpdate,
   Delivery,

@@ -16,7 +16,6 @@ import type {
 import type { AudioPublication, VideoPublication } from "./media.js";
 import type { AudioSubscription, VideoSubscription } from "./reception.js";
 
-import type { Delivery } from "./track.js";
 import type { LocalDataTrack, RemoteDataTrack } from "./data.js";
 
 export type MediaKind = "audio" | "video";
@@ -228,7 +227,7 @@ export interface RemoteParticipant {
   id(): string;
   video(trackId: string): RemoteVideoTrack;
   audio(trackId: string): RemoteAudioTrack;
-  data<D extends Delivery>(trackId: string, delivery: D): RemoteDataTrack<D>;
+  data(trackId: string): RemoteDataTrack;
 }
 
 export interface WatchConfig {
@@ -477,7 +476,7 @@ export interface Agent {
   readonly authorizationExpiresAt: number | null;
   video(trackId: string): LocalVideoTrack;
   audio(trackId: string): LocalAudioTrack;
-  data<D extends Delivery>(trackId: string, delivery: D): LocalDataTrack<D>;
+  data(trackId: string): LocalDataTrack;
   room(name: string): RoomRef;
   /** Synchronously replace the desired room; Core owns admission and recovery. */
   join(room: string): void;

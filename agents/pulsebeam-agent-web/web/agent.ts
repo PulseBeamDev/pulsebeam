@@ -8,7 +8,7 @@ import {
   type RemoteTrack,
 } from "./reconciliation-snapshot.js";
 import { DataRegistry, type LocalDataTrack } from "./data.js";
-import { track, type Delivery } from "./track.js";
+import { track } from "./track.js";
 import {
   AgentObservation,
   OperationError,
@@ -324,8 +324,8 @@ class AgentFacade implements AgentApi {
   audio(trackId: string): LocalAudioTrack {
     return this.#media.track(track.audio(trackId));
   }
-  data<D extends Delivery>(trackId: string, delivery: D): LocalDataTrack<D> {
-    return this.#data.local(track.data(trackId, delivery));
+  data(trackId: string): LocalDataTrack {
+    return this.#data.local(trackId);
   }
   room(name: string): RoomRef {
     return this.#remote.room(name);
@@ -806,8 +806,7 @@ export class Agent implements AgentApi {
 
   readonly video: AgentApi["video"] = (trackId) => this.#raw.video(trackId);
   readonly audio: AgentApi["audio"] = (trackId) => this.#raw.audio(trackId);
-  readonly data: AgentApi["data"] = (trackId, delivery) =>
-    this.#raw.data(trackId, delivery);
+  readonly data: AgentApi["data"] = (trackId) => this.#raw.data(trackId);
   readonly room: AgentApi["room"] = (name) => this.#raw.room(name);
   readonly isClosed = () => this.#raw.isClosed();
   readonly join = (room: string) => this.#raw.join(room);

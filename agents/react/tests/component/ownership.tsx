@@ -184,7 +184,7 @@ export async function ownershipAdapters() {
     }>,
   ) => void;
   let duplicateFailure: Error | undefined;
-  const events: DataEvent<"ordered">[] = [];
+  const events: DataEvent[] = [];
   const native = new Track("video");
   const source = publishableVideoSource(
     { kind: "video" },
@@ -214,7 +214,7 @@ export async function ownershipAdapters() {
     const messages = equivalent
       .room("selected-room")
       .participant("alice")
-      .data("messages", "ordered");
+      .data("messages");
     return (
       <>
         <Audio source={audio} />

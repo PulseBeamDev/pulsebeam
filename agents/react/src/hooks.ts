@@ -1,4 +1,5 @@
 import { useLayoutEffect, useMemo, useState } from "react";
+import { DataDelivery } from "@pulsebeam/web";
 import type {
   AudioPublication,
   AudioSource,
@@ -6,7 +7,8 @@ import type {
   AudioSubscriptionConfig,
   DataPublication,
   DataSubscription,
-  Delivery,
+  DataPublishOptions,
+  DataSubscribeOptions,
   LocalAudioTrack,
   LocalDataTrack,
   LocalVideoTrack,
@@ -66,17 +68,26 @@ export function useWatch(
 export function usePublication(
   track: Local | null,
   source?: Source | null,
-  options?: PublicationConfig,
+  options?: PublicationConfig | DataPublishOptions,
 ) {
+  const mode =
+    track?.kind === "data"
+      ? ((options as DataPublishOptions | undefined)?.delivery ??
+        DataDelivery.Reliable)
+      : undefined;
+  const target = useMemo(
+    () => (track?.kind === "data" ? { track, mode } : track),
+    [track, mode],
+  );
   const committed = useCommittedRef({ track, source, options });
-  const publication = useResource<Publication>(track, () => {
+  const publication = useResource<Publication>(target, () => {
     const view = committed.current;
     return view.track!.kind === "data"
-      ? view.track!.publish()
-      : view.track!.publish(view.options);
+      ? view.track!.publish(view.options as DataPublishOptions | undefined)
+      : view.track!.publish(view.options as PublicationConfig | undefined);
   });
   const owner = publication.value;
-  const enabled = options?.enabled ?? true;
+  const enabled = (options as PublicationConfig | undefined)?.enabled ?? true;
   useLayoutEffect(() => {
     if (owner && track?.kind !== "data") {
       try {
@@ -130,14 +141,15 @@ export function usePublish(
   source?: AudioSource | PublishableAudioSource | null,
   options?: PublicationConfig,
 ): AudioPublication | null;
-export function usePublish<D extends Delivery>(
-  track: LocalDataTrack<D> | null,
+export function usePublish(
+  track: LocalDataTrack | null,
   source?: null,
+  options?: DataPublishOptions,
 ): DataPublication | null;
 export function usePublish(
   track: Local | null,
   source?: Source | null,
-  options?: PublicationConfig,
+  options?: PublicationConfig | DataPublishOptions,
 ): Publication | null {
   return usePublication(track, source, options).value;
 }
@@ -150,17 +162,30 @@ export function useSubscribe(
   track: RemoteAudioTrack | null,
   options?: AudioSubscriptionConfig,
 ): AudioSubscription | null;
-export function useSubscribe<D extends Delivery>(
-  track: RemoteDataTrack<D> | null,
-): DataSubscription<D> | null;
+export function useSubscribe(
+  track: RemoteDataTrack | null,
+  options?: DataSubscribeOptions,
+): DataSubscription | null;
 export function useSubscribe(
   track: Remote | null,
-  options?: VideoObservation | AudioSubscriptionConfig,
+  options?: VideoObservation | AudioSubscriptionConfig | DataSubscribeOptions,
 ): Subscription | null {
+  const mode =
+    track?.kind === "data"
+      ? ((options as DataSubscribeOptions | undefined)?.delivery ??
+        DataDelivery.Reliable)
+      : undefined;
+  const target = useMemo(
+    () => (track?.kind === "data" ? { track, mode } : track),
+    [track, mode],
+  );
   const committed = useCommittedRef({ track, options });
-  const subscription = useResource<Subscription>(track, () => {
+  const subscription = useResource<Subscription>(target, () => {
     const view = committed.current;
-    if (view.track!.kind === "data") return view.track!.subscribe();
+    if (view.track!.kind === "data")
+      return view.track!.subscribe(
+        view.options as DataSubscribeOptions | undefined,
+      );
     return view.track!.kind === "video"
       ? view.track!.subscribe(view.options as VideoObservation | undefined)
       : view.track!.subscribe(

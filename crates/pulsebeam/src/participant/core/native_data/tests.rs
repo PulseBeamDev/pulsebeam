@@ -690,6 +690,8 @@ fn repeated_retirement_keeps_the_receipt_and_does_not_erase_a_reused_channel_ind
     participant.native_data.bind_source(id, handle);
     let message = |source| {
         TopicFrame {
+            recipient_connections: None,
+            repair_target: Default::default(),
             body: Some(pulsebeam_proto::topic::topic_frame::Body::Message(
                 pulsebeam_proto::topic::TopicMessage {
                     captured_at: None,
@@ -707,8 +709,11 @@ fn repeated_retirement_keeps_the_receipt_and_does_not_erase_a_reused_channel_ind
     assert_eq!(sink.publish_track_packet_calls, vec![handle]);
     let probe = |source| {
         TopicFrame {
+            recipient_connections: None,
+            repair_target: Default::default(),
             body: Some(pulsebeam_proto::topic::topic_frame::Body::Probe(
                 pulsebeam_proto::topic::TopicProbe {
+                    requester: Default::default(),
                     publication_id: source,
                     from_sequence: 0,
                     live: true,
@@ -719,24 +724,24 @@ fn repeated_retirement_keeps_the_receipt_and_does_not_erase_a_reused_channel_ind
     };
     participant.native_data_message(channel, &probe(id.as_str()), &mut sink);
     assert_eq!(sink.publish_track_packet_calls, vec![handle]);
-    participant.on_reverse(
-        handle,
-        ReversePacket::reliable_control(probe("foreign".into())),
-    );
+    let requester = crate::entity::ConnectionId::new();
+    let request = |source| ReversePacket::reliable_control(probe(source)).with_requester(requester);
+    participant.on_reverse(handle, request("foreign".into()));
+    participant.on_reverse(handle, ReversePacket::reliable_control(probe(id.as_str())));
     assert!(
         participant
             .transport
             .apply_next_mutation(Instant::now(), |_| true)
             .is_none()
     );
-    participant.on_reverse(handle, ReversePacket::reliable_control(probe(id.as_str())));
+    participant.on_reverse(handle, request(id.as_str()));
     assert!(matches!(
         participant
             .transport
             .apply_next_mutation(Instant::now(), |_| true),
         Some(AppliedMutation::ControlNotWritten)
     ));
-    participant.on_reverse(handle, ReversePacket::reliable_control(probe(id.as_str())));
+    participant.on_reverse(handle, request(id.as_str()));
     let sequence = participant.native_execution.sequence;
     assert!(!participant.native_callback_fenced(1));
     participant.fence_native_resource(1);
@@ -774,7 +779,7 @@ fn repeated_retirement_keeps_the_receipt_and_does_not_erase_a_reused_channel_ind
     assert_eq!(participant.native_execution.sequence, sequence + 1);
     assert!(participant.native_execution.pending.is_empty());
     assert!(participant.native_data.fanouts.is_empty());
-    participant.on_reverse(handle, ReversePacket::reliable_control(probe(id.as_str())));
+    participant.on_reverse(handle, request(id.as_str()));
     assert!(
         participant
             .transport

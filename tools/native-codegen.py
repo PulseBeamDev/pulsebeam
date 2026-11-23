@@ -89,6 +89,7 @@ def main():
         ),
         core: (
             "`capturedAt`: CaptureTimestamp? = null",
+            "`recipients`: List<kotlin.String>? = null",
             "`nanoseconds`: kotlin.Long",
             "`uncertaintyNanoseconds`: kotlin.UInt? = null",
         ),
@@ -98,7 +99,7 @@ def main():
             "send(data: Data, options: DataSendOptions? = nil)",
         ),
         output / "pulsebeam_agent_core.swift": (
-            "init(capturedAt: CaptureTimestamp? = nil)",
+            "init(capturedAt: CaptureTimestamp? = nil, recipients: [String]? = nil)",
             "init(clock: CaptureClock, nanoseconds: Int64, uncertaintyNanoseconds: UInt32? = nil)",
         ),
     }

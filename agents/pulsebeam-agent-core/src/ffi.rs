@@ -202,6 +202,8 @@ pub struct CaptureTimestamp {
 pub struct DataSendOptions {
     #[uniffi(default = None)]
     pub captured_at: Option<CaptureTimestamp>,
+    #[uniffi(default = None)]
+    pub recipients: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
@@ -751,6 +753,7 @@ pub enum TopicFailure {
     SequenceExhausted { name: String },
     MalformedMessage,
     InvalidControl,
+    InvalidRecipients,
     UnknownChannel,
 }
 
@@ -770,6 +773,7 @@ impl From<model::TopicError> for TopicFailure {
             model::TopicError::SequenceExhausted(name) => Self::SequenceExhausted { name },
             model::TopicError::MalformedMessage => Self::MalformedMessage,
             model::TopicError::InvalidControl => Self::InvalidControl,
+            model::TopicError::InvalidRecipients => Self::InvalidRecipients,
             model::TopicError::UnknownChannel => Self::UnknownChannel,
         }
     }

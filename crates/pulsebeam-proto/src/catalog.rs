@@ -548,6 +548,7 @@ mod tests {
 
     fn entry(id: &str, tracks: usize) -> CatalogParticipantEntry {
         CatalogParticipantEntry {
+            data_recipient_id: None,
             participant: Some(crate::state::Participant {
                 participant_id: id.into(),
                 room_id: "room".into(),

@@ -1,13 +1,20 @@
 import { useRef, useState } from "react";
-import { usePublish, type Agent, type DataEvent } from "@pulsebeam/react";
+import {
+  DataDelivery,
+  usePublish,
+  type Agent,
+  type DataEvent,
+} from "@pulsebeam/react";
 import { decodeText, encodeText } from "@/lib/data-codec";
 
 export const reactionEmojis = ["👍", "❤️", "😂", "😮", "👏", "🔥"];
 type Reaction = { key: string; emoji: string };
 
 export function useReaction(agent: Agent) {
-  const Reactions = agent.data("reactions", "lossy");
-  const publication = usePublish(Reactions);
+  const Reactions = agent.data("reactions");
+  const publication = usePublish(Reactions, null, {
+    delivery: DataDelivery.Unreliable,
+  });
   const [reactions, setReactions] = useState<Reaction[]>([]);
   const localKeys = useRef(0);
   const add = (value: Reaction) =>
@@ -16,7 +23,7 @@ export function useReaction(agent: Agent) {
   return {
     Reactions,
     reactions,
-    onEvent(event: DataEvent<"lossy">) {
+    onEvent(event: DataEvent) {
       if (event.type !== "message") return;
       const emoji = decodeText(event.data);
       if (emoji !== null && reactionEmojis.includes(emoji)) {

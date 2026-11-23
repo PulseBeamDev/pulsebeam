@@ -1,6 +1,7 @@
 export {
   AgentStatus,
   ErrorCode,
+  DataDelivery,
   WatchStatus,
   TopicMode as CatalogDelivery,
   MediaKind as PublicationMediaKind,
@@ -22,5 +23,7 @@ export type {
   VideoSubscriptionState,
   AudioSubscriptionState,
   DataPublicationState,
+  DataPublishOptions,
+  DataSubscribeOptions,
   DataSubscriptionState,
 } from "./generated/schema.js";

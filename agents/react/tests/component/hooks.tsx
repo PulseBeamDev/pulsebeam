@@ -10,6 +10,7 @@ import {
 import { createRoot } from "react-dom/client";
 import {
   Agent as WebAgent,
+  DataDelivery,
   VideoSource,
   type Pipe,
   type VideoPublication,
@@ -303,18 +304,18 @@ export async function audioAndDataHookOwners() {
   let audio: import("@pulsebeam/web").AudioPublication | null = null;
   let data: import("@pulsebeam/web").DataPublication | null = null;
   let audioReceive: import("@pulsebeam/web").AudioSubscription | null = null;
-  let dataReceive: import("@pulsebeam/web").DataSubscription<"ordered"> | null =
-    null;
-  function Room() {
+  let dataReceive: import("@pulsebeam/web").DataSubscription | null = null;
+  function Room({ delivery }: { delivery?: DataDelivery }) {
     const agent = useAgent({
       endpoint: "http://localhost",
       token: "audio-data-hooks",
     });
     audio = usePublish(agent?.audio("voice") ?? null);
-    data = usePublish(agent?.data("events", "ordered") ?? null);
+    const options = delivery === undefined ? undefined : { delivery };
+    data = usePublish(agent?.data("events") ?? null, null, options);
     const peer = agent?.room("room").participant("alice");
     audioReceive = useSubscribe(peer?.audio("voice") ?? null);
-    dataReceive = useSubscribe(peer?.data("events", "ordered") ?? null);
+    dataReceive = useSubscribe(peer?.data("events") ?? null, options);
     return null;
   }
   const root = createRoot(document.createElement("div"));
@@ -331,6 +332,30 @@ export async function audioAndDataHookOwners() {
       assert.equal(owner instanceof Promise, false);
       assert.equal(owner.state(), owner.state());
     }
+    const reliablePublication =
+      data! as import("@pulsebeam/web").DataPublication;
+    const reliableSubscription =
+      dataReceive! as import("@pulsebeam/web").DataSubscription;
+    const render = (delivery: DataDelivery) =>
+      flush(() =>
+        root.render(
+          <StrictMode>
+            <Room delivery={delivery} />
+          </StrictMode>,
+        ),
+      );
+    await render(DataDelivery.Reliable);
+    assert.equal(data, reliablePublication);
+    assert.equal(dataReceive, reliableSubscription);
+    await render(DataDelivery.Unreliable);
+    assert.notEqual(data, reliablePublication);
+    assert.notEqual(dataReceive, reliableSubscription);
+    assert.equal(reliablePublication.isClosed(), true);
+    assert.equal(reliableSubscription.isClosed(), true);
+    assert.equal(
+      [...runtimes.at(-1)!.dataOwners.values()][0].spec.delivery,
+      "lossy",
+    );
   } finally {
     await flush(() => root.unmount());
   }

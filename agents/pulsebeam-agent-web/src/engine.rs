@@ -168,7 +168,7 @@ impl Driver {
         &mut self,
         target: DataSendTarget,
         payload: Vec<u8>,
-        captured_at: Option<agent_core::ffi::CaptureTimestamp>,
+        options: Option<agent_core::ffi::DataSendOptions>,
     ) -> (Result<agent_core::OperationId, AgentError>, Turn) {
         let result = (|| {
             let mut agent = self.control.agent.borrow_mut();
@@ -191,7 +191,7 @@ impl Driver {
                     }
                 }
             };
-            agent.send_data_at(spec, payload, captured_at)
+            agent.send_data_with_options(spec, payload, options)
         })();
         let turn = self.finish_turn(None);
         (result, turn)
@@ -371,7 +371,7 @@ pub(crate) enum Message {
     DataSend {
         target: DataSendTarget,
         payload: Vec<u8>,
-        captured_at: Option<agent_core::ffi::CaptureTimestamp>,
+        options: Option<agent_core::ffi::DataSendOptions>,
         completion: DataSendCompletion,
     },
     Resource {
@@ -546,7 +546,7 @@ impl ActorHandle {
         &self,
         owner: u64,
         payload: Vec<u8>,
-        captured_at: Option<agent_core::ffi::CaptureTimestamp>,
+        options: Option<agent_core::ffi::DataSendOptions>,
     ) -> Result<oneshot::Receiver<Result<(), DataSendError>>, agent_core::ffi::ErrorInfo> {
         let expected_join = {
             let agent = self.control.agent.borrow();
@@ -561,7 +561,7 @@ impl ActorHandle {
                 expected_join,
             },
             payload,
-            captured_at,
+            options,
         )
     }
 
@@ -569,7 +569,7 @@ impl ActorHandle {
         &self,
         target: DataSendTarget,
         payload: Vec<u8>,
-        captured_at: Option<agent_core::ffi::CaptureTimestamp>,
+        options: Option<agent_core::ffi::DataSendOptions>,
     ) -> Result<oneshot::Receiver<Result<(), DataSendError>>, agent_core::ffi::ErrorInfo> {
         use agent_core::ffi::{ErrorCode, ErrorInfo};
         if self.closed.get() || !self.control.accepting.get() || self.sender.is_closed() {
@@ -580,7 +580,7 @@ impl ActorHandle {
             .try_send(Message::DataSend {
                 target,
                 payload,
-                captured_at,
+                options,
                 completion,
             })
             .map_err(|error| match error {
@@ -918,10 +918,10 @@ impl<H: Host> Actor<H> {
             Message::DataSend {
                 target,
                 payload,
-                captured_at,
+                options,
                 completion,
             } => {
-                let (result, turn) = self.driver.send_data(target, payload, captured_at);
+                let (result, turn) = self.driver.send_data(target, payload, options);
                 match result {
                     Ok(ticket) => {
                         self.data_sends.insert(ticket, completion);
@@ -1922,7 +1922,7 @@ mod tests {
                 delivery: agent_core::TopicMode::Lossy,
             }),
             payload: vec![0, 255],
-            captured_at: None,
+            options: None,
             completion,
         });
         assert!(pending.try_recv().unwrap().is_none());

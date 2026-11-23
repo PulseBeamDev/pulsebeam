@@ -396,7 +396,12 @@ fn topic_input(
     agent.handle(HostEvent::DataChannel(DataChannelEvent::Message {
         generation,
         channel,
-        payload: TopicFrame { body: Some(body) }.encode_to_vec(),
+        payload: TopicFrame {
+            recipient_connections: None,
+            repair_target: Default::default(),
+            body: Some(body),
+        }
+        .encode_to_vec(),
     }))
 }
 
@@ -410,6 +415,11 @@ fn wire_message(id: &str, sequence: u64, payload: &[u8]) -> TopicBody {
 }
 
 fn next_topic_send(agent: &mut Agent) -> (OperationId, ChannelId, TopicBody) {
+    let (operation, channel, frame) = next_topic_frame(agent);
+    (operation, channel, frame.body.unwrap())
+}
+
+fn next_topic_frame(agent: &mut Agent) -> (OperationId, ChannelId, TopicFrame) {
     match next_effect(agent) {
         Effect::DataChannel(DataChannelEffect::Send {
             operation,
@@ -419,7 +429,7 @@ fn next_topic_send(agent: &mut Agent) -> (OperationId, ChannelId, TopicBody) {
         }) => (
             operation,
             channel,
-            TopicFrame::decode_bounded(&payload).unwrap().body.unwrap(),
+            TopicFrame::decode_bounded(&payload).unwrap(),
         ),
         effect => panic!("expected topic send, got {effect:?}"),
     }
@@ -5720,6 +5730,7 @@ fn ordered_topics_reorder_deduplicate_nack_replay_and_emit_inline_gaps() {
     assert_eq!(
         body,
         TopicBody::Nack(TopicNack {
+            requester: Default::default(),
             publication_id: remote.clone(),
             from_sequence: 1
         })
@@ -5753,6 +5764,7 @@ fn ordered_topics_reorder_deduplicate_nack_replay_and_emit_inline_gaps() {
         generation,
         publish_channel,
         TopicBody::Nack(TopicNack {
+            requester: Default::default(),
             publication_id: local,
             from_sequence: 1,
         }),
@@ -5775,6 +5787,7 @@ fn ordered_topics_reorder_deduplicate_nack_replay_and_emit_inline_gaps() {
     assert_eq!(
         body,
         TopicBody::Nack(TopicNack {
+            requester: Default::default(),
             publication_id: remote.clone(),
             from_sequence: 3
         })
@@ -5839,6 +5852,7 @@ fn late_receiver_starts_live_and_existing_receiver_replays_from_its_checkpoint()
         generation,
         channel,
         TopicBody::Probe(TopicProbe {
+            requester: Default::default(),
             publication_id: id.clone(),
             from_sequence: 0,
             live: true,
@@ -5860,6 +5874,7 @@ fn late_receiver_starts_live_and_existing_receiver_replays_from_its_checkpoint()
         generation,
         channel,
         TopicBody::Probe(TopicProbe {
+            requester: vec![7; 16],
             publication_id: id,
             from_sequence: 1,
             live: false,
@@ -5867,8 +5882,11 @@ fn late_receiver_starts_live_and_existing_receiver_replays_from_its_checkpoint()
     )
     .unwrap();
     for sequence in 1..3 {
-        let (operation, _, body) = next_topic_send(&mut agent);
-        assert!(matches!(body, TopicBody::Message(message) if message.sequence == sequence));
+        let (operation, _, frame) = next_topic_frame(&mut agent);
+        assert_eq!(frame.repair_target, vec![7; 16]);
+        assert!(
+            matches!(frame.body, Some(TopicBody::Message(message)) if message.sequence == sequence)
+        );
         acknowledge_send(&mut agent, generation, channel, operation);
     }
     assert!(agent.next_effect_after_turn().is_none());
@@ -6009,6 +6027,7 @@ fn ordered_replay_exhaustion_emits_floor_before_the_retained_window() {
         generation,
         channel,
         TopicBody::Nack(TopicNack {
+            requester: Default::default(),
             publication_id: id.clone(),
             from_sequence: 0,
         }),
@@ -6044,6 +6063,7 @@ fn ordered_replay_exhaustion_emits_floor_before_the_retained_window() {
         generation,
         channel,
         TopicBody::Probe(TopicProbe {
+            requester: Default::default(),
             publication_id: id,
             from_sequence: 256,
             live: false,
@@ -6665,6 +6685,7 @@ fn topic_boundaries_reject_malformed_cross_mode_unknown_and_oversized_input() {
             generation,
             latest.channel,
             TopicBody::Nack(TopicNack {
+                requester: Default::default(),
                 publication_id: native_connection::SOURCE.into(),
                 from_sequence: 0,
             })
@@ -7193,6 +7214,7 @@ fn reconnect_starts_fresh_publications_without_old_history_or_generation_output(
             generation,
             new_publish_channel,
             TopicBody::Nack(TopicNack {
+                requester: Default::default(),
                 publication_id: old_message.publication_id,
                 from_sequence: 0
             })
@@ -7204,6 +7226,7 @@ fn reconnect_starts_fresh_publications_without_old_history_or_generation_output(
         generation,
         new_publish_channel,
         TopicBody::Nack(TopicNack {
+            requester: Default::default(),
             publication_id: new_message.publication_id.clone(),
             from_sequence: 0,
         }),

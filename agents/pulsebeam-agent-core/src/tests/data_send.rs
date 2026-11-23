@@ -35,6 +35,69 @@ fn finished(agent: &mut Agent) -> Vec<(OperationId, Option<DataSendFailure>)> {
 }
 
 #[test]
+fn reliable_repair_preserves_the_audience_of_the_admitted_unit() {
+    let (mut agent, generation, _, publication) =
+        native_connection::connected_publisher(TopicMode::Ordered);
+    assert!(matches!(
+        agent.send_data_to(spec(TopicMode::Ordered), vec![], None, Some(vec![])),
+        Err(AgentError::InvalidTopic(TopicError::InvalidRecipients))
+    ));
+    assert!(matches!(
+        agent.send_data_with_options(
+            spec(TopicMode::Ordered),
+            vec![],
+            Some(crate::ffi::DataSendOptions {
+                recipients: Some(vec!["bare-participant-id".into()]),
+                ..Default::default()
+            })
+        ),
+        Err(AgentError::InvalidTopic(TopicError::InvalidRecipients))
+    ));
+    agent
+        .send_data_with_options(
+            spec(TopicMode::Ordered),
+            vec![42],
+            Some(crate::ffi::DataSendOptions {
+                recipients: Some(vec![pulsebeam_proto::topic::data_recipient_id(&[7; 16])]),
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+    let timer = deadline(&mut agent);
+    assert_eq!(
+        next_effect(&mut agent),
+        Effect::Timer(TimerEffect::Cancel { timer })
+    );
+    let (operation, channel, frame) = next_topic_frame(&mut agent);
+    assert_eq!(frame.recipient_connections, Some(vec![7; 16]));
+    assert_eq!(channel, publication.channel);
+    acknowledge_send(&mut agent, generation, channel, operation);
+    for requester in [7, 8] {
+        topic_input(
+            &mut agent,
+            generation,
+            channel,
+            TopicBody::Probe(TopicProbe {
+                requester: vec![requester; 16],
+                publication_id: native_connection::SOURCE.to_string(),
+                from_sequence: 0,
+                live: false,
+            }),
+        )
+        .unwrap();
+        let (operation, _, frame) = next_topic_frame(&mut agent);
+        assert_eq!(frame.repair_target, vec![requester; 16]);
+        assert_eq!(frame.recipient_connections, None);
+        match (requester, frame.body.unwrap()) {
+            (7, TopicBody::Message(message)) => assert_eq!(message.payload, [42]),
+            (8, TopicBody::Omission(omission)) => assert_eq!(omission.sequence, 0),
+            other => panic!("unexpected repair: {other:?}"),
+        }
+        acknowledge_send(&mut agent, generation, channel, operation);
+    }
+}
+
+#[test]
 fn owned_sends_wait_for_host_acceptance_and_latest_supersession_is_explicit() {
     let (mut agent, generation, _, publication) =
         native_connection::connected_publisher(TopicMode::Latest);

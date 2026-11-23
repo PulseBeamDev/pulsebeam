@@ -163,8 +163,8 @@ const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
 
 function Chat({ agent }: { agent: Agent }) {
-  const publication = usePublish(agent.data("chat", "ordered"));
-  const incoming = agent.room("meeting").participant("alice").data("chat", "ordered");
+  const publication = usePublish(agent.data("chat"));
+  const incoming = agent.room("meeting").participant("alice").data("chat");
 
   async function send(message: string) {
     if (!publication) return;
@@ -177,10 +177,7 @@ function Chat({ agent }: { agent: Agent }) {
       <Data
       track={incoming}
       onEvent={(event) => {
-        if (event.type === "gap") {
-          showGap(event.from, event.to);
-          return;
-        }
+        if (event.type !== "message") return;
         try {
           const value: unknown = JSON.parse(decoder.decode(event.data));
           if (typeof value === "string") showMessage(value);
@@ -195,9 +192,9 @@ function Chat({ agent }: { agent: Agent }) {
 }
 ```
 
-Mounting `Data` owns one subscription and unmounting releases it. `lossy` emits
-messages only. `ordered` may also emit a `gap` when unavailable history prevents
-continuous recovery. Consumers must preserve the gap before later messages.
+Mounting `Data` owns one subscription and unmounting releases it. The example
+uses Reliable delivery. If recovery cannot preserve continuity, only that
+subscription ends and `onError` receives the failure.
 `onEvent` may return a promise. Each mount awaits its current handler before
 taking the next event, using the latest committed callback. Other mounts keep
 processing independently. Buffering is bounded, so awaiting does not provide

@@ -344,6 +344,7 @@ async def publish_live(endpoint, token, room, package):
                 nanoseconds=-9_007_199_254_740_993 + sequence,
                 uncertainty_nanoseconds=0,
             ))
+            assert options.recipients is None
             await data.send(bytes([0, 255, 128]) + sequence.to_bytes(8, "little"), options)
             sequence += 1
             # Live source cadence, not a retry of an accepted frame or payload.

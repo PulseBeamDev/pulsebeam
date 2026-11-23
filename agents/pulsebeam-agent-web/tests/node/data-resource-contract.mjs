@@ -9,18 +9,19 @@ export async function dataResourceContract(pulsebeam) {
   };
   const agent = new pulsebeam.Agent(config);
   try {
-    const local = agent.data("events", "ordered");
+    const local = agent.data("events");
     assert.equal(Object.isFrozen(local), true);
-    assert.equal(local, agent.data("events", "ordered"));
-    assert.notEqual(local, agent.data("events", "latest"));
+    assert.equal(local, agent.data("events"));
+    assert.notEqual(local, agent.data("other-events"));
+    assert.equal("delivery" in local, false);
     const other = new pulsebeam.Agent(config);
     try {
-      const otherLocal = other.data("events", "ordered");
+      const otherLocal = other.data("events");
       assert.notEqual(local, otherLocal);
       const pendingAdmission = other
         .room("room")
         .participant("pending")
-        .data("events", "ordered")
+        .data("events")
         .subscribe();
       await other.close();
       const closedDuringAdmission = await pendingAdmission;
@@ -30,15 +31,9 @@ export async function dataResourceContract(pulsebeam) {
     } finally {
       await other.close();
     }
-    const alice = agent
-      .room("room")
-      .participant("alice")
-      .data("events", "ordered");
-    const bob = agent.room("room").participant("bob").data("events", "ordered");
-    assert.equal(
-      alice,
-      agent.room("room").participant("alice").data("events", "ordered"),
-    );
+    const alice = agent.room("room").participant("alice").data("events");
+    const bob = agent.room("room").participant("bob").data("events");
+    assert.equal(alice, agent.room("room").participant("alice").data("events"));
     assert.notEqual(alice, bob);
     assert.equal(alice.id, null);
     assert.equal(alice.active, false);
@@ -51,7 +46,7 @@ export async function dataResourceContract(pulsebeam) {
     });
 
     const longLabel = "x".repeat(36);
-    const longNamed = agent.data(longLabel, "ordered");
+    const longNamed = agent.data(longLabel);
     assert.equal(
       longNamed.trackId,
       longLabel,
@@ -59,12 +54,7 @@ export async function dataResourceContract(pulsebeam) {
     );
     for (const trackId of ["", "x".repeat(37), "é", "chat/updates"]) {
       assert.throws(
-        () =>
-          agent
-            .room("room")
-            .participant("alice")
-            .data(trackId, "ordered")
-            .subscribe(),
+        () => agent.room("room").participant("alice").data(trackId).subscribe(),
         (error) => {
           assert.ok(error instanceof pulsebeam.OperationError);
           assert.equal(error.info.code, pulsebeam.ErrorCode.InvalidArgument);
@@ -75,7 +65,7 @@ export async function dataResourceContract(pulsebeam) {
     const all = await agent
       .room("room")
       .participant("carol")
-      .data("events", "ordered")
+      .data("events")
       .subscribe();
     const scoped = alice.subscribe();
     const unrelated = bob.subscribe();
@@ -87,14 +77,15 @@ export async function dataResourceContract(pulsebeam) {
       allResolved = true;
       return value;
     });
-    const scopedReads = [scoped.next(), scoped.next()];
+    const scopedRead = scoped.next();
+    await assert.rejects(scoped.next(), (error) => {
+      assert.equal(error.info.code, pulsebeam.ErrorCode.Conflict);
+      return true;
+    });
     const unrelatedRead = unrelated.next();
     await scoped.close();
     assert.equal(scoped.isClosed(), true);
-    assert.deepEqual(await Promise.all(scopedReads), [
-      { type: "closed" },
-      { type: "closed" },
-    ]);
+    assert.deepEqual(await scopedRead, { type: "closed" });
     assert.equal(allResolved, false);
     assert.equal(all.isClosed(), false);
     assert.equal(unrelated.isClosed(), false);

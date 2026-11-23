@@ -11,7 +11,7 @@ use pulsebeam_core::dd::{
 use pulsebeam_link::{CodecError, WireCodec};
 use pulsebeam_runtime::time::Instant;
 
-use crate::entity::{PublicationId, PublicationKey};
+use crate::entity::{ConnectionId, PublicationId, PublicationKey};
 use crate::participant::{RoutedTrackPacket, TrackPacket};
 use crate::route::{MediaDelivery, NodeRouteAddress, RouteId};
 use crate::rtp::{Frequency, MediaTime, RtpExtensions, RtpPacket};
@@ -58,10 +58,10 @@ impl WireCodec<ShardFrame> for ShardCodec {
                     .ok_or(CodecError::Malformed)?;
                 ShardFrame::Reverse { address, packet }
             }
-            kind @ (1 | 2) => {
+            kind @ 1..=5 => {
                 let publication_id = reader.publication_id()?;
                 let playout_ntp32 = reader.u32()?;
-                let packet = if kind == 1 {
+                let packet = if kind != 2 {
                     if !matches!(publication_id, PublicationKey::Data(_)) {
                         return Err(CodecError::Malformed);
                     }
@@ -71,7 +71,15 @@ impl WireCodec<ShardFrame> for ShardCodec {
                         2 => DataLane::Lossy,
                         _ => return Err(CodecError::Malformed),
                     };
-                    TrackPacket::data(lane, reader.blob()?)
+                    let target = if matches!(kind, 3 | 5) {
+                        if lane != DataLane::Ordered {
+                            return Err(CodecError::Malformed);
+                        }
+                        Some(ConnectionId::from_bytes(reader.array()?))
+                    } else {
+                        None
+                    };
+                    TrackPacket::data_for(lane, reader.blob()?, target, matches!(kind, 4 | 5))
                 } else {
                     if matches!(publication_id, PublicationKey::Data(_)) {
                         return Err(CodecError::Malformed);
@@ -138,7 +146,20 @@ fn encode(frame: &ShardFrame, writer: &mut Writer<'_>) -> Result<(), CodecError>
         }
         ShardFrame::Media { delivery, payload } => {
             writer.u8(match &payload.packet {
-                TrackPacket::Data { .. } => 1,
+                TrackPacket::Data {
+                    filter_recipients: true,
+                    target: Some(_),
+                    ..
+                } => 5,
+                TrackPacket::Data {
+                    filter_recipients: true,
+                    target: None,
+                    ..
+                } => 4,
+                TrackPacket::Data {
+                    target: Some(_), ..
+                } => 3,
+                TrackPacket::Data { target: None, .. } => 1,
                 TrackPacket::Rtp(_) => 2,
             })?;
             writer.u8(match payload.publication_id {
@@ -149,7 +170,12 @@ fn encode(frame: &ShardFrame, writer: &mut Writer<'_>) -> Result<(), CodecError>
             writer.bytes(payload.publication_id.as_bytes())?;
             writer.u32(delivery.playout_ntp32)?;
             match &payload.packet {
-                TrackPacket::Data { lane, bytes } => {
+                TrackPacket::Data {
+                    lane,
+                    bytes,
+                    target,
+                    ..
+                } => {
                     if !matches!(payload.publication_id, PublicationKey::Data(_)) {
                         return Err(CodecError::Unsupported);
                     }
@@ -158,6 +184,12 @@ fn encode(frame: &ShardFrame, writer: &mut Writer<'_>) -> Result<(), CodecError>
                         DataLane::Ordered => 1,
                         DataLane::Lossy => 2,
                     })?;
+                    if let Some(id) = target {
+                        if *lane != DataLane::Ordered {
+                            return Err(CodecError::Unsupported);
+                        }
+                        writer.bytes(id.as_bytes())?;
+                    }
                     writer.blob(bytes)
                 }
                 TrackPacket::Rtp(packet) => {

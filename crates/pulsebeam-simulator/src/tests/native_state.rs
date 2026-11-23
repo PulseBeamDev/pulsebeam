@@ -467,6 +467,8 @@ fn subscription(source: &wire::Track, channel: u32, enabled: bool) -> wire::Reso
 
 fn message(source: &wire::Track, sequence: u64, payload: u8) -> pulsebeam_proto::topic::TopicFrame {
     pulsebeam_proto::topic::TopicFrame {
+        recipient_connections: None,
+        repair_target: Default::default(),
         body: Some(pulsebeam_proto::topic::topic_frame::Body::Message(
             pulsebeam_proto::topic::TopicMessage {
                 captured_at: None,
@@ -510,11 +512,20 @@ async fn run_publisher(
     );
     tx.send(PeerStep::Source(first.clone())).await?;
     assert!(matches!(rx.recv().await, Some(PeerStep::Ready)));
-    peer.send_payload(0, &message(&first, 1, 43));
+    let mut excluded = message(&first, 1, 43);
+    excluded.recipient_connections = Some(vec![0; 16]);
+    peer.send_payload(0, &excluded);
     let probe = peer.payload(0).await?;
     assert!(probe.is_subscriber_control());
     assert_eq!(probe.publication_id(), Some(first.publication_id.as_str()));
-    peer.send_payload(0, &message(&first, 2, 44));
+    let requester = probe
+        .requester()
+        .context("missing server-stamped requester")?;
+    assert_eq!(requester.len(), 16);
+    assert_ne!(requester, [0; 16]);
+    let mut included = message(&first, 2, 44);
+    included.recipient_connections = Some(requester.to_vec());
+    peer.send_payload(0, &included);
     assert!(matches!(rx.recv().await, Some(PeerStep::Delivered)));
     peer.desire(1, 4, None);
     let removed = peer.confirmed(1, 4).await?;
@@ -568,7 +579,14 @@ async fn run_receiver(
         .await?;
     assert_eq!(live(value, &spec, &first.participant_id), first);
     tx.send(PeerStep::Ready).await?;
-    assert_eq!(peer.payload(0).await?, message(&first, 1, 43));
+    use pulsebeam_proto::topic::{TopicFrame, TopicOmission, topic_frame::Body};
+    assert_eq!(
+        peer.payload(0).await?,
+        TopicFrame::from(Body::Omission(TopicOmission {
+            publication_id: first.publication_id.clone(),
+            sequence: 1,
+        }))
+    );
     let disabled = subscription(&first, 1, false);
     peer.desire(1, 2, Some(disabled.clone()));
     let value = peer
@@ -583,8 +601,11 @@ async fn run_receiver(
     peer.send_payload(
         0,
         &pulsebeam_proto::topic::TopicFrame {
+            recipient_connections: None,
+            repair_target: Default::default(),
             body: Some(pulsebeam_proto::topic::topic_frame::Body::Probe(
                 pulsebeam_proto::topic::TopicProbe {
+                    requester: Default::default(),
                     publication_id: first.publication_id.clone(),
                     from_sequence: 2,
                     live: true,

@@ -350,6 +350,8 @@ mod tests {
             TopicFrame, TopicFrontier, TopicMessage, TopicNack, topic_frame::Body,
         };
         let message = |id: crate::entity::PublicationKey| TopicFrame {
+            recipient_connections: None,
+            repair_target: Default::default(),
             body: Some(Body::Message(TopicMessage {
                 captured_at: None,
                 publication_id: id.as_str(),
@@ -365,6 +367,8 @@ mod tests {
         assert!(!state.accepts_publisher_frame(
             cid,
             &TopicFrame {
+                recipient_connections: None,
+                repair_target: Default::default(),
                 body: Some(Body::Frontier(TopicFrontier {
                     publication_id: meta.id.as_str(),
                     next_sequence: 0
@@ -374,7 +378,10 @@ mod tests {
         assert!(!state.accepts_publisher_frame(
             cid,
             &TopicFrame {
+                recipient_connections: None,
+                repair_target: Default::default(),
                 body: Some(Body::Nack(TopicNack {
+                    requester: Default::default(),
                     publication_id: meta.id.as_str(),
                     from_sequence: 0
                 }))

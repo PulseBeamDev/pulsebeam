@@ -24,6 +24,7 @@ mod admission;
 pub use admission::DataSendFailure;
 
 pub const MAX_TOPIC_CHANNELS: usize = 64;
+pub const MAX_TOPIC_RECIPIENTS: usize = pulsebeam_proto::topic::MAX_RECIPIENT_CONNECTIONS;
 pub const MAX_TOPIC_PAYLOAD_BYTES: usize = pulsebeam_proto::topic::MAX_PAYLOAD_BYTES;
 pub const TOPIC_HISTORY_CAPACITY: usize = 256;
 pub const TOPIC_REORDER_CAPACITY: usize = 256;
@@ -194,6 +195,11 @@ pub enum TopicError {
     SequenceExhausted(String),
     #[error("topic frame is malformed")]
     MalformedMessage,
+    #[error(
+        "data recipient list must contain between 1 and {} connections",
+        pulsebeam_proto::topic::MAX_RECIPIENT_CONNECTIONS
+    )]
+    InvalidRecipients,
     #[error("topic control is invalid")]
     InvalidControl,
     #[error("topic channel is not active")]
@@ -228,8 +234,14 @@ struct PendingSend {
     admission: Option<OperationId>,
 }
 
-struct QueuedMessage {
+#[derive(Clone)]
+struct OutboundMessage {
     message: WireMessage,
+    recipients: Option<Vec<u8>>,
+}
+
+struct QueuedMessage {
+    unit: OutboundMessage,
     admission: Option<OperationId>,
 }
 
@@ -237,7 +249,7 @@ struct QueuedMessage {
 struct PublisherState {
     publication_id: Option<String>,
     next_sequence: u64,
-    history: VecDeque<WireMessage>,
+    history: VecDeque<OutboundMessage>,
     queue: VecDeque<QueuedMessage>,
     pending: Option<PendingSend>,
 }
@@ -442,10 +454,12 @@ impl Topics {
                     source.channel,
                     TopicChannel::Subscriber(subscriber),
                     Body::Probe(TopicProbe {
+                        requester: Default::default(),
                         publication_id: source.track.publication_id.clone(),
                         from_sequence: cursor.unwrap_or(0),
                         live: cursor.is_none(),
-                    }),
+                    })
+                    .into(),
                     ids,
                     effects,
                 );
@@ -565,6 +579,7 @@ impl Topics {
                     *channel,
                     subscriber.clone(),
                     TopicProbe {
+                        requester: Default::default(),
                         publication_id: id.clone(),
                         from_sequence: cursor.unwrap_or(0),
                         live: cursor.is_none(),
@@ -577,7 +592,7 @@ impl Topics {
                 generation,
                 channel,
                 TopicChannel::Subscriber(subscriber),
-                Body::Probe(probe),
+                Body::Probe(probe).into(),
                 ids,
                 effects,
             );
@@ -811,6 +826,11 @@ impl Topics {
             sequence,
             payload: send.payload,
         };
+        let message = OutboundMessage {
+            message,
+            recipients: admission
+                .and_then(|ticket| self.admissions.get(&ticket)?.recipients.clone()),
+        };
         let superseded =
             send.publisher.mode == TopicMode::Latest && state.queue.pop_back().is_some();
         if send.publisher.mode == TopicMode::Ordered {
@@ -819,7 +839,10 @@ impl Topics {
             }
             state.history.push_back(message.clone());
         }
-        state.queue.push_back(QueuedMessage { message, admission });
+        state.queue.push_back(QueuedMessage {
+            unit: message,
+            admission,
+        });
         if superseded {
             self.record_drop(&send.publisher, TopicDropReason::Superseded, notifications);
         }
@@ -972,6 +995,7 @@ impl Topics {
                 {
                     return Err(TopicError::InvalidControl);
                 }
+                let repair_target = frame.requester().unwrap_or_default().to_vec();
                 let response = match frame.body {
                     Some(Body::Probe(probe)) if probe.live => {
                         alloc::vec![Body::Frontier(TopicFrontier {
@@ -979,8 +1003,12 @@ impl Topics {
                             next_sequence: state.next_sequence
                         })]
                     }
-                    Some(Body::Probe(probe)) => Self::replay(state, probe.from_sequence)?,
-                    Some(Body::Nack(nack)) => Self::replay(state, nack.from_sequence)?,
+                    Some(Body::Probe(probe)) => {
+                        Self::replay(state, probe.from_sequence, &repair_target)?
+                    }
+                    Some(Body::Nack(nack)) => {
+                        Self::replay(state, nack.from_sequence, &repair_target)?
+                    }
                     _ => return Err(TopicError::InvalidControl),
                 };
                 for body in response {
@@ -988,7 +1016,11 @@ impl Topics {
                         generation,
                         channel,
                         TopicChannel::Publisher(publisher.clone()),
-                        body,
+                        TopicFrame {
+                            recipient_connections: None,
+                            repair_target: repair_target.clone(),
+                            body: Some(body),
+                        },
                         ids,
                         effects,
                     );
@@ -1057,6 +1089,9 @@ impl Topics {
                                 delivery.drain()
                             }
                             Some(Body::Message(message)) => delivery.accept(message),
+                            Some(Body::Omission(omission)) => {
+                                delivery.accept_unit(omission.sequence, None)
+                            }
                             _ => return Err(TopicError::InvalidControl),
                         };
                         if let Some((expected_sequence, available_sequence)) = gap {
@@ -1077,9 +1112,11 @@ impl Topics {
                                 channel,
                                 TopicChannel::Subscriber(subscriber),
                                 Body::Nack(TopicNack {
+                                    requester: Default::default(),
                                     publication_id: id,
                                     from_sequence,
-                                }),
+                                })
+                                .into(),
                                 ids,
                                 effects,
                             );
@@ -1162,14 +1199,18 @@ impl Topics {
         true
     }
 
-    fn replay(state: &PublisherState, from: u64) -> Result<Vec<Body>, TopicError> {
+    fn replay(
+        state: &PublisherState,
+        from: u64,
+        recipient: &[u8],
+    ) -> Result<Vec<Body>, TopicError> {
         if from > state.next_sequence {
             return Err(TopicError::InvalidControl);
         }
         let floor = state
             .history
             .front()
-            .map_or(state.next_sequence, |message| message.sequence);
+            .map_or(state.next_sequence, |unit| unit.message.sequence);
         let mut result = Vec::new();
         if from < floor {
             result.push(Body::Floor(TopicFloor {
@@ -1184,9 +1225,21 @@ impl Topics {
             state
                 .history
                 .iter()
-                .filter(|message| message.sequence >= from)
-                .cloned()
-                .map(Body::Message),
+                .filter(|unit| unit.message.sequence >= from)
+                .map(|unit| {
+                    if unit
+                        .recipients
+                        .as_ref()
+                        .is_none_or(|ids| ids.as_chunks::<16>().0.iter().any(|id| id == recipient))
+                    {
+                        Body::Message(unit.message.clone())
+                    } else {
+                        Body::Omission(pulsebeam_proto::topic::TopicOmission {
+                            publication_id: unit.message.publication_id.clone(),
+                            sequence: unit.message.sequence,
+                        })
+                    }
+                }),
         );
         Ok(result)
     }
@@ -1308,7 +1361,9 @@ impl Topics {
             channel,
             binary: true,
             payload: TopicFrame {
-                body: Some(Body::Message(message.message)),
+                recipient_connections: message.unit.recipients,
+                repair_target: Default::default(),
+                body: Some(Body::Message(message.unit.message)),
             }
             .encode_to_vec(),
         }));
@@ -1323,7 +1378,7 @@ impl Topics {
         generation: Generation,
         channel: ChannelId,
         registration: TopicChannel,
-        body: Body,
+        frame: TopicFrame,
         ids: &mut IdGenerator,
         effects: &mut VecDeque<Effect>,
     ) {
@@ -1344,7 +1399,7 @@ impl Topics {
             generation,
             channel,
             binary: true,
-            payload: TopicFrame { body: Some(body) }.encode_to_vec(),
+            payload: frame.encode_to_vec(),
         }));
     }
 
@@ -1483,7 +1538,7 @@ impl LossyDelivery {
 #[derive(Default)]
 struct OrderedDelivery {
     next_sequence: Option<u64>,
-    pending: BTreeMap<u64, WireMessage>,
+    pending: BTreeMap<u64, Option<WireMessage>>,
 }
 
 struct DeliveryResult {
@@ -1493,24 +1548,29 @@ struct DeliveryResult {
 
 impl OrderedDelivery {
     fn accept(&mut self, message: WireMessage) -> DeliveryResult {
+        self.accept_unit(message.sequence, Some(message))
+    }
+
+    fn accept_unit(&mut self, sequence: u64, message: Option<WireMessage>) -> DeliveryResult {
         let Some(next) = self.next_sequence else {
             return DeliveryResult {
                 messages: Vec::new(),
                 nack_from: None,
             };
         };
-        if message.sequence == next {
+        if sequence == next {
             self.next_sequence = Some(next.saturating_add(1));
             let mut result = self.drain();
-            result.messages.insert(0, message);
+            if let Some(message) = message {
+                result.messages.insert(0, message);
+            }
             return result;
         }
-        let missing = message.sequence > next;
-        if message.sequence > next
-            && (self.pending.len() < TOPIC_REORDER_CAPACITY
-                || self.pending.contains_key(&message.sequence))
+        let missing = sequence > next;
+        if sequence > next
+            && (self.pending.len() < TOPIC_REORDER_CAPACITY || self.pending.contains_key(&sequence))
         {
-            self.pending.entry(message.sequence).or_insert(message);
+            self.pending.entry(sequence).or_insert(message);
         }
         let mut result = self.drain();
         if missing && result.messages.is_empty() {
@@ -1523,7 +1583,9 @@ impl OrderedDelivery {
         let mut messages = Vec::new();
         if let Some(mut next) = self.next_sequence {
             while let Some(message) = self.pending.remove(&next) {
-                messages.push(message);
+                if let Some(message) = message {
+                    messages.push(message);
+                }
                 next = next.saturating_add(1);
             }
             self.next_sequence = Some(next);
@@ -1655,7 +1717,7 @@ mod tests {
                     "authoritative".into(),
                     OrderedDelivery {
                         next_sequence: Some(4),
-                        pending: BTreeMap::from([(5, message(5))]),
+                        pending: BTreeMap::from([(5, Some(message(5)))]),
                     },
                 )]),
                 ..SubscriberState::default()
@@ -1812,6 +1874,38 @@ mod tests {
         assert!(delivery.seen.len() <= TOPIC_DEDUPLICATION_CAPACITY);
         assert!(!delivery.accept(0));
         assert!(!delivery.accept(299));
+    }
+
+    #[test]
+    fn ordered_omissions_advance_the_cursor_without_delivering_payloads() {
+        let mut state = OrderedDelivery::default();
+        assert!(state.accept_unit(30, None).messages.is_empty());
+        assert_eq!(state.next_sequence, None);
+        state.next_sequence = Some(40);
+        assert_eq!(state.accept_unit(41, None).nack_from, Some(40));
+        let result = state.accept(message(40));
+        assert_eq!(
+            result
+                .messages
+                .iter()
+                .map(|value| value.sequence)
+                .collect::<Vec<_>>(),
+            [40]
+        );
+        assert_eq!(result.nack_from, None);
+        assert_eq!(state.next_sequence, Some(42));
+        assert_eq!(state.accept(message(43)).nack_from, Some(42));
+        let result = state.accept_unit(42, None);
+        assert_eq!(
+            result
+                .messages
+                .iter()
+                .map(|value| value.sequence)
+                .collect::<Vec<_>>(),
+            [43]
+        );
+        assert!(state.accept(message(42)).messages.is_empty());
+        assert_eq!(state.next_sequence, Some(44));
     }
 
     #[test]

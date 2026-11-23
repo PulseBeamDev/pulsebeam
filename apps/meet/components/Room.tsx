@@ -7,6 +7,7 @@ import {
   useWatch,
   WatchStatus,
   CatalogDelivery,
+  DataDelivery,
   Video,
   useAgent,
   useCapture,
@@ -194,8 +195,8 @@ function ActiveRoom({
   } = useMemo(() => {
     const videos: RemoteVideoTrack[] = [];
     const audios: RemoteAudioTrack[] = [];
-    const chats: RemoteDataTrack<"ordered">[] = [];
-    const reactions: RemoteDataTrack<"lossy">[] = [];
+    const chats: RemoteDataTrack[] = [];
+    const reactions: RemoteDataTrack[] = [];
     if (agent.roomId !== room)
       return {
         remoteVideoTracks: videos,
@@ -215,12 +216,12 @@ function ActiveRoom({
           track.trackId === "chat" &&
           track.kind.inner.delivery === CatalogDelivery.Ordered
         )
-          chats.push(participant.data("chat", "ordered"));
+          chats.push(participant.data("chat"));
         if (
           track.trackId === "reactions" &&
           track.kind.inner.delivery === CatalogDelivery.Lossy
         )
-          reactions.push(participant.data("reactions", "lossy"));
+          reactions.push(participant.data("reactions"));
       }
     }
     return {
@@ -274,7 +275,6 @@ function ActiveRoom({
   const closeAlert = () => {
     setFailure(null);
     playbackRetry.current = null;
-    clearChatError();
   };
   const send = async () => {
     if (sending || !draft.trim()) return;
@@ -359,6 +359,7 @@ function ActiveRoom({
         <Data
           key={`${track.room}:${track.participantId}:${track.trackId}`}
           track={track}
+          options={{ delivery: DataDelivery.Unreliable }}
           onEvent={receiveReaction}
         />
       ))}
@@ -469,9 +470,9 @@ function ActiveRoom({
           {(capture.error || devices.error)?.message}
         </Alert>
       )}
-      {(failure || chatError || agent.error) && (
+      {(failure || agent.error) && (
         <Alert severity="error" onClose={closeAlert}>
-          {failure ?? chatError ?? agent.error?.message}
+          {failure ?? agent.error?.message}
         </Alert>
       )}
       <Box
@@ -651,6 +652,11 @@ function ActiveRoom({
                 <Icons.X size={18} />
               </IconButton>
             </Stack>
+            {chatError && (
+              <Alert severity="error" onClose={clearChatError}>
+                {chatError}
+              </Alert>
+            )}
             <Stack
               role="log"
               aria-label="Chat transcript"
@@ -662,37 +668,28 @@ function ActiveRoom({
                   No messages yet
                 </Typography>
               )}
-              {messages.map((message) =>
-                message.type === "gap" ? (
-                  <Alert
-                    key={`gap:${message.publicationId}:${message.expectedSequence}:${message.availableSequence}`}
-                    severity="warning"
+              {messages.map((message) => (
+                <Box
+                  key={
+                    message.type === "local"
+                      ? message.key
+                      : `${message.publicationId}:${message.sequence}`
+                  }
+                  className={`max-w-[90%] ${message.participantId === agent.participantId ? "self-end" : "self-start"}`}
+                >
+                  <Typography variant="caption" color="text.secondary">
+                    {message.participantId === agent.participantId
+                      ? "You"
+                      : message.participantId}
+                  </Typography>
+                  <Paper
+                    elevation={0}
+                    className={`break-words px-3 py-2 ${message.participantId === agent.participantId ? "bg-blue-700! text-white!" : "bg-slate-100!"}`}
                   >
-                    Some messages could not be recovered.
-                  </Alert>
-                ) : (
-                  <Box
-                    key={
-                      message.type === "local"
-                        ? message.key
-                        : `${message.publicationId}:${message.sequence}`
-                    }
-                    className={`max-w-[90%] ${message.participantId === agent.participantId ? "self-end" : "self-start"}`}
-                  >
-                    <Typography variant="caption" color="text.secondary">
-                      {message.participantId === agent.participantId
-                        ? "You"
-                        : message.participantId}
-                    </Typography>
-                    <Paper
-                      elevation={0}
-                      className={`break-words px-3 py-2 ${message.participantId === agent.participantId ? "bg-blue-700! text-white!" : "bg-slate-100!"}`}
-                    >
-                      {message.value}
-                    </Paper>
-                  </Box>
-                ),
-              )}
+                    {message.value}
+                  </Paper>
+                </Box>
+              ))}
             </Stack>
             <Stack
               component="form"

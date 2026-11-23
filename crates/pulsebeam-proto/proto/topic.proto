@@ -20,6 +20,8 @@ message TopicCaptureTimestamp {
 message TopicNack {
   string publication_id = 1;
   uint64 from_sequence = 2;
+  // Server stamped; subscriber-originated frames must omit it.
+  bytes requester = 3;
 }
 
 // A new subscription requests a live frontier, never retained history. An
@@ -28,6 +30,8 @@ message TopicProbe {
   string publication_id = 1;
   uint64 from_sequence = 2;
   bool live = 3;
+  // Server stamped; subscriber-originated frames must omit it.
+  bytes requester = 4;
 }
 
 // Establishes the starting cursor of a live subscription. It is not a message.
@@ -43,6 +47,12 @@ message TopicFloor {
   uint64 available_sequence = 2;
 }
 
+// Advances an ordered receiver over a unit omitted from its audience.
+message TopicOmission {
+  string publication_id = 1;
+  uint64 sequence = 2;
+}
+
 message TopicFrame {
   oneof body {
     TopicMessage message = 1;
@@ -50,5 +60,10 @@ message TopicFrame {
     TopicProbe probe = 3;
     TopicFrontier frontier = 4;
     TopicFloor floor = 5;
+    TopicOmission omission = 7;
   }
+  // Used only on repair output and intersected with installed subscription routes.
+  bytes repair_target = 6;
+  // Optional sorted, unique 16-byte connection IDs. Absent means no audience filter.
+  optional bytes recipient_connections = 8;
 }

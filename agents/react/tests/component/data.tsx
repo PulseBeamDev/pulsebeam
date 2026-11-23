@@ -5,7 +5,7 @@ import { Data, useAgent, type Agent, type DataEvent } from "../../src/index.js";
 import { deferred, flush } from "./platform.js";
 import { runtimes } from "./runtime.js";
 
-const message = (sequence: bigint): DataEvent<"ordered"> => ({
+const message = (sequence: bigint): DataEvent => ({
   type: "message",
   participantId: "alice",
   publicationId: "chat-id",
@@ -51,7 +51,7 @@ export async function dataLifetimes() {
             track={equivalent
               .room("selected-room")
               .participant("alice")
-              .data(state.trackId, "ordered")}
+              .data(state.trackId)}
             onEvent={async (event) => {
               assert.equal(event.type, "message");
               if (event.type !== "message") return;
@@ -67,10 +67,7 @@ export async function dataLifetimes() {
           />
         )}
         <Data
-          track={agent
-            .room("selected-room")
-            .participant("alice")
-            .data("chat", "ordered")}
+          track={agent.room("selected-room").participant("alice").data("chat")}
           onEvent={(event) => {
             assert.equal(event.type, "message");
             if (event.type !== "message") return;
@@ -95,19 +92,19 @@ export async function dataLifetimes() {
       ),
     );
     const runtime = runtimes.at(-1)!;
-    const room = agent.data("chat", "ordered");
-    assert.equal(room, agent.data("chat", "ordered"));
-    assert.notEqual(room, agent.data("chat", "lossy"));
+    const room = agent.data("chat");
+    assert.equal(room, agent.data("chat"));
+    assert.equal("delivery" in room, false);
     assert.notEqual(room, agent.video("chat"));
-    assert.notEqual(room, agent.data("other", "ordered"));
+    assert.notEqual(room, agent.data("other"));
     const participant = agent
       .room("selected-room")
       .participant("alice")
-      .data("chat", "ordered");
+      .data("chat");
     assert.notEqual(room, participant);
     assert.notEqual(
       participant,
-      agent.room("selected-room").participant("bob").data("chat", "ordered"),
+      agent.room("selected-room").participant("bob").data("chat"),
     );
     const owners = [...runtime.dataOwners.keys()];
     assert.equal(owners.length, 2);
@@ -214,10 +211,7 @@ export async function staleDataClaims() {
     mount = setMounted;
     return mounted ? (
       <Data
-        track={agent
-          .room("selected-room")
-          .participant("alice")
-          .data("late", "ordered")}
+        track={agent.room("selected-room").participant("alice").data("late")}
         onEvent={(event) => {
           calls.push(event);
         }}

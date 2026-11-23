@@ -52,6 +52,8 @@ message CatalogParticipantEntry {
   Participant participant = 1;
   // Complete authorized list, including the empty list for presence-only entries.
   repeated Track tracks = 2;
+  // Server-issued data recipient reference for this participant's current room connection.
+  optional string data_recipient_id = 3;
 }
 
 // Each record carries a bounded slice of one encoded complete entry. Fragments

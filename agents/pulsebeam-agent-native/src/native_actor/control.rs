@@ -720,7 +720,7 @@ impl Control {
         owner: u64,
         expected_join: u64,
         data: Vec<u8>,
-        captured_at: Option<agent_core::ffi::CaptureTimestamp>,
+        options: Option<agent_core::ffi::DataSendOptions>,
     ) -> Result<OperationId, agent_core::AgentError> {
         self.with(|core| {
             let state = agent_core::ffi::AgentState::from(core.snapshot());
@@ -728,13 +728,13 @@ impl Control {
                 return Err(agent_core::TrackResourceError::NotConnected.into());
             }
             let publication = core.data_publication_state(owner)?;
-            core.send_data_at(
+            core.send_data_with_options(
                 agent_core::TrackSpec::Data {
                     track_id: publication.track_id,
                     delivery: publication.delivery.into(),
                 },
                 data,
-                captured_at,
+                options,
             )
         })
     }

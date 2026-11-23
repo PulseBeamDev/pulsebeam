@@ -3,6 +3,7 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { MeetApp } from "../components/MeetApp";
 import { WatchStatus, CatalogDelivery } from "@pulsebeam/react";
+import { ErrorCode } from "@pulsebeam/web";
 import {
   captures,
   displays,
@@ -444,30 +445,17 @@ assert.equal(
   3,
   "payload IDs do not replace data-track and sequence identity",
 );
-await flush(() =>
-  deliver({
-    type: "gap",
-    participantId: "bob",
-    publicationId: "remote-chat",
-    from: 2n,
-    to: 4n,
-  }),
-);
 const transcript = document.querySelector(
   '[role="log"][aria-label="Chat transcript"]',
 );
 assert.ok(transcript, "chat owns an inline transcript");
-assert.equal(
-  transcript.lastElementChild!.textContent,
-  "Some messages could not be recovered.",
-);
 await flush(() =>
   deliver({
     type: "message",
     participantId: "bob",
     publicationId: "remote-chat",
     sequence: 4n,
-    data: new TextEncoder().encode(JSON.stringify("after the gap")),
+    data: new TextEncoder().encode(JSON.stringify("final remote message")),
   }),
 );
 await flush(() => {
@@ -493,23 +481,18 @@ await flush(() => {
   }
 });
 const transcriptEntries = Array.from(transcript.children);
-assert.equal(transcriptEntries.length, 5);
+assert.equal(transcriptEntries.length, 4);
 assert.match(
   transcriptEntries[2].textContent!,
   /delivered through production data tracks/,
 );
-assert.equal(
-  transcriptEntries[3].textContent,
-  "Some messages could not be recovered.",
-);
-assert.match(transcriptEntries[4].textContent!, /after the gap/);
-assert.equal(transcript.querySelectorAll('[role="alert"]').length, 1);
+assert.match(transcriptEntries[3].textContent!, /final remote message/);
 await click("Close chat");
 await click("Chat");
 assert.match(
   document.querySelector('[aria-label="Chat transcript"]')!.textContent!,
-  /Some messages could not be recovered\..*after the gap/s,
-  "chat history retains the gap before continuation when reopened",
+  /final remote message/,
+  "chat history remains visible when reopened",
 );
 const chat =
   document.querySelector<HTMLTextAreaElement>("textarea") ??
@@ -547,6 +530,29 @@ assert.equal(sentChat.mode, "ordered");
 assert.equal(
   JSON.parse(new TextDecoder().decode(sentChat.payload)),
   "hello from component",
+);
+const chatOwners = [...runtime.dataOwners].filter(
+  ([, receiver]) => receiver.spec.trackId === "chat",
+);
+assert.equal(chatOwners.length, 1);
+const [[chatOwner]] = chatOwners;
+await flush(() => {
+  runtime.setObservation(chatOwner, {
+    observationRevision: 2n,
+    terminalError: {
+      code: ErrorCode.ContinuityLost,
+      message: "Reliable data continuity was lost",
+    },
+  });
+});
+assert.equal(
+  runtime.dataOwners.has(chatOwner),
+  false,
+  "the broken Reliable owner is released",
+);
+assert.match(
+  updatedTranscript.closest("aside")!.textContent!,
+  /Chat is unavailable/,
 );
 privateSoFar();
 await flush(() =>

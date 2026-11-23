@@ -18,7 +18,7 @@ export interface DataTrackSpec<D extends Delivery = Delivery> {
 
 export type TrackSpec = VideoTrackSpec | AudioTrackSpec | DataTrackSpec;
 
-function trackName(value: string): string {
+export function trackName(value: string): string {
   if (typeof value !== "string")
     throw new TypeError("trackId must be a string");
   return value;

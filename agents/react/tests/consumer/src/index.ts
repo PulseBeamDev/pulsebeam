@@ -1,3 +1,4 @@
+import { DataDelivery } from "@pulsebeam/react";
 import {
   Audio,
   Data,
@@ -35,10 +36,12 @@ camera.source;
 // @ts-expect-error Kind-specific sources must remain safe in packed declarations.
 usePublish(camera, capture.audio);
 const remote = agent.room("selected-room").participant("alice");
-const messages = remote.data("messages", "lossy");
+const messages = remote.data("messages");
 Data({
   track: messages,
+  options: { delivery: DataDelivery.Unreliable },
   async onEvent(event) {
+    if (event.type !== "message") return;
     const bytes: Uint8Array = event.data;
     // @ts-expect-error Lossy events cannot contain a gap.
     event.from;
@@ -47,16 +50,13 @@ Data({
 });
 // @ts-expect-error Remote data handles cannot send.
 messages.send(new Uint8Array());
-// @ts-expect-error Data delivery is required.
-agent.data("messages");
+// @ts-expect-error Delivery belongs on the owner.
+agent.data("messages", "lossy");
 Data({
-  track: agent
-    .room("selected-room")
-    .participant("alice")
-    .data("chat", "ordered"),
+  track: agent.room("selected-room").participant("alice").data("chat"),
   onEvent(event) {
-    if (event.type === "gap") {
-      const from: bigint = event.from;
+    if (event.type === "discontinuity") {
+      const from: string = event.previousPublicationId;
       void from;
     }
   },

@@ -38,6 +38,7 @@ fn records(
     tracks: usize,
 ) -> Vec<wire::CatalogPageRecord> {
     let entry = wire::CatalogParticipantEntry {
+        data_recipient_id: Some("pbr_00000000000070008000000000000004".into()),
         participant: Some(wire::Participant {
             participant_id: participant.into(),
 
@@ -123,6 +124,12 @@ fn agent_emits_raw_open_observes_page_and_closes_without_receive_demand() {
         .unwrap();
     let state = agent.catalog_watch_state(owner).unwrap();
     assert_eq!(state.status, WatchStatus::Live);
+    assert_eq!(
+        state.page.as_ref().unwrap().participants()[0]
+            .data_recipient_id
+            .as_deref(),
+        Some("pbr_00000000000070008000000000000004")
+    );
     assert!(
         state.page.as_ref().unwrap().participants()[0]
             .publications

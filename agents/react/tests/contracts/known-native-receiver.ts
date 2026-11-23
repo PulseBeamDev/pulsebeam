@@ -78,7 +78,7 @@ export async function observeCatalog(config: {
         ),
       "React useWatch renders the actual Native catalog",
     );
-    const publication = publisher.data("catalog-change", "ordered").publish();
+    const publication = publisher.data("catalog-change").publish();
     await until(
       () =>
         Boolean(
@@ -135,7 +135,7 @@ export async function receiveNative(config: Config): Promise<{
     );
     const camera = useMemo(() => participant.video("camera"), [participant]);
     const bytes = useMemo(
-      () => participant.data("frame-events", "ordered"),
+      () => participant.data("frame-events"),
       [participant],
     );
     const reception = useSubscribe(camera);

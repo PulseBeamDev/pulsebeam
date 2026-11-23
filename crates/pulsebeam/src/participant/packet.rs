@@ -9,6 +9,8 @@ use crate::track::DataLane;
 pub enum TrackPacket {
     Data {
         lane: DataLane,
+        filter_recipients: bool,
+        target: Option<crate::entity::ConnectionId>,
         #[allow(
             clippy::disallowed_types,
             reason = "RFC254 local Link fanout shares immutable payload storage; network peers serialize it"
@@ -25,17 +27,31 @@ pub enum TrackPacketRef<'a> {
 
 impl TrackPacket {
     pub(crate) fn data(lane: DataLane, payload: &[u8]) -> Self {
+        Self::data_for(lane, payload, None, false)
+    }
+
+    pub(crate) fn data_for(
+        lane: DataLane,
+        payload: &[u8],
+        target: Option<crate::entity::ConnectionId>,
+        filter_recipients: bool,
+    ) -> Self {
         #[allow(
             clippy::disallowed_types,
             reason = "RFC254 snapshots data once before shallow immutable local fanout"
         )]
         let bytes = bytes::Bytes::copy_from_slice(payload);
-        Self::Data { lane, bytes }
+        Self::Data {
+            lane,
+            bytes,
+            target,
+            filter_recipients,
+        }
     }
 
     pub fn as_ref(&self) -> TrackPacketRef<'_> {
         match self {
-            Self::Data { lane, bytes } => TrackPacketRef::Data { lane: *lane, bytes },
+            Self::Data { lane, bytes, .. } => TrackPacketRef::Data { lane: *lane, bytes },
             Self::Rtp(packet) => TrackPacketRef::Rtp(packet),
         }
     }

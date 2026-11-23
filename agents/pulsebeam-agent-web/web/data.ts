@@ -4,10 +4,13 @@ import type {
   DataSubscriptionUpdates,
 } from "./types.js";
 import {
+  DataDelivery,
   ErrorCode,
   PublicationAdmissionStatus,
   PublicationExecution,
   SubscriptionSourceStatus,
+  type DataPublishOptions,
+  type DataSubscribeOptions,
   type DataPublicationState,
   type DataSubscriptionState,
   type ErrorInfo,
@@ -23,7 +26,23 @@ import {
   type ResourceBinding,
   type ResourceRuntime,
 } from "./resources.js";
-import { track, trackKey, type DataTrackSpec, type Delivery } from "./track.js";
+import {
+  track,
+  trackName,
+  type DataTrackSpec,
+  type Delivery,
+} from "./track.js";
+
+export interface CaptureTimestamp {
+  readonly clock: "publication";
+  readonly nanoseconds: bigint;
+  readonly uncertaintyNanoseconds?: number;
+}
+
+export interface DataSendOptions {
+  readonly recipients?: readonly string[];
+  readonly capturedAt?: CaptureTimestamp;
+}
 
 export interface DataMessage {
   readonly type: "message";
@@ -31,18 +50,7 @@ export interface DataMessage {
   readonly publicationId: string;
   readonly sequence: bigint;
   readonly data: Uint8Array;
-  readonly capturedAt?: {
-    readonly clock: "publication";
-    readonly nanoseconds: bigint;
-    readonly uncertaintyNanoseconds?: number;
-  };
-}
-export interface DataGap {
-  readonly type: "gap";
-  readonly participantId: string;
-  readonly publicationId: string;
-  readonly from: bigint;
-  readonly to: bigint;
+  readonly capturedAt?: CaptureTimestamp;
 }
 export interface DataDiscontinuity {
   readonly type: "discontinuity";
@@ -50,30 +58,43 @@ export interface DataDiscontinuity {
   readonly previousPublicationId: string;
   readonly publicationId: string;
 }
-export type DataEvent<D extends Delivery = Delivery> =
-  | DataMessage
-  | (D extends "ordered" ? DataGap : DataDiscontinuity);
-export type DataUpdate<D extends Delivery = Delivery> =
-  | { readonly type: "event"; readonly event: DataEvent<D> }
+export type DataEvent = DataMessage | DataDiscontinuity;
+export type DataUpdate =
+  | { readonly type: "event"; readonly event: DataEvent }
   | { readonly type: "closed" };
 
-interface DataTrack<D extends Delivery> {
+interface DataTrack {
   readonly kind: "data";
   readonly trackId: string;
-  readonly delivery: D;
 }
-export interface LocalDataTrack<D extends Delivery = Delivery>
-  extends DataTrack<D> {
-  publish(): DataPublication;
+export interface LocalDataTrack extends DataTrack {
+  publish(options?: DataPublishOptions): DataPublication;
 }
-export interface RemoteDataTrack<D extends Delivery = Delivery>
-  extends DataTrack<D> {
-  subscribe(): DataSubscription<D>;
+export interface RemoteDataTrack extends DataTrack {
+  subscribe(options?: DataSubscribeOptions): DataSubscription;
   readonly room: string;
   readonly participantId: string;
   readonly id: string | null;
   readonly active: boolean;
   watch(listener: () => void): () => void;
+}
+
+function delivery(
+  options?: DataPublishOptions | DataSubscribeOptions,
+): Delivery {
+  if (options !== undefined && (!options || typeof options !== "object"))
+    throw new TypeError("invalid data options");
+  switch (options?.delivery) {
+    case undefined:
+    case DataDelivery.Reliable:
+      return "ordered";
+    case DataDelivery.Unreliable:
+      return "lossy";
+    case DataDelivery.Latest:
+      return "latest";
+    default:
+      throw new TypeError("invalid data delivery mode");
+  }
 }
 
 export class DataError extends Error {
@@ -116,7 +137,13 @@ function bytes(data: Uint8Array): void {
 }
 
 export interface DataRuntime extends ResourceRuntime {
-  send_owned_data(owner: bigint, payload: Uint8Array): Promise<void>;
+  send_owned_data(
+    owner: bigint,
+    payload: Uint8Array,
+    recipients?: readonly string[],
+    captureNanoseconds?: bigint,
+    uncertaintyNanoseconds?: number,
+  ): Promise<void>;
   data_publication(owner: bigint): NativeResourceObserver;
   data_subscription(owner: bigint): NativeResourceObserver;
 }
@@ -129,8 +156,8 @@ type Source = {
   readonly participantId: string;
   readonly trackId: string;
 };
-type PendingRead<D extends Delivery> = {
-  resolve(result: DataUpdate<D>): void;
+type PendingRead = {
+  resolve(result: DataUpdate): void;
   reject(error: unknown): void;
 };
 
@@ -139,27 +166,26 @@ export class DataRegistry {
   #closing: Promise<void> | undefined;
   readonly #locals = new Map<string, LocalDataTrack>();
   readonly #remotes = new Map<string, RemoteDataTrack>();
-  readonly #streams = new Set<DataStream<Delivery>>();
+  readonly #streams = new Set<DataStream>();
   readonly #publications = new Set<DataPublication>();
-  readonly #owners = new Map<bigint, DataStream<Delivery>>();
+  readonly #owners = new Map<bigint, DataStream>();
 
   constructor(
     readonly host: DataHost,
     readonly resources: ResourceOwners,
   ) {}
 
-  local<D extends Delivery>(value: DataTrackSpec<D>): LocalDataTrack<D> {
+  local(label: string): LocalDataTrack {
     this.#requireOpen();
-    const spec = track.data(value.trackId, value.delivery);
-    const key = trackKey(spec);
-    let handle = this.#locals.get(key);
+    const trackId = trackName(label);
+    let handle = this.#locals.get(trackId);
     if (!handle) {
       handle = Object.freeze({
         kind: "data" as const,
-        trackId: spec.trackId,
-        delivery: spec.delivery,
-        publish: () => {
+        trackId,
+        publish: (options?: DataPublishOptions) => {
           this.#requireOpen();
+          const spec = track.data(trackId, delivery(options));
           const publication = new DataPublication(this.resources, spec, () =>
             this.#publications.delete(publication),
           );
@@ -167,41 +193,37 @@ export class DataRegistry {
           return publication;
         },
       });
-      this.#locals.set(key, handle);
+      this.#locals.set(trackId, handle);
     }
-    return handle as LocalDataTrack<D>;
+    return handle;
   }
 
-  remote<D extends Delivery>(
-    value: DataTrackSpec<D>,
+  remote(
+    label: string,
     source: { readonly room: string; readonly participantId: string },
-  ): RemoteDataTrack<D> {
+  ): RemoteDataTrack {
     this.#requireOpen();
-    const spec = track.data(value.trackId, value.delivery);
+    const trackId = trackName(label);
     const { room, participantId } = source;
-    const key = JSON.stringify([room, participantId, trackKey(spec)]);
+    const key = JSON.stringify([room, participantId, trackId]);
     let handle = this.#remotes.get(key);
     if (!handle) {
-      const selector = Object.freeze({
-        room,
-        participantId,
-        trackId: spec.trackId,
-      });
-      const id = () =>
-        this.host
-          .getSnapshot()
-          .catalog.tracks.find(
+      const selector = Object.freeze({ room, participantId, trackId });
+      const id = () => {
+        const snapshot = this.host.getSnapshot();
+        if (snapshot.roomId !== room) return null;
+        return (
+          snapshot.catalog.tracks.find(
             (entry) =>
-              this.host.getSnapshot().roomId === room &&
               entry.participantId === participantId &&
               entry.kind === "data" &&
-              entry.trackId === spec.trackId &&
-              entry.delivery === spec.delivery,
-          )?.id ?? null;
+              entry.trackId === trackId,
+          )?.id ?? null
+        );
+      };
       handle = Object.freeze({
         kind: "data" as const,
-        trackId: spec.trackId,
-        delivery: spec.delivery,
+        trackId,
         room,
         participantId,
         get id() {
@@ -210,27 +232,22 @@ export class DataRegistry {
         get active() {
           return id() !== null;
         },
-        subscribe: () => this.subscribe(spec, selector),
+        subscribe: (options?: DataSubscribeOptions) =>
+          this.subscribe(track.data(trackId, delivery(options)), selector),
         watch: (listener: () => void) => this.host.subscribe(listener),
       });
       this.#remotes.set(key, handle);
     }
-    return handle as RemoteDataTrack<D>;
+    return handle;
   }
 
-  #stream<D extends Delivery>(
-    spec: DataTrackSpec<D>,
-    source: Source,
-  ): DataStream<D> {
+  #stream(spec: DataTrackSpec, source: Source): DataStream {
     this.#requireOpen();
     const stream = new DataStream(this, spec, source);
     this.#streams.add(stream);
     return stream;
   }
-  subscribe<D extends Delivery>(
-    spec: DataTrackSpec<D>,
-    source: Source,
-  ): DataSubscription<D> {
+  subscribe(spec: DataTrackSpec, source: Source): DataSubscription {
     return new DataSubscription(this.#stream(spec, source));
   }
   deactivate(): void {
@@ -248,14 +265,14 @@ export class DataRegistry {
       for (const owner of value.owners) this.#owners.get(owner)?.wake();
     return true;
   }
-  claimed(stream: DataStream<Delivery>, binding: ResourceBinding): void {
+  claimed(stream: DataStream, binding: ResourceBinding): void {
     this.#owners.set(binding.owner, stream);
   }
-  unclaimed(stream: DataStream<Delivery>, binding: ResourceBinding): void {
+  unclaimed(stream: DataStream, binding: ResourceBinding): void {
     if (this.#owners.get(binding.owner) === stream)
       this.#owners.delete(binding.owner);
   }
-  forget(stream: DataStream<Delivery>): void {
+  forget(stream: DataStream): void {
     this.#streams.delete(stream);
   }
   close(): Promise<void> {
@@ -312,9 +329,31 @@ export class DataPublication {
   isClosed(): boolean {
     return this.#resource.isClosed();
   }
-  send(data: Uint8Array): Promise<void> {
+  send(data: Uint8Array, options?: DataSendOptions): Promise<void> {
     try {
       bytes(data);
+      const invalid = () =>
+        new OperationError({
+          code: ErrorCode.InvalidArgument,
+          message: "Invalid data send options",
+        });
+      if (options !== undefined && (!options || typeof options !== "object"))
+        throw invalid();
+      const recipients = options?.recipients;
+      if (recipients !== undefined && !Array.isArray(recipients))
+        throw invalid();
+      const capture = options?.capturedAt;
+      if (
+        capture !== undefined &&
+        (capture?.clock !== "publication" ||
+          typeof capture.nanoseconds !== "bigint" ||
+          BigInt.asIntN(64, capture.nanoseconds) !== capture.nanoseconds ||
+          (capture.uncertaintyNanoseconds !== undefined &&
+            (!Number.isInteger(capture.uncertaintyNanoseconds) ||
+              capture.uncertaintyNanoseconds < 0 ||
+              capture.uncertaintyNanoseconds > 0xffff_ffff)))
+      )
+        throw invalid();
       if (this.isClosed())
         throw new OperationError({
           code: ErrorCode.Closed,
@@ -327,7 +366,13 @@ export class DataPublication {
           message: "Data runtime is not active",
         });
       const pending = (binding.runtime as DataRuntime)
-        .send_owned_data(binding.owner, data)
+        .send_owned_data(
+          binding.owner,
+          data,
+          recipients,
+          capture?.nanoseconds,
+          capture?.uncertaintyNanoseconds,
+        )
         .catch((error) => {
           throw failure(error);
         });
@@ -353,16 +398,14 @@ export class DataPublication {
   }
 }
 
-export interface DataReceiver<D extends Delivery = Delivery> {
-  next(): Promise<DataUpdate<D>>;
+export interface DataReceiver {
+  next(): Promise<DataUpdate>;
   close(): Promise<void>;
   isClosed(): boolean;
 }
-export class DataSubscription<D extends Delivery = Delivery>
-  implements DataReceiver<D>
-{
-  readonly #stream: DataStream<D>;
-  constructor(stream: DataStream<D>) {
+export class DataSubscription implements DataReceiver {
+  readonly #stream: DataStream;
+  constructor(stream: DataStream) {
     this.#stream = stream;
   }
   state(): Readonly<DataSubscriptionState> {
@@ -371,7 +414,7 @@ export class DataSubscription<D extends Delivery = Delivery>
   updates(): DataSubscriptionUpdates {
     return this.#stream.updates();
   }
-  next(): Promise<DataUpdate<D>> {
+  next(): Promise<DataUpdate> {
     return this.#stream.next();
   }
   close(): Promise<void> {
@@ -382,7 +425,7 @@ export class DataSubscription<D extends Delivery = Delivery>
   }
 }
 
-class DataStream<D extends Delivery> {
+class DataStream {
   #closed = false;
   #error: Error | undefined;
   readonly #resource: ResourceOwner;
@@ -391,11 +434,11 @@ class DataStream<D extends Delivery> {
   #closing: Promise<void> | undefined;
   #pumping = false;
   #again = false;
-  readonly #pending: PendingRead<D>[] = [];
+  #pending: PendingRead | undefined;
 
   constructor(
     private readonly registry: DataRegistry,
-    spec: DataTrackSpec<D>,
+    spec: DataTrackSpec,
     source: Source,
   ) {
     let bound: ResourceBinding | undefined;
@@ -461,12 +504,19 @@ class DataStream<D extends Delivery> {
       this.wake();
     }
   }
-  next(): Promise<DataUpdate<D>> {
+  next(): Promise<DataUpdate> {
     if (this.#error) return Promise.reject(this.#error);
     if (this.#closed) return Promise.resolve({ type: "closed" });
-    const result = new Promise<DataUpdate<D>>((resolve, reject) =>
-      this.#pending.push({ resolve, reject }),
-    );
+    if (this.#pending)
+      return Promise.reject(
+        new OperationError({
+          code: ErrorCode.Conflict,
+          message: "A data read is already pending",
+        }),
+      );
+    const result = new Promise<DataUpdate>((resolve, reject) => {
+      this.#pending = { resolve, reject };
+    });
     this.wake();
     return result;
   }
@@ -475,10 +525,10 @@ class DataStream<D extends Delivery> {
     if (this.#watcher) this.#capture(this.state());
     this.#closed = true;
     const release = this.#resource.close();
-    for (const pending of this.#pending.splice(0)) {
-      if (this.#error) pending.reject(this.#error);
-      else pending.resolve({ type: "closed" });
-    }
+    const pending = this.#pending;
+    this.#pending = undefined;
+    if (this.#error) pending?.reject(this.#error);
+    else pending?.resolve({ type: "closed" });
     return (this.#closing = release.then(() => {
       this.registry.forget(this);
     }));
@@ -494,7 +544,7 @@ class DataStream<D extends Delivery> {
   async #drain(): Promise<void> {
     this.#pumping = true;
     try {
-      while (!this.#closed && this.#pending.length && this.#resource.binding) {
+      while (!this.#closed && this.#pending && this.#resource.binding) {
         const binding = this.#resource.binding;
         this.#again = false;
         let value: unknown;
@@ -513,9 +563,25 @@ class DataStream<D extends Delivery> {
           if (this.#again) continue;
           break;
         }
-        this.#pending.shift()?.resolve({
+        if (
+          typeof value === "object" &&
+          value !== null &&
+          "type" in value &&
+          value.type === "gap"
+        ) {
+          this.#fail(
+            new OperationError({
+              code: ErrorCode.ContinuityLost,
+              message: "Reliable data continuity was lost",
+            }),
+          );
+          continue;
+        }
+        const pending = this.#pending;
+        this.#pending = undefined;
+        pending.resolve({
           type: "event",
-          event: Object.freeze(value) as DataEvent<D>,
+          event: Object.freeze(value) as DataEvent,
         });
       }
     } finally {

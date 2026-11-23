@@ -15,21 +15,13 @@ type RemoteMessage = {
   participantId: string;
   value: string;
 };
-type Gap = {
-  type: "gap";
-  publicationId: string;
-  participantId: string;
-  expectedSequence: bigint;
-  availableSequence: bigint;
-};
-
 export function useChat(agent: Agent) {
   const { participantId } = agent;
-  const Chat = agent.data("chat", "ordered");
+  const Chat = agent.data("chat");
   const publication = usePublish(Chat);
-  const [messages, setMessages] = useState<
-    (RemoteMessage | Gap | LocalMessage)[]
-  >([]);
+  const [messages, setMessages] = useState<(RemoteMessage | LocalMessage)[]>(
+    [],
+  );
   const [error, setError] = useState<string | null>(null);
   const localKeys = useRef(0);
 
@@ -38,20 +30,8 @@ export function useChat(agent: Agent) {
     messages,
     error,
     clearError: () => setError(null),
-    onEvent(event: DataEvent<"ordered">) {
-      if (event.type === "gap") {
-        setMessages((current) => [
-          ...current,
-          {
-            type: "gap",
-            publicationId: event.publicationId,
-            participantId: event.participantId,
-            expectedSequence: event.from,
-            availableSequence: event.to,
-          },
-        ]);
-        return;
-      }
+    onEvent(event: DataEvent) {
+      if (event.type !== "message") return;
       const value = decodeText(event.data);
       if (value === null) return;
       setMessages((current) => [

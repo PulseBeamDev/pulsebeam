@@ -46,7 +46,10 @@ pub(crate) enum ReverseInput {
         encoding: SourceEncoding,
         kind: KeyframeRequestKind,
     },
-    ReliableControl(Vec<u8>),
+    ReliableControl {
+        requester: Option<crate::entity::ConnectionId>,
+        bytes: Vec<u8>,
+    },
 }
 
 impl ReversePacket {
@@ -139,10 +142,16 @@ impl ReversePacket {
         let (&tag, body) = self.payload.split_first()?;
         match tag {
             KEYFRAME => Self::decode_keyframe(body),
-            RELIABLE_CONTROL => Some(ReverseInput::ReliableControl(body.to_vec())),
+            RELIABLE_CONTROL => Some(ReverseInput::ReliableControl {
+                requester: None,
+                bytes: body.to_vec(),
+            }),
             SCOPED_RELIABLE_CONTROL => {
-                let (_, control) = Self::scoped_control(body)?;
-                Some(ReverseInput::ReliableControl(control.to_vec()))
+                let (requester, control) = Self::scoped_control(body)?;
+                Some(ReverseInput::ReliableControl {
+                    requester: Some(requester),
+                    bytes: control.to_vec(),
+                })
             }
             _ => None,
         }
@@ -231,7 +240,7 @@ mod tests {
             Some((first, &[4, 5][..]))
         );
         assert!(
-            matches!(round_trip.decode(), Some(ReverseInput::ReliableControl(bytes)) if bytes == vec![4, 5])
+            matches!(round_trip.decode(), Some(ReverseInput::ReliableControl { requester: Some(requester), bytes }) if requester == first && bytes == vec![4, 5])
         );
         assert!(ReversePacket::from_wire(&[SCOPED_RELIABLE_CONTROL, 0]).is_none());
     }
@@ -241,7 +250,7 @@ mod tests {
         let packet = ReversePacket::reliable_control(vec![4, 5]);
         assert!(matches!(
             packet.decode(),
-            Some(ReverseInput::ReliableControl(bytes)) if bytes == vec![4, 5]
+            Some(ReverseInput::ReliableControl { requester: None, bytes }) if bytes == vec![4, 5]
         ));
     }
 }

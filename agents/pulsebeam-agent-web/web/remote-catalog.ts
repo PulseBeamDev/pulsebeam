@@ -22,7 +22,6 @@ import {
   type ResourceBinding,
 } from "./resources.js";
 import type { DataRegistry, RemoteDataTrack } from "./data.js";
-import { track, type Delivery } from "./track.js";
 import type {
   Agent,
   AudioSubscriptionConfig,
@@ -97,11 +96,13 @@ export function watchCatalog(
               const reference = participant(entry.id);
               return Object.freeze({
                 id: entry.id,
+                ...(entry.dataRecipientId !== undefined && {
+                  dataRecipientId: entry.dataRecipientId,
+                }),
                 tracks: entry.publications,
                 video: (label: string) => reference.video(label),
                 audio: (label: string) => reference.audio(label),
-                data: <D extends Delivery>(label: string, delivery: D) =>
-                  reference.data(label, delivery),
+                data: (label: string) => reference.data(label),
               });
             }),
           ),
@@ -287,8 +288,8 @@ class ParticipantHandle implements RemoteParticipant {
   id(): string {
     return this.participantId;
   }
-  data<D extends Delivery>(trackId: string, delivery: D): RemoteDataTrack<D> {
-    return this.catalog.data.remote(track.data(trackId, delivery), {
+  data(trackId: string): RemoteDataTrack {
+    return this.catalog.data.remote(trackId, {
       room: this.room,
       participantId: this.participantId,
     });
@@ -402,8 +403,7 @@ export class RemoteCatalog {
         },
         video: (trackId: string) => wrapVideo(handle.video(trackId)),
         audio: (trackId: string) => wrapAudio(handle.audio(trackId)),
-        data: <D extends Delivery>(trackId: string, delivery: D) =>
-          handle.data(trackId, delivery),
+        data: (trackId: string) => handle.data(trackId),
       });
       this.#publicParticipants.set(handle, value);
       return value;

@@ -227,8 +227,19 @@ impl ShardRuntime {
     ) {
         match packet {
             TrackPacket::Rtp(packet) => self.route_rtp_with_plan(key, origin, packet, plan, ctx),
-            TrackPacket::Data { lane, bytes } => {
-                self.route_data_with_plan(key, origin, lane, bytes, plan, ctx);
+            TrackPacket::Data {
+                lane,
+                bytes,
+                target,
+                filter_recipients,
+            } => {
+                self.route_data_with_plan(
+                    key,
+                    origin,
+                    (lane, bytes, target, filter_recipients),
+                    plan,
+                    ctx,
+                );
             }
         }
     }
@@ -241,8 +252,12 @@ impl ShardRuntime {
         &mut self,
         stream: TrackHandle,
         origin: Origin,
-        lane: crate::track::DataLane,
-        packet: bytes::Bytes,
+        (lane, packet, target, filter_recipients): (
+            crate::track::DataLane,
+            bytes::Bytes,
+            Option<crate::entity::ConnectionId>,
+            bool,
+        ),
         plan: &InstalledTrackPlan,
         ctx: &mut ForwardingContext<'_>,
     ) {
@@ -250,15 +265,57 @@ impl ShardRuntime {
             debug_assert!(false, "data key must resolve to runtime state");
             return;
         };
+        use crate::track::DataLane;
+        use pulsebeam_proto::prelude::Message;
+        use pulsebeam_proto::topic::{TopicFrame, TopicOmission, topic_frame::Body};
+
+        let audience = if filter_recipients {
+            let Ok(mut frame) = TopicFrame::decode_bounded(&packet) else {
+                return;
+            };
+            let Some(ids) = frame.recipient_connections.take() else {
+                return;
+            };
+            let Some(Body::Message(message)) = &frame.body else {
+                return;
+            };
+            let omitted = (lane == DataLane::Ordered).then(|| {
+                TopicFrame::from(Body::Omission(TopicOmission {
+                    publication_id: message.publication_id.clone(),
+                    sequence: message.sequence,
+                }))
+                .encode_to_vec()
+            });
+            let receivers: Vec<_> = ids
+                .as_chunks::<16>()
+                .0
+                .iter()
+                .filter_map(|id| {
+                    ctx.registry
+                        .resolve_connection(crate::entity::ConnectionId::from_bytes(*id))
+                })
+                .collect();
+            frame.repair_target.clear();
+            Some((receivers, frame.encode_to_vec(), omitted))
+        } else {
+            None
+        };
+        let local_target = target.and_then(|id| ctx.registry.resolve_connection(id));
         fanout_local(plan, |subscriber| {
+            if target.is_some() && local_target != Some(subscriber) {
+                return;
+            }
+            let bytes = match &audience {
+                Some((receivers, included, _)) if receivers.contains(&subscriber) => included,
+                Some((_, _, Some(omitted))) => omitted,
+                Some((_, _, None)) => return,
+                None => packet.as_ref(),
+            };
             forward_track(
                 ctx,
                 subscriber,
                 stream,
-                TrackPacketRef::Data {
-                    lane,
-                    bytes: &packet,
-                },
+                TrackPacketRef::Data { lane, bytes },
                 None,
             );
         });
@@ -270,6 +327,8 @@ impl ShardRuntime {
                 packet: TrackPacket::Data {
                     lane,
                     bytes: packet.clone(),
+                    target,
+                    filter_recipients,
                 },
             });
         }

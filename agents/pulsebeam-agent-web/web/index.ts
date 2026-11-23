@@ -5,6 +5,7 @@ export {
   ErrorCode,
   WatchStatus,
   CatalogDelivery,
+  DataDelivery,
   PipeStatus,
   PublicationMediaKind,
   PublicationAdmissionStatus,
@@ -21,6 +22,8 @@ export type {
   VideoSubscriptionState,
   AudioSubscriptionState,
   DataPublicationState,
+  DataPublishOptions,
+  DataSubscribeOptions,
   DataSubscriptionState,
 } from "./schema.js";
 export type { Delivery } from "./track.js";
@@ -34,7 +37,9 @@ export type {
   DataUpdate,
   DataEvent,
   DataMessage,
-  DataGap,
+  DataSendOptions,
+  CaptureTimestamp,
+  DataDiscontinuity,
 } from "./data.js";
 export type { AudioPublication, Pipe, VideoPublication } from "./media.js";
 export { AudioSource, VideoSource } from "./capture-source.js";

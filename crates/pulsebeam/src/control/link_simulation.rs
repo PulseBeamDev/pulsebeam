@@ -240,6 +240,8 @@ fn udp_host_fanout_saturation_and_cutoffs_preserve_delivery_boundaries() {
                     payload: RoutedTrackPacket {
                         publication_id: track,
                         packet: TrackPacket::Data {
+                            filter_recipients: false,
+                            target: None,
                             lane: DataLane::Lossy,
                             bytes: bytes::Bytes::from_static(bytes),
                         },

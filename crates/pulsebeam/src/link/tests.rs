@@ -42,9 +42,18 @@ fn data_lanes_round_trip_without_trusting_application_destination() {
     let codec = ShardCodec {
         origin: Instant::now(),
     };
-    for lane in [DataLane::Latest, DataLane::Lossy, DataLane::Ordered] {
+    for (lane, expected_target, expected_filter) in [
+        (DataLane::Latest, None, false),
+        (DataLane::Lossy, None, false),
+        (DataLane::Ordered, None, false),
+        (DataLane::Ordered, Some(ConnectionId::new()), false),
+        (DataLane::Lossy, None, true),
+        (DataLane::Ordered, Some(ConnectionId::new()), true),
+    ] {
         let frame = media(
             TrackPacket::Data {
+                filter_recipients: expected_filter,
+                target: expected_target,
                 lane,
                 bytes: bytes::Bytes::from_static(b"value"),
             },
@@ -66,11 +75,15 @@ fn data_lanes_round_trip_without_trusting_application_destination() {
         let TrackPacket::Data {
             lane: decoded_lane,
             bytes,
+            target,
+            filter_recipients,
         } = payload.packet
         else {
             panic!("data expected");
         };
         assert_eq!(decoded_lane, lane);
+        assert_eq!(target, expected_target);
+        assert_eq!(filter_recipients, expected_filter);
         assert_eq!(bytes.as_ref(), b"value");
         for length in 0..wire.len() {
             assert!(codec.decode(&wire[..length]).is_err());
@@ -198,6 +211,8 @@ fn oversize_is_rejected_before_encoding_or_admission() {
     };
     let frame = media(
         TrackPacket::Data {
+            filter_recipients: false,
+            target: None,
             lane: DataLane::Lossy,
             bytes: bytes::Bytes::from(vec![0; 1200]),
         },

@@ -1023,7 +1023,7 @@ impl Connection {
         let Ok(frame) = TopicFrame::decode_bounded(bytes) else {
             return;
         };
-        if frame.is_subscriber_control()
+        if frame.requester().is_some_and(<[u8]>::is_empty)
             && frame.publication_id() == Some(receiver.source_id.as_str())
             && let Some(handle) = receiver.handle
         {

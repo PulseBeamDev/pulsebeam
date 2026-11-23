@@ -1099,10 +1099,50 @@ impl BrowserRuntime {
     }
 
     #[wasm_bindgen(unchecked_return_type = "Promise<void>")]
-    pub fn send_owned_data(&self, owner: u64, payload: &[u8]) -> Result<js_sys::Promise, JsValue> {
+    pub fn send_owned_data(
+        &self,
+        owner: u64,
+        payload: &[u8],
+        recipients: Option<js_sys::Array>,
+        capture_nanoseconds: Option<i64>,
+        uncertainty_nanoseconds: Option<u32>,
+    ) -> Result<js_sys::Promise, JsValue> {
+        use agent_core::ffi::{
+            CaptureClock, CaptureTimestamp, DataSendOptions, ErrorCode, ErrorInfo,
+        };
+        let recipients = recipients
+            .map(|values| {
+                let invalid = || {
+                    operation_error_value(ErrorInfo::new(
+                        ErrorCode::InvalidArgument,
+                        "Invalid data recipients",
+                    ))
+                };
+                let length = usize::try_from(values.length()).map_err(|_| invalid())?;
+                if length == 0 || length > agent_core::MAX_TOPIC_RECIPIENTS {
+                    return Err(invalid());
+                }
+                values
+                    .iter()
+                    .map(|id| id.as_string().ok_or_else(invalid))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?;
+        let captured_at = capture_nanoseconds.map(|nanoseconds| CaptureTimestamp {
+            clock: CaptureClock::Publication,
+            nanoseconds,
+            uncertainty_nanoseconds,
+        });
         Ok(data_send_promise(
-            self.admit_owned_data(owner, payload.to_vec(), None)
-                .map_err(operation_error_value)?,
+            self.admit_owned_data(
+                owner,
+                payload.to_vec(),
+                Some(DataSendOptions {
+                    captured_at,
+                    recipients,
+                }),
+            )
+            .map_err(operation_error_value)?,
         ))
     }
 
@@ -3065,7 +3105,7 @@ impl BrowserRuntime {
         &self,
         owner: u64,
         payload: Vec<u8>,
-        captured_at: Option<agent_core::ffi::CaptureTimestamp>,
+        options: Option<agent_core::ffi::DataSendOptions>,
     ) -> Result<
         futures_channel::oneshot::Receiver<Result<(), crate::engine::DataSendError>>,
         agent_core::ffi::ErrorInfo,
@@ -3079,7 +3119,7 @@ impl BrowserRuntime {
             .borrow()
             .as_ref()
             .ok_or_else(|| ErrorInfo::new(ErrorCode::NotReady, "Data runtime is not ready"))?
-            .send_owned_data(owner, payload, captured_at)
+            .send_owned_data(owner, payload, options)
     }
 
     #[cfg(feature = "uniffi")]
@@ -3141,9 +3181,9 @@ impl BrowserRuntime {
         &self,
         owner: u64,
         payload: Vec<u8>,
-        captured_at: Option<agent_core::ffi::CaptureTimestamp>,
+        options: Option<agent_core::ffi::DataSendOptions>,
     ) -> Result<(), agent_core::ffi::ErrorInfo> {
-        complete_data_send(self.admit_owned_data(owner, payload, captured_at)?).await
+        complete_data_send(self.admit_owned_data(owner, payload, options)?).await
     }
 }
 

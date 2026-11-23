@@ -14,11 +14,7 @@ test("data sends preserve shared codes for local admission and backend failure",
     },
     owners,
   );
-  const local = registry.local({
-    kind: "data",
-    trackId: "events",
-    delivery: "ordered",
-  });
+  const local = registry.local("events");
   const publication = local.publish();
   const rejectsWith = (code) => (error) => {
     assert.ok(error instanceof OperationError);
@@ -54,7 +50,18 @@ test("data sends preserve shared codes for local admission and backend failure",
     async resource(command) {
       assert.equal(command.op, "release");
     },
-    async send_owned_data() {
+    async send_owned_data(
+      owner,
+      payload,
+      recipients,
+      nanoseconds,
+      uncertainty,
+    ) {
+      assert.equal(owner, 1n);
+      assert.deepEqual(payload, Uint8Array.of(1));
+      assert.deepEqual(recipients, ["recipient"]);
+      assert.equal(nanoseconds, -(2n ** 63n));
+      assert.equal(uncertainty, 0);
       throw Object.assign(new Error("private transport details"), {
         pulsebeamInfo: {
           code: ErrorCode.CapacityExceeded,
@@ -64,12 +71,28 @@ test("data sends preserve shared codes for local admission and backend failure",
     },
   };
   owners.activate(runtime);
-  await assert.rejects(publication.send(Uint8Array.of(1)), (error) => {
-    rejectsWith(ErrorCode.CapacityExceeded)(error);
-    assert.equal(error.message, "Data send queue is full");
-    assert.equal(error.message.includes("private"), false);
-    return true;
-  });
+  await assert.rejects(
+    publication.send(Uint8Array.of(1), {
+      recipients: ["recipient"],
+      capturedAt: {
+        clock: "publication",
+        nanoseconds: -(2n ** 63n),
+        uncertaintyNanoseconds: 0,
+      },
+    }),
+    (error) => {
+      rejectsWith(ErrorCode.CapacityExceeded)(error);
+      assert.equal(error.message, "Data send queue is full");
+      assert.equal(error.message.includes("private"), false);
+      return true;
+    },
+  );
+  await assert.rejects(
+    publication.send(Uint8Array.of(1), {
+      capturedAt: { clock: "publication", nanoseconds: 2n ** 63n },
+    }),
+    rejectsWith(ErrorCode.InvalidArgument),
+  );
   await registry.close();
   await assert.rejects(
     publication.send(Uint8Array.of(1)),
@@ -130,19 +153,18 @@ test("exact-source failures wake pending reads and preserve their shared cause a
     { kind: "data", trackId: "events", delivery: "ordered" },
     { room: "room", participantId: "alice", trackId: "events" },
   );
-  const pending = [receiver.next(), receiver.next()];
-  const outcomes = Promise.allSettled(pending);
+  const pending = receiver.next();
   failed = true;
   assert.equal(registry.notify({ type: "data-ready", owners: [1n] }), true);
-  const results = await outcomes;
-  for (const result of results) {
-    assert.equal(result.status, "rejected");
-    assert.ok(result.reason instanceof OperationError);
-    assert.deepEqual(result.reason.info, info);
-    assert.equal(Object.isFrozen(result.reason.info), true);
-  }
-  assert.equal(results[0].reason, results[1].reason);
+  let terminal;
+  await assert.rejects(pending, (error) => {
+    terminal = error;
+    assert.ok(error instanceof OperationError);
+    assert.deepEqual(error.info, info);
+    assert.equal(Object.isFrozen(error.info), true);
+    return true;
+  });
   await receiver.close();
-  await assert.rejects(receiver.next(), (error) => error === results[0].reason);
+  await assert.rejects(receiver.next(), (error) => error === terminal);
   assert.equal(released, 1);
 });

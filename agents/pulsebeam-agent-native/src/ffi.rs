@@ -363,7 +363,7 @@ impl DataPublication {
         options: Option<core_ffi::DataSendOptions>,
     ) -> Result<(), NativeError> {
         self.runtime
-            .send_at(data, options.and_then(|options| options.captured_at))
+            .send_at(data, options)
             .await
             .map_err(operation_error)
     }
@@ -464,6 +464,7 @@ pub struct NativeCatalogPage {
 
 #[derive(uniffi::Object)]
 pub struct CatalogParticipant {
+    data_recipient_id: Option<String>,
     tracks: Vec<core_ffi::CatalogPublicationInfo>,
     reference: Arc<Participant>,
 }
@@ -472,6 +473,10 @@ pub struct CatalogParticipant {
 impl CatalogParticipant {
     pub fn id(&self) -> String {
         self.reference.id().into()
+    }
+
+    pub fn data_recipient_id(&self) -> Option<String> {
+        self.data_recipient_id.clone()
     }
 
     pub fn tracks(&self) -> Vec<core_ffi::CatalogPublicationInfo> {
@@ -504,6 +509,7 @@ impl NativeCatalogPage {
             .map(|entry| {
                 let runtime = self.room.participant(entry.id.clone())?;
                 Ok(Arc::new(CatalogParticipant {
+                    data_recipient_id: entry.data_recipient_id,
                     tracks: entry.publications,
                     reference: Arc::new(Participant { runtime }),
                 }))

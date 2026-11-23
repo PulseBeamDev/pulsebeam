@@ -274,6 +274,9 @@ fn page_value(page: &ffi::CatalogPage) -> JsValue {
     for participant in page.participants() {
         let value = Object::new();
         set(&value, "id", participant.id);
+        if let Some(id) = participant.data_recipient_id {
+            set(&value, "dataRecipientId", id);
+        }
         let publications = Array::new();
         for publication in participant.publications {
             let value = Object::new();

@@ -823,7 +823,13 @@ impl Connection {
         self.evaluate_native_preparations(events);
     }
 
-    pub(super) fn native_data_reverse(&mut self, stream: TrackHandle, bytes: Vec<u8>) {
+    pub(super) fn native_data_reverse(
+        &mut self,
+        stream: TrackHandle,
+        requester: Option<crate::entity::ConnectionId>,
+        bytes: Vec<u8>,
+    ) {
+        use pulsebeam_proto::{prelude::Message, topic::topic_frame::Body};
         if self.disconnect_reason.is_some()
             || self
                 .authorization_expiry
@@ -843,17 +849,24 @@ impl Connection {
         if !publication.enabled || publication.lane != DataLane::Ordered {
             return;
         }
-        let Ok(frame) = TopicFrame::decode_bounded(&bytes) else {
+        let Ok(mut frame) = TopicFrame::decode_bounded(&bytes) else {
             return;
         };
-        if !frame.is_subscriber_control()
-            || frame.publication_id() != Some(admitted.source_id.as_str())
+        if frame.publication_id() != Some(admitted.source_id.as_str())
+            || frame.requester().is_none_or(|id| !id.is_empty())
         {
             return;
         }
+        let Some(requester) = requester else { return };
+        let field = match frame.body.as_mut() {
+            Some(Body::Probe(probe)) => &mut probe.requester,
+            Some(Body::Nack(nack)) => &mut nack.requester,
+            _ => return,
+        };
+        field.extend_from_slice(requester.as_bytes());
         self.enqueue_fanout(TransportMutation::Data {
             channel: publication.channel,
-            bytes,
+            bytes: frame.encode_to_vec(),
             required: true,
         });
     }
@@ -903,10 +916,29 @@ impl Connection {
         {
             return;
         }
+        let target = if frame.repair_target.is_empty() {
+            None
+        } else {
+            let Ok(target) = <[u8; 16]>::try_from(frame.repair_target.as_slice()) else {
+                return;
+            };
+            if publication.lane != DataLane::Ordered {
+                return;
+            }
+            Some(crate::entity::ConnectionId::from_bytes(target))
+        };
         if publication.enabled
             && let Some(fanout) = publication.fanout
         {
-            events.publish_track_packet(Some(fanout), TrackPacket::data(publication.lane, bytes));
+            events.publish_track_packet(
+                Some(fanout),
+                TrackPacket::data_for(
+                    publication.lane,
+                    bytes,
+                    target,
+                    frame.recipient_connections.is_some(),
+                ),
+            );
         }
     }
 }

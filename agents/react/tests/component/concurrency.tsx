@@ -50,7 +50,7 @@ export async function concurrentRender() {
     const messages = agent
       .room("selected-room")
       .participant("alice")
-      .data("messages", "ordered");
+      .data("messages");
     const remote = agent
       .room("selected-room")
       .participant("alice")

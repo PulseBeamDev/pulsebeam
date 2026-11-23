@@ -126,11 +126,7 @@ impl DataPublication {
             }
             self.agent
                 .runtime
-                .send_exact_data(
-                    self.owner,
-                    bytes,
-                    options.and_then(|value| value.captured_at),
-                )
+                .send_exact_data(self.owner, bytes, options)
                 .await?;
             Ok(())
         }

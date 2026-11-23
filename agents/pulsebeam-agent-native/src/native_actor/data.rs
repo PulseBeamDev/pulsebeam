@@ -157,7 +157,7 @@ impl DataPublication {
     pub(crate) async fn send_at(
         &self,
         data: Vec<u8>,
-        captured_at: Option<agent_core::ffi::CaptureTimestamp>,
+        options: Option<agent_core::ffi::DataSendOptions>,
     ) -> Result<(), Error> {
         if self.inner.closed.is_closed()
             || self.inner.address.closed.is_closed()
@@ -174,7 +174,7 @@ impl DataPublication {
                 owner: self.inner.owner,
                 expected_join,
                 data,
-                captured_at,
+                options,
                 response,
             })
             .await

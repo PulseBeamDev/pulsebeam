@@ -75,17 +75,17 @@ exists. Unmount and Strict Mode replay close owned resources and cursors.
 ```ts
 const Camera = agent.video("camera");
 const Microphone = agent.audio("microphone");
-const Chat = agent.data("chat", "ordered");
+const Chat = agent.data("chat");
 ```
 
 Track IDs are application-defined names. Lookup returns a stable logical
 handle but does not reserve capacity, publish, subscribe, or play media. Local
-media refs expose `kind`, `trackId`, and `publish()`. Local data refs also expose
-`delivery`; their publications send bytes. Remote refs expose `subscribe()`.
+refs expose `kind`, `trackId`, and `publish()`. Remote refs expose `subscribe()`.
+Data publications send bytes.
 
 Equivalent SDK-issued handles within an Agent identify the same logical target.
 Agent scope, local versus participant selection, participant ID, kind, track ID,
-and data delivery distinguish targets. Re-rendering with an equivalent handle
+and room distinguish targets. Re-rendering with an equivalent handle
 preserves its owner. A different target releases the old owner and acquires a
 new one after commit. Fabricated handles are unsupported.
 
@@ -98,12 +98,10 @@ resource lifetimes.
 Track IDs are case-sensitive. Use 1 to 36 ASCII letters, digits, underscores,
 or hyphens (`[A-Za-z0-9_-]{1,36}`).
 
-Data delivery is `"latest" | "lossy" | "ordered"`:
-
-- `latest` provides current-value semantics and does not report gaps.
-- `lossy` emits available live messages without recovery gaps.
-- `ordered` preserves ordered delivery and may emit gaps when history is no
-  longer recoverable.
+Data delivery is selected at publication or subscription creation, not lookup.
+Pass `{ delivery: DataDelivery.Unreliable }` or `{ delivery: DataDelivery.Latest }`
+to opt out of `DataDelivery.Reliable`, the default. A subscription requires the
+selected mode on the exact source. Changing the selected mode replaces the owner.
 
 ## `useCapture`
 
@@ -231,7 +229,7 @@ See [bounded roster navigation](/react/guides#remote-discovery-and-video-receive
 agent.room(room).participant(id): RemoteParticipant
 participant.video(trackId): RemoteVideoTrack
 participant.audio(trackId): RemoteAudioTrack
-participant.data(trackId, delivery): RemoteDataTrack
+participant.data(trackId): RemoteDataTrack
 ```
 
 Lookup is inert. Use an application-known address or a publication from the
@@ -249,7 +247,7 @@ application participant ID when turning a roster into receive owners.
 
 ```tsx
 <Data
-  track={agent.room("meeting").participant("alice").data("chat", "ordered")}
+  track={agent.room("meeting").participant("alice").data("chat")}
   onEvent={handleEvent}
   onError={report}
 />
@@ -260,7 +258,7 @@ Receiving does not require watching the room catalog. To send, retain an owned
 publication created with `usePublish`:
 
 ```tsx
-const publication = usePublish(agent.data("chat", "ordered"));
+const publication = usePublish(agent.data("chat"));
 
 async function send(payload: Uint8Array) {
   if (!publication) return;
@@ -276,23 +274,23 @@ Events are discriminated by `type`:
 ```ts
 type DataMessage = {
   readonly type: "message";
-  readonly trackId: string;
+  readonly publicationId: string;
   readonly participantId: string;
   readonly sequence: bigint;
   readonly data: Uint8Array;
 };
 
-type DataGap = {
-  readonly type: "gap";
-  readonly trackId: string;
+type DataDiscontinuity = {
+  readonly type: "discontinuity";
   readonly participantId: string;
-  readonly from: bigint;
-  readonly to: bigint;
+  readonly previousPublicationId: string;
+  readonly publicationId: string;
 };
 ```
 
-`DataEvent<"latest" | "lossy">` is message-only. `DataEvent<"ordered">` may
-also be a gap. PulseBeam does not apply JSON or text codecs. Applications must
+A discontinuity reports source replacement on a stream that can continue.
+Reliable subscriptions report unrecoverable continuity loss through `onError`.
+PulseBeam does not apply JSON or text codecs. Applications must
 encode, decode, validate, version, and decide how to handle malformed payloads.
 Catch malformed-payload errors inside `onEvent` if reception should continue.
 
@@ -303,10 +301,10 @@ sends reject on disconnect, invalid binding, terminal failure, timeout, or host
 rejection rather than migrating to replacement publications.
 
 Each receive owner buffers at most 256 events. Latest coalesces by publisher
-track; lossy may drop queued events; ordered overflow exposes skipped ranges
-before later messages. Unrepresentable overflow ends only the affected owner.
+track, Unreliable may drop queued events, and Reliable overflow ends only the
+affected subscription.
 
-`onEvent` has type `(event: DataEvent<D>) => void | Promise<void>`. Each mount
+`onEvent` has type `(event: DataEvent) => void | Promise<void>`. Each mount
 runs one serial loop and awaits the handler before taking its next event. Other
 mounts, including mounts of the same track, continue independently. Awaiting is
 not transport backpressure, persistence, exactly-once processing, or protection

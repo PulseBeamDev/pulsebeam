@@ -231,6 +231,7 @@ js_run_binary(
         "VideoSubscriptionState", "AudioSubscriptionState", "DataPublicationState", "DataSubscriptionState",
         "MediaKind", "PublicationAdmissionStatus", "PublicationDemand", "PublicationExecution",
         "WatchStatus", "CatalogParticipantInfo", "CatalogPublicationInfo", "CatalogPublicationKind",
+        "DataDelivery", "DataPublishOptions", "DataSubscribeOptions",
     ],
     chdir = package_name(),
     outs = ["web/generated/schema.ts"],

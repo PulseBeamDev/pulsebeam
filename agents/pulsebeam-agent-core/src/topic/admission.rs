@@ -36,6 +36,7 @@ pub enum DataSendFailure {
 }
 
 pub(super) struct Admission {
+    pub(super) recipients: Option<Vec<u8>>,
     pub(super) captured_at: Option<crate::ffi::CaptureTimestamp>,
     publisher: TopicPublisher,
     payload: Option<Vec<u8>>,
@@ -89,6 +90,7 @@ impl Topics {
         &mut self,
         send: TopicSend,
         captured_at: Option<crate::ffi::CaptureTimestamp>,
+        recipients: Option<Vec<u8>>,
         ids: &mut IdGenerator,
         effects: &mut VecDeque<Effect>,
     ) -> OperationId {
@@ -98,6 +100,7 @@ impl Topics {
             ticket,
             Admission {
                 captured_at,
+                recipients,
                 publisher: send.publisher,
                 payload: Some(send.payload),
                 generation: None,

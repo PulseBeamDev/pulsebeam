@@ -97,7 +97,7 @@ export async function catalogContract(BrowserRuntime, ErrorCode, pulsebeam) {
   await closing;
   const independent = await room
     .participant("publisher")
-    .data("events", "ordered")
+    .data("events")
     .subscribe();
   const first = watch.updates();
   const second = watch.updates();

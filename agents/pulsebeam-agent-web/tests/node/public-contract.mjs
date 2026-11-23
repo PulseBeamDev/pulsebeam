@@ -310,12 +310,12 @@ export async function publicContract(pulsebeam) {
       assert.equal(await siblingCursor.next(), undefined);
       siblingCursor.close();
     }
-    const localData = agent.data("owned-events", "ordered");
+    const localData = agent.data("owned-events");
     const publication = localData.publish();
-    const dataSubscription = participant
-      .data("owned-events", "ordered")
-      .subscribe();
-    const unrelatedData = participant.data("other-events", "lossy").subscribe();
+    const dataSubscription = participant.data("owned-events").subscribe();
+    const unrelatedData = participant
+      .data("other-events")
+      .subscribe({ delivery: pulsebeam.DataDelivery.Unreliable });
     assert.equal(publication instanceof Promise, false);
     assert.equal(dataSubscription instanceof Promise, false);
     const publicationState = publication.state();
@@ -418,17 +418,16 @@ export async function publicContract(pulsebeam) {
     await input.close();
     await owner.close();
     assert.equal(borrowed.readyState, "live", "publication borrows capture");
-    assert.equal("receive" in agent.data("chat", "ordered"), false);
-    assert.equal("send" in agent.data("chat", "ordered"), false);
+    assert.equal("receive" in agent.data("chat"), false);
+    assert.equal("send" in agent.data("chat"), false);
     assert.equal(
-      "receive" in
-        agent.room("room").participant("alice").data("chat", "ordered"),
+      "receive" in agent.room("room").participant("alice").data("chat"),
       false,
     );
     const data = await agent
       .room("room")
       .participant("alice")
-      .data("chat", "ordered")
+      .data("chat")
       .subscribe();
     const pending = data.next();
     const closing = agent.close();

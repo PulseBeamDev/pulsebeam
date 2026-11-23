@@ -20,7 +20,7 @@ export async function watchLifecycle() {
   const room = agent.room("pinned-room");
   const independent = await room
     .participant("sender")
-    .data("events", "ordered")
+    .data("events")
     .subscribe();
   const host = document.createElement("div");
   document.body.append(host);

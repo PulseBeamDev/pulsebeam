@@ -631,9 +631,9 @@ impl Connection {
                 };
                 self.enqueue_remote_keyframe((publication_id, encoding), kind);
             }
-            Some(ReverseInput::ReliableControl(bytes)) => {
+            Some(ReverseInput::ReliableControl { requester, bytes }) => {
                 if self.native_data.owns_fanout(stream) {
-                    self.native_data_reverse(stream, bytes);
+                    self.native_data_reverse(stream, requester, bytes);
                     return;
                 }
                 let Some(channel) = self.data.source(stream) else {
@@ -1240,7 +1240,10 @@ impl Connection {
                         let Ok(frame) = TopicFrame::decode_bounded(bytes.as_ref()) else {
                             return;
                         };
-                        if !self.data.accepts_publisher_frame(cid, &frame) {
+                        if !frame.repair_target.is_empty()
+                            || frame.recipient_connections.is_some()
+                            || !self.data.accepts_publisher_frame(cid, &frame)
+                        {
                             return;
                         }
                         events.publish_track_packet(

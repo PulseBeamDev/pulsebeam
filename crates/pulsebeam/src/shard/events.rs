@@ -361,6 +361,8 @@ mod tests {
         sink.publish_track_packet(
             Some(TrackHandle::default()),
             TrackPacket::Data {
+                filter_recipients: false,
+                target: None,
                 lane: DataLane::Latest,
                 bytes: vec![1].into(),
             },
@@ -417,6 +419,8 @@ mod tests {
             sink.publish_track_packet(
                 Some(TrackHandle::default()),
                 TrackPacket::Data {
+                    filter_recipients: false,
+                    target: None,
                     lane: DataLane::Latest,
                     bytes: vec![n].into(),
                 },
@@ -441,6 +445,8 @@ mod tests {
         sink.publish_track_packet(
             Some(key),
             TrackPacket::Data {
+                filter_recipients: false,
+                target: None,
                 lane: DataLane::Latest,
                 bytes: vec![1].into(),
             },
@@ -448,6 +454,8 @@ mod tests {
         sink.publish_track_packet(
             Some(key),
             TrackPacket::Data {
+                filter_recipients: false,
+                target: None,
                 lane: DataLane::Ordered,
                 bytes: vec![2].into(),
             },
@@ -455,6 +463,8 @@ mod tests {
         sink.publish_track_packet(
             Some(key),
             TrackPacket::Data {
+                filter_recipients: false,
+                target: None,
                 lane: DataLane::Latest,
                 bytes: vec![3].into(),
             },

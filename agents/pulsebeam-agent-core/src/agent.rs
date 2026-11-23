@@ -411,6 +411,50 @@ impl Agent {
         payload: Vec<u8>,
         captured_at: Option<crate::ffi::CaptureTimestamp>,
     ) -> Result<OperationId, AgentError> {
+        self.send_data_to(spec, payload, captured_at, None)
+    }
+
+    pub fn send_data_with_options(
+        &mut self,
+        spec: crate::TrackSpec,
+        payload: Vec<u8>,
+        options: Option<crate::ffi::DataSendOptions>,
+    ) -> Result<OperationId, AgentError> {
+        use pulsebeam_proto::topic::{MAX_RECIPIENT_CONNECTIONS, parse_data_recipient_id};
+        let options = options.unwrap_or_default();
+        let recipients = if let Some(refs) = options.recipients {
+            if refs.is_empty() || refs.len() > MAX_RECIPIENT_CONNECTIONS {
+                return Err(crate::TopicError::InvalidRecipients.into());
+            }
+            Some(
+                refs.iter()
+                    .map(|id| parse_data_recipient_id(id))
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or(crate::TopicError::InvalidRecipients)?,
+            )
+        } else {
+            None
+        };
+        self.send_data_to(spec, payload, options.captured_at, recipients)
+    }
+
+    pub(crate) fn send_data_to(
+        &mut self,
+        spec: crate::TrackSpec,
+        payload: Vec<u8>,
+        captured_at: Option<crate::ffi::CaptureTimestamp>,
+        recipients: Option<Vec<[u8; 16]>>,
+    ) -> Result<OperationId, AgentError> {
+        let recipients = if let Some(mut ids) = recipients {
+            if ids.is_empty() || ids.len() > pulsebeam_proto::topic::MAX_RECIPIENT_CONNECTIONS {
+                return Err(crate::TopicError::InvalidRecipients.into());
+            }
+            ids.sort_unstable();
+            ids.dedup();
+            Some(ids.into_iter().flatten().collect())
+        } else {
+            None
+        };
         if let Some(failure) = &self.snapshot.terminal_failure {
             return Err(AgentError::OperationFailed(failure.into()));
         }
@@ -423,9 +467,13 @@ impl Agent {
         };
         self.topics.validate_data_send(&send)?;
         self.resource_command(crate::ResourceCommand::RetainProducer { spec })?;
-        let ticket =
-            self.topics
-                .begin_data_send(send, captured_at, &mut self.ids, &mut self.effects);
+        let ticket = self.topics.begin_data_send(
+            send,
+            captured_at,
+            recipients,
+            &mut self.ids,
+            &mut self.effects,
+        );
         self.flush_notifications()?;
         Ok(ticket)
     }

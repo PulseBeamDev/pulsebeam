@@ -452,11 +452,11 @@
       }, "ordered live-frontier rendezvous");
       await delivery;
     };
-    const steadyPublisher = sender.data("reuse-steady", "ordered").publish();
+    const steadyPublisher = sender.data("reuse-steady").publish();
     steadyIterator = receiver
       .room(receiver.roomId)
       .participant("web-sender")
-      .data("reuse-steady", "ordered")
+      .data("reuse-steady")
       .subscribe();
     await warmOrdered(steadyPublisher, steadyIterator, 0);
     await steadyPublisher.send(Uint8Array.of(1));
@@ -468,13 +468,13 @@
       steadyChannels.length === 2,
       "one continuing data route on the two peers",
     );
-    const cyclingPublisher = sender.data("reuse-cycle", "ordered").publish();
+    const cyclingPublisher = sender.data("reuse-cycle").publish();
     let retiredPayload;
     for (let lifetime = 0; lifetime < 3; lifetime++) {
       cyclingIterator = receiver
         .room(receiver.roomId)
         .participant("web-sender")
-        .data("reuse-cycle", "ordered")
+        .data("reuse-cycle")
         .subscribe();
       // Witness each fresh subscription's live frontier before the assertion send.
       await warmOrdered(cyclingPublisher, cyclingIterator, lifetime * 2);
@@ -1057,9 +1057,7 @@
       const retained = JSON.stringify(page, (_, value) =>
         typeof value === "bigint" ? String(value) : value,
       );
-      metadataPublication = sender
-        .data("catalog-metadata", "ordered")
-        .publish();
+      metadataPublication = sender.data("catalog-metadata").publish();
       await until(
         () =>
           catalogWatch

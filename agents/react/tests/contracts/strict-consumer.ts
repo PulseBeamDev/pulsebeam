@@ -1,3 +1,4 @@
+import { DataDelivery } from "@pulsebeam/react";
 import {
   Audio,
   Data,
@@ -81,11 +82,11 @@ const videoPublication = usePublish(actualAgent.video("video"), videoSource);
 const audioPublication = usePublish(actualAgent.audio("audio"), audioSource, {
   enabled: true,
 });
-const dataPublication = usePublish(actualAgent.data("data", "ordered"));
+const dataPublication = usePublish(actualAgent.data("data"));
 const remote = actualAgent.room("room").participant("alice");
 const videoSubscription = useSubscribe(remote.video("video"));
 const audioSubscription = useSubscribe(remote.audio("audio"));
-const dataSubscription = useSubscribe(remote.data("data", "ordered"));
+const dataSubscription = useSubscribe(remote.data("data"));
 type VideoPublicationIdentity = Expect<
   Equal<typeof videoPublication, VideoPublication | null>
 >;
@@ -102,7 +103,7 @@ type AudioSubscriptionIdentity = Expect<
   Equal<typeof audioSubscription, AudioSubscription | null>
 >;
 type DataSubscriptionIdentity = Expect<
-  Equal<typeof dataSubscription, DataSubscription<"ordered"> | null>
+  Equal<typeof dataSubscription, DataSubscription | null>
 >;
 usePublish(actualAgent.video("video"), null);
 usePublish(null, null);
@@ -165,7 +166,7 @@ import type { DataTrackSpec } from "@pulsebeam/react";
 
 const localVideo = agent.video("camera");
 const localAudio = agent.audio("microphone");
-const chat = agent.data("chat", "ordered");
+const chat = agent.data("chat");
 usePublish(localVideo, capture.video, { enabled: false })?.configureSender({
   contentHint: "detail",
 });
@@ -184,22 +185,24 @@ localVideo.setEnabled(false);
 localVideo.source;
 // @ts-expect-error Descriptors are not React lookup API.
 agent.track({ kind: "video", trackId: "camera" });
-// @ts-expect-error Delivery is required.
-agent.data("chat");
+// @ts-expect-error Delivery belongs on the owner.
+agent.data("chat", "ordered");
 
 const participant = agent.room("selected-room").participant("alice");
 const participantId: string = participant.id();
 void participantId;
 const remoteVideo = participant.video("camera");
 const remoteAudio = participant.audio("microphone");
-const remoteChat = participant.data("chat", "ordered");
+const remoteChat = participant.data("chat");
 // @ts-expect-error Participant descriptor lookup was removed.
 participant.track({ kind: "video", trackId: "camera" });
-// @ts-expect-error Remote delivery is also required.
-participant.data("chat");
+// @ts-expect-error Delivery belongs on the owner.
+participant.data("chat", "ordered");
 Data({
-  track: participant.data("live", "lossy"),
+  track: participant.data("live"),
+  options: { delivery: DataDelivery.Unreliable },
   async onEvent(event) {
+    if (event.type !== "message") return;
     const bytes: Uint8Array = event.data;
     // @ts-expect-error Lossy delivery cannot emit a gap.
     event.from;
@@ -207,9 +210,10 @@ Data({
   },
 });
 Data({
-  track: participant.data("state", "latest"),
+  track: participant.data("state"),
+  options: { delivery: DataDelivery.Latest },
   onEvent(event) {
-    const message: "message" = event.type;
+    const message: "message" | "discontinuity" = event.type;
     void message;
   },
 });
@@ -246,9 +250,8 @@ createElement(Data, {
       const sequence: bigint = event.sequence;
       void [bytes, sequence];
     } else {
-      const from: bigint = event.from;
-      const to: bigint = event.to;
-      void [from, to];
+      const previous: string = event.previousPublicationId;
+      void previous;
     }
     void [participantId, publicationId];
   },

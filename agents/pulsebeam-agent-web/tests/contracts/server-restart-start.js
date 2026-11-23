@@ -7,12 +7,13 @@
     });
   const sender = create("__SENDER_TOKEN__");
   const receiver = create("__RECEIVER_TOKEN__");
-  const publisher = sender.data("chat", "lossy").publish();
+  const options = { delivery: window.pulsebeam.DataDelivery.Unreliable };
+  const publisher = sender.data("chat").publish(options);
   const stream = receiver
     .room("web-adapter-restart")
     .participant("publisher")
-    .data("chat", "lossy")
-    .subscribe();
+    .data("chat")
+    .subscribe(options);
   const events = [];
   let probe = 0;
   let observedProbe = 0;
