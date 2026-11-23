@@ -307,7 +307,7 @@ mod tests {
     fn wan_ready_pins_the_exact_data_repair_scope_position_and_window() {
         const WIRE: [u8; 65] = [
             1, 11, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0,
-            3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 1, 0xff, 0xff, 3, 1, 0, 4, 0, 0, 0, 0,
+            3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 1, 0xff, 0xff, 3, 1, 1, 4, 0, 0, 0, 0,
             0, 1, 0x80, 0, 1, 5, 6, 7, 9,
         ];
         let ready = WanRepairReady::decode(&WIRE, 0).unwrap();

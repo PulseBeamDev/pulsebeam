@@ -85,6 +85,13 @@ pub(crate) trait ParticipantSink {
         source: crate::shard::router::FabricSourceHandle,
         input: crate::rtp::fabric_ingress::MediaIngress,
     );
+    fn observe_fabric_sender_report(
+        &mut self,
+        _source: crate::shard::router::FabricSourceHandle,
+        _now: pulsebeam_runtime::time::Instant,
+        _report: pulsebeam_rtc::SenderReport,
+    ) {
+    }
     fn fence_fabric_source(&mut self, source: crate::shard::router::FabricSourceHandle);
     fn stage_fabric_receiver(&mut self, work: crate::control::native::Preparation);
     fn stage_local_rtp_receiver(&mut self, reference: u64);

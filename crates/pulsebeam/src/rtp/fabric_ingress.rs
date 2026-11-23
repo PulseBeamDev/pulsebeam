@@ -338,6 +338,10 @@ impl RtpIngressShadow {
         })
     }
 
+    pub(crate) fn mid(&self) -> Option<crate::media::Mid> {
+        crate::media::Mid::new(&self.binding.mid).ok()
+    }
+
     pub(crate) const fn primary_ssrc(&self) -> u32 {
         self.binding.primary_ssrc
     }

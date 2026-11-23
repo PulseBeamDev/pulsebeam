@@ -2,6 +2,8 @@
 
 use pulsebeam_feedback::{PacketId, ReceiverTime, SendStatus};
 
+use crate::fabric_wan::TIMING_REVISION;
+
 pub(crate) const UDP_BUDGET: usize = 1200;
 // Fixed-path DTLS 1.3 without CID: reserve a conservative header, tag and
 // encrypted-content-type allowance. The driver also enforces the sealed size.
@@ -29,12 +31,12 @@ pub(crate) enum Capability {
 }
 
 impl Capability {
-    pub(crate) fn encode(self) -> [u8; 5] {
+    pub(crate) fn encode(self) -> [u8; 6] {
         let kind = match self {
             Self::Offer => 1,
             Self::Accept => 2,
         };
-        [2, 1, kind, 0x04, 0x80]
+        [2, 1, kind, TIMING_REVISION, 0x04, 0x80]
     }
 }
 
@@ -123,8 +125,8 @@ pub(crate) fn decode_for(wire: &[u8], fabric: bool) -> Result<Frame<'_>, Invalid
             })
         }
         [2, 1] if fabric => match body {
-            [1, 0x04, 0x80] => Ok(Frame::Capability(Capability::Offer)),
-            [2, 0x04, 0x80] => Ok(Frame::Capability(Capability::Accept)),
+            [1, TIMING_REVISION, 0x04, 0x80] => Ok(Frame::Capability(Capability::Offer)),
+            [2, TIMING_REVISION, 0x04, 0x80] => Ok(Frame::Capability(Capability::Accept)),
             _ => Err(InvalidFrame),
         },
         [1, 1] => {

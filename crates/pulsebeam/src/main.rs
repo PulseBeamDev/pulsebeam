@@ -81,6 +81,18 @@ struct Args {
     /// Write newline-delimited JSON instead of compact console logs.
     #[arg(long)]
     json_logs: bool,
+    #[command(flatten)]
+    host_clock: HostClockOptions,
+}
+
+#[derive(clap::Args, Debug)]
+struct HostClockOptions {
+    /// Validity-bounded IANA leap-seconds.list for the media clock.
+    #[arg(long, default_value = "/usr/share/zoneinfo/leap-seconds.list")]
+    utc_policy: PathBuf,
+    /// Attest that the Linux time service uses unsmeared UTC.
+    #[arg(long)]
+    unsmeared_utc: bool,
 }
 
 fn main() {
@@ -151,6 +163,7 @@ fn main() {
             args.iface,
             registry,
             cluster,
+            args.host_clock,
         )
         .await
     })
@@ -176,13 +189,14 @@ fn configured_key_registry(args: &Args, path: &Path) -> Result<KeyRegistry> {
     Ok(KeyRegistry::parse_json(&json)?)
 }
 
-pub async fn run(
+async fn run(
     shutdown: CancellationToken,
     execution: ExecutionConfig,
     rtc_port: u16,
     network_interface: Option<String>,
     key_registry: KeyRegistry,
     cluster: Option<pulsebeam::cluster::Options>,
+    host_clock: HostClockOptions,
 ) -> Result<()> {
     let external_ips =
         pulsebeam_runtime::system::select_host_addresses(network_interface.as_deref());
@@ -202,6 +216,7 @@ pub async fn run(
     );
     let rng = rand::os_rng();
     let node_builder = NodeBuilder::new()
+        .host_utc_policy(host_clock.utc_policy, host_clock.unsmeared_utc)
         .workers(execution.workers)
         .local_addr(local_addr)
         .external_addrs(external_addrs)
@@ -300,6 +315,29 @@ mod tests {
         assert!(
             Args::try_parse_from(["pulsebeam", "--project-registry", "registry.json"]).is_err()
         );
+    }
+
+    #[test]
+    fn media_clock_policy_and_unsmeared_attestation_are_explicit() {
+        let default = Args::try_parse_from(["pulsebeam"]).unwrap();
+        assert_eq!(
+            default.host_clock.utc_policy,
+            PathBuf::from("/usr/share/zoneinfo/leap-seconds.list")
+        );
+        assert!(!default.host_clock.unsmeared_utc);
+
+        let configured = Args::try_parse_from([
+            "pulsebeam",
+            "--utc-policy",
+            "/config/leap-seconds.list",
+            "--unsmeared-utc",
+        ])
+        .unwrap();
+        assert_eq!(
+            configured.host_clock.utc_policy,
+            PathBuf::from("/config/leap-seconds.list")
+        );
+        assert!(configured.host_clock.unsmeared_utc);
     }
 
     #[test]

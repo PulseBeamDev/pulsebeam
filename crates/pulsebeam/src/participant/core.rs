@@ -1912,6 +1912,14 @@ impl Connection {
         true
     }
 
+    pub(crate) fn claim_fabric_sender_report(
+        &mut self,
+        ssrc: u32,
+        mid: Mid,
+    ) -> Option<pulsebeam_rtc::SenderReport> {
+        self.transport.claim_fabric_sender_report(ssrc, mid)
+    }
+
     pub(crate) fn request_fabric_refresh(&mut self, ssrc: u32) -> bool {
         self.fabric_io_authorized() && self.transport.request_fabric_refresh(ssrc)
     }
@@ -2073,7 +2081,7 @@ impl Connection {
                 };
                 self.measure_incoming_dd_rtp(packet, mid, rid);
             }
-            Event::SenderReport(report) => self.handle_sender_report(report),
+            Event::SenderReport(report) => self.handle_sender_report(now, report, events),
             Event::EncodingDiscovered(info) => {
                 if self.native_terminal
                     || self
@@ -2088,11 +2096,11 @@ impl Connection {
                 };
                 if self.native_rtp.owns_encoding(info.ssrc) {
                     if let Some(report) = self.transport.register_owned_encoding(info) {
-                        self.handle_sender_report(report);
+                        self.handle_legacy_sender_report(report);
                     }
                 } else if self.activate_sdp_sender(mid) {
                     if let Some(report) = self.transport.register_encoding(info) {
-                        self.handle_sender_report(report);
+                        self.handle_legacy_sender_report(report);
                     }
                     self.handle_stream_paused(mid, false, events);
                 }
@@ -2451,7 +2459,25 @@ impl Connection {
         }
     }
 
-    fn handle_sender_report(&mut self, report: pulsebeam_rtc::SenderReport) {
+    fn handle_sender_report(
+        &mut self,
+        now: Instant,
+        report: pulsebeam_rtc::SenderReport,
+        events: &mut impl ParticipantSink,
+    ) {
+        if self.fabric_io_authorized() {
+            match self.media_ingress.get(&report.ssrc).and_then(|ingress| ingress.publisher_source) {
+                Some(source) if !self.fenced_fabric_sources.contains(&source) => {
+                    events.observe_fabric_sender_report(source, now, report);
+                }
+                None => self.transport.defer_fabric_sender_report(report),
+                _ => (),
+            }
+        }
+        self.handle_legacy_sender_report(report);
+    }
+
+    fn handle_legacy_sender_report(&mut self, report: pulsebeam_rtc::SenderReport) {
         let owned = self.native_rtp.owns_encoding(report.ssrc);
         if !owned
             && self.sdp_senders.is_empty()

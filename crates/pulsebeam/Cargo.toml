@@ -45,6 +45,7 @@ pulsebeam-link = { path = "../pulsebeam-link" }
 pulsebeam-rtc = { path = "../pulsebeam-rtc" }
 pulsebeam-proto = { path = "../pulsebeam-proto", features = ["json"] }
 pulsebeam-steer = { path = "../pulsebeam-steer" }
+pulsebeam-clock = { path = "../pulsebeam-clock" }
 pulsebeam-runtime = { path = "../pulsebeam-runtime", features = ["http"] }
 pulsebeam-udp = { path = "../pulsebeam-udp" }
 rand = { workspace = true }

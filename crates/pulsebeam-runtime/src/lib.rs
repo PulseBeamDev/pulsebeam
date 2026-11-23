@@ -1,4 +1,4 @@
-#![cfg_attr(not(test), forbid(unsafe_code))]
+#![cfg_attr(not(test), deny(unsafe_code))]
 //! Runtime primitives underneath the shard model.
 //!
 //! Shared-state exception, crate-wide: this is the layer that *implements*

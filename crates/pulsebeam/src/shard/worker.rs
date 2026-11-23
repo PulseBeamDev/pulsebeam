@@ -442,6 +442,7 @@ pub(crate) struct ShardWorker {
     tcp_inbox: Option<crate::ice_tcp::Inbox>,
     loop_start: Instant,
     command_rx: mailbox::Receiver<ShardCommand>,
+    clock_rx: mailbox::Receiver<crate::clock::reference::Snapshot>,
     event_tx: mailbox::Sender<ShardEventMessage>,
     shard_event_backlog: VecDeque<ShardEvent>,
     frame_rx: pulsebeam_link::LinkRx<ShardFrame>,
@@ -558,9 +559,12 @@ impl ShardWorker {
         metrics: Arc<ShardMetrics>,
         stats_tx: Option<mailbox::Sender<Box<ShardStatsReport>>>,
         wall: WallAnchor,
+        global_clock: crate::clock::reference::Snapshot,
+        clock_rx: mailbox::Receiver<crate::clock::reference::Snapshot>,
     ) -> Self {
         let shard_count = frame_txs.len();
-        let core = ShardCore::new(shard_id, max_gso_segments, shard_count, wall, update_rx);
+        let mut core = ShardCore::new(shard_id, max_gso_segments, shard_count, wall, update_rx);
+        core.set_global_clock(global_clock);
         let router = LinkTransport {
             shard_id,
             frame_txs,
@@ -576,6 +580,7 @@ impl ShardWorker {
             tcp_inbox,
             loop_start: Instant::now(),
             command_rx,
+            clock_rx,
             event_tx,
             shard_event_backlog: VecDeque::new(),
             frame_rx,
@@ -655,6 +660,7 @@ impl ShardWorker {
         pulsebeam_runtime::select! {
             biased;
             true = self.core.update_readable() => {}
+            true = self.clock_rx.readable() => {}
             ready = io.readable(deadline) => { ready?; }
             true = self.frame_rx.readable() => {}
             true = async {
@@ -676,6 +682,9 @@ impl ShardWorker {
         udp_socket: &mut pulsebeam_udp::UdpSocket,
     ) {
         let now = self.core.observe_execution_time(at).monotonic;
+        if let Ok(snapshot) = self.clock_rx.try_recv() {
+            self.core.set_global_clock(snapshot);
+        }
         // phase 1: input
         let mut commands: usize = 0;
         for _ in 0..SHARD_COMMAND_BUDGET {

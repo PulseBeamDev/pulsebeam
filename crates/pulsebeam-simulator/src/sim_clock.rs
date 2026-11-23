@@ -73,6 +73,11 @@ fn sim_elapsed() -> Duration {
     turmoil::sim_elapsed().unwrap_or(Duration::ZERO)
 }
 
+pub(crate) fn unix_nanos() -> i64 {
+    let now = Duration::from_secs(SIM_EPOCH_SECS).saturating_add(sim_elapsed());
+    i64::try_from(now.as_nanos()).expect("simulated UTC fits in the media clock era")
+}
+
 fn timespec(secs: u64, nanos: u32) -> libc::timespec {
     libc::timespec {
         // Simulated time starts at zero and never approaches the sign bit.

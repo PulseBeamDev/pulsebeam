@@ -125,6 +125,7 @@ struct FabricSource {
     ingress: FabricIngress,
     fanout: SourceFanout,
     reliable_installation: Option<pulsebeam_rtc::DataChannelInstallation>,
+    publisher_clock: Option<Box<crate::rtp::publisher_clock::PublisherClock>>,
 }
 
 impl FabricSource {
@@ -543,6 +544,7 @@ impl ShardRuntime {
             },
             fanout: SourceFanout::new(emission),
             reliable_installation: None,
+            publisher_clock: None,
         });
         bound.media.insert_fabric(source);
         Some(source)
@@ -699,6 +701,7 @@ impl ShardRuntime {
             },
             fanout: SourceFanout::new(emission),
             reliable_installation: None,
+            publisher_clock: None,
         });
         bound.media.insert_fabric(source);
         Some(source)
@@ -860,6 +863,7 @@ impl ShardRuntime {
                 },
                 fanout,
                 reliable_installation: None,
+                publisher_clock: None,
             });
             track.media.insert_fabric(source);
         }
@@ -1862,11 +1866,52 @@ impl ShardRuntime {
         source: FabricSourceHandle,
         publisher: ParticipantHandle,
         identity: pulsebeam_core::fabric::media_source::MediaIdentity,
+        primary_ssrc: u32,
+        reference: Option<(pulsebeam_runtime::time::Instant, crate::clock::reference::Estimate)>,
+        deferred: Option<pulsebeam_rtc::SenderReport>,
     ) -> bool {
-        self.fabric_sources.get_mut(source).is_some_and(|bound| {
-            bound.ingress.owner() == FabricOwner::Local(publisher)
-                && bound.fanout.bind_media_identity(identity)
-        })
+        use pulsebeam_clock::time::{Binding, ClockRate, DomainId, Generation};
+        let Some(bound) = self.fabric_sources.get_mut(source) else { return false };
+        let FabricIngress::Publisher { participant, incarnation, .. } = bound.ingress else {
+            return false;
+        };
+        if participant != publisher || !bound.fanout.bind_media_identity(identity) {
+            return false;
+        }
+        use pulsebeam_core::fabric::Profile;
+        let rate = match bound.fanout.emission().profile() {
+            Profile::Opus => ClockRate::OPUS,
+            Profile::H264 | Profile::Av1 => ClockRate::VIDEO,
+            Profile::Data => return false,
+        };
+        if let Some((now, reference)) = reference
+            && let Ok(clock) = crate::rtp::publisher_clock::PublisherClock::admit(
+                Binding { domain: DomainId(incarnation.get()), generation: Generation(0) },
+                primary_ssrc,
+                rate,
+                now,
+                &reference,
+                deferred,
+            )
+        {
+            bound.publisher_clock = Some(Box::new(clock));
+        }
+        true
+    }
+
+    pub(super) fn observe_fabric_sender_report(
+        &mut self,
+        source: FabricSourceHandle,
+        publisher: ParticipantHandle,
+        now: pulsebeam_runtime::time::Instant,
+        report: pulsebeam_rtc::SenderReport,
+    ) {
+        if let Some(bound) = self.fabric_sources.get_mut(source)
+            && bound.ingress.owner() == FabricOwner::Local(publisher)
+            && let Some(clock) = bound.publisher_clock.as_mut()
+        {
+            let _ = clock.report(report, now);
+        }
     }
 
     pub(super) fn offer_fabric_media(
@@ -1875,6 +1920,7 @@ impl ShardRuntime {
         publisher: ParticipantHandle,
         now: pulsebeam_runtime::time::Instant,
         input: &crate::rtp::fabric_ingress::MediaIngress,
+        reference: Option<&crate::clock::reference::Estimate>,
     ) -> Result<Offers, Rejection> {
         let bound = self
             .fabric_sources
@@ -1894,9 +1940,18 @@ impl ShardRuntime {
         let peer_repair = publisher_sends
             .iter()
             .any(|hop| now < hop.route.expires_at && hop.route.tx.is_live());
-        let Some((sequence, hops, mut report)) =
-            bound.fanout.offer_endpoint_media(now, input, peer_repair)?
-        else {
+        let clock = &mut bound.publisher_clock;
+        let Some((sequence, hops, mut report)) = bound.fanout.offer_endpoint_media(
+            now,
+            input,
+            peer_repair,
+            |arrival, timestamp| {
+                if let Some(clock) = clock {
+                    clock.sync_host_reference(now, reference);
+                    let _ = clock.media(0, timestamp, arrival, now);
+                }
+            },
+        )? else {
             return Ok(Offers::default());
         };
         Self::forward_publisher_branches(bound, now, sequence, hops, None, &mut report);

@@ -141,7 +141,8 @@ pub fn sfu_node_builder(
             )
             .expect("development registry is valid"),
         )
-        .with_current_runtime();
+        .with_current_runtime()
+        .sim_utc_clock(crate::sim_clock::unix_nanos);
     if shards > 1 {
         builder = builder.room_partition_size(1).round_robin_rooms();
     }

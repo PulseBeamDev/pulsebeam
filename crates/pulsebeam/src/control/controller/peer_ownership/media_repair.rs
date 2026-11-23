@@ -140,7 +140,7 @@ mod tests {
             "010c05060708000000000000000100000000000000020000000000000004000000000001ffff",
         )
         .unwrap();
-        let ready_wire = hex::decode("010d05060708000000000000000100000000000000020000000000000004000000000001ffff0301000200000000000180000305060709").unwrap();
+        let ready_wire = hex::decode("010d05060708000000000000000100000000000000020000000000000004000000000001ffff0301010200000000000180000305060709").unwrap();
         let demand = Demand {
             live: NonZeroU32::new(0x0506_0708).unwrap(),
             source: NonZeroU64::MIN,
@@ -167,6 +167,9 @@ mod tests {
 
         let mut invalid = ready_wire.clone();
         invalid[51..].copy_from_slice(&demand.live.get().to_be_bytes());
+        assert_eq!(Ready::decode(&invalid, parent), None);
+        invalid = ready_wire.clone();
+        invalid[40] = 0;
         assert_eq!(Ready::decode(&invalid, parent), None);
         invalid = ready_wire.clone();
         invalid[50] = 1;

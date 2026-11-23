@@ -11,6 +11,7 @@ pub mod frame_selector;
 pub mod h264;
 pub mod monitor;
 pub mod normalize;
+pub(crate) mod publisher_clock;
 pub mod switcher;
 pub mod sync;
 pub mod time;

@@ -35,6 +35,22 @@ The deterministic simulator provides its own steering implementation so tests
 can exercise the same ownership and flow-pinning behavior without kernel
 dependencies.
 
+## Media clock prerequisites
+
+Provide an unexpired IANA `leap-seconds.list` at
+`/usr/share/zoneinfo/leap-seconds.list`, or pass `--utc-policy /path/to/leap-seconds.list`.
+Install the host time-zone data or mount the file in a minimal container. The
+server requires an initial UTC label covered by the table. Replace the table
+atomically before it expires; the node checks for a replacement once a minute.
+
+Configure the host time service for unsmeared UTC and a correct Linux
+`CLOCK_TAI` offset, then pass `--unsmeared-utc`. That option attests the time
+service configuration; matching UTC and TAI reads alone do not rule out a
+smear. Without this attestation or valid kernel discipline evidence, the media
+clock reports unknown absolute uncertainty. Lost discipline or policy expiry
+keeps the media clock advancing monotonically, and recovery slews rather than
+stepping it. This clock does not set the system clock or change transport time.
+
 ## CPU scheduling
 
 `CAP_SYS_NICE` is not required to run the server. Dataplane `SCHED_FIFO`

@@ -106,6 +106,7 @@ pub(crate) struct ShardExecution {
     udp_send_batch: GsoSendBatch,
     pipeline: EventPipeline,
     wall: WallAnchor,
+    global_clock: Option<crate::clock::reference::ShardClock>,
 }
 
 impl ShardCore {
@@ -120,6 +121,13 @@ impl ShardCore {
         Self {
             execution: ShardExecution::new(shard_id, max_gso_segments, shard_count, wall),
             updates: ShardUpdateApplication::new(shard_id, update_rx),
+        }
+    }
+
+    pub(crate) fn set_global_clock(&mut self, snapshot: crate::clock::reference::Snapshot) {
+        match &mut self.execution.global_clock {
+            Some(clock) => clock.update(snapshot),
+            clock @ None => *clock = Some(crate::clock::reference::ShardClock::new(snapshot)),
         }
     }
 
@@ -348,6 +356,7 @@ impl ShardExecution {
             udp_send_batch: GsoSendBatch::preallocated(),
             pipeline: EventPipeline::with_capacity(PARTICIPANT_CAPACITY_HINT),
             wall,
+            global_clock: None,
         }
     }
 
@@ -1365,12 +1374,24 @@ impl ShardExecution {
         let Some(identity) = ingress.take_identity() else {
             return false;
         };
-        self.runtime
-            .bind_fabric_media_identity(source, publisher, identity)
-            && self
-                .registry
-                .resolve_mut(publisher)
-                .is_some_and(|owner| owner.attach_fabric_media_source(publication, ingress, source))
+        let now = Instant::now();
+        let reference = self.global_clock.as_mut()
+            .and_then(|clock| clock.now(now))
+            .map(|estimate| (now, estimate));
+        let primary = ingress.primary_ssrc();
+        let Some(mid) = ingress.mid() else { return false };
+        let Some(owner) = self.registry.resolve_mut(publisher) else { return false };
+        if !owner.attach_fabric_media_source(publication, ingress, source) {
+            return false;
+        }
+        let report = owner.claim_fabric_sender_report(primary, mid);
+        if !self.runtime.bind_fabric_media_identity(
+            source, publisher, identity, primary, reference, report,
+        ) {
+            owner.detach_fabric_media_source(source);
+            return false;
+        }
+        true
     }
 
     /// Stage the source and its exact RTC installation together. Callers must
@@ -2556,6 +2577,7 @@ impl ShardExecution {
     pub(crate) fn flush_stream_buffers(&mut self, now: Instant, budget: usize) -> usize {
         debug_assert!(budget > 0);
         use crate::shard::events::QueuedPublication;
+        let reference = self.global_clock.as_mut().and_then(|clock| clock.now(now));
         let mut processed = 0;
         while processed < budget {
             let Some(queued) = self.pipeline.pop_publication() else {
@@ -2571,7 +2593,7 @@ impl ShardExecution {
                     if self.fabric_publisher_authorized(publisher, source) {
                         match self
                             .runtime
-                            .offer_fabric_media(source, publisher, now, &input)
+                            .offer_fabric_media(source, publisher, now, &input, reference.as_ref())
                         {
                             Ok(report) => {
                                 use crate::route::fabric::local::DecodeTargetSample;

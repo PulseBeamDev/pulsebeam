@@ -220,6 +220,8 @@ struct Encoding {
     payloads: Box<[InboundPayload]>,
     sequence: Option<u64>,
     timestamp: Option<u64>,
+    pending_fabric_report: Option<pulsebeam_rtc::SenderReport>,
+    fabric_claimed: bool,
 }
 struct Sender {
     ssrc: Ssrc,
@@ -918,6 +920,8 @@ impl RtcDriver {
             payloads,
             sequence: None,
             timestamp: None,
+            pending_fabric_report: None,
+            fabric_claimed: false,
         });
         self.pending_reports.shift_remove(&info.ssrc)
     }
@@ -1077,6 +1081,27 @@ impl RtcDriver {
         }
         Some(RtpIngress { mid, rid, packet })
     }
+    pub(super) fn defer_fabric_sender_report(&mut self, report: pulsebeam_rtc::SenderReport) {
+        if let Some(encoding) = self.encodings.get_mut(&report.ssrc.into())
+            && !encoding.fabric_claimed
+            && encoding.pending_fabric_report.is_none_or(|old| old.arrival < report.arrival)
+        {
+            encoding.pending_fabric_report = Some(report);
+        }
+    }
+
+    pub(super) fn claim_fabric_sender_report(
+        &mut self,
+        ssrc: u32,
+        mid: Mid,
+    ) -> Option<pulsebeam_rtc::SenderReport> {
+        let encoding = self.encodings.get_mut(&ssrc.into())?;
+        if encoding.mid != mid || std::mem::replace(&mut encoding.fabric_claimed, true) {
+            return None;
+        }
+        encoding.pending_fabric_report.take()
+    }
+
     pub(crate) fn sender_report(
         &mut self,
         report: pulsebeam_rtc::SenderReport,
@@ -1483,10 +1508,18 @@ mod tests {
             rtp_timestamp: 2000,
         };
         assert!(transport.sender_report(report).is_none());
+        transport.defer_fabric_sender_report(report);
         assert_eq!(
             transport.register_encoding(info(0, 111, "opus", MediaKind::Audio)),
             Some(report)
         );
+        // SSRC-only reports from before registration do not enter Fabric.
+        assert!(transport.encodings.get(&0.into()).unwrap().pending_fabric_report.is_none());
+        transport.defer_fabric_sender_report(report);
+        assert_eq!(transport.claim_fabric_sender_report(0, Mid::from("other")), None);
+        assert_eq!(transport.claim_fabric_sender_report(0, mid), Some(report));
+        transport.defer_fabric_sender_report(report);
+        assert_eq!(transport.claim_fabric_sender_report(0, mid), None);
         let (report_mid, sender) = transport.sender_report(report).unwrap();
         assert_eq!(report_mid, mid);
         assert_eq!(
@@ -1536,6 +1569,10 @@ mod tests {
         replacement.header.ssrc = 1;
         replacement.header.payload_type = 112;
         assert!(transport.convert_rtp(replacement, mid, None).is_some());
+        transport.defer_fabric_sender_report(pulsebeam_rtc::SenderReport { ssrc: 1, ..report });
+        transport.retire_encoding(1);
+        transport.register_encoding(info(1, 112, "opus", MediaKind::Audio));
+        assert_eq!(transport.claim_fabric_sender_report(1, mid), None);
         transport.register_encoding(info(2, 96, "vp8", MediaKind::Video));
         assert!(!transport.encodings.contains_key(&2.into()));
     }

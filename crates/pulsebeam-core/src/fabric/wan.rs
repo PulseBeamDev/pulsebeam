@@ -1,6 +1,7 @@
 //! PRODUCTION WIRE CONTRACT — EDIT WITH EXTREME CARE. Changes can break deployed clients, mixed-version nodes, and production traffic. Require compatibility review and wire-vector tests.
 //!
-//! Fabric WAN RTP revision 0, [RFC #275 §9.1][rfc]. The authenticated route
+//! Fabric WAN RTP timing revision 1, using the [RFC #275 §9.1][rfc] layout.
+//! The authenticated route
 //! selects the profile, SSRC, aligned 32,768-position window and allowed RTP
 //! extensions. The header has V=2, P=0, CC=0, optional X, M, PT=96+H, low
 //! sequence bits, timestamp and SSRC. Fields are big-endian. An RFC 8285 block
@@ -19,6 +20,7 @@ use super::{
     Profile, WireError, check_wan_size, wan_size,
 };
 
+pub const TIMING_REVISION: u8 = 1;
 pub const WINDOW_TUPLE_BYTES: usize = 17;
 pub const WINDOW_SPAN: u64 = 0x8000;
 const WINDOW_MASK: u64 = WINDOW_SPAN - 1;
@@ -40,7 +42,7 @@ pub struct Window {
 
 impl Window {
     pub fn from_tuple(tuple: [u8; WINDOW_TUPLE_BYTES], emission: u16) -> Result<Self, WireError> {
-        let [3, 1, 0, profile, a, b, c, d, e, f, g, h, forms, i, j, k, l] = tuple else {
+        let [3, 1, TIMING_REVISION, profile, a, b, c, d, e, f, g, h, forms, i, j, k, l] = tuple else {
             return Err(WireError::Window);
         };
         let profile = match profile {
@@ -103,7 +105,7 @@ impl Window {
         let [a, b, c, d, e, f, g, h] = self.start.to_be_bytes();
         let [i, j, k, l] = self.ssrc.get().to_be_bytes();
         [
-            3, 1, 0, profile, a, b, c, d, e, f, g, h, self.forms, i, j, k, l,
+            3, 1, TIMING_REVISION, profile, a, b, c, d, e, f, g, h, self.forms, i, j, k, l,
         ]
     }
 

@@ -497,6 +497,7 @@ fn prove_endpoint_identity(peer_repair: bool) {
             now,
             &input(now, u16::MAX, Some(b"original"), 100),
             peer_repair,
+            |arrival, _| assert_eq!(arrival, now),
         )
         .unwrap()
         .unwrap();
@@ -514,6 +515,7 @@ fn prove_endpoint_identity(peer_repair: bool) {
             retry,
             &input(retry, u16::MAX, Some(b"original"), 110),
             peer_repair,
+            |_, _| panic!("duplicate must not advance publisher clock"),
         )
         .unwrap()
         .unwrap();
@@ -528,7 +530,12 @@ fn prove_endpoint_identity(peer_repair: bool) {
 
     assert!(
         fanout
-            .offer_endpoint_media(retry, &input(retry, 3, None, 0), peer_repair)
+            .offer_endpoint_media(
+                retry,
+                &input(retry, 3, None, 0),
+                peer_repair,
+                |_, _| panic!("padding is not a clock sample")
+            )
             .unwrap()
             .is_none()
     );
@@ -546,17 +553,28 @@ fn prove_endpoint_identity(peer_repair: bool) {
         fanout.offer_endpoint_media(
             retry,
             &input(retry, u16::MAX, Some(b"original"), 100),
-            peer_repair
+            peer_repair,
+            |_, _| panic!("stale packet must not advance publisher clock"),
         ),
         Err(Rejection::Stale)
     );
     let (position, _, _) = fanout
-        .offer_endpoint_media(retry, &input(retry, 4, Some(b"new"), 120), peer_repair)
+        .offer_endpoint_media(
+            retry,
+            &input(retry, 4, Some(b"new"), 120),
+            peer_repair,
+            |arrival, _| assert_eq!(arrival, retry),
+        )
         .unwrap()
         .unwrap();
     assert_eq!(position, 65_540);
     assert_eq!(
-        fanout.offer_endpoint_media(retry, &input(retry, 4, Some(b"changed"), 120), peer_repair),
+        fanout.offer_endpoint_media(
+            retry,
+            &input(retry, 4, Some(b"changed"), 120),
+            peer_repair,
+            |_, _| panic!("conflicting packet must not advance publisher clock")
+        ),
         Err(Rejection::Conflict)
     );
     assert!(fanout.transit(position, hops).is_none());

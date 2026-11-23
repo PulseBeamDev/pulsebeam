@@ -3762,6 +3762,7 @@ dependencies = [
  "pprof",
  "proptest",
  "pulsebeam-agent-native",
+ "pulsebeam-clock",
  "pulsebeam-core",
  "pulsebeam-link",
  "pulsebeam-membership",

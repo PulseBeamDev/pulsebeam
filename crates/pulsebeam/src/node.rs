@@ -85,6 +85,7 @@ pub struct NodeBuilder {
     // Dependencies (Transport / Logic)
     rng: Option<rand::Rng>,
     udp_mode: UdpMode,
+    time_source: crate::clock::reference::Source,
 
     // Services
     cluster: Option<crate::cluster::Options>,
@@ -136,6 +137,15 @@ impl NodeBuilder {
             advertise_bound_udp: false,
             rng: None,
             udp_mode: UdpMode::Batch,
+            #[cfg(not(test))]
+            time_source: crate::clock::reference::Source::host(
+                "/usr/share/zoneinfo/leap-seconds.list".into(),
+                false,
+            ),
+            #[cfg(test)]
+            time_source: crate::clock::reference::Source::Virtual {
+                unix_nanos: || 1_700_000_000_000_000_000,
+            },
             cluster: None,
             provisioned_peers: Vec::new(),
             link_listen: None,
@@ -408,6 +418,21 @@ impl NodeBuilder {
         self
     }
 
+    /// Use an IANA leap-seconds.list as the UTC policy. Only attest unsmeared
+    /// UTC if the host discipline is configured for it; a UTC/TAI pair cannot
+    /// detect a smear applied to both clocks.
+    pub fn host_utc_policy(mut self, path: impl Into<std::path::PathBuf>, unsmeared: bool) -> Self {
+        self.time_source = crate::clock::reference::Source::host(path.into(), unsmeared);
+        self
+    }
+
+    /// Inject the simulator's Unix clock, using the same authority and shard handoff.
+    #[cfg(feature = "sim")]
+    pub fn sim_utc_clock(mut self, unix_nanos: fn() -> i64) -> Self {
+        self.time_source = crate::clock::reference::Source::Virtual { unix_nanos };
+        self
+    }
+
     /// Consumes the builder and runs the node until `shutdown` is cancelled.
     pub async fn run(mut self, shutdown: CancellationToken) -> Result<()> {
         let Some(options) = self.cluster.take() else {
@@ -534,6 +559,9 @@ impl NodeBuilder {
             .local_addr
             .unwrap_or_else(|| SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0));
         let mut control_tasks = JoinSet::new();
+        let global_clock = crate::clock::reference::ClockService::start(self.time_source)
+            .await
+            .context("initializing the node media clock")?;
         // Initialised here so the global recorder is in place before anything
         // runs, but served after the shards exist — it needs their metrics lane.
         let internal_ctx = match self.internal_metrics {
@@ -674,6 +702,8 @@ impl NodeBuilder {
         // One NTP<->Instant anchor for the whole node: read the wall clock once,
         // here, so every shard shares a timeline and nothing reads it again.
         let wall_anchor = WallAnchor::from(pulsebeam_runtime::net::ReceiveTime::now());
+        let initial_global_clock = global_clock.snapshot();
+        let mut clock_senders = Vec::with_capacity(shard_count);
 
         let mut shard_contexts = Vec::with_capacity(shard_count);
 
@@ -722,6 +752,9 @@ impl NodeBuilder {
             let occupancy = Arc::new(ShardMetrics::new());
             let worker_occupancy = occupancy.clone();
             let shard_stats_tx = stats_tx.clone();
+            let (clock_tx, clock_rx) = mailbox::bounded(core::num::NonZeroUsize::MIN);
+            clock_senders.push(clock_tx);
+            let initial_global_clock = initial_global_clock.clone();
 
             let launch =
                 move || -> std::io::Result<pulsebeam_runtime::rt::ManagedService<ShardWorker>> {
@@ -739,6 +772,8 @@ impl NodeBuilder {
                         worker_occupancy,
                         shard_stats_tx,
                         wall_anchor,
+                        initial_global_clock,
+                        clock_rx,
                     );
                     Ok(pulsebeam_runtime::rt::ManagedService::new(shard, udp_sock))
                 };
@@ -752,6 +787,8 @@ impl NodeBuilder {
                 metrics: occupancy,
             });
         }
+
+        control_tasks.spawn(global_clock.run(clock_senders, shutdown.child_token()));
 
         if let (Some(ctx), Some(stats_rx)) = (internal_ctx, stats_rx) {
             control_tasks.spawn(ignore(ctx.serve_internal_http(

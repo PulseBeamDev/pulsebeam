@@ -15,6 +15,7 @@ rust_library(
     edition = "2024",
     rustc_env_files = [":cargo_env"],
     lint_config = ":lints",
+    visibility = ["//crates/pulsebeam:__pkg__"],
 )
 
 rust_test(name = "unit_tests", crate = ":pulsebeam-clock", lint_config = ":lints")

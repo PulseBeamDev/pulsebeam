@@ -3,7 +3,7 @@ use std::num::NonZeroU16;
 use super::*;
 use crate::fabric::Extension;
 
-const H264: [u8; 17] = [3, 1, 0, 2, 0, 0, 0, 0, 0, 1, 0x80, 0, 3, 5, 6, 7, 8];
+const H264: [u8; 17] = [3, 1, 1, 2, 0, 0, 0, 0, 0, 1, 0x80, 0, 3, 5, 6, 7, 8];
 const LIVE: [u8; 14] = [0x80, 0xe6, 0x80, 0, 1, 2, 3, 4, 5, 6, 7, 8, 0x65, 0x88];
 
 #[test]
@@ -100,12 +100,12 @@ fn protected_wan_primary_can_grow_within_the_path_envelope() {
 }
 
 #[test]
-fn retired_opus_budget_window_revision_is_not_accepted() {
+fn timing_revision_does_not_restore_the_retired_opus_budget_extension() {
     let window = Window::new(Profile::Opus, 0, 3, NonZeroU32::new(11).unwrap(), 1 << 4).unwrap();
-    let mut tuple = window.to_tuple();
-    tuple[2] = 1;
+    let tuple = window.to_tuple();
+    assert_eq!(Window::from_tuple(tuple, window.emission()), Ok(window));
     assert_eq!(
-        Window::from_tuple(tuple, window.emission()),
+        Window::from_tuple(tuple, window.emission() | (1 << 10)),
         Err(WireError::Window)
     );
 }
@@ -192,7 +192,7 @@ fn hop_payload_types_are_mux_safe_and_stop_at_local_delivery() {
 
 #[test]
 fn window_and_packet_reject_unselected_or_malformed_wire() {
-    for (at, value) in [(0, 2), (2, 1), (11, 1), (12, 4)] {
+    for (at, value) in [(0, 2), (2, 0), (2, 2), (11, 1), (12, 4)] {
         let mut tuple = H264;
         tuple[at] = value;
         assert_eq!(Window::from_tuple(tuple, 0), Err(WireError::Window));

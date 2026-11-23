@@ -21,6 +21,8 @@
 //! the correct answer.
 #![deny(clippy::arithmetic_side_effects)]
 
+pub(crate) mod reference;
+
 use pulsebeam_runtime::net::ReceiveTime;
 use pulsebeam_runtime::time::Instant;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

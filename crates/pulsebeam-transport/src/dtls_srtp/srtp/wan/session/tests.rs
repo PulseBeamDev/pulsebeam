@@ -653,95 +653,104 @@ fn exercise_windows(client: &mut Session, server: &mut Session, now: Instant) {
 
 #[cfg(feature = "datagram")]
 #[test]
-fn mixed_real_dtls_peers_never_accept_the_other_carrier() {
+fn mixed_real_dtls_peers_never_activate_the_other_carrier_or_timing_revision() {
+    for revision_zero in [false, true] {
+        for role in [Role::Client, Role::Server] {
+            reject_incompatible_peer(role, revision_zero);
+        }
+    }
+}
+
+fn reject_incompatible_peer(role: Role, revision_zero: bool) {
     use crate::wire;
 
-    for role in [Role::Client, Role::Server] {
-        let now = Instant::now();
-        let wan_id = LocalIdentity::generate().unwrap();
-        let legacy_id = LocalIdentity::generate().unwrap();
-        let wan_is_client = role == Role::Client;
-        let legacy_role = if wan_is_client {
-            Role::Server
-        } else {
-            Role::Client
-        };
-        let mut wan = session(role, &wan_id, &legacy_id, now);
-        let mut legacy = Association::single_record_datagrams(
-            legacy_role,
-            &legacy_id,
-            wan_id.fingerprint(),
-            1200,
-            now,
-        )
-        .unwrap();
-        let mut to_legacy = VecDeque::new();
-        let mut to_wan = VecDeque::new();
-        let send = |_, bytes: &[u8]| -> SocketOutcome {
-            to_legacy.push_back(bytes.to_vec());
-            SocketOutcome::Accepted { bytes: bytes.len() }
-        };
-        wan.tick(now, &mut { send }).unwrap();
-        legacy.handle_timeout(now).unwrap();
-        let mut legacy_offer = !wan_is_client;
-        let mut rejected_offer = false;
-        let mut rejected_legacy = false;
-        for _ in 0..64 {
-            let mut buffer = [0; 4096];
-            match legacy.poll_output(&mut buffer).unwrap() {
-                Output::Datagram(bytes) => to_wan.push_back(bytes.to_vec()),
-                Output::ApplicationData(bytes) => {
-                    assert!(wire::decode_for(bytes, true).is_err());
-                    assert_eq!(Capability::decode(bytes), Some(Capability::Offer));
-                    rejected_offer = true;
+    let now = Instant::now();
+    let wan_id = LocalIdentity::generate().unwrap();
+    let legacy_id = LocalIdentity::generate().unwrap();
+    let wan_is_client = role == Role::Client;
+    let legacy_role = if wan_is_client {
+        Role::Server
+    } else {
+        Role::Client
+    };
+    let mut wan = session(role, &wan_id, &legacy_id, now);
+    let connect = if revision_zero {
+        Association::fabric_wan
+    } else {
+        Association::single_record_datagrams
+    };
+    let mut legacy = connect(legacy_role, &legacy_id, wan_id.fingerprint(), 1200, now).unwrap();
+    let mut to_legacy = VecDeque::new();
+    let mut to_wan = VecDeque::new();
+    let send = |_, bytes: &[u8]| -> SocketOutcome {
+        to_legacy.push_back(bytes.to_vec());
+        SocketOutcome::Accepted { bytes: bytes.len() }
+    };
+    wan.tick(now, &mut { send }).unwrap();
+    legacy.handle_timeout(now).unwrap();
+    let mut incompatible_control_pending = !wan_is_client;
+    let mut rejected_offer = false;
+    let mut rejected_legacy = false;
+    for _ in 0..64 {
+        let mut buffer = [0; 4096];
+        match legacy.poll_output(&mut buffer).unwrap() {
+            Output::Datagram(bytes) => to_wan.push_back(bytes.to_vec()),
+            Output::ApplicationData(bytes) => {
+                assert!(wire::decode_for(bytes, true).is_err());
+                assert_eq!(Capability::decode(bytes), Some(Capability::Offer));
+                rejected_offer = true;
+                incompatible_control_pending = revision_zero;
+            }
+            Output::Timeout(_) => {
+                if incompatible_control_pending && legacy.is_connected() {
+                    incompatible_control_pending = false;
+                    let incompatible = match (revision_zero, legacy_role) {
+                        (true, Role::Client) => &[3, 1, 1, 0, 0, 8][..],
+                        (true, Role::Server) => &[3, 1, 2, 0, 0, 8][..],
+                        (false, _) => &[2, 1, 1, 0x04, 0x80][..],
+                    };
+                    legacy.send_application_data(incompatible).unwrap();
+                    continue;
                 }
-                Output::Timeout(_) => {
-                    if legacy_offer && legacy.is_connected() {
-                        legacy_offer = false;
-                        legacy
-                            .send_application_data(&wire::Capability::Offer.encode())
-                            .unwrap();
-                        continue;
-                    }
-                    if let Some(packet) = to_legacy.pop_front() {
-                        legacy.handle_packet(&packet).unwrap();
-                    } else if let Some(packet) = to_wan.pop_front() {
-                        let incoming =
-                            wan.receive(now, binding(wan_is_client), &packet, &mut |_, bytes| {
-                                to_legacy.push_back(bytes.to_vec());
-                                SocketOutcome::Accepted { bytes: bytes.len() }
-                            });
-                        if let Err(error) = incoming {
-                            assert!(matches!(error, Error::Incompatible));
-                            rejected_legacy = true;
-                            break;
-                        }
-                    } else {
+                if let Some(packet) = to_legacy.pop_front() {
+                    legacy.handle_packet(&packet).unwrap();
+                } else if let Some(packet) = to_wan.pop_front() {
+                    let incoming =
+                        wan.receive(now, binding(wan_is_client), &packet, &mut |_, bytes| {
+                            to_legacy.push_back(bytes.to_vec());
+                            SocketOutcome::Accepted { bytes: bytes.len() }
+                        });
+                    if let Err(error) = incoming {
+                        assert!(matches!(error, Error::Incompatible));
+                        rejected_legacy = true;
                         break;
                     }
+                } else {
+                    break;
                 }
-                Output::Connected | Output::Progress => {}
-                _ => panic!("unexpected historical DTLS event"),
             }
+            Output::Connected | Output::Progress | Output::KeyingMaterial(..) => {}
+            _ => panic!("unexpected incompatible peer event"),
         }
-        assert!(!wan.selected());
-        assert!(wan.lease(now).is_none());
-        if wan_is_client {
-            assert!(rejected_offer);
-            assert!(matches!(
-                wan.tick(now + CAPABILITY_TIMEOUT, &mut |_, _| panic!(
-                    "expired WAN retried another carrier"
-                )),
-                Err(Error::Incompatible)
-            ));
-        } else {
-            assert!(rejected_legacy);
-            assert!(matches!(
-                wan.tick(now, &mut |_, _| panic!(
-                    "rejected WAN retried another carrier"
-                )),
-                Err(Error::Closed)
-            ));
-        }
+    }
+    assert!(!wan.selected());
+    assert!(wan.lease(now).is_none());
+    assert_eq!(rejected_offer, wan_is_client);
+    assert!(wan.take_control().is_none());
+    if wan_is_client && !revision_zero {
+        assert!(matches!(
+            wan.tick(now + CAPABILITY_TIMEOUT, &mut |_, _| panic!(
+                "expired WAN retried another carrier"
+            )),
+            Err(Error::Incompatible)
+        ));
+    } else {
+        assert!(rejected_legacy);
+        assert!(matches!(
+            wan.tick(now, &mut |_, _| panic!(
+                "rejected WAN retried another carrier"
+            )),
+            Err(Error::Closed)
+        ));
     }
 }

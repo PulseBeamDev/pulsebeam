@@ -1666,7 +1666,7 @@ fn authenticated_large_primary_and_rtx_fan_out_and_receiver_refresh_reaches_the_
     let mut frames = Vec::new();
     assert_eq!(mailbox.try_recv_batch(&mut frames, 8), 3);
     let window =
-        Window::from_tuple([3, 1, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 6, 7, 8], 0).unwrap();
+        Window::from_tuple([3, 1, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 6, 7, 8], 0).unwrap();
     let mut large_positions = Vec::new();
     for frame in frames {
         let ShardFrame::Fabric(offer) = frame.packet else {

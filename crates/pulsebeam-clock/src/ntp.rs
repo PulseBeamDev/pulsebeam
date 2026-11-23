@@ -101,11 +101,24 @@ impl<'a> UtcRules<'a> {
             .and_then(|n| n.checked_add(i128::from(value.timestamp.seconds)))
             .and_then(|n| n.checked_sub(UTC_TO_NTP_SECONDS))
             .ok_or(Error::Overflow)?;
-        let offset = self.offset_at_utc(utc)?;
         let fraction = i128::from(value.timestamp.fraction)
             .checked_mul(NS_PER_SECOND)
             .ok_or(Error::Overflow)?
             .div_euclid(UNITS);
+        self.from_utc_parts(utc, fraction)
+    }
+
+    /// Convert a qualified unsmeared Unix UTC label without NTP fraction rounding.
+    pub fn decode_unix_nanos(self, unix_nanos: i64) -> Result<GlobalInstant, Error> {
+        let unix_nanos = i128::from(unix_nanos);
+        self.from_utc_parts(
+            unix_nanos.div_euclid(NS_PER_SECOND),
+            unix_nanos.rem_euclid(NS_PER_SECOND),
+        )
+    }
+
+    fn from_utc_parts(self, utc: i128, fraction: i128) -> Result<GlobalInstant, Error> {
+        let offset = self.offset_at_utc(utc)?;
         let global = utc
             .checked_add(i128::from(offset))
             .and_then(|n| n.checked_mul(NS_PER_SECOND))

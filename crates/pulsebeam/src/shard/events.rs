@@ -423,6 +423,17 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
         }
     }
 
+    fn observe_fabric_sender_report(
+        &mut self,
+        source: crate::shard::router::FabricSourceHandle,
+        now: pulsebeam_runtime::time::Instant,
+        report: pulsebeam_rtc::SenderReport,
+    ) {
+        if let Some(runtime) = &mut self.runtime {
+            runtime.observe_fabric_sender_report(source, self.key, now, report);
+        }
+    }
+
     fn publish_fabric_media(
         &mut self,
         source: crate::shard::router::FabricSourceHandle,

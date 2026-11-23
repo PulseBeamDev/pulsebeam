@@ -136,7 +136,7 @@ fn optional_descriptor_round_trips_through_bound_wan_live_and_repair() {
         Err(WireError::ExtensionProfile)
     );
     assert_eq!(project(first.packet, None), Err(Error::Projection));
-    let mut tuple = [3, 1, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 1, 5, 6, 7, 10];
+    let mut tuple = [3, 1, 1, 4, 0, 0, 0, 0, 0, 0, 0, 0, 1, 5, 6, 7, 10];
     for (ssrc_end, repair) in [
         (10, None),
         (

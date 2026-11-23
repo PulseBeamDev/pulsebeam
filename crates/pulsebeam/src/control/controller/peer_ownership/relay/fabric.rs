@@ -209,7 +209,7 @@ mod tests {
         let json = serde_json::to_value(WireWanLiveRouteAck::from(ack)).unwrap();
         assert_eq!(
             json["window"],
-            serde_json::json!([3, 1, 0, 2, 0, 0, 0, 0, 0, 1, 128, 0, 3, 5, 6, 7, 8])
+            serde_json::json!([3, 1, 1, 2, 0, 0, 0, 0, 0, 1, 128, 0, 3, 5, 6, 7, 8])
         );
         assert_eq!(json["extensions"], 4);
         assert_eq!(json["sequence_anchor"], 0x17fff);
@@ -222,9 +222,11 @@ mod tests {
             Some(&[ack][..])
         );
         assert!(decode_wan(Box::new([ack.into(), ack.into()])).is_none());
-        let mut invalid = WireWanLiveRouteAck::from(ack);
-        invalid.window[2] = 1;
-        assert!(decode_wan(Box::new([invalid])).is_none());
+        for revision in [0, 2] {
+            let mut invalid = WireWanLiveRouteAck::from(ack);
+            invalid.window[2] = revision;
+            assert!(decode_wan(Box::new([invalid])).is_none());
+        }
     }
 
     #[test]
