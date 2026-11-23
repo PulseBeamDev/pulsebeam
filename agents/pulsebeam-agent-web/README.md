@@ -118,15 +118,12 @@ for (const track of capture.getTracks()) track.stop();
 Subscribe to the exact remote track before attaching playback:
 
 ```ts
-import { PlayoutDelay } from "@pulsebeam/web";
-
 const subscription = remoteCamera.subscribe({
   visible: true,
   height: 720,
   minHeight: 360,
   minFps: 15,
   priority: 100,
-  playoutDelay: PlayoutDelay.Fixed.new({ minMs: 100, maxMs: 200 }),
 });
 const output = await subscription.playbackOutput();
 const receivedTrack = output.track();

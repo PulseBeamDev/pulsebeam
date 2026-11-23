@@ -3,13 +3,7 @@ use crate::media::{Rid, SimulcastLayer};
 use crate::rtp::cache::TrackStreamCache;
 use crate::rtp::test_utils::H264StreamBuilder;
 
-fn receiver_spec(
-    track: PublicationKey,
-    room: &str,
-    mid: &str,
-    ssrc: u32,
-    fixed: bool,
-) -> wire::ResourceSpec {
+fn receiver_spec(track: PublicationKey, room: &str, mid: &str, ssrc: u32) -> wire::ResourceSpec {
     let format = capabilities()
         .codecs
         .into_iter()
@@ -33,10 +27,10 @@ fn receiver_spec(
                 codec: Some(wire::RtpCodecParameters { payload_type: Some(96), format: Some(format), feedback: vec![wire::RtcpFeedback::TransportCc.as_str().into()], ..Default::default() }),
                 encodings: vec![wire::RtpEncodingParameters { ssrc: Some(ssrc), ..Default::default() }],
                 rtcp: Some(wire::RtcpParameters { cname: "component-video-receiver".into(), reduced_size: false }),
-                header_extensions: vec![wire::RtpHeaderExtensionParameters { id: 1, uri: wire::RtpHeaderExtensionType::RtpHeaderExtensionMid.as_str().into() }, wire::RtpHeaderExtensionParameters { id: 2, uri: wire::RtpHeaderExtensionType::RtpHeaderExtensionTransportCcDraft01.as_str().into() }, wire::RtpHeaderExtensionParameters { id: 3, uri: wire::RtpHeaderExtensionType::RtpHeaderExtensionPlayoutDelay.as_str().into() }],
+                header_extensions: vec![wire::RtpHeaderExtensionParameters { id: 1, uri: wire::RtpHeaderExtensionType::RtpHeaderExtensionMid.as_str().into() }, wire::RtpHeaderExtensionParameters { id: 2, uri: wire::RtpHeaderExtensionType::RtpHeaderExtensionTransportCcDraft01.as_str().into() }],
             })) }),
         })),
-        settings: Some(wire::ResourceSettings { enabled: Some(true), receive: Some(wire::resource_settings::Receive::Video(wire::VideoReceiveOptions { min_height: Some(1), min_fps: Some(1), playout_delay: fixed.then_some(wire::PlayoutDelay { min_ms: 100, max_ms: 100 }), ..Default::default() })) }),
+        settings: Some(wire::ResourceSettings { enabled: Some(true), receive: Some(wire::resource_settings::Receive::Video(wire::VideoReceiveOptions { min_height: Some(1), min_fps: Some(1), ..Default::default() })) }),
     }
 }
 
@@ -127,7 +121,7 @@ pub(super) fn check(
         .update_bitrate(Instant::now(), crate::bitrate::Bitrate::from(2_000_000));
     let (mut tx, mut video) =
         track::new_video(Mid::from("camera"), meta, vec![SimulcastLayer::new("q")]);
-    let first = receiver_spec(id, audio.meta().room.room.as_str(), "video-a", 801, true);
+    let first = receiver_spec(id, audio.meta().room.room.as_str(), "video-a", 801);
     let Some(resource_spec::Declaration::Subscription(subscription)) = &first.declaration else {
         unreachable!()
     };
@@ -151,7 +145,7 @@ pub(super) fn check(
         (5, first.clone()),
         (
             7,
-            receiver_spec(id, audio.meta().room.room.as_str(), "video-b", 803, false),
+            receiver_spec(id, audio.meta().room.room.as_str(), "video-b", 803),
         ),
     ] {
         pulsebeam_proto::state::validation::validate_spec(&spec).unwrap();
@@ -178,7 +172,6 @@ pub(super) fn check(
                     audio.meta().room.room.as_str(),
                     "blocked",
                     803,
-                    false,
                 )),
             );
             let rejected = native_data::tests::confirmations_for(participant, 6)
@@ -228,8 +221,6 @@ pub(super) fn check(
         801.into(),
         96u8.into()
     ));
-    assert!(participant.native_receivers.playout_delay(a).is_some());
-    assert!(participant.native_receivers.playout_delay(b).is_none());
     let mut frames = H264StreamBuilder::new(991, 100, 0, Instant::now());
     let mut cache = TrackStreamCache::new();
     feed(participant, handle, &mut tx, &mut cache, &mut frames, None);
@@ -242,23 +233,19 @@ pub(super) fn check(
         &mut frames,
         Some(180),
     );
-    desire(
-        participant,
-        sink,
-        5,
-        8,
-        Some(receiver_spec(
-            id,
-            audio.meta().room.room.as_str(),
-            "video-a",
-            801,
-            false,
-        )),
-    );
+    let mut updated = receiver_spec(id, audio.meta().room.room.as_str(), "video-a", 801);
+    let Some(wire::resource_settings::Receive::Video(options)) = updated
+        .settings
+        .as_mut()
+        .and_then(|settings| settings.receive.as_mut())
+    else {
+        unreachable!()
+    };
+    options.min_fps = Some(2);
+    desire(participant, sink, 5, 8, Some(updated));
     confirmations(participant);
-    assert!(participant.native_receivers.playout_delay(a).is_none());
     assert_eq!(outputs(participant, id), [b].into());
-    let mut bounded = receiver_spec(id, audio.meta().room.room.as_str(), "video-a", 801, false);
+    let mut bounded = receiver_spec(id, audio.meta().room.room.as_str(), "video-a", 801);
     let Some(wire::resource_settings::Receive::Video(options)) = bounded
         .settings
         .as_mut()

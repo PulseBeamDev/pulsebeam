@@ -13,7 +13,6 @@ import {
   VideoPublication,
   VideoSource,
   VideoSubscription,
-  type AudioSubscriptionConfig,
   type Catalog,
   type DataPublication,
   type DataPublishOptions,
@@ -174,7 +173,6 @@ export function useSubscribe(
 ): VideoSubscription | null;
 export function useSubscribe(
   track: RemoteAudioTrack | null,
-  options?: AudioSubscriptionConfig,
 ): AudioSubscription | null;
 export function useSubscribe(
   track: RemoteDataTrack | null,
@@ -182,7 +180,7 @@ export function useSubscribe(
 ): DataSubscription | null;
 export function useSubscribe(
   track: Remote | null,
-  options?: VideoObservation | AudioSubscriptionConfig | DataSubscribeOptions,
+  options?: VideoObservation | DataSubscribeOptions,
 ): Subscription | null {
   const mode =
     track instanceof RemoteDataTrack
@@ -200,7 +198,7 @@ export function useSubscribe(
         : track instanceof RemoteVideoTrack
           ? track.subscribe(options as VideoObservation | undefined)
           : track instanceof RemoteAudioTrack
-            ? track.subscribe(options as AudioSubscriptionConfig | undefined)
+            ? track.subscribe()
             : undefined;
     if (!owner) throw new TypeError("Expected an SDK remote track");
     applied.current.set(owner, key);
@@ -212,10 +210,6 @@ export function useSubscribe(
     try {
       if (owner instanceof VideoSubscription)
         owner.configure(committed.current as VideoObservation | undefined);
-      if (owner instanceof AudioSubscription)
-        owner.configure(
-          committed.current as AudioSubscriptionConfig | undefined,
-        );
       applied.current.set(owner, key);
     } catch (error) {
       subscription.fail(error);

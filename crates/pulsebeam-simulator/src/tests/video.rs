@@ -916,10 +916,17 @@ fn same_receiver_encoded_and_native_decoded_video_test() {
     ];
     for (phase, room, seconds) in [(0, "room1", 3), (1, "breakout", 4), (2, "room1", 4)] {
         if phase > 0 {
-            plan.push(Step::MoveRoom {
-                description: "Move the same Agent while retaining logical reception and outbound owners",
-                participant: "bob", room, timeout: Duration::from_secs(5),
-            });
+            plan.extend([
+                Step::MoveRoom {
+                    description: "Move the same Agent while retaining logical reception and outbound owners",
+                    participant: "bob", room, timeout: Duration::from_secs(5),
+                },
+                Step::WaitForNativeVideo {
+                    description: "Reacquire fresh 720p from Alice's current room admission before steady measurement",
+                    participant: "bob", publisher: "alice", min_resolution: (1280, 720),
+                    timeout: Duration::from_secs(15),
+                },
+            ]);
         }
         plan.extend([
             Step::Run {
@@ -964,6 +971,7 @@ fn same_receiver_encoded_and_native_decoded_video_test() {
         .with_encoded_and_native_decoded_video();
     bob.auto_subscribe = false;
     LocalNodeSim::new()
+        .with_link(LinkProfile::fiber())
         .with_room(
             Room::new("room1")
                 .with_participant(

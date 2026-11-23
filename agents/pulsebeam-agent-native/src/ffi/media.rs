@@ -247,12 +247,8 @@ pub struct RemoteAudioTrack {
 
 #[uniffi::export]
 impl RemoteAudioTrack {
-    #[uniffi::method(default(configuration = None))]
-    pub fn subscribe(
-        &self,
-        configuration: Option<core_ffi::AudioSubscriptionConfig>,
-    ) -> Result<Arc<AudioSubscription>, NativeError> {
-        let runtime = self.runtime.subscribe(configuration.unwrap_or_default())?;
+    pub fn subscribe(&self) -> Result<Arc<AudioSubscription>, NativeError> {
+        let runtime = self.runtime.subscribe()?;
         let observer = runtime.audio_observer()?;
         Ok(Arc::new(AudioSubscription { runtime, observer }))
     }
@@ -332,23 +328,13 @@ impl VideoSubscription {
     }
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[uniffi::export]
 impl AudioSubscription {
     pub fn frames(&self) -> Result<Arc<AudioFrames>, NativeError> {
         Ok(Arc::new(AudioFrames::new(
             self.runtime.clone(),
             self.observer.clone(),
         )?))
-    }
-
-    pub async fn configure(
-        &self,
-        configuration: core_ffi::AudioSubscriptionConfig,
-    ) -> Result<(), NativeError> {
-        self.runtime
-            .configure_audio(configuration.playout_delay.into())
-            .await
-            .map_err(Into::into)
     }
 }
 

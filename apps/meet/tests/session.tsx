@@ -2,12 +2,7 @@ import assert from "node:assert/strict";
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { MeetApp } from "../components/MeetApp";
-import {
-  AgentStatus,
-  WatchStatus,
-  CatalogDelivery,
-  PlayoutDelay,
-} from "@pulsebeam/react";
+import { AgentStatus, WatchStatus, CatalogDelivery } from "@pulsebeam/react";
 import { AgentError, ErrorCode, type CatalogParticipant } from "@pulsebeam/web";
 import {
   captures,
@@ -309,7 +304,6 @@ assert.deepEqual(
       selector,
       minFps: configuration.minFps,
       priority: configuration.priority,
-      playoutDelay: configuration.playoutDelay,
     }))
     .sort((a, b) => a.selector.trackId.localeCompare(b.selector.trackId)),
   [
@@ -321,7 +315,6 @@ assert.deepEqual(
       },
       minFps: 15,
       priority: 200,
-      playoutDelay: PlayoutDelay.Adaptive.new(),
     },
     {
       selector: {
@@ -331,7 +324,6 @@ assert.deepEqual(
       },
       minFps: 15,
       priority: 10,
-      playoutDelay: PlayoutDelay.Adaptive.new(),
     },
   ],
   "page-derived remote videos preserve spotlight/FPS/playout policy and exclude self",

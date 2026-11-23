@@ -766,12 +766,8 @@ async fn execute_inner(
                     }
                 }
             }
-            Op::Audio {
-                pinned,
-                automatic,
-                fixed_ms,
-            } => {
-                audio::request(&mut state, handles, pinned, *automatic, *fixed_ms, witness).await?;
+            Op::Audio { pinned, automatic } => {
+                audio::request(&mut state, handles, pinned, *automatic, witness).await?;
             }
             Op::AudioProgress => audio::progress(&mut state, handles, witness).await?,
             Op::Pressure => audio::pressure(&mut state, handles, witness).await?,

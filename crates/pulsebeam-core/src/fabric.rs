@@ -31,8 +31,9 @@ use arrayvec::ArrayVec;
 pub const MAJOR: u8 = 1;
 pub const REGISTRY_REVISION: u8 = 1;
 pub const MAX_PACKET_BYTES: usize = 1_152;
-// Pinned Native Opus input plus fixed RTP header and the retained audio-level block.
-pub const MAX_WAN_RTP_BYTES: usize = 1_200 + 12 + 8;
+pub const MAX_UDP_PAYLOAD_BYTES: u16 = 1_280 - 40 - 8;
+// Provisioned WAN SRTP uses the full 16-byte GCM tag.
+pub const MAX_WAN_RTP_BYTES: usize = MAX_UDP_PAYLOAD_BYTES as usize - 16;
 
 fn legacy_extension_allowed(profile: Profile, kind: ExtensionKind) -> bool {
     (profile, kind) != (Profile::Data, ExtensionKind::DependencyDescriptor)

@@ -519,7 +519,6 @@ impl BrowserRuntime {
     pub(crate) fn claim_audio(
         &self,
         selector: agent_core::TrackSelector,
-        playout_delay: agent_core::PlayoutDelay,
     ) -> Result<
         (
             u64,
@@ -530,10 +529,7 @@ impl BrowserRuntime {
         use agent_core::ResourceCommand;
         self.claim_observed_resource(
             ResourceCommand::ClaimAudioSubscription { selector },
-            |owner| {
-                self.configure_owned_audio(owner, playout_delay)?;
-                self.audio_state_observer(owner)
-            },
+            |owner| self.audio_state_observer(owner),
         )
     }
 
@@ -544,19 +540,6 @@ impl BrowserRuntime {
         observation: agent_core::VideoObservation,
     ) -> Result<(), agent_core::ffi::ErrorInfo> {
         self.apply_resource(agent_core::ResourceCommand::ObserveVideo { owner, observation })?;
-        Ok(())
-    }
-
-    #[cfg(feature = "uniffi")]
-    pub(crate) fn configure_owned_audio(
-        &self,
-        owner: u64,
-        playout_delay: agent_core::PlayoutDelay,
-    ) -> Result<(), agent_core::ffi::ErrorInfo> {
-        self.apply_resource(agent_core::ResourceCommand::ConfigureAudio {
-            owner,
-            playout_delay,
-        })?;
         Ok(())
     }
 

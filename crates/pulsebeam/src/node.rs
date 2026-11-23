@@ -93,8 +93,6 @@ pub struct NodeBuilder {
     link_control: Option<pulsebeam_runtime::sync::oneshot::Sender<crate::link::Control>>,
     http_api: Option<ListenerSource>,
     key_registry: Option<KeyRegistry>,
-    data_profile: crate::control::native::DataProfile,
-    local_rtp_v1: bool,
     internal_metrics: Option<ListenerSource>,
     steering: Option<SteeringFactory>,
 
@@ -142,8 +140,6 @@ impl NodeBuilder {
             provisioned_peers: Vec::new(),
             link_listen: None,
             link_control: None,
-            data_profile: crate::control::native::DataProfile::default(),
-            local_rtp_v1: false,
             http_api: None,
             key_registry: None,
             internal_metrics: None,
@@ -175,25 +171,6 @@ impl NodeBuilder {
     }
 
     /// Notify when the controller mailbox exists, before controller spawn and HTTP binding.
-    #[cfg(any(feature = "sim", feature = "transport-conformance"))]
-    pub fn with_local_data_v1(mut self) -> Self {
-        self.data_profile = crate::control::native::DataProfile::FabricLive;
-        self
-    }
-
-    /// Select the explicit reliable DATA_V1 profile for qualification fixtures.
-    pub fn with_reliable_data_v1(mut self) -> Self {
-        self.data_profile = crate::control::native::DataProfile::FabricReliable;
-        self
-    }
-
-    /// Exercise core-only, single-encoding Native RTP through Fabric.
-    #[cfg(feature = "sim")]
-    pub fn with_local_rtp_v1(mut self) -> Self {
-        self.local_rtp_v1 = true;
-        self
-    }
-
     #[cfg(feature = "sim")]
     pub fn with_sim_startup_notification(
         mut self,
@@ -433,18 +410,6 @@ impl NodeBuilder {
 
     /// Consumes the builder and runs the node until `shutdown` is cancelled.
     pub async fn run(mut self, shutdown: CancellationToken) -> Result<()> {
-        let simulated_wan_source = cfg!(feature = "sim")
-            && self.link_listen.is_none()
-            && self.cluster.as_ref().is_some_and(|options| {
-                !options.ownership_peers.is_empty()
-                    && options.ownership_peers.iter().all(|peer| peer.fabric_wan)
-            });
-        anyhow::ensure!(
-            !self.local_rtp_v1
-                || (self.cluster.is_none() && self.link_listen.is_none())
-                || simulated_wan_source,
-            "local Fabric RTP requires a standalone node or a simulated provisioned Fabric route"
-        );
         let Some(options) = self.cluster.take() else {
             return self
                 .run_media(
@@ -591,7 +556,6 @@ impl NodeBuilder {
 
         debug_assert!(!udp_sockets.is_empty());
         let shard_count = udp_sockets.len();
-        let local_rtp_v1 = self.local_rtp_v1;
 
         if shard_count != requested_shard_count {
             tracing::warn!(
@@ -775,7 +739,6 @@ impl NodeBuilder {
                         worker_occupancy,
                         shard_stats_tx,
                         wall_anchor,
-                        local_rtp_v1,
                     );
                     Ok(pulsebeam_runtime::rt::ManagedService::new(shard, udp_sock))
                 };
@@ -813,7 +776,6 @@ impl NodeBuilder {
             view_writers,
         );
         controller.set_ownership_mode(ownership_mode);
-        controller.set_data_profile(self.data_profile);
         #[cfg(feature = "sim")]
         if let Some(peer) = self.sim_ownership_peer.as_ref() {
             controller.set_sim_ownership_peer(peer.clone());
@@ -992,6 +954,8 @@ async fn bind_udp_socket(
         let mut options = pulsebeam_udp::BindOptions::new(local_addr);
         options.reuse_port = true;
         options.max_datagram_bytes = pulsebeam_udp::MAX_DATAGRAM_BYTES;
+        options.nonfragmenting_max_datagram_bytes =
+            std::num::NonZeroU16::new(pulsebeam_core::fabric::MAX_UDP_PAYLOAD_BYTES);
         options.mode = match mode {
             UdpMode::Batch => pulsebeam_udp::Mode::Auto,
             UdpMode::Scalar => pulsebeam_udp::Mode::Scalar,

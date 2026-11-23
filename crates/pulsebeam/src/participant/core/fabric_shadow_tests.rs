@@ -518,10 +518,6 @@ fn exercise_native_data_v1(delivery: pulsebeam_proto::state::DataV1Delivery) {
     let mut control = fabric_native_control(&mut config, now, publisher.clock.monotonic);
     let mut subscriber_control =
         fabric_native_control(&mut receiver, now, subscriber.clock.monotonic);
-    if reliable {
-        control.enable_reliable_data_fixture();
-        subscriber_control.enable_reliable_data_fixture();
-    }
     let mut shard = FabricRtpFixture::new(config, receiver, Profile::Data, None);
     publisher.connect(shard.publisher());
     subscriber.connect(shard.receiver());
@@ -1101,7 +1097,6 @@ fn fabric_native_control(
     config.authorization_expiry =
         Some(pulsebeam_core::auth::AuthorizationExpiry::from_unix_seconds(expiry));
     config.resources.native_handoff = Some(handoff);
-    control.enable_data_v1();
     control.set_cid(crate::media::ChannelId::from_value(0), rtc_now);
     control
 }
@@ -1387,7 +1382,7 @@ fn protected_sctp_data_uses_the_bound_pt99_route_and_preserves_each_message() {
 }
 
 #[test]
-fn authenticated_opus_shadow_uses_observed_clock_without_a_second_delivery() {
+fn authenticated_opus_observes_the_source_clock_and_fences_retired_media() {
     let (mut pair, config, mid, peer_mid, payload_type) = media_pair(
         str0m::media::MediaKind::Audio,
         str0m::media::Direction::SendOnly,
@@ -1442,20 +1437,11 @@ fn authenticated_opus_shadow_uses_observed_clock_without_a_second_delivery() {
     }
     let (_, publication_id) = connection.upstream.slot_for_mid(mid).unwrap();
     assert_eq!(sink.publish_track_calls, [publication_id]);
-    assert!(sink.publish_track_packet_calls.is_empty());
     let fanout = slotmap::SlotMap::<TrackHandle, ()>::with_key().insert(());
     connection.apply(
         ParticipantEffect::TrackPublished { publication_id },
         Some(fanout),
     );
-    write(&mut pair, 40, &[0xf8, 0xff, 0xfe]);
-    for _ in 0..200 {
-        pair.step_with_sink(&mut connection, None, &mut sink);
-        if !sink.publish_track_packet_calls.is_empty() {
-            break;
-        }
-    }
-    assert_eq!(sink.publish_track_packet_calls, [fanout]);
     assert!(
         connection
             .prepare_whip_rtp_ingress(publication_id, fanout)
@@ -1474,11 +1460,14 @@ fn authenticated_opus_shadow_uses_observed_clock_without_a_second_delivery() {
     write(&mut pair, 60, &[0xf8, 0xff, 0xfe]);
     for _ in 0..200 {
         pair.step_with_sink(&mut connection, None, &mut sink);
-        if sink.publish_track_packet_calls.len() >= 2 {
+        if connection
+            .media_ingress
+            .values()
+            .any(|shadow| shadow.observation.is_some())
+        {
             break;
         }
     }
-    assert_eq!(sink.publish_track_packet_calls, [fanout, fanout]);
     let shadow = connection.media_ingress.values().next().unwrap();
     let (stamp, observation) = shadow.observation.unwrap();
     assert_eq!(
@@ -1496,19 +1485,21 @@ fn authenticated_opus_shadow_uses_observed_clock_without_a_second_delivery() {
 
     let fenced =
         slotmap::SlotMap::<crate::shard::router::FabricSourceHandle, ()>::with_key().insert(());
-    connection
-        .media_ingress
-        .values_mut()
-        .next()
-        .unwrap()
-        .publisher_source = Some(fenced);
+    let shadow = connection.media_ingress.values_mut().next().unwrap();
+    shadow.publisher_source = Some(fenced);
+    shadow.observation = None;
     connection.fenced_fabric_sources.insert(fenced);
     assert!(!connection.fabric_source_authorized(fenced));
     write(&mut pair, 80, &[0xf8, 0xff, 0xfe]);
     for _ in 0..200 {
         pair.step_with_sink(&mut connection, None, &mut sink);
     }
-    assert_eq!(sink.publish_track_packet_calls, [fanout, fanout]);
+    assert!(
+        connection
+            .media_ingress
+            .values()
+            .all(|shadow| shadow.observation.is_none())
+    );
 }
 
 #[test]
@@ -1600,7 +1591,7 @@ fn authenticated_large_primary_and_rtx_fan_out_and_receiver_refresh_reaches_the_
         pulsebeam_rtc::RtpExtensionForm::TwoByte => ExtensionForm::TwoByte,
         pulsebeam_rtc::RtpExtensionForm::Mixed => ExtensionForm::Mixed,
     };
-    let hints = EndpointHints::new(Profile::H264, form, &[], None).unwrap();
+    let hints = EndpointHints::new(Profile::H264, form, &[]).unwrap();
     let leg = SenderLeg::new(
         OutputLeg {
             mid,
@@ -1781,7 +1772,7 @@ async fn dd_free_h264_repairs_at_exact_protected_ceiling_on_participant_udp() {
 async fn native_maximum_encoded_opus_reaches_authenticated_rtp() {
     use crate::stock_rtc::{LoopbackMedia, NativeMediaEndpoint, assert_decoded_stock_opus};
 
-    let opus = maximum_stock_opus_packet();
+    let opus = padded_stock_opus_packet(1_200);
     assert_decoded_stock_opus(opus.clone(), 960);
 
     // The observation socket must not inherit the narrower Fabric limit.
@@ -1837,20 +1828,19 @@ async fn native_maximum_encoded_opus_reaches_authenticated_rtp() {
 }
 
 #[cfg(feature = "transport-conformance")]
-fn maximum_stock_opus_packet() -> Vec<u8> {
-    const MAX_OPUS_INPUT: usize = 1_200;
+fn padded_stock_opus_packet(payload_bytes: usize) -> Vec<u8> {
     let source = crate::stock_rtc::stock_opus_packet();
     assert_eq!(source[0] & 3, 0, "single-frame stock packet");
     // Use Opus code 3 padding without changing the stock encoded frame.
     let mut opus = vec![source[0] | 3, 0b0100_0001];
-    let mut remaining = MAX_OPUS_INPUT - source.len() - 1;
+    let mut remaining = payload_bytes - source.len() - 1;
     while remaining > 255 {
         opus.push(255);
         remaining -= 255;
     }
     opus.push(u8::try_from(remaining - 1).unwrap());
     opus.extend_from_slice(&source[1..]);
-    opus.resize(MAX_OPUS_INPUT, 0);
+    opus.resize(payload_bytes, 0);
     opus
 }
 
@@ -1861,8 +1851,8 @@ async fn stock_opus_decodes_across_capped_whip_and_whep_udp() {
     use crate::stock_rtc::{LoopbackMedia, NativeMediaEndpoint, assert_decoded_stock_opus};
     use pulsebeam_core::fabric::Profile;
 
-    const PUBLISHER_WIRE_BYTES: u16 = 1_236;
-    let opus = maximum_stock_opus_packet();
+    const PUBLISHER_WIRE_BYTES: u16 = 1_232;
+    let opus = padded_stock_opus_packet(1_196);
     let (mut publisher, config, mid, primary) =
         NativePublisherUdp::connect_with_cap(LoopbackMedia::OpusPublisher, PUBLISHER_WIRE_BYTES)
             .await;
@@ -1924,26 +1914,23 @@ async fn stock_opus_decodes_across_capped_whip_and_whep_udp() {
             .shard
             .attach_publisher_ingress(binding.expect("authenticated Opus ingress binding"))
     );
-    assert!(
-        endpoint.shard.bind_output(
-            SenderLeg::new(
-                OutputLeg {
-                    mid: endpoint.mid,
-                    primary: None,
-                    max_wire_bytes: 1_216,
-                    replace_queued: false,
-                },
-                EndpointHints::new(Profile::Opus, endpoint.form, &[], None).unwrap(),
-                timeline::Timeline::new(500, 1500, 48_000, 64).unwrap(),
-            )
-            .with_source_wire_budget(),
-            SourceMetadata {
-                vad: Vad::On,
-                capture: CaptureClock::Unmapped,
-                same_topology: true,
+    assert!(endpoint.shard.bind_output(
+        SenderLeg::new(
+            OutputLeg {
+                mid: endpoint.mid,
+                primary: None,
+                max_wire_bytes: usize::from(PUBLISHER_WIRE_BYTES),
+                replace_queued: false,
             },
-        )
-    );
+            EndpointHints::new(Profile::Opus, endpoint.form, &[]).unwrap(),
+            timeline::Timeline::new(500, 1500, 48_000, 64).unwrap(),
+        ),
+        SourceMetadata {
+            vad: Vad::On,
+            capture: CaptureClock::Unmapped,
+            same_topology: true,
+        },
+    ));
     let endpoint_original_ssrc = endpoint.udp.primary;
     let mut input = None;
     let mut output = None;
@@ -1993,8 +1980,8 @@ async fn stock_opus_decodes_across_capped_whip_and_whep_udp() {
     });
     assert_eq!(input, Some(usize::from(PUBLISHER_WIRE_BYTES)));
     assert!(
-        (1_217..=input.unwrap()).contains(&output.unwrap()),
-        "Opus delivery must exceed the old cap without primary growth"
+        (1_217..=usize::from(PUBLISHER_WIRE_BYTES)).contains(&output.unwrap()),
+        "Opus delivery must fit the protected UDP ceiling"
     );
     assert_eq!(endpoint.udp.received_primary, 1);
     assert_eq!(audio.ssrc, endpoint.udp.primary);
@@ -2156,7 +2143,7 @@ async fn prove_stock_video_on_capped_udp(
                     max_wire_bytes: 1_216,
                     replace_queued: false,
                 },
-                EndpointHints::new(profile, endpoint.form, &[], None).unwrap(),
+                EndpointHints::new(profile, endpoint.form, &[]).unwrap(),
                 timeline::Timeline::new(500, 1500, 90_000, 64).unwrap(),
             )
             .with_answer_fid(fid),
@@ -2252,9 +2239,12 @@ async fn prove_stock_video_on_capped_udp(
                 && input.primary_sizes.values().any(|bytes| *bytes >= 1_100)
         );
         assert_eq!(input.primary_sizes.len(), output.primary_sizes.len());
-        for (sequence, input_len) in &input.primary_sizes {
+        for sequence in input.primary_sizes.keys() {
             let projected = first_output.wrapping_add(sequence.wrapping_sub(first_input));
-            assert!(output.primary_sizes[&projected] <= *input_len);
+            assert!(
+                output.primary_sizes[&projected]
+                    <= usize::from(pulsebeam_core::fabric::MAX_UDP_PAYLOAD_BYTES)
+            );
         }
         first_output = first_output.wrapping_add(u16::try_from(input.primary_sizes.len()).unwrap());
         if cross_shard {
@@ -2943,6 +2933,9 @@ impl NativeParticipantUdp {
             peer.connect(shard.publisher());
             now = now.max(peer.clock.monotonic);
         }
+        now = now
+            .max(shard.publisher().transport.clock())
+            .max(shard.receiver().transport.clock());
         Self {
             shard,
             native,
@@ -3006,11 +2999,11 @@ async fn decode_stock_h264_on_participant_udp(filtered: bool) {
     };
     use pulsebeam_core::fabric::{Extension, ExtensionKind, FabricPacket, Header, Profile};
 
-    const WIRE_CAP: usize = 1_216;
+    const WIRE_CAP: u16 = pulsebeam_core::fabric::MAX_UDP_PAYLOAD_BYTES;
     const RTP_HEADER: usize = 12;
     const GCM_TAG: usize = 16;
     const RTX_OSN: usize = 2;
-    const PAYLOAD_CAP: usize = WIRE_CAP - RTP_HEADER - GCM_TAG - RTX_OSN;
+    const PAYLOAD_CAP: usize = WIRE_CAP as usize - RTP_HEADER - GCM_TAG - RTX_OSN;
     let packets: Vec<(Box<[u8]>, bool)> = if filtered {
         let mut source = crate::stock_rtc::PeerFixture::connected_video_with_rfc8888();
         assert!(matches!(
@@ -3038,7 +3031,7 @@ async fn decode_stock_h264_on_participant_udp(filtered: bool) {
     } else {
         LoopbackMedia::H264
     };
-    let mut endpoint = NativeParticipantUdp::connect(media).await;
+    let mut endpoint = NativeParticipantUdp::connect_with_cap(media, None, WIRE_CAP).await;
     let fid = [endpoint.udp.primary, endpoint.udp.repair.unwrap()];
     let mid = endpoint.mid;
     let form = endpoint.form;
@@ -3053,10 +3046,10 @@ async fn decode_stock_h264_on_participant_udp(filtered: bool) {
         OutputLeg {
             mid,
             primary: None,
-            max_wire_bytes: WIRE_CAP,
+            max_wire_bytes: usize::from(WIRE_CAP),
             replace_queued: false,
         },
-        EndpointHints::new(Profile::H264, form, mapping.as_slice(), None).unwrap(),
+        EndpointHints::new(Profile::H264, form, mapping.as_slice()).unwrap(),
         timeline::Timeline::new(FIRST_OUTPUT_SEQUENCE, 1500, 90_000, 64).unwrap(),
     );
     let mut leg = if filtered {
@@ -3082,15 +3075,25 @@ async fn decode_stock_h264_on_participant_udp(filtered: bool) {
                 && first >> 6 == 2
                 && !(64..=95).contains(&(pt & 127))
             {
-                if !filtered {
-                    assert_eq!(*first, 0x80, "no output RTP header extensions or padding");
-                }
+                assert!(bytes.len() <= usize::from(WIRE_CAP));
                 let ssrc = u32::from_be_bytes([*w, *x, *y, *z]);
                 let sequence = u16::from_be_bytes([*a, *b]);
                 if ssrc == fid[0] {
                     let index = usize::from(sequence - FIRST_OUTPUT_SEQUENCE);
                     if !filtered {
-                        assert_eq!(bytes.len(), RTP_HEADER + packets[index].0.len() + GCM_TAG);
+                        assert_eq!(*first & 0x2f, 0, "no padding or CSRCs");
+                        let extension_bytes = if *first & 0x10 == 0 {
+                            0
+                        } else {
+                            4 + usize::from(u16::from_be_bytes([bytes[14], bytes[15]])) * 4
+                        };
+                        assert_eq!(
+                            bytes.len(),
+                            RTP_HEADER + extension_bytes + packets[index].0.len() + GCM_TAG
+                        );
+                        if packets[index].0.len() == PAYLOAD_CAP {
+                            assert_eq!(extension_bytes, 0, "full-size RTX requires omitting MID");
+                        }
                     }
                     if index == lost {
                         assert!(!dropped, "repair cannot be a second primary");
@@ -3101,7 +3104,11 @@ async fn decode_stock_h264_on_participant_udp(filtered: bool) {
                     assert_eq!(ssrc, fid[1]);
                     assert!(dropped);
                     if !filtered {
-                        assert_eq!(bytes.len(), WIRE_CAP, "full-size protected RTX");
+                        assert_eq!(
+                            bytes.len(),
+                            usize::from(WIRE_CAP),
+                            "full-size protected RTX"
+                        );
                     }
                     repaired = true;
                 }
@@ -3188,7 +3195,7 @@ async fn decode_stock_h264_on_participant_udp(filtered: bool) {
         dropped && repaired,
         "Native decoded after a lost primary was repaired on its installed FID"
     );
-    assert!((1_000..=WIRE_CAP).contains(&endpoint.udp.peak));
+    assert!((1_000..=usize::from(WIRE_CAP)).contains(&endpoint.udp.peak));
 }
 
 fn prove_filtered_dd_switch(
@@ -3230,7 +3237,6 @@ fn prove_filtered_dd_switch(
             uri: dd::URI,
             attributes: None,
         }],
-        None,
     )
     .unwrap();
     let mut leg = SenderLeg::new(
@@ -3550,7 +3556,7 @@ fn installed_fabric_branch_projects_authenticated_rtp_without_waiting_for_holes(
         pulsebeam_rtc::RtpExtensionForm::TwoByte => ExtensionForm::TwoByte,
         pulsebeam_rtc::RtpExtensionForm::Mixed => ExtensionForm::Mixed,
     };
-    let endpoint = EndpointHints::new(Profile::Opus, form, &[], None).unwrap();
+    let endpoint = EndpointHints::new(Profile::Opus, form, &[]).unwrap();
     let leg = SenderLeg::new(
         OutputLeg {
             mid,

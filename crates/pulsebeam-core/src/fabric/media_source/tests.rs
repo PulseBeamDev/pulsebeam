@@ -32,6 +32,61 @@ fn dd(value: &[u8]) -> Extension<'_> {
 }
 
 #[test]
+fn authenticated_primary_resumes_idle_without_reopening_old_positions() {
+    let mut identity = source(8, Anchors::default()).into_identity();
+    let now = Instant::now();
+    let idle = now + Duration::from_secs(3);
+    let mut admit = |at, position, input| identity.admit(at, at, 0, position, input, |_| None);
+    assert!(matches!(
+        admit(
+            now,
+            Position::AuthenticatedPrimary(65535),
+            media(false, 500, &[])
+        ),
+        Ok(IdentityAdmission::Media {
+            sequence: 65535,
+            ..
+        })
+    ));
+    assert!(matches!(
+        admit(idle, Position::LowSequence(0), media(true, 501, &[])),
+        Err(Rejected::Epoch)
+    ));
+    assert!(matches!(
+        admit(
+            idle,
+            Position::AuthenticatedPrimary(65536),
+            Input::PrimaryPadding
+        ),
+        Err(Rejected::Epoch)
+    ));
+    assert!(matches!(
+        admit(
+            idle,
+            Position::AuthenticatedPrimary(65534),
+            media(false, 499, &[])
+        ),
+        Err(Rejected::Epoch)
+    ));
+    assert!(matches!(
+        admit(
+            idle,
+            Position::AuthenticatedPrimary(65537),
+            media(false, 502, &[])
+        ),
+        Ok(IdentityAdmission::Media {
+            sequence: 65537,
+            ..
+        })
+    ));
+    assert!(matches!(
+        admit(idle, Position::LowSequence(0), media(true, 501, &[])),
+        Err(Rejected::Stale)
+    ));
+    assert_eq!(identity.oldest(), 65537);
+}
+
+#[test]
 fn rtx_first_freezes_image_but_later_primary_fixes_presence() {
     let now = Instant::now();
     let mut source = source(4, Anchors::default());
@@ -92,7 +147,14 @@ fn identity_retries_require_the_owners_exact_retained_original() {
         original: Some(original),
         ..
     } = identity
-        .admit(now, now, 10, 5, media(true, 30, &[]), |_| None)
+        .admit(
+            now,
+            now,
+            10,
+            Position::LowSequence(5),
+            media(true, 30, &[]),
+            |_| None,
+        )
         .unwrap()
     else {
         panic!("first admission did not transfer an original");
@@ -100,18 +162,27 @@ fn identity_retries_require_the_owners_exact_retained_original() {
     assert_eq!(sequence, 5);
     let later = now + Duration::from_millis(1);
     assert!(matches!(
-        identity.admit(later, later, 11, 5, media(false, 30, &[]), |_| None),
+        identity.admit(
+            later,
+            later,
+            11,
+            Position::LowSequence(5),
+            media(false, 30, &[]),
+            |_| None
+        ),
         Err(Rejected::Stale)
     ));
     assert!(matches!(
-        identity.admit(later, later, 12, 5, media(false, 30, &[]), |position| {
+        identity.admit(later, later, 12, Position::LowSequence(5), media(false, 30, &[]), |position| {
             assert_eq!(position, sequence);
             Some(&original)
         }),
         Ok(IdentityAdmission::Media { sequence: 5, arrival, original: None }) if arrival == now
     ));
     let changed = media(false, 31, &[]);
-    let result = identity.admit(later, later, 12, 5, changed, |_| Some(&original));
+    let result = identity.admit(later, later, 12, Position::LowSequence(5), changed, |_| {
+        Some(&original)
+    });
     assert!(matches!(result, Err(Rejected::Conflict)));
 }
 

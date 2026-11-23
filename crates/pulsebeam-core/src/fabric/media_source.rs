@@ -51,6 +51,12 @@ pub enum Input<'a> {
     Media(MediaCopy<'a>),
 }
 
+#[derive(Clone, Copy)]
+pub enum Position {
+    LowSequence(u16),
+    AuthenticatedPrimary(u64),
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Admission<'a> {
     Padding,
@@ -86,6 +92,7 @@ pub struct MediaIdentity {
     profile: Profile,
     limits: Limits,
     high: Option<u64>,
+    resume_floor: u64,
     last_progress: Option<Instant>,
     clock: Clock,
     ledger: BTreeMap<u64, Entry>,
@@ -147,7 +154,7 @@ impl MediaSource {
             now,
             arrival,
             ingress_ntp32,
-            low_sequence,
+            Position::LowSequence(low_sequence),
             input,
             |sequence| originals.get(&sequence),
         )?;
@@ -193,6 +200,7 @@ impl MediaIdentity {
         Some(Self {
             profile,
             high: anchors.sequence,
+            resume_floor: 0,
             clock: anchors.timestamp.map_or(Clock::Unanchored, Clock::Tracking),
             limits,
             last_progress: None,
@@ -214,12 +222,13 @@ impl MediaIdentity {
         self.high
             .unwrap_or_default()
             .saturating_sub(u64::from(self.limits.positions.get()).saturating_sub(1))
+            .max(self.resume_floor)
     }
 
     /// True only when every position in a nonempty range was authenticated
     /// as primary padding for this incarnation.
     pub fn covers_padding(&self, positions: std::ops::Range<u64>) -> bool {
-        if self.fenced || positions.is_empty() {
+        if self.fenced || positions.is_empty() || positions.start < self.resume_floor {
             return false;
         }
         let count = positions.end.saturating_sub(positions.start);
@@ -236,7 +245,7 @@ impl MediaIdentity {
         now: Instant,
         arrival: Instant,
         ingress_ntp32: u32,
-        low_sequence: u16,
+        position: Position,
         input: Input<'_>,
         original: impl FnOnce(u64) -> Option<&'a FabricPacket<Box<[u8]>>>,
     ) -> Result<IdentityAdmission, Rejected> {
@@ -249,16 +258,32 @@ impl MediaIdentity {
         {
             return Err(Rejected::Stale);
         }
-        if self
+        let idle = self
             .last_progress
-            .is_some_and(|last| now.saturating_duration_since(last) > self.limits.max_idle)
+            .is_some_and(|last| now.saturating_duration_since(last) > self.limits.max_idle);
+        let sequence = match position {
+            Position::AuthenticatedPrimary(sequence) if !matches!(&input, Input::Media(copy) if copy.is_repair) => {
+                sequence
+            }
+            Position::LowSequence(low) if !idle => {
+                let low = u64::from(low);
+                self.high
+                    .map_or(Ok(low), |high| unwrap(low, high, SEQUENCE_CYCLE))?
+            }
+            Position::AuthenticatedPrimary(_) | Position::LowSequence(_) => {
+                return Err(Rejected::Epoch);
+            }
+        };
+        // Only an advancing, replay-checked primary carrying media may resume
+        // an idle binding. RTX's independent SRTP index proves no primary position.
+        if idle
+            && (self.high.is_none_or(|high| sequence <= high) || !matches!(&input, Input::Media(_)))
         {
             return Err(Rejected::Epoch);
         }
-        let low = u64::from(low_sequence);
-        let sequence = self
-            .high
-            .map_or(Ok(low), |anchor| unwrap(low, anchor, SEQUENCE_CYCLE))?;
+        if sequence < self.resume_floor {
+            return Err(Rejected::Stale);
+        }
         let span = u64::from(self.limits.positions.get());
         if let Some(high) = self.high {
             if high.saturating_sub(sequence) >= span {
@@ -322,7 +347,10 @@ impl MediaIdentity {
         if newer {
             self.high = Some(sequence);
             self.last_progress = Some(self.last_progress.map_or(arrival, |last| last.max(arrival)));
-            let oldest = sequence.saturating_sub(span.saturating_sub(1));
+            if idle {
+                self.resume_floor = sequence;
+            }
+            let oldest = self.oldest();
             while self
                 .ledger
                 .first_key_value()

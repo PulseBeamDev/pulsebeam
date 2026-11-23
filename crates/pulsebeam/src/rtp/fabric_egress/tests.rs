@@ -47,7 +47,6 @@ fn output_vad_default_and_asymmetric_omission() {
                 uri: "urn:ietf:params:rtp-hdrext:ssrc-audio-level",
                 attributes,
             }],
-            None,
         )
         .unwrap();
         let projection = endpoint.project(policy(source, CaptureClock::Unmapped, true), &packet);
@@ -68,7 +67,6 @@ fn capture_clock_offset_is_signed_and_missing_is_not_zero() {
             uri: "http://www.webrtc.org/experiments/rtp-hdrext/abs-capture-time",
             attributes: None,
         }],
-        None,
     )
     .unwrap();
     let original = [1, 2, 3, 4, 5, 6, 7, 8, 0xff, 0xff, 0xff, 0xfe, 0, 0, 0, 0];
@@ -115,13 +113,13 @@ fn rewritten_dependency_descriptor_must_fit_the_negotiated_form() {
         (ExtensionForm::TwoByte, 255),
         (ExtensionForm::Mixed, 255),
     ] {
-        let endpoint = EndpointHints::new(Profile::H264, form, &mappings, None).unwrap();
+        let endpoint = EndpointHints::new(Profile::H264, form, &mappings).unwrap();
         assert!(endpoint.dependency_hint(2).is_none());
         assert_eq!(endpoint.dependency_hint(3).unwrap().id, 14);
         assert_eq!(endpoint.dependency_hint(max).unwrap().id, 14);
         assert!(endpoint.dependency_hint(max + 1).is_none());
     }
-    let unmapped = EndpointHints::new(Profile::H264, ExtensionForm::Mixed, &[], None).unwrap();
+    let unmapped = EndpointHints::new(Profile::H264, ExtensionForm::Mixed, &[]).unwrap();
     assert!(unmapped.dependency_hint(3).is_none());
 }
 
@@ -137,11 +135,6 @@ fn whole_source_hints_respect_topology_form_and_presence() {
         Mapping {
             id: 5,
             uri: "http://www.webrtc.org/experiments/rtp-hdrext/color-space",
-            attributes: None,
-        },
-        Mapping {
-            id: 6,
-            uri: "http://www.webrtc.org/experiments/rtp-hdrext/playout-delay",
             attributes: None,
         },
         Mapping {
@@ -162,40 +155,22 @@ fn whole_source_hints_respect_topology_form_and_presence() {
                 value: &[0],
             },
             Extension {
-                kind: ExtensionKind::PlayoutDelay,
-                value: &[0, 0, 1],
-            },
-            Extension {
                 kind: ExtensionKind::DependencyDescriptor,
                 value: &[0xc0, 0, 1],
             },
         ],
     );
     let absent = packet(Profile::H264, &[]);
-    let override_bytes = [0, 0, 2];
     for (form, same, expected) in [
-        (
-            ExtensionForm::OneByte,
-            true,
-            vec![(4, &[0][..]), (6, override_bytes.as_slice())],
-        ),
+        (ExtensionForm::OneByte, true, vec![(4, &[0][..])]),
         (
             ExtensionForm::TwoByte,
             true,
-            vec![
-                (4, &[0][..]),
-                (5, hdr.as_slice()),
-                (6, override_bytes.as_slice()),
-            ],
+            vec![(4, &[0][..]), (5, hdr.as_slice())],
         ),
-        (
-            ExtensionForm::Mixed,
-            false,
-            vec![(5, hdr.as_slice()), (6, override_bytes.as_slice())],
-        ),
+        (ExtensionForm::Mixed, false, vec![(5, hdr.as_slice())]),
     ] {
-        let endpoint =
-            EndpointHints::new(Profile::H264, form, &mappings, Some(override_bytes)).unwrap();
+        let endpoint = EndpointHints::new(Profile::H264, form, &mappings).unwrap();
         let policy = policy(Vad::On, CaptureClock::Unmapped, same);
         assert_eq!(
             endpoint

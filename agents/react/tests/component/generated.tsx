@@ -19,7 +19,6 @@ import {
   DataSubscription,
   LocalVideoTrack,
   PipeStatus,
-  PlayoutDelay,
   VideoPublication,
   VideoSource,
   VideoSubscription,
@@ -100,7 +99,6 @@ async function handles() {
       minHeight: 0,
       minFps: 0,
       priority: 1,
-      playoutDelay: PlayoutDelay.Adaptive.new(),
     });
     const audio = useSubscribe(peer.audio("microphone"));
     const microphone = usePublish(agent.audio("microphone"));

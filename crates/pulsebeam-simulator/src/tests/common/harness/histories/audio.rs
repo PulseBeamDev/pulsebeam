@@ -5,7 +5,6 @@ pub(super) async fn request(
     handles: &PlanHandles,
     pinned: &[u8],
     automatic: bool,
-    fixed_ms: Option<u16>,
     witness: &mut Witness,
 ) -> Result<()> {
     let targets = pinned
@@ -30,7 +29,6 @@ pub(super) async fn request(
         .push(PendingDriverOp::SetAudioRequest(
             targets,
             automatic,
-            fixed_ms,
             issued.clone(),
         ));
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -43,7 +41,7 @@ pub(super) async fn request(
     .context("audio desired state was not issued")??;
     state.recovery_at = state.recovery_at.max(Instant::now());
     witness.record(format!(
-        "audio-input pinned={pinned:?} automatic={automatic} fixed_ms={fixed_ms:?}"
+        "audio-input pinned={pinned:?} automatic={automatic}"
     ));
     Ok(())
 }
@@ -200,13 +198,13 @@ pub(super) async fn pressure(
     witness: &mut Witness,
 ) -> Result<()> {
     // Four actual desired-state commands, not a loop waiting for convergence.
-    for (pinned, automatic, delay) in [
-        (vec![0], false, None),
-        (vec![], false, None),
-        (vec![], true, None),
-        (vec![0], false, None),
+    for (pinned, automatic) in [
+        (vec![0], false),
+        (vec![], false),
+        (vec![], true),
+        (vec![0], false),
     ] {
-        request(state, handles, &pinned, automatic, delay, witness).await?;
+        request(state, handles, &pinned, automatic, witness).await?;
     }
     witness.reach("bounded-signaling-input-burst-issued");
     let settled = Arc::new(Mutex::new(None));

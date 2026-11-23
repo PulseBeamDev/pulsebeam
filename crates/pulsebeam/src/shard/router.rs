@@ -1,8 +1,6 @@
-use crate::clock::WallAnchor;
 use crate::id::ShardId;
 use crate::keys::ParticipantHandle;
 use crate::participant::reverse::ReversePacket;
-use crate::participant::{ParticipantInput, RoutedTrackPacket, TrackPacket, TrackPacketRef};
 use crate::route::fabric::local::{
     Emission, FabricBranchHandle, MAX_BRANCHES, Offers, OwnedPacket, PacketView, Rejection,
     RepairAdmission, RepairRequest, RepairTarget, SourceFanout,
@@ -11,35 +9,16 @@ use crate::route::fabric::{
     CompiledLiveRelay, CompiledPublisherSend, LiveAdmissions, LiveNetworkChild, NetworkPacket,
     ShardBinding, ShardOffer, network_repair::Interest, relay::LiveRelays,
 };
-use crate::route::{MediaDelivery, NodeRouteAddress, RouteAction, RouteRuntime};
-use crate::rtp::cache::TrackStreamCache;
+use crate::route::{NodeRouteAddress, RouteAction, RouteRuntime};
 use slotmap::SlotMap;
 use std::{collections::HashMap, num::NonZeroU64};
 
-use super::worker::{MediaPayload, ShardFrame};
+use super::worker::ShardFrame;
 
 pub(crate) use crate::keys::TrackHandle;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Origin {
-    Local,
-    Remote,
-}
-
-impl Origin {
-    fn is_local(self) -> bool {
-        matches!(self, Self::Local)
-    }
-}
-
 pub(crate) trait IngressTransport {
     fn send_frame(&self, dst: ShardId, frame: ShardFrame);
-}
-
-pub(crate) struct ForwardingContext<'a> {
-    pub registry: &'a mut super::participants::ParticipantRegistry,
-    pub dirty: &'a mut super::dirty::DirtyTracker,
-    pub wall: &'a WallAnchor,
 }
 
 slotmap::new_key_type! {
@@ -272,6 +251,7 @@ enum FabricIngress {
         binding: ShardBinding,
         /// Only an exact binding installation can widen this entitlement.
         members: Vec<ParticipantHandle>,
+        last_refresh: Option<pulsebeam_runtime::time::Instant>,
     },
     Network {
         incarnation: NonZeroU64,
@@ -377,17 +357,12 @@ impl FabricRefresh {
 const MAX_TRACK_FABRIC_SOURCES: usize = crate::track::MAX_SIMULCAST_LAYERS;
 type TrackFabricSources = arrayvec::ArrayVec<FabricSourceHandle, MAX_TRACK_FABRIC_SOURCES>;
 
-enum TrackMedia {
-    Legacy(Option<TrackStreamCache>),
-    Fabric(TrackFabricSources),
-}
+#[derive(Default)]
+struct TrackSources(TrackFabricSources);
 
-impl TrackMedia {
+impl TrackSources {
     fn sources(&self) -> &[FabricSourceHandle] {
-        match self {
-            Self::Legacy(_) => &[],
-            Self::Fabric(sources) => sources,
-        }
+        &self.0
     }
 
     fn fabric(&self) -> Option<FabricSourceHandle> {
@@ -398,26 +373,17 @@ impl TrackMedia {
     }
 
     fn insert_fabric(&mut self, source: FabricSourceHandle) {
-        match self {
-            Self::Legacy(_) => {
-                let mut sources = TrackFabricSources::new();
-                sources.push(source);
-                *self = Self::Fabric(sources);
-            }
-            Self::Fabric(sources) => sources.push(source),
-        }
+        self.0.push(source);
     }
 
     fn remove_fabric(&mut self, source: FabricSourceHandle) {
-        if let Self::Fabric(sources) = self {
-            sources.retain(|candidate| *candidate != source);
-        }
+        self.0.retain(|candidate| *candidate != source);
     }
 }
 
 struct TrackRuntime {
     id: crate::entity::PublicationKey,
-    media: TrackMedia,
+    media: TrackSources,
     origin: Option<ParticipantHandle>,
     publisher: Option<ParticipantHandle>,
 }
@@ -428,58 +394,6 @@ pub(crate) struct InstalledTrackPlan {
     pub remote: Vec<crate::shard_update::CompiledRoute>,
     pub wan_transit: bool,
     pub reverse_route: Option<crate::shard_update::CompiledRoute>,
-}
-
-/// Hand a packet to every destination-local recipient in an owned track plan.
-fn fanout_local(plan: &InstalledTrackPlan, mut deliver: impl FnMut(ParticipantHandle)) {
-    for &subscriber in &plan.local {
-        deliver(subscriber);
-    }
-}
-
-/// Forward legacy media only to other shards in this node.
-fn fanout_remote(
-    plan: &InstalledTrackPlan,
-    playout: u32,
-    mut payload: impl FnMut() -> MediaPayload,
-) {
-    for remote in plan
-        .remote
-        .iter()
-        .filter(|route| route.targets_local_route())
-    {
-        let delivery = MediaDelivery {
-            address: remote.address,
-            playout_ntp32: playout,
-        };
-        let _ = super::worker::send_link_frame(
-            &remote.tx,
-            remote.clock_origin,
-            ShardFrame::Media {
-                delivery,
-                payload: payload(),
-            },
-        );
-    }
-}
-
-fn forward_track(
-    ctx: &mut ForwardingContext<'_>,
-    subscriber: ParticipantHandle,
-    fanout: TrackHandle,
-    pkt: TrackPacketRef<'_>,
-    cache: Option<&TrackStreamCache>,
-) {
-    let Some(participant) = ctx.registry.resolve_mut(subscriber) else {
-        debug_assert!(false, "a track plan must name a live participant");
-        return;
-    };
-    participant.input(ParticipantInput::Track {
-        key: fanout,
-        packet: pkt,
-        cache,
-    });
-    ctx.dirty.mark(subscriber, participant);
 }
 
 fn admits_fabric_encoding<'a>(
@@ -746,6 +660,7 @@ impl ShardRuntime {
             let FabricIngress::Shard {
                 binding: installed,
                 members,
+                ..
             } = &mut existing.ingress
             else {
                 return None;
@@ -780,6 +695,7 @@ impl ShardRuntime {
             ingress: FabricIngress::Shard {
                 binding,
                 members: plan.local.clone(),
+                last_refresh: None,
             },
             fanout: SourceFanout::new(emission),
             reliable_installation: None,
@@ -2121,7 +2037,7 @@ impl ShardRuntime {
             FabricIngress::Publisher {
                 refresh: Some(_),
                 ..
-            }
+            } | FabricIngress::Shard { .. }
         ) {
             return None;
         }
@@ -2189,6 +2105,29 @@ impl ShardRuntime {
         route.tx.covers(position)
             && Self::publisher_path_live(publisher_sends, route, now)
             && refresh.request(now, request)
+    }
+
+    pub(super) fn prepare_shard_fabric_refresh(
+        &mut self,
+        handle: FabricLocalBranch,
+        destination: ParticipantHandle,
+        now: pulsebeam_runtime::time::Instant,
+    ) -> Option<ShardBinding> {
+        let FabricOwner::Shard(binding) = self.fabric_handoff_owner(handle, destination)? else {
+            return None;
+        };
+        let FabricIngress::Shard { last_refresh, .. } =
+            &mut self.fabric_sources.get_mut(handle.source)?.ingress
+        else {
+            return None;
+        };
+        if last_refresh.is_some_and(|last| {
+            now.saturating_duration_since(last) < crate::track::KEYFRAME_DEBOUNCE
+        }) {
+            return None;
+        }
+        *last_refresh = Some(now);
+        Some(binding)
     }
 
     pub(super) fn request_shard_fabric_refresh(
@@ -3054,7 +2993,7 @@ impl ShardRuntime {
     pub(crate) fn install_track(
         &mut self,
         publication_id: crate::entity::PublicationKey,
-        descriptor: Option<&crate::shard_update::TrackDescriptor>,
+        _descriptor: Option<&crate::shard_update::TrackDescriptor>,
         origin: Option<ParticipantHandle>,
         publisher: Option<ParticipantHandle>,
     ) -> TrackHandle {
@@ -3067,10 +3006,8 @@ impl ShardRuntime {
                 runtime.origin, origin,
                 "a runtime handle cannot change its publisher binding"
             );
-            if runtime.origin.or(runtime.publisher) != origin.or(publisher)
-                && let TrackMedia::Fabric(sources) = &mut runtime.media
-            {
-                for source in std::mem::take(sources) {
+            if runtime.origin.or(runtime.publisher) != origin.or(publisher) {
+                for source in std::mem::take(&mut runtime.media.0) {
                     self.fabric_sources.remove(source);
                 }
             }
@@ -3078,68 +3015,14 @@ impl ShardRuntime {
             runtime.publisher = publisher;
             return handle;
         }
-        let cache = descriptor
-            .filter(|descriptor| descriptor.kind == crate::entity::TrackKind::Video)
-            .map(|descriptor| {
-                debug_assert!(descriptor.encodings.len() <= 3);
-                TrackStreamCache::with_encodings(&descriptor.encodings)
-            });
         let handle = self.tracks.insert(TrackRuntime {
             id: publication_id,
-            media: TrackMedia::Legacy(cache),
+            media: TrackSources::default(),
             origin,
             publisher,
         });
         self.track_handles.insert(publication_id, handle);
         handle
-    }
-
-    #[inline]
-    pub fn route_packet_with_plan(
-        &mut self,
-        key: TrackHandle,
-        origin: Origin,
-        pkt: TrackPacket,
-        plan: &InstalledTrackPlan,
-        ctx: &mut ForwardingContext<'_>,
-    ) {
-        let Some(runtime) = self.tracks.get_mut(key) else {
-            debug_assert!(false, "an RTP packet must resolve to a live track");
-            return;
-        };
-        let TrackMedia::Legacy(cache) = &mut runtime.media else {
-            return;
-        };
-        let seq = pkt.seq_no;
-        let too_old;
-        let (packet, cache) = if let Some(track_cache) = cache.as_mut() {
-            let Some(encoding) = track_cache.source(&pkt) else {
-                return;
-            };
-            too_old = track_cache.push_encoding(encoding, pkt);
-            let Some(packet) = too_old.as_ref().or_else(|| {
-                track_cache
-                    .encoding(encoding)
-                    .and_then(|stream| stream.get(seq))
-            }) else {
-                debug_assert!(false, "a cached packet must be readable");
-                return;
-            };
-            (packet, Some(&*track_cache))
-        } else {
-            (&pkt, None)
-        };
-        fanout_local(plan, |subscriber| {
-            forward_track(ctx, subscriber, key, packet, cache);
-        });
-        if origin.is_local() {
-            let playout = ctx.wall.to_ntp(packet.playout_time);
-            let publication_id = runtime.id;
-            fanout_remote(plan, playout.middle32(), || RoutedTrackPacket {
-                publication_id,
-                packet: packet.to_transit(),
-            });
-        }
     }
 
     pub fn route_reverse(&self, packet: ReversePacket, plan: &InstalledTrackPlan) {
@@ -3388,64 +3271,7 @@ mod tests {
         );
 
         assert_eq!(runtime.tracks.get(key).unwrap().origin, origin_before);
-        assert!(matches!(
-            runtime.tracks.get(key).unwrap().media,
-            TrackMedia::Legacy(Some(_))
-        ));
-    }
-
-    #[test]
-    fn an_empty_encoding_descriptor_still_allocates_stream_cache() {
-        let _rng = pulsebeam_runtime::rand::seeded_rng(1);
-        let mut runtime = ShardRuntime::new(ShardId::new(0));
-        let mut participant_keys = SlotMap::<ParticipantHandle, ()>::with_key();
-        let origin_key = participant_keys.insert(());
-
-        let descriptor = crate::shard_update::TrackDescriptor {
-            origin: crate::entity::ConnectionId::new(),
-            kind: crate::entity::TrackKind::Video,
-            encodings: Vec::new(),
-        };
-        let key = runtime.install_track(
-            publication_id(crate::entity::TrackKind::Video, "empty"),
-            Some(&descriptor),
-            Some(origin_key),
-            None,
-        );
-
-        assert!(
-            runtime
-                .tracks
-                .get(key)
-                .is_some_and(|track| matches!(track.media, TrackMedia::Legacy(Some(_))))
-        );
-    }
-
-    #[test]
-    fn an_audio_track_descriptor_does_not_allocate_a_stream_cache() {
-        let _rng = pulsebeam_runtime::rand::seeded_rng(1);
-        let mut runtime = ShardRuntime::new(ShardId::new(0));
-        let mut participant_keys = SlotMap::<ParticipantHandle, ()>::with_key();
-        let origin_key = participant_keys.insert(());
-
-        let descriptor = crate::shard_update::TrackDescriptor {
-            origin: crate::entity::ConnectionId::new(),
-            kind: crate::entity::TrackKind::Audio,
-            encodings: Vec::new(),
-        };
-        let key = runtime.install_track(
-            publication_id(crate::entity::TrackKind::Audio, "audio"),
-            Some(&descriptor),
-            Some(origin_key),
-            None,
-        );
-
-        assert!(
-            runtime
-                .tracks
-                .get(key)
-                .is_some_and(|track| matches!(track.media, TrackMedia::Legacy(None)))
-        );
+        assert!(runtime.tracks[key].media.sources().is_empty());
     }
 
     #[test]
@@ -3603,7 +3429,7 @@ mod tests {
     }
 
     #[test]
-    fn reinserting_a_fenced_fabric_track_does_not_restore_legacy_forwarding() {
+    fn reinserting_a_fenced_track_cannot_revive_its_retired_source() {
         let _rng = pulsebeam_runtime::rand::seeded_rng(1);
         let mut runtime = ShardRuntime::new(ShardId::new(0));
         let publisher = SlotMap::<ParticipantHandle, ()>::with_key().insert(());
@@ -3614,10 +3440,7 @@ mod tests {
         };
         let publication_id = publication_id(crate::entity::TrackKind::Video, "video");
         let key = runtime.install_track(publication_id, Some(&descriptor), Some(publisher), None);
-        assert!(matches!(
-            runtime.tracks.get(key).unwrap().media,
-            TrackMedia::Legacy(Some(_))
-        ));
+        assert!(runtime.tracks[key].media.sources().is_empty());
         let emission = Emission::new(pulsebeam_core::fabric::Profile::H264, &[]).unwrap();
         let source = runtime
             .install_fabric_source(key, publisher, emission, None, None)
@@ -3628,10 +3451,7 @@ mod tests {
             key
         );
 
-        assert!(matches!(
-            runtime.tracks.get(key).unwrap().media,
-            TrackMedia::Fabric(ref sources) if sources.is_empty()
-        ));
+        assert!(runtime.tracks[key].media.sources().is_empty());
     }
 
     #[test]

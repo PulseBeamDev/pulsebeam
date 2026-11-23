@@ -3202,7 +3202,6 @@ pub struct RequestedVideo {
     pub min_height: u32,
     pub min_fps: u32,
     pub priority: u32,
-    pub playout_delay: pulsebeam_agent_native::agent_core::PlayoutDelay,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4215,7 +4214,6 @@ impl ClientContext {
                 min_height: request.min_height,
                 min_fps: request.min_fps,
                 priority: request.priority,
-                playout_delay: request.playout_delay,
             };
             if visible {
                 resolved.push(VideoSubscription {
@@ -4226,7 +4224,6 @@ impl ClientContext {
                     min_height: request.min_height,
                     min_fps: request.min_fps,
                     priority: request.priority,
-                    playout_delay: request.playout_delay,
                 });
             }
             anyhow::ensure!(
@@ -4298,24 +4295,14 @@ impl ClientContext {
                     && (automatic || audio.pinned.contains(&publication.id))
             })
             .filter_map(|(publication, external_id)| {
-                Some((
-                    TrackSelector {
-                        room: snapshot.room_id.clone()?,
-                        participant_id: external_id.clone(),
-                        track_id: publication.track_id.clone(),
-                    },
-                    audio.playout_delays.get(&publication.id).copied(),
-                ))
+                Some(TrackSelector {
+                    room: snapshot.room_id.clone()?,
+                    participant_id: external_id.clone(),
+                    track_id: publication.track_id.clone(),
+                })
             })
             .collect();
-        audio.selector_delays = sources
-            .iter()
-            .filter_map(|(selector, delay)| delay.map(|delay| (selector.clone(), delay)))
-            .collect();
-        audio.selected = sources
-            .iter()
-            .map(|(selector, _)| selector.clone())
-            .collect();
+        audio.selected = sources.clone();
         let obsolete: Vec<_> = self
             .audio_subscriptions
             .keys()
@@ -4327,30 +4314,14 @@ impl ClientContext {
                 subscription.close().await?;
             }
         }
-        for (selector, delay) in sources {
-            let delay = delay.unwrap_or_default();
-            if let Some(subscription) = self.audio_subscriptions.get(&selector) {
-                let previous = self
-                    .desired
-                    .audio
-                    .selector_delays
-                    .get(&selector)
-                    .copied()
-                    .unwrap_or_default();
-                if previous != delay {
-                    subscription.configure_audio(delay).await?;
-                }
-            } else {
+        for selector in sources {
+            if !self.audio_subscriptions.contains_key(&selector) {
                 let subscription = self
                     .agent
                     .room(selector.room.clone())?
                     .participant(selector.participant_id.clone())?
                     .audio(selector.track_id.clone())?
-                    .subscribe(
-                        pulsebeam_agent_native::agent_core::ffi::AudioSubscriptionConfig {
-                            playout_delay: delay.into(),
-                        },
-                    )?;
+                    .subscribe()?;
                 self.audio_subscriptions.insert(selector, subscription);
             }
         }
@@ -4367,15 +4338,6 @@ impl ClientContext {
         participants: &[String],
         automatic: bool,
     ) -> anyhow::Result<bool> {
-        self.set_audio_request(participants, automatic, None).await
-    }
-
-    pub async fn set_audio_request(
-        &mut self,
-        participants: &[String],
-        automatic: bool,
-        fixed_ms: Option<u16>,
-    ) -> anyhow::Result<bool> {
         let snapshot = self.agent.snapshot();
         let mut pinned = Vec::new();
         for participant in participants {
@@ -4386,23 +4348,8 @@ impl ClientContext {
             };
             pinned.push(publication.id.clone());
         }
-        let playout_delays = pinned
-            .iter()
-            .filter_map(|track| {
-                fixed_ms.map(|delay| {
-                    (
-                        track.clone(),
-                        pulsebeam_agent_native::agent_core::PlayoutDelay::Fixed {
-                            min_ms: u32::from(delay),
-                            max_ms: u32::from(delay),
-                        },
-                    )
-                })
-            })
-            .collect();
         let audio = AudioSubscription {
             pinned,
-            playout_delays,
             ..Default::default()
         };
         self.sync_audio_desired(&snapshot, audio, automatic).await?;

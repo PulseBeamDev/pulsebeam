@@ -267,13 +267,6 @@ impl std::fmt::Display for NodeTransportAddress {
     }
 }
 
-/// Destination-local media dispatch metadata, not a transport wire header.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct MediaDelivery {
-    pub address: NodeRouteAddress,
-    pub playout_ntp32: u32,
-}
-
 /// What the destination does with a frame that arrives on a route.
 ///
 /// Every variant holds keys, never names — `Copy`, and nothing here is ever

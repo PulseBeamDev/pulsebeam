@@ -185,22 +185,19 @@ absent publication and survives connection reconstruction. Each returned
 `RemoteMedia` is a terminal physical observation: after closure, call
 `subscription.observe` again for the next matching incarnation. A renamed
 publication does not match the old subscription. `configure_video` updates video
-demand; `configure_audio` sets audio playout delay. Neither renames the interest,
-and using the wrong media kind is refused. Shared audio interests use adaptive
-playout; changing to a non-adaptive delay requires exclusive ownership. The
-stock native profile rejects fixed audio delay; adaptive is the default. Closing the subscription ends its pending and active
-observations. Do not mix owned subscriptions with raw desired state for the
+demand without renaming the interest. Audio uses the native receiver's default
+buffering. Closing the subscription ends its pending and active observations. Do not mix owned subscriptions with raw desired state for the
 same media kind.
 
 To discover audio sources, use a bounded room watch with Discover permission.
 Then subscribe to each chosen participant and track with Subscribe permission.
 
 Generated callers use `room(name).participant(id).video(label).subscribe(core.VideoObservation)`
-or `room(name).participant(id).audio(label).subscribe(core.AudioSubscriptionConfig)` and the
+or `room(name).participant(id).audio(label).subscribe()` and the
 returned typed subscription's `observe(mode)`. Video preferences contain only
 display demand, not a receiver slot or publication ID. Explicitly visible video
 with height zero has no height ceiling; set `visible: false` to withdraw display
-demand. `configure(record)` updates each owner's configuration. Generated bindings
+demand. `configure(record)` updates a video owner's preferences. Generated bindings
 require an exact audio source for each subscription. Headless native APIs do not
 fabricate capture devices or playback controls.
 

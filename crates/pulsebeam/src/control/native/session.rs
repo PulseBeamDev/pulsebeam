@@ -216,8 +216,6 @@ impl DataBranchIds {
 
 #[derive(Default)]
 pub(crate) struct NativeSession {
-    data_v1_enabled: bool,
-    reliable_data_enabled: bool,
     pub(crate) cid: Option<ChannelId>,
     incident_context: Option<(ProjectId, ConnectionId)>,
     pub(crate) catalog: catalog::CatalogSession,
@@ -257,12 +255,6 @@ pub(crate) struct NativeSession {
     retained_bytes: usize,
     unavailable: usize,
     initial_deadline: Option<pulsebeam_runtime::time::Instant>,
-}
-
-fn is_reliable_data(parameters: &wire::SctpDataV1Parameters) -> bool {
-    parameters.format().is_some_and(|format| {
-        format.delivery() == pulsebeam_proto::data_endpoint::Delivery::Reliable
-    })
 }
 
 impl NativeSession {
@@ -1266,21 +1258,6 @@ impl NativeSession {
         )))
     }
 
-    pub(crate) fn configure_data_profile(&mut self, profile: super::DataProfile) {
-        self.data_v1_enabled = profile != super::DataProfile::Legacy;
-        self.reliable_data_enabled = profile == super::DataProfile::FabricReliable;
-    }
-
-    #[cfg(test)]
-    pub(crate) fn enable_data_v1(&mut self) {
-        self.configure_data_profile(super::DataProfile::FabricLive);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn enable_reliable_data_fixture(&mut self) {
-        self.configure_data_profile(super::DataProfile::FabricReliable);
-    }
-
     pub(crate) fn preparation_pending(&self, unix_now: u64) -> bool {
         self.source_scan || (!self.preparations.is_empty() && self.authorization_current(unix_now))
     }
@@ -1435,13 +1412,7 @@ impl NativeSession {
                         &spec.declaration
                     {
                         let requested = logical.data_version.is_some();
-                        let reliable = matches!(&track.kind, Some(wire::track::Kind::Data(data))
-                            if data.delivery == wire::DataDelivery::Ordered as i32);
-                        if requested != fabric_source.is_some()
-                            || (requested
-                                && (!self.data_v1_enabled
-                                    || (reliable && !self.reliable_data_enabled)))
-                        {
+                        if requested != fabric_source.is_some() {
                             return None;
                         }
                     }
@@ -1627,13 +1598,6 @@ impl NativeSession {
         else {
             return Ok(None);
         };
-        if let crate::control::native::Publication::Data(data) = &plan {
-            let enabled = self.data_v1_enabled
-                && (self.reliable_data_enabled || !is_reliable_data(&data.parameters));
-            if !enabled {
-                return Err(failure(wire::FailureCode::Unsupported));
-            }
-        }
         let reserved = self
             .rows
             .get(&Key::Owned(work.owned()))
@@ -1710,7 +1674,6 @@ impl NativeSession {
         }
         let data_v1_endpoint = work
             .logical_owner
-            .filter(|_| self.data_v1_enabled)
             .and_then(|owner| self.rows.get(&Key::Owned(owner.get())))
             .and_then(|row| row.owned.as_ref()?.logical_binding.as_ref())
             .filter(|binding| binding.id == work.reference && !binding.retiring)
@@ -1726,16 +1689,6 @@ impl NativeSession {
             diagnostic: "native receiver transport preparation failed".to_owned(),
             ..failure(code)
         })?;
-        let enabled = match &transport {
-            ReceiveTransport::FabricData(fabric) => {
-                self.data_v1_enabled
-                    && (self.reliable_data_enabled || !is_reliable_data(&fabric.parameters))
-            }
-            ReceiveTransport::Rtp(_) => true,
-        };
-        if !enabled {
-            return Err(failure(wire::FailureCode::Unsupported));
-        }
         let plan = Receiver {
             source_room: source.track.meta().room,
             source: source.track.clone(),

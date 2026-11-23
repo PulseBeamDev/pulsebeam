@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { Agent, InputFrame, NativeError, PublicationUpdates, ReceiveMode } from "@pulsebeam/agent/native";
-import { AgentStatus, ErrorCode, LogLevel, PlayoutDelay, PublicationAdmissionStatus, PublicationDemand } from "@pulsebeam/agent/core";
+import { AgentStatus, ErrorCode, LogLevel, PublicationAdmissionStatus, PublicationDemand } from "@pulsebeam/agent/core";
 
 const room = process.argv[4];
 assert.ok(room, "an explicit room is required");
@@ -89,7 +89,7 @@ try {
   console.log("installed Node owned binary data exchanged");
   await replies.close();
   const interest = agent.room(room).participant("publisher").video("production-camera").subscribe(
-    { visible: true, height: 96, minHeight: 0, minFps: 0, priority: 1, playoutDelay: new PlayoutDelay.Adaptive() },
+    { visible: true, height: 96, minHeight: 0, minFps: 0, priority: 1 },
   );
   if (interest instanceof Promise) throw new Error("video subscribe must be synchronous");
   const receiver = await interest.observe(ReceiveMode.Decoded);

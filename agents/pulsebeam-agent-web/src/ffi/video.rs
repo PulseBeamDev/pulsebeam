@@ -73,7 +73,7 @@ impl Participant {
 
 macro_rules! subscription {
     ($track:ident, $subscription:ident, $state:ident, $observer:ident, $cursor:ident,
-     $options:ident, $claim:ident, $configure:ident, $configuration:expr) => {
+     $claim:ident $(, $options:ident, $configure:ident, $configuration:expr, $arg:ident)?) => {
         #[derive(uniffi::Object)]
         pub struct $track {
             #[cfg(target_arch = "wasm32")]
@@ -98,17 +98,14 @@ macro_rules! subscription {
                 self.selector.clone().into()
             }
 
-            #[uniffi::method(default(options = None))]
-            pub fn subscribe(
-                &self,
-                options: Option<ffi::$options>,
-            ) -> Result<Arc<$subscription>, WebAgentError> {
+            $(#[uniffi::method(default($arg = None))])?
+            pub fn subscribe(&self $(, $arg: Option<ffi::$options>)?) -> Result<Arc<$subscription>, WebAgentError> {
                 #[cfg(target_arch = "wasm32")]
                 {
                     let (owner, observer) = self
                         .agent
                         .runtime
-                        .$claim(self.selector.clone(), ($configuration)(options))?;
+                        .$claim(self.selector.clone() $(, ($configuration)($arg))?)?;
                     Ok(Arc::new($subscription {
                         agent: self.agent.clone(),
                         owner,
@@ -117,7 +114,7 @@ macro_rules! subscription {
                 }
                 #[cfg(not(target_arch = "wasm32"))]
                 {
-                    let _ = options;
+                    $(let _ = $arg;)?
                     Err(super::browser_required())
                 }
             }
@@ -135,21 +132,23 @@ macro_rules! subscription {
 
         #[uniffi::export]
         impl $subscription {
-            #[uniffi::method(default(options = None))]
-            pub fn configure(&self, options: Option<ffi::$options>) -> Result<(), WebAgentError> {
+            $(
+            #[uniffi::method(default($arg = None))]
+            pub fn configure(&self, $arg: Option<ffi::$options>) -> Result<(), WebAgentError> {
                 #[cfg(target_arch = "wasm32")]
                 {
                     self.agent
                         .runtime
-                        .$configure(self.owner, ($configuration)(options))?;
+                        .$configure(self.owner, ($configuration)($arg))?;
                     Ok(())
                 }
                 #[cfg(not(target_arch = "wasm32"))]
                 {
-                    let _ = options;
+                    let _ = $arg;
                     Err(super::browser_required())
                 }
             }
+            )?
 
             pub fn state(&self) -> Result<ffi::$state, WebAgentError> {
                 #[cfg(target_arch = "wasm32")]
@@ -191,15 +190,16 @@ subscription!(
     VideoSubscriptionState,
     VideoSubscriptionStateObserver,
     VideoSubscriptionUpdates,
-    VideoObservation,
     claim_video,
+    VideoObservation,
     configure_owned_video,
     |options: Option<ffi::VideoObservation>| options
         .unwrap_or_else(|| ffi::VideoObservation {
             visible: true,
             ..Default::default()
         })
-        .into()
+        .into(),
+    options
 );
 subscription!(
     RemoteAudioTrack,
@@ -207,13 +207,7 @@ subscription!(
     AudioSubscriptionState,
     AudioSubscriptionStateObserver,
     AudioSubscriptionUpdates,
-    AudioSubscriptionConfig,
-    claim_audio,
-    configure_owned_audio,
-    |options: Option<ffi::AudioSubscriptionConfig>| options
-        .unwrap_or_default()
-        .playout_delay
-        .into()
+    claim_audio
 );
 
 #[cfg(target_arch = "wasm32")]

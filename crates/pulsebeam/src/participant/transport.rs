@@ -14,7 +14,7 @@ use crate::bitrate::Bitrate;
 use crate::entity::PublicationKey;
 use crate::ice_tcp::{FlowRoute, TcpFlow, TcpFlowId, TcpPacket};
 use crate::media::{
-    ChannelId, KeyframeRequest, KeyframeRequestKind, MediaKind, Mid, Pt, Rid, SeqNo, Ssrc,
+    ChannelId, KeyframeRequest, KeyframeRequestKind, MediaKind, Mid, Pt, Rid, Ssrc,
 };
 use crate::participant::batcher::{Handoff, NetworkEgress, OwnedPacketQueue};
 use crate::participant::signaling::{SignalingOutput, SignalingWrite, SignalingWriter};
@@ -99,26 +99,8 @@ fn tcp_frame_payload(frame: &[u8]) -> Option<&[u8]> {
     (usize::from(length) == payload.len()).then_some(payload)
 }
 
-fn playout_delay_extension(
-    (min, max): (MediaTime, MediaTime),
-) -> Result<RtpExtension, pulsebeam_rtc::WriteError> {
-    let millis = |time: MediaTime| {
-        time.numer()
-            .saturating_mul(1000)
-            .checked_div(u64::from(time.frequency().get()))
-            .ok_or(pulsebeam_rtc::WriteError::InvalidRtp)
-    };
-    let delay = pulsebeam_rtc::PlayoutDelay::from_millis(millis(min)?, millis(max)?)
-        .map_err(|_| pulsebeam_rtc::WriteError::InvalidRtp)?;
-    Ok(RtpExtension {
-        uri: crate::rtp::PLAYOUT_DELAY_URI.into(),
-        value: rtc_bytes(&delay.to_bytes()),
-    })
-}
-
 fn egress_extensions(
     values: RtpExtensions,
-    playout_delay: Option<(MediaTime, MediaTime)>,
     writer: &mut pulsebeam_core::dd::DependencyDescriptorWriter,
     mappings: &[pulsebeam_rtc::RtpExtensionInfo],
 ) -> Result<Vec<RtpExtension>, pulsebeam_rtc::WriteError> {
@@ -160,9 +142,6 @@ fn egress_extensions(
             });
         }
     }
-    if let Some(delay) = playout_delay {
-        extensions.push(playout_delay_extension(delay)?);
-    }
     Ok(extensions)
 }
 
@@ -194,7 +173,6 @@ pub(crate) struct RtpWriteCommand {
     pub(crate) pt: Pt,
     pub(crate) kind: MediaKind,
     pub(crate) now: Instant,
-    pub(crate) playout_delay: Option<(MediaTime, MediaTime)>,
 }
 
 pub(crate) struct RtpIngress {
@@ -248,7 +226,6 @@ struct Sender {
     pt: Pt,
     sequence_origin: Option<u64>,
     highest_accepted: Option<u64>,
-    highest_reported: Option<u64>,
     source: Option<(PublicationKey, Ssrc)>,
     descriptor_writer: pulsebeam_core::dd::DependencyDescriptorWriter,
     extensions: Vec<pulsebeam_rtc::RtpExtensionInfo>,
@@ -268,26 +245,6 @@ impl Sender {
         self.sequence_origin
             .get_or_insert_with(|| sequence & !u64::from(u16::MAX));
         self.highest_accepted = Some(self.highest_accepted.unwrap_or(sequence).max(sequence));
-    }
-
-    fn reception_progress(&mut self, extended_highest: u32) -> Option<SeqNo> {
-        let highest = self.highest_accepted?;
-        let origin = self.sequence_origin?;
-        let index = extend_serial(
-            Some(highest.checked_sub(origin)?),
-            u64::from(extended_highest),
-            32,
-        );
-        let progress = index.checked_add(origin)?;
-        if progress > highest
-            || self
-                .highest_reported
-                .is_some_and(|previous| progress <= previous)
-        {
-            return None;
-        }
-        self.highest_reported = Some(progress);
-        Some(progress.into())
     }
 }
 
@@ -339,7 +296,6 @@ impl RtcDriver {
                         pt: info.codec.payload_type.into(),
                         sequence_origin: None,
                         highest_accepted: None,
-                        highest_reported: None,
                         source: None,
                         descriptor_writer: Default::default(),
                         extensions: info.extensions.to_vec(),
@@ -770,7 +726,6 @@ impl RtcDriver {
                     pt: binding.codec.payload_type.into(),
                     sequence_origin: None,
                     highest_accepted: None,
-                    highest_reported: None,
                     source: None,
                     descriptor_writer: Default::default(),
                     extensions: binding
@@ -1079,7 +1034,6 @@ impl RtcDriver {
         branch: crate::shard::router::FabricLocalBranch,
         source: crate::rtp::fabric_egress::SourceMetadata,
         packet: crate::rtp::fabric_egress::CandidatePacket<'_, '_>,
-        playout_delay: Option<(MediaTime, MediaTime)>,
     ) -> Result<(), crate::rtp::fabric_egress::AdmissionError> {
         use crate::rtp::fabric_egress::AdmissionError;
 
@@ -1088,28 +1042,7 @@ impl RtcDriver {
         if leg.cut_pending() && !self.udp_packets.is_empty() {
             return Err(AdmissionError::Rtc(pulsebeam_rtc::WriteError::WouldBlock));
         }
-        let output = leg.output();
-        let playout = playout_delay
-            .filter(|_| {
-                self.rtc
-                    .rtp_egress_extension_id(
-                        output.mid.as_str(),
-                        output.primary,
-                        crate::rtp::PLAYOUT_DELAY_URI,
-                    )
-                    .is_some()
-            })
-            .map(playout_delay_extension)
-            .transpose()
-            .map_err(AdmissionError::Rtc)?;
-        leg.admit(
-            &mut self.rtc,
-            self.rtc_clock.into(),
-            branch,
-            source,
-            packet,
-            playout.as_ref(),
-        )?;
+        leg.admit(&mut self.rtc, self.rtc_clock.into(), branch, source, packet)?;
         self.rtc_needs_drain = true;
         Ok(())
     }
@@ -1169,20 +1102,6 @@ impl RtcDriver {
                     u64::from(report.ntp_seconds).wrapping_shl(32) | u64::from(report.ntp_fraction),
                 ),
             },
-        ))
-    }
-    pub(crate) fn receiver_report(
-        &mut self,
-        report: pulsebeam_rtc::ReceiverReport,
-    ) -> Option<(Mid, SeqNo)> {
-        let mid = Mid::new(&report.mid).ok()?;
-        let sender = self.senders.get_mut(&mid)?;
-        if *sender.ssrc != report.ssrc {
-            return None;
-        }
-        Some((
-            mid,
-            sender.reception_progress(report.extended_highest_sequence)?,
         ))
     }
     pub(crate) fn keyframe_request(&self, ssrc: u32) -> Option<KeyframeRequest> {
@@ -1310,7 +1229,6 @@ impl RtcDriver {
         let marker = command.pkt.marker;
         let Ok(extensions) = egress_extensions(
             command.pkt.ext_vals,
-            command.playout_delay,
             &mut sender.descriptor_writer,
             &sender.extensions,
         ) else {
@@ -1622,15 +1540,12 @@ mod tests {
         assert!(!transport.encodings.contains_key(&2.into()));
     }
 
-    fn extensions(
-        values: RtpExtensions,
-        delay: Option<(MediaTime, MediaTime)>,
-    ) -> Vec<RtpExtension> {
+    fn extensions(values: RtpExtensions) -> Vec<RtpExtension> {
         let mappings = [pulsebeam_rtc::RtpExtensionInfo {
             id: 1,
             uri: "http://www.webrtc.org/experiments/rtp-hdrext/playout-delay".into(),
         }];
-        egress_extensions(values, delay, &mut Default::default(), &mappings).unwrap()
+        egress_extensions(values, &mut Default::default(), &mappings).unwrap()
     }
 
     #[test]
@@ -1643,13 +1558,7 @@ mod tests {
             .into(),
             ..Default::default()
         };
-        assert!(extensions(ingress.clone(), None).is_empty());
-        let fixed = extensions(
-            ingress,
-            Some((MediaTime::from_millis(50), MediaTime::from_millis(80))),
-        );
-        assert_eq!(fixed.len(), 1);
-        assert_eq!(fixed[0].value.as_ref(), &[0, 0x50, 8]);
+        assert!(extensions(ingress).is_empty());
     }
 
     #[test]
@@ -1663,7 +1572,7 @@ mod tests {
             .into(),
             ..Default::default()
         };
-        assert!(extensions(ingress, None).is_empty());
+        assert!(extensions(ingress).is_empty());
     }
 
     #[test]
@@ -1673,7 +1582,6 @@ mod tests {
             pt: 111.into(),
             sequence_origin: None,
             highest_accepted: None,
-            highest_reported: None,
             source: None,
             descriptor_writer: Default::default(),
             extensions: [].into(),
@@ -1684,9 +1592,6 @@ mod tests {
         assert_eq!(sender.rtp_index(65539), Some(3));
         sender.accept_index(65539);
         assert_eq!(sender.rtp_index(65537), Some(1));
-        assert_eq!(sender.reception_progress(3), Some(SeqNo::from(65539)));
-        assert_eq!(sender.reception_progress(2), None);
-        assert_eq!(sender.reception_progress(4), None);
     }
 
     #[test]

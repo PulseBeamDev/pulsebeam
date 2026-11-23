@@ -379,13 +379,16 @@ impl<'a> NativeResponse<'a> {
         connection_id: ConnectionId,
         rtp_capabilities: &'a pulsebeam_proto::state::RtpCapabilities,
         answer: &'a str,
-        data_profile: super::native::DataProfile,
     ) -> Self {
         Self {
             profile: pulsebeam_proto::state::PROFILE,
             rtp_capabilities,
-            data_delivery: data_profile.delivery_modes(),
-            data_version: data_profile.version(),
+            data_delivery: &[
+                pulsebeam_proto::state::DataDelivery::Latest,
+                pulsebeam_proto::state::DataDelivery::Lossy,
+                pulsebeam_proto::state::DataDelivery::Ordered,
+            ],
+            data_version: Some(u32::from(pulsebeam_proto::data_endpoint::DATA_V1)),
             room_id: authorization
                 .room_id
                 .as_ref()
@@ -1502,7 +1505,6 @@ mod tests {
             message.state.connection_id,
             &capabilities,
             "v=0\r\n",
-            crate::control::native::DataProfile::Legacy,
         ))
         .unwrap();
         assert_eq!(
@@ -1510,6 +1512,10 @@ mod tests {
             authorization.room_id.as_ref().unwrap().as_str()
         );
         assert!(response_body.get("room_external_id").is_none());
+        assert_eq!(
+            response_body["data_version"],
+            u32::from(pulsebeam_proto::data_endpoint::DATA_V1)
+        );
         let long_location = HeaderValue::from_bytes(&vec![b'a'; 300_000]).unwrap();
         let escaped = "\0".repeat(MAX_NATIVE_SDP_BYTES);
         assert!(matches!(
@@ -1519,7 +1525,6 @@ mod tests {
                 message.state.connection_id,
                 &capabilities,
                 &escaped,
-                crate::control::native::DataProfile::Legacy,
             )
             .validate(),
             Err(creation::Error::TooLarge)

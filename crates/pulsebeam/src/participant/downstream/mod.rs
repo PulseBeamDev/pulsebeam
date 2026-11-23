@@ -10,14 +10,12 @@ use crate::entity::PublicationKey;
 use crate::entity::TrackKind;
 use crate::keys::TrackHandle;
 use crate::log::{LogCtx, plog_trace};
-use crate::media::{KeyframeRequest, MediaKind, Mid, Pt, Rid, SeqNo, Ssrc};
+use crate::media::{KeyframeRequest, MediaKind, Mid, Pt, Rid, Ssrc};
 use crate::participant::downstream::video::START_BANDWIDTH;
 use crate::participant::event::ParticipantSink;
 pub use crate::participant::intent::AudioIntent;
-use crate::rtp::MediaTime;
 use crate::rtp::RtpPacket;
 use crate::track::{StreamWriter, Track, TrackLayer, TrackMeta};
-use ahash::{HashMap, HashMapExt};
 pub use audio::DownstreamAudio;
 use indexmap::IndexMap;
 use pulsebeam_runtime::time::Instant;
@@ -104,17 +102,6 @@ impl BweFilter {
     }
 }
 
-struct PlayoutDelayConfirm {
-    rid: Option<Rid>,
-    seq: SeqNo,
-}
-
-struct FixedReceiver {
-    bounds: (MediaTime, MediaTime),
-    pending: bool,
-    confirm: Option<PlayoutDelayConfirm>,
-}
-
 pub struct Downstream {
     ctx: LogCtx,
     pub dirty_allocation: bool,
@@ -131,10 +118,6 @@ pub struct Downstream {
 
     available_bandwidth: BweFilter,
     last_desired: Bitrate,
-    /// When forwarding fell below the rate needed to keep measuring the link, while demand
-    /// exists, and the estimate it was at then.
-    desired_playout: HashMap<PublicationKey, (MediaTime, MediaTime)>,
-    fixed_receivers: HashMap<Mid, FixedReceiver>,
 }
 
 #[derive(Clone, Copy)]
@@ -158,8 +141,6 @@ impl Downstream {
 
             available_bandwidth: BweFilter::new(START_BANDWIDTH),
             last_desired: video::START_BANDWIDTH,
-            desired_playout: HashMap::new(),
-            fixed_receivers: HashMap::new(),
         }
     }
 
@@ -191,58 +172,6 @@ impl Downstream {
         self.catalog.iter().find_map(|(handle, entry)| {
             (entry.publication_id == track).then_some((handle, entry.bound))
         })
-    }
-
-    /// A fixed receiver cannot return to native defaults during this transport generation.
-    /// The caller must send Reconnect and suppress the incompatible packet.
-    pub fn playout_delay_to_stamp(
-        &mut self,
-        publication_id: PublicationKey,
-        mid: Mid,
-    ) -> Result<Option<(MediaTime, MediaTime)>, ()> {
-        let Some(&bounds) = self.desired_playout.get(&publication_id) else {
-            return if self.fixed_receivers.contains_key(&mid) {
-                Err(())
-            } else {
-                Ok(None)
-            };
-        };
-        let receiver = self.fixed_receivers.entry(mid).or_insert(FixedReceiver {
-            bounds,
-            pending: true,
-            confirm: None,
-        });
-        if receiver.bounds != bounds {
-            receiver.bounds = bounds;
-            receiver.pending = true;
-            receiver.confirm = None;
-        }
-        let stamp = receiver.pending.then_some(bounds);
-        if publication_id.kind() == TrackKind::Audio {
-            self.audio.mark_fixed_receiver(mid);
-        }
-        Ok(stamp)
-    }
-
-    pub fn record_playout_delay_stamp(&mut self, mid: Mid, rid: Option<Rid>, seq: SeqNo) {
-        if let Some(receiver) = self.fixed_receivers.get_mut(&mid)
-            && receiver.confirm.is_none()
-        {
-            receiver.confirm = Some(PlayoutDelayConfirm { rid, seq });
-        }
-    }
-
-    pub fn handle_egress_stats(&mut self, mid: Mid, rid: Option<Rid>, remote_max_seq: SeqNo) {
-        let Some(receiver) = self.fixed_receivers.get_mut(&mid) else {
-            return;
-        };
-        let Some(confirm) = &receiver.confirm else {
-            return;
-        };
-        if confirm.rid == rid && remote_max_seq >= confirm.seq {
-            receiver.pending = false;
-            receiver.confirm = None;
-        }
     }
 
     pub(crate) fn install_track(&mut self, key: TrackHandle, track: Track) {
@@ -420,40 +349,6 @@ mod tests {
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See crates/pulsebeam/docs/thread-per-core.md.
     use super::*;
-
-    #[test]
-    fn fixed_playout_is_per_receiver_and_defaults_require_a_fresh_mid() {
-        let mut downstream = Downstream::new(LogCtx {
-            connection_id: crate::entity::ConnectionId::new(),
-        });
-        let fixed =
-            crate::entity::ConnectionId::new().fixture_publication(TrackKind::Video, "fixed");
-        let default =
-            crate::entity::ConnectionId::new().fixture_publication(TrackKind::Video, "default");
-        let first = Mid::from("0");
-        let fresh = Mid::from("1");
-        let bounds = (
-            MediaTime::from_hundredths(200),
-            MediaTime::from_hundredths(200),
-        );
-        downstream.desired_playout.insert(fixed, bounds);
-        assert_eq!(
-            downstream.playout_delay_to_stamp(fixed, first),
-            Ok(Some(bounds))
-        );
-        downstream.record_playout_delay_stamp(first, None, SeqNo::from(7u64));
-        downstream.handle_egress_stats(first, None, SeqNo::from(8u64));
-        assert_eq!(downstream.playout_delay_to_stamp(fixed, first), Ok(None));
-        downstream.desired_playout.clear();
-        assert_eq!(downstream.playout_delay_to_stamp(default, first), Err(()));
-        assert_eq!(downstream.playout_delay_to_stamp(default, fresh), Ok(None));
-        let zero = (MediaTime::from_hundredths(0), MediaTime::from_hundredths(0));
-        downstream.desired_playout.insert(default, zero);
-        assert_eq!(
-            downstream.playout_delay_to_stamp(default, first),
-            Ok(Some(zero))
-        );
-    }
 
     fn expected(initial: f64, target: f64, elapsed: Duration, time_constant: Duration) -> f64 {
         let alpha = (-elapsed.as_secs_f64() / time_constant.as_secs_f64()).exp();

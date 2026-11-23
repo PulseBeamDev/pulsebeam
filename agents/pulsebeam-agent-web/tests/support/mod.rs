@@ -256,31 +256,12 @@ async fn serve(mut stream: TcpStream, root: &Path, relays: &Mutex<Relays>) -> io
         let result = relays.lock().await.allocate(destination).await;
         return respond_relay(&mut stream, result, method).await;
     }
-    if let Some(path) = target.strip_prefix("/__test/rtp-relay/") {
-        if let Some(id) = path.strip_suffix("/peaks").and_then(|id| id.parse().ok()) {
-            let result = relays.lock().await.peaks(id).await;
-            return respond_relay(&mut stream, result, method).await;
-        }
-        let keys = path.split_once('?').and_then(|(path, query)| {
-            let (id, ssrc) = path.split_once('/')?;
-            let extension = query.strip_prefix("extension=")?.parse::<u8>().ok()?;
-            (extension > 0).then_some((
-                id.parse::<usize>().ok()?,
-                ssrc.parse::<u32>().ok()?,
-                extension,
-            ))
-        });
-        let Some((id, ssrc, extension)) = keys else {
-            return respond(
-                &mut stream,
-                503,
-                "text/plain",
-                b"invalid relay observation key",
-                method,
-            )
-            .await;
-        };
-        let result = relays.lock().await.observation(id, ssrc, extension).await;
+    if let Some(id) = target
+        .strip_prefix("/__test/rtp-relay/")
+        .and_then(|path| path.strip_suffix("/peaks"))
+        .and_then(|id| id.parse().ok())
+    {
+        let result = relays.lock().await.peaks(id).await;
         return respond_relay(&mut stream, result, method).await;
     }
     let Some(path) = static_path(root, target) else {

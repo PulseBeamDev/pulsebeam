@@ -51,6 +51,7 @@ impl ProtectionLayout {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RtpMetadata {
     pub sequence: u16,
+    pub authenticated_index: Option<u64>,
     pub timestamp: u32,
     pub ssrc: u32,
     pub payload_type: u8,
@@ -62,6 +63,7 @@ pub(crate) fn outbound_rtp_metadata(packet: &[u8]) -> Result<RtpMetadata, SrtpEr
     let parsed = RtpPacket::parse(packet).map_err(|_| SrtpError::InvalidPacket)?;
     Ok(RtpMetadata {
         sequence: parsed.sequence(),
+        authenticated_index: None,
         timestamp: parsed.timestamp(),
         ssrc: parsed.ssrc(),
         payload_type: parsed.payload_type(),
@@ -556,6 +558,7 @@ fn decrypt_rtp(
         .ok_or(SrtpError::Crypto)?;
     let metadata = RtpMetadata {
         sequence: parsed.sequence,
+        authenticated_index: Some(index),
         timestamp: parsed.timestamp,
         ssrc: parsed.ssrc,
         payload_type: parsed.payload_type,

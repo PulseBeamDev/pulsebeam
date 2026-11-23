@@ -25,7 +25,6 @@ import {
   type AudioSource,
   type Catalog as WebCatalog,
   LogLevel,
-  PlayoutDelay,
 } from "@pulsebeam/web";
 import {
   usePublish,
@@ -224,7 +223,6 @@ createElement(Video, {
     minHeight: 360,
     minFps: 15,
     priority: 1,
-    playoutDelay: PlayoutDelay.Fixed.new({ minMs: 0, maxMs: 100 }),
   }),
 });
 // @ts-expect-error Playback cannot create an implicit reception owner.

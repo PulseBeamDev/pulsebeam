@@ -548,6 +548,9 @@ fn negotiate_inner(
             .into_vec()
             .into_iter()
             .filter_map(|mut extension| {
+                if extension.uri == PLAYOUT_DELAY_URI {
+                    return None;
+                }
                 if config
                     .rtp_capabilities
                     .as_ref()
@@ -2315,7 +2318,6 @@ mod tests {
             for uri in [
                 DEPENDENCY_URIS[1],
                 "http://www.webrtc.org/experiments/rtp-hdrext/video-layers-allocation00",
-                PLAYOUT_DELAY_URI,
             ] {
                 assert!(
                     video

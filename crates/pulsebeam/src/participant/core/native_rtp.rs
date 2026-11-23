@@ -55,12 +55,6 @@ impl NativeRtp {
             .then_some(source.slot)
     }
 
-    pub(super) fn requires_fabric(&self, ssrc: u32) -> bool {
-        self.publication_for_ssrc(ssrc).is_some_and(|publication| {
-            publication.fabric_dd_video || publication.whole_source_fabric_profile().is_some()
-        })
-    }
-
     pub(super) fn ingress_route(
         &self,
         ssrc: u32,
@@ -192,14 +186,7 @@ impl RtpPublication {
             "av1" if crate::control::rtp::is_stock_av1(&description.codec.parameters) => {
                 Some(Profile::Av1)
             }
-            "h264"
-                if !description
-                    .extensions
-                    .iter()
-                    .any(|extension| extension.uri == pulsebeam_core::dd::URI) =>
-            {
-                Some(Profile::H264)
-            }
+            "h264" if !self.fabric_dd_video => Some(Profile::H264),
             _ => None,
         }
     }
@@ -532,14 +519,28 @@ impl Connection {
         }
         let active = source.enabled && demanded;
         for encoding in &source.binding.description().encodings {
-            if encoding.active != active
-                && self
-                    .transport
-                    .set_rtp_encoding_active(encoding.primary, active)
-                    .is_err()
+            if encoding.active == active {
+                continue;
+            }
+            if self
+                .transport
+                .set_rtp_encoding_active(encoding.primary, active)
+                .is_err()
             {
                 self.disconnect(DisconnectReason::SignalingOutput);
                 return;
+            }
+            if active && source.fabric_dd_video {
+                // The transport deliberately ignored RTP while undemanded.
+                if let Some(binding) = self.media_ingress.get_mut(&encoding.primary) {
+                    binding.loss_measurement = FabricLossMeasurement::AwaitingPrimary;
+                }
+                if let Some(track) = self.upstream.track_mut(source.slot) {
+                    track.monitor.restart_fabric_loss_window(
+                        encoding.primary.into(),
+                        self.transport.clock(),
+                    );
+                }
             }
         }
         if let Some(source) = self.native_rtp.publications.get_mut(&reference) {

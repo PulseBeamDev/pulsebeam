@@ -14,7 +14,8 @@ use arrayvec::ArrayVec;
 use pulsebeam_core::fabric::{
     Extension, ExtensionKind, ExtensionWidth, Profile,
     media_source::{
-        Admission, Anchors, Input, Limits, MediaCopy, MediaIdentity, MediaSource, Rejected,
+        Admission, Anchors, Input, Limits, MediaCopy, MediaIdentity, MediaSource, Position,
+        Rejected,
     },
 };
 use pulsebeam_rtc::{
@@ -394,6 +395,7 @@ impl RtpIngressShadow {
             return Err(DropReason::Binding);
         }
         let arrival = packet.arrival;
+        let primary_index = packet.authenticated_primary_index();
         let protected_bytes = (!packet.is_repair)
             .then(|| packet.protected_bytes())
             .flatten()
@@ -404,7 +406,10 @@ impl RtpIngressShadow {
             .map(|(sequence, input)| MediaIngress {
                 arrival,
                 ingress_ntp32,
-                sequence,
+                position: primary_index.map_or(
+                    Position::LowSequence(sequence),
+                    Position::AuthenticatedPrimary,
+                ),
                 protected_bytes,
                 media: (!input.payload.is_empty()).then(|| OwnedCopy {
                     payload: input.payload.into(),
@@ -482,7 +487,7 @@ impl RtpIngressShadow {
 pub(crate) struct MediaIngress {
     pub arrival: Instant,
     pub ingress_ntp32: u32,
-    pub sequence: u16,
+    pub position: Position,
     pub protected_bytes: Option<NonZeroU16>,
     media: Option<OwnedCopy>,
 }
@@ -678,7 +683,6 @@ pub(super) fn extension_kind(uri: &str) -> Option<ExtensionKind> {
             "video-layers-allocation00" => Some(ExtensionKind::VideoLayersAllocation),
             "video-content-type" => Some(ExtensionKind::VideoContentType),
             "color-space" => Some(ExtensionKind::ColorSpace),
-            "playout-delay" => Some(ExtensionKind::PlayoutDelay),
             _ => None,
         },
     }

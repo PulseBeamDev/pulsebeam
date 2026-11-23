@@ -127,20 +127,6 @@ impl Subscription {
         .await
     }
 
-    pub async fn configure_audio(
-        &self,
-        playout_delay: agent_core::PlayoutDelay,
-    ) -> Result<(), Error> {
-        if self.is_closed() {
-            return Err(Error::Closed);
-        }
-        self.resource(ResourceCommand::ConfigureAudio {
-            owner: self.inner.owner,
-            playout_delay,
-        })
-        .await
-    }
-
     pub async fn close(&self) -> Result<(), Error> {
         if self.is_closed() {
             return Ok(());
@@ -209,24 +195,6 @@ where
             ));
         };
         Ok(self.subscription_handle(owner))
-    }
-
-    #[cfg(test)]
-    pub(super) fn claim_configured_audio_subscription(
-        &mut self,
-        selector: TrackSelector,
-        playout_delay: agent_core::PlayoutDelay,
-    ) -> Result<Subscription, Error> {
-        let subscription = self.claim_audio_subscription(selector)?;
-        if let Err(error) = self.core.resource(ResourceCommand::ConfigureAudio {
-            owner: subscription.inner.owner,
-            playout_delay,
-        }) {
-            subscription.inner.closed.close();
-            self.retire_subscriptions();
-            return Err(error.into());
-        }
-        Ok(subscription)
     }
 
     fn subscription_handle(&mut self, owner: u64) -> Subscription {

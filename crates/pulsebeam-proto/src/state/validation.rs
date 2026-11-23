@@ -275,13 +275,11 @@ pub fn validate_spec(spec: &ResourceSpec) -> Result {
 
 fn validate_receive_settings(settings: &ResourceSettings, kind: TrackKind) -> Result {
     match (kind, &settings.receive) {
-        (TrackKind::Audio, Some(resource_settings::Receive::Audio(options))) => {
-            validate_playout(options.playout_delay.as_ref())
-        }
         (TrackKind::Video, Some(resource_settings::Receive::Video(options))) => {
             validate_video(options)
         }
-        (TrackKind::Data, None) => Ok(()),
+        (TrackKind::Audio, Some(resource_settings::Receive::Audio(_)))
+        | (TrackKind::Data, None) => Ok(()),
         _ => Err(ValidationError::Settings),
     }
 }
@@ -578,13 +576,6 @@ fn validate_video(options: &VideoReceiveOptions) -> Result {
     {
         return Err(ValidationError::Settings);
     }
-    validate_playout(options.playout_delay.as_ref())
-}
-
-fn validate_playout(delay: Option<&PlayoutDelay>) -> Result {
-    if delay.is_some_and(|d| d.min_ms > d.max_ms || d.max_ms > 4095) {
-        return Err(ValidationError::Settings);
-    }
     Ok(())
 }
 
@@ -781,7 +772,6 @@ pub fn declarations_equivalent(left: &ResourceSpec, right: &ResourceSpec) -> boo
 }
 
 /// Full mutable equality for validated settings, including documented defaults.
-/// Omitted playout bounds are not an explicit zero-delay request.
 pub fn settings_equivalent(left: &ResourceSettings, right: &ResourceSettings) -> bool {
     use resource_settings::Receive;
     left.enabled == right.enabled
@@ -790,7 +780,6 @@ pub fn settings_equivalent(left: &ResourceSettings, right: &ResourceSettings) ->
                 left.max_height == right.max_height
                     && left.min_height == right.min_height
                     && left.min_fps == right.min_fps
-                    && left.playout_delay == right.playout_delay
                     && left.priority.unwrap_or(1) == right.priority.unwrap_or(1)
             }
             _ => left.receive == right.receive,

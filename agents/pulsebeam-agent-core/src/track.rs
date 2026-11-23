@@ -6,9 +6,9 @@ use alloc::{
 };
 
 use crate::{
-    MediaKind, PlayoutDelay, PublicationIntent, TopicChannel, TopicMode, TopicNotification,
-    TopicPublisher, TopicRegistrations, TopicSubscriber, TrackSelector, ValidationError,
-    VideoSubscription, model::validate_identifier,
+    MediaKind, PublicationIntent, TopicChannel, TopicMode, TopicNotification, TopicPublisher,
+    TopicRegistrations, TopicSubscriber, TrackSelector, ValidationError, VideoSubscription,
+    model::validate_identifier,
 };
 
 mod observation;
@@ -142,8 +142,6 @@ pub enum TrackResourceError {
     SlotSpaceExhausted { kind: MediaKind },
     #[error("owner no longer owns this resource")]
     Released,
-    #[error("playout delay minimum exceeds maximum")]
-    InvalidPlayoutDelay,
     #[error("data receive buffer cannot represent all publisher tracks")]
     ReceiveOverflow,
     #[error("data receive channel failed: {0}")]
@@ -210,7 +208,6 @@ pub struct VideoObservation {
     pub min_height: u32,
     pub min_fps: u32,
     pub priority: u32,
-    pub playout_delay: PlayoutDelay,
 }
 
 struct VideoView {
@@ -219,24 +216,8 @@ struct VideoView {
 }
 
 enum AudioView {
-    Named {
-        selector: TrackSelector,
-        playout_delay: PlayoutDelay,
-    },
+    Named { selector: TrackSelector },
     Policy(crate::AudioSubscription),
-}
-
-impl AudioView {
-    fn has_fixed_delay(&self) -> bool {
-        match self {
-            Self::Named { playout_delay, .. } => *playout_delay != PlayoutDelay::Adaptive,
-            Self::Policy(policy) => policy
-                .playout_delays
-                .values()
-                .chain(policy.selector_delays.values())
-                .any(|delay| *delay != PlayoutDelay::Adaptive),
-        }
-    }
 }
 
 #[derive(Default)]
@@ -498,10 +479,6 @@ pub enum ResourceCommand {
     ClaimAudioSubscription {
         selector: TrackSelector,
     },
-    ConfigureAudio {
-        owner: u64,
-        playout_delay: PlayoutDelay,
-    },
     ClaimAudioPolicy {
         policy: crate::AudioSubscription,
     },
@@ -612,12 +589,9 @@ impl TrackResources {
         Some((&view.selector, &view.observation))
     }
 
-    pub(crate) fn audio_view(&self, owner: TrackOwner) -> Option<(&TrackSelector, PlayoutDelay)> {
+    pub(crate) fn audio_view(&self, owner: TrackOwner) -> Option<&TrackSelector> {
         match self.audio_views.get(&owner)? {
-            AudioView::Named {
-                selector,
-                playout_delay,
-            } => Some((selector, *playout_delay)),
+            AudioView::Named { selector } => Some(selector),
             AudioView::Policy(_) => None,
         }
     }
@@ -1270,66 +1244,9 @@ impl TrackResources {
         if self.audio_views.contains_key(&owner) {
             return Err(TrackResourceError::OwnerInUse);
         }
-        if self.audio_views.values().any(|view| match view {
-            AudioView::Named {
-                selector: other,
-                playout_delay,
-            } => *other == selector && *playout_delay != PlayoutDelay::Adaptive,
-            AudioView::Policy(_) => view.has_fixed_delay(),
-        }) {
-            return Err(TrackResourceError::AlreadyOwned);
-        }
         self.begin_intent(owner)?;
-        self.audio_views.insert(
-            owner,
-            AudioView::Named {
-                selector,
-                playout_delay: PlayoutDelay::Adaptive,
-            },
-        );
-        Ok(())
-    }
-
-    pub(crate) fn configure_audio(
-        &mut self,
-        owner: TrackOwner,
-        playout_delay: PlayoutDelay,
-    ) -> Result<(), TrackResourceError> {
-        if self.video.contains_key(&owner) {
-            return Err(TrackResourceError::WrongKind);
-        }
-        if matches!(playout_delay, PlayoutDelay::Fixed { min_ms, max_ms } if min_ms > max_ms) {
-            return Err(TrackResourceError::InvalidPlayoutDelay);
-        }
-        let AudioView::Named { selector, .. } = self
-            .audio_views
-            .get(&owner)
-            .ok_or(TrackResourceError::Released)?
-        else {
-            return Err(TrackResourceError::WrongKind);
-        };
-        if self.audio_views.iter().any(|(other, view)| {
-            *other != owner
-                && match view {
-                    AudioView::Named {
-                        selector: candidate,
-                        playout_delay: delay,
-                    } => candidate == selector && *delay != playout_delay,
-                    AudioView::Policy(_) => {
-                        playout_delay != PlayoutDelay::Adaptive || view.has_fixed_delay()
-                    }
-                }
-        }) {
-            return Err(TrackResourceError::AlreadyOwned);
-        }
-        self.begin_intent(owner)?;
-        if let Some(AudioView::Named {
-            playout_delay: delay,
-            ..
-        }) = self.audio_views.get_mut(&owner)
-        {
-            *delay = playout_delay;
-        }
+        self.audio_views
+            .insert(owner, AudioView::Named { selector });
         Ok(())
     }
 
@@ -1341,7 +1258,7 @@ impl TrackResources {
         if self.audio_views.contains_key(&owner) {
             return Err(TrackResourceError::OwnerInUse);
         }
-        self.validate_audio_policy(owner, &policy)?;
+        Self::validate_audio_policy(&policy)?;
         self.begin_intent(owner)?;
         self.audio_views.insert(owner, AudioView::Policy(policy));
         Ok(())
@@ -1357,44 +1274,18 @@ impl TrackResources {
             Some(AudioView::Named { .. }) => return Err(TrackResourceError::WrongKind),
             None => return Err(TrackResourceError::Released),
         }
-        self.validate_audio_policy(owner, &policy)?;
+        Self::validate_audio_policy(&policy)?;
         self.begin_intent(owner)?;
         self.audio_views.insert(owner, AudioView::Policy(policy));
         Ok(())
     }
 
-    fn validate_audio_policy(
-        &self,
-        owner: TrackOwner,
-        policy: &crate::AudioSubscription,
-    ) -> Result<(), TrackResourceError> {
+    fn validate_audio_policy(policy: &crate::AudioSubscription) -> Result<(), TrackResourceError> {
         crate::DesiredState {
             audio: policy.clone(),
             ..Default::default()
         }
         .validate()?;
-        if policy
-            .playout_delays
-            .values()
-            .chain(policy.selector_delays.values())
-            .any(|delay| matches!(delay, PlayoutDelay::Fixed { min_ms, max_ms } if min_ms > max_ms))
-        {
-            return Err(TrackResourceError::InvalidPlayoutDelay);
-        }
-        let fixed = policy
-            .playout_delays
-            .values()
-            .chain(policy.selector_delays.values())
-            .any(|delay| *delay != PlayoutDelay::Adaptive);
-        // Policy matching can overlap named or opaque-ID demand after discovery.
-        // Fixed policy delay therefore requires exclusive audio ownership.
-        if self
-            .audio_views
-            .iter()
-            .any(|(other, view)| *other != owner && (fixed || view.has_fixed_delay()))
-        {
-            return Err(TrackResourceError::AlreadyOwned);
-        }
         Ok(())
     }
 
@@ -1420,24 +1311,10 @@ impl TrackResources {
         let mut projection = crate::AudioSubscription::default();
         for view in self.audio_views.values() {
             match view {
-                AudioView::Named {
-                    selector,
-                    playout_delay,
-                } => {
-                    projection.selected.push(selector.clone());
-                    projection
-                        .selector_delays
-                        .insert(selector.clone(), *playout_delay);
-                }
+                AudioView::Named { selector } => projection.selected.push(selector.clone()),
                 AudioView::Policy(policy) => {
                     projection.pinned.extend(policy.pinned.iter().cloned());
                     projection.selected.extend(policy.selected.iter().cloned());
-                    projection
-                        .playout_delays
-                        .extend(policy.playout_delays.clone());
-                    projection
-                        .selector_delays
-                        .extend(policy.selector_delays.clone());
                 }
             }
         }
@@ -1485,10 +1362,6 @@ impl TrackResources {
         if self.audio_views.contains_key(&owner) {
             return Err(TrackResourceError::WrongKind);
         }
-        if matches!(observation.playout_delay, PlayoutDelay::Fixed { min_ms, max_ms } if min_ms > max_ms)
-        {
-            return Err(TrackResourceError::InvalidPlayoutDelay);
-        }
         if !self.video.contains_key(&owner) {
             return Err(TrackResourceError::Released);
         }
@@ -1520,19 +1393,6 @@ impl TrackResources {
             aggregate.min_height = aggregate.min_height.max(observation.min_height);
             aggregate.min_fps = aggregate.min_fps.max(observation.min_fps);
             aggregate.priority = aggregate.priority.max(observation.priority);
-            aggregate.playout_delay = match (aggregate.playout_delay, observation.playout_delay) {
-                (
-                    PlayoutDelay::Fixed {
-                        min_ms: a_min,
-                        max_ms: a_max,
-                    },
-                    PlayoutDelay::Fixed { min_ms, max_ms },
-                ) => PlayoutDelay::Fixed {
-                    min_ms: a_min.min(min_ms),
-                    max_ms: a_max.max(max_ms),
-                },
-                (PlayoutDelay::Adaptive, delay) | (delay, PlayoutDelay::Adaptive) => delay,
-            };
         }
         self.video_slots
             .retain(|selector, _| self.video.values().any(|view| view.selector == *selector));
@@ -1557,7 +1417,6 @@ impl TrackResources {
                 min_height: observation.min_height,
                 min_fps: observation.min_fps,
                 priority: observation.priority,
-                playout_delay: observation.playout_delay,
             });
         }
         projection.sort_by_key(|subscription| subscription.slot);

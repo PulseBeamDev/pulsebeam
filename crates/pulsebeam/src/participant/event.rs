@@ -1,4 +1,3 @@
-use super::packet::TrackPacket;
 use super::reverse::ReversePacket;
 use crate::entity::PublicationKey;
 use crate::keys::TrackHandle;
@@ -64,7 +63,6 @@ pub(crate) trait ParticipantSink {
     fn renew_authorization(&mut self, token: String);
     fn exit(&mut self);
 
-    fn publish_track_packet(&mut self, fanout: Option<TrackHandle>, packet: TrackPacket);
     #[cfg(test)]
     fn publish_fabric_packet(&mut self, publication: FabricPublication);
     fn publish_fabric_data(
@@ -120,7 +118,6 @@ pub mod test_utils {
         pub reverse_requests: Vec<TrackHandle>,
         pub reverse_packets: Vec<ReversePacket>,
         pub exit_count: usize,
-        pub publish_track_packet_calls: Vec<TrackHandle>,
         pub fabric_publications: Vec<(crate::control::native::Preparation, PublicationKey)>,
     }
 
@@ -240,12 +237,6 @@ pub mod test_utils {
             publication: PublicationKey,
         ) {
             self.fabric_publications.push((work, publication));
-        }
-
-        fn publish_track_packet(&mut self, fanout: Option<TrackHandle>, _packet: TrackPacket) {
-            if let Some(key) = fanout {
-                self.publish_track_packet_calls.push(key);
-            }
         }
     }
 }

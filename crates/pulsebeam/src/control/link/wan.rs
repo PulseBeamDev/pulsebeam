@@ -58,7 +58,6 @@ impl From<crate::control::controller::peer_ownership::fabric_data::WanRepairRead
 pub(super) struct WanPeer {
     commands: Commands,
     next_label: u32,
-    opus_source_budget: bool,
     receives: HashMap<NonZeroU32, Receive>,
 }
 
@@ -117,16 +116,6 @@ impl Receive {
 type Local = (BindingId, LinkTx<ShardFrame>);
 
 impl WanPeer {
-    fn configure_window(&self, window: Window) -> Result<Window, BindError> {
-        if self.opus_source_budget && window.profile() == fabric::Profile::Opus {
-            window
-                .with_opus_source_budget()
-                .map_err(|_| BindError::UnsupportedProfile)
-        } else {
-            Ok(window)
-        }
-    }
-
     fn allocate_label(&mut self) -> Result<NonZeroU32, BindError> {
         let mut label = self.next_label.checked_add(1).ok_or(BindError::Capacity)?;
         if label == FEEDBACK_SSRC {
@@ -183,7 +172,6 @@ impl Links {
     pub(in crate::control) fn attach_wan_host(
         &mut self,
         commands: Commands,
-        opus_source_budget: bool,
     ) -> Result<(), BindError> {
         if self.wan.len() >= crate::link::host::PEERS || self.wan.contains_key(&commands.peer()) {
             return Err(BindError::Capacity);
@@ -193,7 +181,6 @@ impl Links {
             WanPeer {
                 commands,
                 next_label: 0,
-                opus_source_budget,
                 receives: HashMap::new(),
             },
         );
@@ -220,11 +207,6 @@ impl Links {
             source.publisher.emission.wire_profile().1,
         )
         .map_err(|_| BindError::UnsupportedProfile)?;
-        let expected = self
-            .wan
-            .get(&peer)
-            .ok_or(BindError::Closed)?
-            .configure_window(expected)?;
         let spec = pulsebeam_link::wan::WindowSpec {
             authority: source.publisher.incarnation,
             direction: pulsebeam_link::wan::Direction::Send,
@@ -322,11 +304,6 @@ impl Links {
             window.emission(),
         )
         .map_err(|_| BindError::UnsupportedProfile)?;
-        let expected = self
-            .wan
-            .get(&peer)
-            .ok_or(BindError::Closed)?
-            .configure_window(expected)?;
         if expected != ack.window {
             return Err(BindError::Closed);
         }
@@ -495,7 +472,6 @@ impl Links {
             live.emission.wire_profile().1,
         )
         .map_err(|_| BindError::UnsupportedProfile)?;
-        let window = peer.configure_window(window)?;
         let bindings = self.bind_wan_locals(&live.addresses)?;
         let built = live
             .addresses

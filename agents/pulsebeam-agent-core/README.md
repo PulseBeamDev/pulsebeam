@@ -38,11 +38,8 @@ completion/failure results remain ordered operations.
 
 ## Receive policy support
 
-Use adaptive audio playout with the stock native and browser WebRTC profiles.
-They do not negotiate the audio RTP playout-delay extension. The native resource
-receiver rejects fixed audio with `FailureCode::Unsupported`; it does not use a
-receiver-local minimum-delay setter as a substitute for the full
-`Fixed { min_ms, max_ms }` interval.
+WebRTC receivers use their runtime's default buffering. Configure video
+quality and audio source selection independently of buffering.
 
 Native signaling evaluates each resource independently. At most one sent
 ordinary proposal per resource may remain unevaluated; newer unsent desire is

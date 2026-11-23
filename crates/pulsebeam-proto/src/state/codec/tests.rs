@@ -1014,14 +1014,6 @@ fn receive_replacements_preserve_explicit_zero_and_reject_not_clamp() {
     };
     let defaults = VideoReceiveOptions::default();
     assert_eq!(validation::validate_spec(&spec(defaults.clone())), Ok(()));
-    let minimum_delay = VideoReceiveOptions {
-        playout_delay: Some(PlayoutDelay {
-            min_ms: 0,
-            max_ms: 0,
-        }),
-        ..defaults.clone()
-    };
-    assert_eq!(validation::validate_spec(&spec(minimum_delay)), Ok(()));
     for invalid in [
         VideoReceiveOptions {
             max_height: Some(0),
@@ -1038,20 +1030,6 @@ fn receive_replacements_preserve_explicit_zero_and_reject_not_clamp() {
         },
         VideoReceiveOptions {
             priority: Some(0),
-            ..defaults.clone()
-        },
-        VideoReceiveOptions {
-            playout_delay: Some(PlayoutDelay {
-                min_ms: 1,
-                max_ms: 0,
-            }),
-            ..defaults.clone()
-        },
-        VideoReceiveOptions {
-            playout_delay: Some(PlayoutDelay {
-                min_ms: 0,
-                max_ms: 4096,
-            }),
             ..defaults.clone()
         },
     ] {
@@ -1287,7 +1265,7 @@ fn immutable_declarations_use_codec_defaults_without_reassociating_sources() {
 }
 
 #[test]
-fn mutable_defaults_do_not_erase_presence_or_explicit_playout_requests() {
+fn mutable_defaults_do_not_erase_codec_parameter_presence() {
     let settings = |options| ResourceSettings {
         enabled: Some(false),
         receive: Some(resource_settings::Receive::Video(options)),
@@ -1305,15 +1283,6 @@ fn mutable_defaults_do_not_erase_presence_or_explicit_playout_requests() {
     assert!(!validation::settings_equivalent(
         &default,
         &settings(options.clone())
-    ));
-    options.priority = None;
-    options.playout_delay = Some(PlayoutDelay {
-        min_ms: 0,
-        max_ms: 0,
-    });
-    assert!(!validation::settings_equivalent(
-        &default,
-        &settings(options)
     ));
     let opus = |dtx| {
         CodecFormat::from(codec_format::Codec::Opus(OpusParameters {

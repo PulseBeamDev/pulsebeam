@@ -9,7 +9,6 @@ import {
   ErrorCode,
   LogLevel,
   PipeStatus,
-  PlayoutDelay,
   PublicationAdmissionStatus,
   VideoSource,
   WatchStatus,
@@ -221,15 +220,6 @@ export async function receiveGenerated(config: {
     const audio = remoteAudio.subscribe();
     const audioUpdates = audio.updates();
     try {
-      audio.configure({
-        playoutDelay: PlayoutDelay.Fixed.new({ minMs: 10, maxMs: 20 }),
-      });
-      if (!PlayoutDelay.Fixed.instanceOf(audio.state().playoutDelay)) {
-        throw new Error(
-          "Generated audio reconfiguration did not update playout delay",
-        );
-      }
-      audio.configure();
       const initialAudio = audio.state();
       if (
         initialAudio.closed ||

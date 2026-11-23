@@ -93,7 +93,6 @@ pub struct VideoDemand {
     pub min_height: u32,
     pub min_fps: u32,
     pub priority: u32,
-    pub playout_delay: PlayoutDelay,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, uniffi::Record)]
@@ -103,26 +102,12 @@ pub struct VideoObservation {
     pub min_height: u32,
     pub min_fps: u32,
     pub priority: u32,
-    pub playout_delay: PlayoutDelay,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, uniffi::Record)]
-pub struct AudioSubscriptionConfig {
-    pub playout_delay: PlayoutDelay,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, uniffi::Record)]
 pub struct AudioDemand {
     pub pinned: Vec<String>,
     pub selected: Vec<TrackSelector>,
-    pub playout_delays: Vec<AudioTrackDelay>,
-    pub selector_delays: Vec<SelectorDelay>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
-pub struct AudioTrackDelay {
-    pub publication_id: String,
-    pub playout_delay: PlayoutDelay,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
@@ -130,22 +115,6 @@ pub struct TrackSelector {
     pub room: String,
     pub participant_id: String,
     pub track_id: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
-pub struct SelectorDelay {
-    pub selector: TrackSelector,
-    pub playout_delay: PlayoutDelay,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, uniffi::Enum)]
-pub enum PlayoutDelay {
-    #[default]
-    Adaptive,
-    Fixed {
-        min_ms: u32,
-        max_ms: u32,
-    },
 }
 
 /// Delivery policy for the negotiated Fabric DATA binding.
@@ -762,7 +731,6 @@ pub enum ResourceFailure {
     PublicationConfigurationSpaceExhausted,
     SlotSpaceExhausted { kind: MediaKind },
     Released,
-    InvalidPlayoutDelay,
     ReceiveOverflow,
     ReceiveChannelFailed { message: String },
     ReceiveFailed { error: ErrorInfo },
@@ -792,7 +760,6 @@ impl From<model::TrackResourceError> for ResourceFailure {
                 Self::SlotSpaceExhausted { kind: kind.into() }
             }
             model::TrackResourceError::Released => Self::Released,
-            model::TrackResourceError::InvalidPlayoutDelay => Self::InvalidPlayoutDelay,
             model::TrackResourceError::ReceiveOverflow => Self::ReceiveOverflow,
             model::TrackResourceError::ReceiveChannelFailed(message) => {
                 Self::ReceiveChannelFailed { message }
@@ -992,7 +959,6 @@ impl From<VideoDemand> for model::VideoSubscription {
             min_height: value.min_height,
             min_fps: value.min_fps,
             priority: value.priority,
-            playout_delay: value.playout_delay.into(),
         }
     }
 }
@@ -1007,7 +973,6 @@ impl From<model::VideoSubscription> for VideoDemand {
             min_height: value.min_height,
             min_fps: value.min_fps,
             priority: value.priority,
-            playout_delay: value.playout_delay.into(),
         }
     }
 }
@@ -1020,7 +985,6 @@ impl From<VideoObservation> for crate::VideoObservation {
             min_height: value.min_height,
             min_fps: value.min_fps,
             priority: value.priority,
-            playout_delay: value.playout_delay.into(),
         }
     }
 }
@@ -1033,7 +997,6 @@ impl From<crate::VideoObservation> for VideoObservation {
             min_height: value.min_height,
             min_fps: value.min_fps,
             priority: value.priority,
-            playout_delay: value.playout_delay.into(),
         }
     }
 }
@@ -1043,16 +1006,6 @@ impl From<AudioDemand> for model::AudioSubscription {
         Self {
             pinned: value.pinned,
             selected: value.selected.into_iter().map(Into::into).collect(),
-            playout_delays: value
-                .playout_delays
-                .into_iter()
-                .map(|entry| (entry.publication_id, entry.playout_delay.into()))
-                .collect(),
-            selector_delays: value
-                .selector_delays
-                .into_iter()
-                .map(|entry| (entry.selector.into(), entry.playout_delay.into()))
-                .collect(),
         }
     }
 }
@@ -1062,22 +1015,6 @@ impl From<model::AudioSubscription> for AudioDemand {
         Self {
             pinned: value.pinned,
             selected: value.selected.into_iter().map(Into::into).collect(),
-            playout_delays: value
-                .playout_delays
-                .into_iter()
-                .map(|(publication_id, playout_delay)| AudioTrackDelay {
-                    publication_id,
-                    playout_delay: playout_delay.into(),
-                })
-                .collect(),
-            selector_delays: value
-                .selector_delays
-                .into_iter()
-                .map(|(selector, playout_delay)| SelectorDelay {
-                    selector: selector.into(),
-                    playout_delay: playout_delay.into(),
-                })
-                .collect(),
         }
     }
 }
@@ -1098,24 +1035,6 @@ impl From<model::TrackSelector> for TrackSelector {
             room: value.room,
             participant_id: value.participant_id,
             track_id: value.track_id,
-        }
-    }
-}
-
-impl From<PlayoutDelay> for model::PlayoutDelay {
-    fn from(value: PlayoutDelay) -> Self {
-        match value {
-            PlayoutDelay::Adaptive => Self::Adaptive,
-            PlayoutDelay::Fixed { min_ms, max_ms } => Self::Fixed { min_ms, max_ms },
-        }
-    }
-}
-
-impl From<model::PlayoutDelay> for PlayoutDelay {
-    fn from(value: model::PlayoutDelay) -> Self {
-        match value {
-            model::PlayoutDelay::Adaptive => Self::Adaptive,
-            model::PlayoutDelay::Fixed { min_ms, max_ms } => Self::Fixed { min_ms, max_ms },
         }
     }
 }
@@ -1514,7 +1433,6 @@ mod tests {
                 min_height: 180,
                 min_fps: 15,
                 priority: 1,
-                playout_delay: PlayoutDelay::Adaptive,
             }],
             ..DesiredState::default()
         };
@@ -1729,10 +1647,6 @@ mod tests {
             min_height: 180,
             min_fps: 15,
             priority: 2,
-            playout_delay: PlayoutDelay::Fixed {
-                min_ms: 80,
-                max_ms: 160,
-            },
         });
         let observation = VideoObservation {
             visible: true,
@@ -1740,10 +1654,6 @@ mod tests {
             min_height: 180,
             min_fps: 15,
             priority: 2,
-            playout_delay: PlayoutDelay::Fixed {
-                min_ms: 80,
-                max_ms: 160,
-            },
         };
         assert_ffi_round_trip(observation.clone());
         let model = crate::VideoObservation::from(observation.clone());
@@ -1755,10 +1665,6 @@ mod tests {
                 min_height: 180,
                 min_fps: 15,
                 priority: 2,
-                playout_delay: model::PlayoutDelay::Fixed {
-                    min_ms: 80,
-                    max_ms: 160
-                }
             }
         );
         assert_eq!(VideoObservation::from(model), observation);
@@ -1772,24 +1678,9 @@ mod tests {
             track_id: "camera".to_string(),
         };
         assert_ffi_round_trip(selector.clone());
-        assert_ffi_round_trip(SelectorDelay {
-            selector: selector.clone(),
-            playout_delay: PlayoutDelay::Adaptive,
-        });
         assert_ffi_round_trip(AudioDemand {
             pinned: vec!["participant/audio".to_string()],
-            selected: vec![selector.clone()],
-            playout_delays: vec![AudioTrackDelay {
-                publication_id: "participant/audio".to_string(),
-                playout_delay: PlayoutDelay::Fixed {
-                    min_ms: 0,
-                    max_ms: 0,
-                },
-            }],
-            selector_delays: vec![SelectorDelay {
-                selector,
-                playout_delay: PlayoutDelay::Adaptive,
-            }],
+            selected: vec![selector],
         });
         assert_ffi_round_trip(publisher.clone());
         assert_ffi_round_trip(subscriber.clone());
@@ -1874,15 +1765,6 @@ mod tests {
             LogLevel::Info,
             LogLevel::Debug,
             LogLevel::Trace,
-        ] {
-            assert_ffi_round_trip(value);
-        }
-        for value in [
-            PlayoutDelay::Adaptive,
-            PlayoutDelay::Fixed {
-                min_ms: 1,
-                max_ms: 2,
-            },
         ] {
             assert_ffi_round_trip(value);
         }

@@ -274,13 +274,10 @@ fn desired(revision: u64) -> DesiredState {
             min_height: 180,
             min_fps: 15,
             priority: 100,
-            playout_delay: PlayoutDelay::Adaptive,
         }],
         audio: AudioSubscription {
             pinned: vec!["audio-track".to_string()],
             selected: Vec::new(),
-            playout_delays: BTreeMap::new(),
-            selector_delays: BTreeMap::new(),
         },
         topics: TopicRegistrations::default(),
     }
@@ -1306,25 +1303,18 @@ fn construction_and_desired_state_validate_complete_external_input() {
     let mut agent = Agent::new(config()).unwrap();
     let mut valid = desired(1);
     valid.video[0].min_height = 721;
-    valid.video[0].playout_delay = PlayoutDelay::Fixed {
-        min_ms: 3000,
-        max_ms: 500,
-    };
     agent.command(AgentCommand::ReplaceDesired(valid)).unwrap();
     assert_eq!(agent.snapshot().desired_revision, 1);
 
     let mut invalid = desired(2);
-    invalid.audio.playout_delays.insert(
-        "not-pinned".into(),
-        PlayoutDelay::Fixed {
-            min_ms: 0,
-            max_ms: 0,
-        },
-    );
+    invalid.audio.pinned = vec!["same".into(), "same".into()];
     assert_eq!(
         agent.command(AgentCommand::ReplaceDesired(invalid)),
         Err(AgentError::InvalidConfiguration(
-            ValidationError::UnknownAudioTrack("not-pinned".into())
+            ValidationError::Duplicate {
+                field: "audio pin",
+                value: "same".into()
+            }
         ))
     );
 }
@@ -3970,22 +3960,12 @@ fn native_settings_replace_per_resource_and_omitted_declarations_retire_owned_li
             .collect(),
     );
     let mut per_track = native_media::scoped_desired(2);
-    per_track.video[0].playout_delay = PlayoutDelay::Fixed {
-        min_ms: 20,
-        max_ms: 100,
-    };
-    per_track.audio.selector_delays.insert(
-        per_track.audio.selected[0].clone(),
-        PlayoutDelay::Fixed {
-            min_ms: 0,
-            max_ms: 0,
-        },
-    );
+    per_track.video[0].priority = 42;
     agent
         .command(AgentCommand::ReplaceDesired(per_track))
         .unwrap();
     let mut fixed = native_media::next(&mut agent, generation, channel);
-    assert_eq!(fixed.len(), 2);
+    assert_eq!(fixed.len(), 1);
     for target in &mut fixed {
         target.prepared = targets
             .iter()
@@ -3997,30 +3977,15 @@ fn native_settings_replace_per_resource_and_omitted_declarations_retire_owned_li
                 .any(|previous| previous.reference == target.reference
                     && previous.spec().declaration == target.spec().declaration)
         );
-        match target
+        let Some(state::resource_settings::Receive::Video(options)) = target
             .spec()
             .settings
             .as_ref()
-            .unwrap()
-            .receive
-            .as_ref()
-            .unwrap()
-        {
-            state::resource_settings::Receive::Video(options) => assert_eq!(
-                options.playout_delay,
-                Some(state::PlayoutDelay {
-                    min_ms: 20,
-                    max_ms: 100
-                })
-            ),
-            state::resource_settings::Receive::Audio(options) => assert_eq!(
-                options.playout_delay,
-                Some(state::PlayoutDelay {
-                    min_ms: 0,
-                    max_ms: 0
-                })
-            ),
-        }
+            .and_then(|settings| settings.receive.as_ref())
+        else {
+            panic!("video-only settings update");
+        };
+        assert_eq!(options.priority, Some(42));
     }
     agent
         .command(AgentCommand::ReplaceDesired(native_media::scoped_desired(
@@ -4041,7 +4006,7 @@ fn native_settings_replace_per_resource_and_omitted_declarations_retire_owned_li
             .collect(),
     );
     let adaptive = native_media::next(&mut agent, generation, channel);
-    assert_eq!(adaptive.len(), 2);
+    assert_eq!(adaptive.len(), 1);
     for target in &adaptive {
         assert!(
             fixed
@@ -4049,22 +4014,15 @@ fn native_settings_replace_per_resource_and_omitted_declarations_retire_owned_li
                 .any(|previous| previous.reference == target.reference
                     && previous.spec().declaration == target.spec().declaration)
         );
-        match target
+        let Some(state::resource_settings::Receive::Video(options)) = target
             .spec()
             .settings
             .as_ref()
-            .unwrap()
-            .receive
-            .as_ref()
-            .unwrap()
-        {
-            state::resource_settings::Receive::Video(options) => {
-                assert!(options.playout_delay.is_none());
-            }
-            state::resource_settings::Receive::Audio(options) => {
-                assert!(options.playout_delay.is_none());
-            }
-        }
+            .and_then(|settings| settings.receive.as_ref())
+        else {
+            panic!("video-only settings update");
+        };
+        assert_ne!(options.priority, Some(42));
     }
     let mut retracted = native_media::scoped_desired(4);
     retracted.publications.clear();

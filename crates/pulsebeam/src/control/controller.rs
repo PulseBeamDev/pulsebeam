@@ -663,7 +663,6 @@ pub struct ControllerActor {
     retiring_native: std::collections::HashMap<ConnectionId, native_service::RetiringNative>,
     source_lookup_index: native_service::SourceLookupIndex,
     data_branches: super::native::DataBranchIds,
-    data_profile: super::native::DataProfile,
     catalog: catalog::CatalogRuntime,
     native_ready_tx: mailbox::Sender<ConnectionId>,
     native_ready_rx: mailbox::Receiver<ConnectionId>,
@@ -749,7 +748,6 @@ impl ControllerActor {
             retiring_native: std::collections::HashMap::new(),
             source_lookup_index: native_service::SourceLookupIndex::default(),
             data_branches: super::native::DataBranchIds::default(),
-            data_profile: super::native::DataProfile::default(),
             catalog: catalog::CatalogRuntime::default(),
             native_ready_tx,
             native_ready_rx,
@@ -760,10 +758,6 @@ impl ControllerActor {
     #[cfg(feature = "sim")]
     pub(crate) fn set_sim_ownership_peer(&mut self, peer: ownership::sim::SimOwnershipPeer) {
         self.receipt_trust = Some(ownership::receipt::Authority::Local(peer.trust()));
-    }
-
-    pub(crate) fn set_data_profile(&mut self, data_profile: super::native::DataProfile) {
-        self.data_profile = data_profile;
     }
 
     pub(crate) fn set_ownership_mode(&mut self, mode: OwnershipMode) {
@@ -1402,7 +1396,6 @@ impl ControllerActor {
                 pending.connection_id(),
                 capabilities,
                 &pending.answer,
-                self.data_profile,
             )
         } else {
             creation::CreationResponse::sdp(&location, &pending.answer)
@@ -3707,7 +3700,6 @@ impl ControllerActor {
                 self.core.release_transport(address, now);
                 return Err(ControllerError::ServiceUnavailable);
             };
-            native.model.configure_data_profile(self.data_profile);
             if let Some(lease) = authorization.as_ref() {
                 let initialized = lease.native_expiry().ok().and_then(|expiry| {
                     native
@@ -4389,7 +4381,6 @@ mod replacement_tests {
                 retiring_native: std::collections::HashMap::new(),
                 source_lookup_index: native_service::SourceLookupIndex::default(),
                 data_branches: crate::control::native::DataBranchIds::default(),
-                data_profile: crate::control::native::DataProfile::Legacy,
                 catalog: catalog::CatalogRuntime::default(),
                 native_ready_tx,
                 native_ready_rx,

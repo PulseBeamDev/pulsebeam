@@ -446,17 +446,12 @@ async fn session(
     })?;
     assert!(proof.output.len() >= 3);
     assert_eq!(proof.input.len(), proof.output.len());
-    assert!(
-        proof
-            .input
-            .iter()
-            .zip(&proof.output)
-            .all(|(input, output)| output <= input)
-    );
+    const UDP_PAYLOAD_CAP: usize = 1_232;
+    assert!(proof.output.iter().all(|&bytes| bytes <= UDP_PAYLOAD_CAP));
     // Repeated Native NACKs may cause several copies before decode completes.
     assert!(!proof.repairs.is_empty());
     assert!(proof.repairs.iter().all(|&bytes| bytes == dropped + 2));
-    assert!(dropped + 2 <= 1_216);
+    assert!(proof.repairs.iter().all(|&bytes| bytes <= UDP_PAYLOAD_CAP));
     Ok(())
 }
 

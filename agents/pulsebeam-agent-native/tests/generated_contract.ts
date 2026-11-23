@@ -3,8 +3,6 @@ import {
   AgentStatus,
   AgentUpdates,
   ErrorCode,
-  AudioSubscriptionConfig,
-  PlayoutDelay,
   PublicationConfig,
   PublicationAdmissionStatus,
   PublicationDemand,
@@ -243,15 +241,9 @@ try {
 }
 const explicitVideo = remoteVideo.subscribe(VideoObservation.create({
   visible: false, height: 0, minHeight: 0, minFps: 0, priority: 1,
-  playoutDelay: PlayoutDelay.Adaptive.new(),
 }));
 await explicitVideo.close();
 explicitVideo.uniffiDestroy();
-const explicitAudio = remoteAudio.subscribe(AudioSubscriptionConfig.create({
-  playoutDelay: PlayoutDelay.Adaptive.new(),
-}));
-await explicitAudio.close();
-explicitAudio.uniffiDestroy();
 const videoSubscription = remoteVideo.subscribe();
 if (videoSubscription instanceof Promise) throw new Error("video subscribe must be synchronous");
 const audioSubscription = remoteAudio.subscribe();
@@ -263,8 +255,6 @@ const audioUpdates = audioSubscription.updates();
 if (!videoState.configuration.visible || videoState.configuration.height !== 0 ||
     videoState.configuration.minHeight !== 0 || videoState.configuration.minFps !== 0 ||
     videoState.configuration.priority !== 0 ||
-    !PlayoutDelay.Adaptive.instanceOf(videoState.configuration.playoutDelay) ||
-    !PlayoutDelay.Adaptive.instanceOf(audioState.playoutDelay) ||
     (await videoUpdates.next())?.observationRevision !== videoState.observationRevision ||
     (await audioUpdates.next())?.observationRevision !== audioState.observationRevision) {
   throw new Error("subscription defaults or current-first state were lost");

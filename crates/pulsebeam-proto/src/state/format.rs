@@ -232,7 +232,6 @@ features!(RtpHeaderExtensionType {
     RtpHeaderExtensionRid => "urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id",
     RtpHeaderExtensionRepairedRid => "urn:ietf:params:rtp-hdrext:sdes:repaired-rtp-stream-id",
     RtpHeaderExtensionTransportCcDraft01 => "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01",
-    RtpHeaderExtensionPlayoutDelay => "http://www.webrtc.org/experiments/rtp-hdrext/playout-delay",
     RtpHeaderExtensionDependencyDescriptor => "https://aomediacodec.github.io/av1-rtp-spec/#dependency-descriptor-rtp-header-extension",
     RtpHeaderExtensionAudioLevel => "urn:ietf:params:rtp-hdrext:ssrc-audio-level",
     RtpHeaderExtensionVideoLayersAllocation => "http://www.webrtc.org/experiments/rtp-hdrext/video-layers-allocation00",

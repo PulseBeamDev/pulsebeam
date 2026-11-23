@@ -591,22 +591,8 @@ enum MediaActivity {
 
 // Mutable audio subscription policy; an empty message requests defaults.
 message AudioReceiveOptions {
-  // Absent resets to runtime-default buffering; present supplies explicit bounds.
-  PlayoutDelay playout_delay = 1;
-}
-
-// Receiver buffering policy in milliseconds: 0<=min<=max<=4095. [0,0] requests minimum available buffering, not zero end-to-end
-// latency. Invalid values reject; they MUST NOT be clamped into acceptance.
-//
-// RTP extension encoding uses floor(min/10) and ceil(max/10) in 10-ms units.
-// Keep application intent in milliseconds. Unsupported feature rejects
-// UNSUPPORTED; inability to apply/reset supported bounds rejects INCOMPATIBLE.
-message PlayoutDelay {
-  // Inclusive requested minimum buffering; omitted scalar defaults to zero.
-  uint32 min_ms = 1;
-
-  // Inclusive requested maximum, >=min_ms; omitted scalar defaults to zero.
-  uint32 max_ms = 2;
+  reserved 1;
+  reserved "playout_delay";
 }
 
 // Mutable video subscription policy; omission restores each documented default.
@@ -634,8 +620,8 @@ message VideoReceiveOptions {
   // Contention weight, 1..255; absent defaults to 1.
   // Does not create subscriptions or evict another resource owner.
   optional uint32 priority = 4;
-  // Absent restores default buffering; present requests explicit bounds.
-  PlayoutDelay playout_delay = 5;
+  reserved 5;
+  reserved "playout_delay";
 }
 
 

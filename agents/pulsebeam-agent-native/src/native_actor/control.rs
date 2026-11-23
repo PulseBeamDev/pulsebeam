@@ -6,7 +6,7 @@ mod resource_state;
 
 pub(super) enum SubscriptionConfiguration {
     Video(agent_core::VideoObservation),
-    Audio(agent_core::PlayoutDelay),
+    Audio,
 }
 
 type PipeObservers = Arc<
@@ -317,7 +317,7 @@ impl Control {
                     }
                     Ok(owner)
                 }
-                SubscriptionConfiguration::Audio(playout_delay) => {
+                SubscriptionConfiguration::Audio => {
                     let agent_core::ResourceResult::Owned { owner } =
                         core.resource(agent_core::ResourceCommand::ClaimAudioSubscription {
                             selector,
@@ -327,13 +327,6 @@ impl Control {
                             agent_core::TrackResourceError::WrongKind,
                         ));
                     };
-                    if let Err(error) = core.resource(agent_core::ResourceCommand::ConfigureAudio {
-                        owner,
-                        playout_delay,
-                    }) {
-                        let _ = core.resource(agent_core::ResourceCommand::Release { owner });
-                        return Err(error);
-                    }
                     Ok(owner)
                 }
             };

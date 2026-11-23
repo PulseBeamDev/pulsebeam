@@ -23,7 +23,6 @@ pub struct ProvisionedPeer {
     /// Explicit programmatic selection of the WAN carrier, with no fallback.
     pub fabric_wan: bool,
     /// Both pinned peers must support revision-1 Opus windows before enabling this.
-    pub wan_opus_source_budget: bool,
     /// Explicitly allow WAN sources from this pinned upstream on this outgoing edge.
     pub relay_from: Option<NodeId>,
     pub authority_epoch: [u8; 16],
@@ -195,7 +194,6 @@ impl PeerConfig {
             receipt_key,
             peer_receipt_key: self.peer_receipt_key,
             fabric_wan: false,
-            wan_opus_source_budget: false,
             relay_from: None,
             transport: NetworkPeer {
                 endpoint: self.peer_endpoint,
@@ -308,10 +306,6 @@ impl Options {
         let mut nodes = BTreeSet::new();
         let first = self.ownership_peers.first();
         for peer in &self.ownership_peers {
-            ensure!(
-                !peer.wan_opus_source_budget || peer.fabric_wan,
-                "Opus source budgeting requires Fabric WAN"
-            );
             if let Some(upstream) = peer.relay_from {
                 ensure!(
                     peer.fabric_wan

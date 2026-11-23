@@ -45,7 +45,6 @@ export {
 export {
   AgentState,
   AgentStatus,
-  AudioSubscriptionConfig,
   AudioSubscriptionState,
   CaptureClock,
   CaptureTimestamp,
@@ -64,7 +63,6 @@ export {
   LogLevel,
   PipeState,
   PipeStatus,
-  PlayoutDelay,
   PublicationAdmissionStatus,
   PublicationExecution,
   SubscriptionSourceStatus,

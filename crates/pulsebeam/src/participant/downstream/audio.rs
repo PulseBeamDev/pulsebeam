@@ -2,8 +2,6 @@ use std::array;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use ahash::{HashSet, HashSetExt};
-
 use crate::media::{Mid, Pt, Ssrc};
 use pulsebeam_runtime::time::Instant;
 
@@ -44,8 +42,6 @@ pub struct AudioAllocator {
     /// What the client asked for. Auto with no pins until it says otherwise,
     /// which is what the SFU did before a client could say anything about audio.
     intent: AudioIntent,
-    fixed_receivers: HashSet<Mid>,
-    fixed_tracks: HashSet<PublicationKey>,
 }
 
 pub struct DownstreamAudio {
@@ -158,8 +154,6 @@ impl AudioAllocator {
                 pinned: Vec::new(),
                 auto: false,
             },
-            fixed_receivers: HashSet::new(),
-            fixed_tracks: HashSet::new(),
         }
     }
 
@@ -177,46 +171,6 @@ impl AudioAllocator {
             }
         }
         self.intent = intent;
-    }
-
-    pub(crate) fn set_playout_compatibility(
-        &mut self,
-        fixed_receivers: HashSet<Mid>,
-        fixed_tracks: HashSet<PublicationKey>,
-    ) {
-        self.fixed_receivers = fixed_receivers;
-        self.fixed_tracks = fixed_tracks;
-        // A default track cannot remain assigned to a fixed-delay receiver.
-        // Retire it at this policy commit, before a packet can move it elsewhere.
-        for slot in self.slots.iter_mut().flatten() {
-            if self.fixed_receivers.contains(&slot.mid)
-                && slot
-                    .occupant
-                    .is_some_and(|occupant| !self.fixed_tracks.contains(&occupant.origin.track))
-            {
-                slot.occupant = None;
-                slot.pending_marker = true;
-                self.speakers_changed = true;
-            }
-        }
-    }
-
-    pub(crate) fn mark_fixed_receiver(&mut self, mid: Mid) {
-        self.fixed_receivers.insert(mid);
-    }
-
-    pub(crate) fn default_needs_reconnect(&self) -> bool {
-        let has_default_demand = self.intent.auto
-            || self
-                .intent
-                .pinned
-                .iter()
-                .any(|id| !self.fixed_tracks.contains(id));
-        has_default_demand
-            && self.provisioned().next().is_some()
-            && self
-                .provisioned()
-                .all(|(_, slot)| self.fixed_receivers.contains(&slot.mid))
     }
 
     fn is_pinned(&self, track: PublicationKey) -> bool {
@@ -432,21 +386,18 @@ impl AudioAllocator {
     /// Which slot this speaker gets, if any.
     fn slot_for(&self, origin: AudioOrigin, power: f32, now: Instant) -> Option<usize> {
         let pinned = self.is_pinned(origin.track);
-        let compatible = |slot: &Slot| {
-            self.fixed_tracks.contains(&origin.track) || !self.fixed_receivers.contains(&slot.mid)
-        };
         if !pinned && !self.intent.auto {
             return None;
         }
         if let Some((idx, _)) = self
             .provisioned()
-            .find(|(_, slot)| compatible(slot) && slot.occupant.map(|o| o.origin) == Some(origin))
+            .find(|(_, slot)| slot.occupant.map(|o| o.origin) == Some(origin))
         {
             return Some(idx);
         }
         if let Some((idx, _)) = self
             .provisioned()
-            .find(|(_, slot)| compatible(slot) && slot.is_dead(now) && !slot.is_immune(now))
+            .find(|(_, slot)| slot.is_dead(now) && !slot.is_immune(now))
         {
             return Some(idx);
         }
@@ -454,7 +405,7 @@ impl AudioAllocator {
         // quiet it goes - that is what pinning means.
         let (idx, quietest) = self
             .provisioned()
-            .filter(|(_, slot)| compatible(slot) && !slot.is_immune(now) && !self.holds_pin(slot))
+            .filter(|(_, slot)| !slot.is_immune(now) && !self.holds_pin(slot))
             .min_by(|(_, a), (_, b)| {
                 a.last_power
                     .partial_cmp(&b.last_power)
@@ -639,67 +590,6 @@ mod tests {
         alloc.remove_owned_slot(mid);
         alloc.on_owned_rtp(mid, source, &packet, &mut writer);
         assert!(writer.pop().is_none());
-    }
-
-    #[test]
-    fn default_audio_uses_a_fresh_receiver_instead_of_a_fixed_one() {
-        let mut alloc = allocator_with(2);
-        alloc.mark_fixed_receiver(Mid::from("a0"));
-        alloc.on_rtp(origin(1), &speaking(-30), &mut StreamWriter::new());
-        assert_eq!(alloc.assignments()[0].mid, Mid::from("a1"));
-        assert!(!alloc.default_needs_reconnect());
-
-        let mut downstream = super::super::Downstream::new(test_ctx());
-        downstream.audio.set_intent(AudioIntent::default());
-        downstream.audio.add_slot(slot_config("a0", 1000));
-        downstream.audio.add_slot(slot_config("a1", 1001));
-        let speaker = origin(2);
-        let fixed = HashSet::from_iter([Mid::from("a0")]);
-        downstream
-            .audio
-            .set_playout_compatibility(fixed.clone(), HashSet::from_iter([speaker.track]));
-        downstream
-            .audio
-            .on_rtp(speaker, &speaking(-30), &mut StreamWriter::new());
-        assert_eq!(
-            downstream.native_assignments().1,
-            vec![(1000, speaker.track)]
-        );
-        assert!(downstream.audio.take_speakers_changed());
-        downstream
-            .audio
-            .set_playout_compatibility(fixed.clone(), HashSet::new());
-        assert!(
-            downstream.native_assignments().1.is_empty(),
-            "the incompatible old assignment retires before migration"
-        );
-        assert!(downstream.audio.take_speakers_changed());
-        downstream
-            .audio
-            .on_rtp(speaker, &speaking(-30), &mut StreamWriter::new());
-        assert_eq!(heard_origins(&downstream.audio), vec![speaker]);
-        assert_eq!(
-            downstream.native_assignments().1,
-            vec![(1001, speaker.track)],
-            "one track must never occupy two native receiver indices"
-        );
-        assert!(downstream.audio.take_speakers_changed());
-        downstream
-            .audio
-            .set_playout_compatibility(fixed, HashSet::new());
-        assert!(
-            !downstream.audio.take_speakers_changed(),
-            "an unchanged compatible assignment is stable"
-        );
-
-        let mut only_fixed = allocator_with(1);
-        only_fixed.mark_fixed_receiver(Mid::from("a0"));
-        assert!(only_fixed.default_needs_reconnect());
-        assert!(
-            only_fixed
-                .on_rtp(origin(1), &speaking(-30), &mut StreamWriter::new())
-                .is_none()
-        );
     }
 
     #[test]

@@ -363,9 +363,10 @@ impl WirePeer {
         let enqueued = || pulsebeam::sim_metrics::routing_counter(route);
         let before = enqueued();
         let udp = self._host.observe_udp_rtp(server);
-        // Opus code 3 with one 20 ms frame and 1,191 bytes of codec padding.
-        let mut payload = vec![0xfb, 0x41, 255, 255, 255, 255, 175, 0xff, 0xfe];
-        payload.resize(1_200, 0);
+        // Opus code 3 padding fills the qualified endpoint layout with one 20 ms frame.
+        const UDP_PAYLOAD_CAP: usize = 1_232;
+        let mut payload = vec![0xfb, 0x41, 255, 255, 255, 255, 167, 0xff, 0xfe];
+        payload.resize(UDP_PAYLOAD_CAP - 40, 0);
         push_payload(&source, 20, &payload).await?;
         let first = native.frames_with_payload(5, &payload)?;
         let peaks = udp.peaks();
@@ -374,14 +375,11 @@ impl WirePeer {
             enqueued() > before,
             "Native Opus did not use the expected Fabric path: {route}"
         );
-        // Both peers carry only the exact constant Opus source in this window.
-        // Comparing the largest receiver primary with the smallest publisher
-        // primary bounds every corresponding pair without sequence-offset assumptions.
         anyhow::ensure!(
-            peaks
-                .min_sent
-                .is_some_and(|min| (1_217..=min).contains(&peaks.received)),
-            "Native protected Opus did not exceed the old cap without growth: {peaks:?}"
+            [peaks.sent, peaks.received]
+                .into_iter()
+                .all(|bytes| (1_217..=UDP_PAYLOAD_CAP).contains(&bytes)),
+            "boundary-size Native Opus exceeded a protected UDP limit or was not observed: {peaks:?}"
         );
         assert_decoded_opus(first)?;
         native.enabled(31, false).await?;
@@ -642,9 +640,10 @@ impl WirePeer {
             counter().saturating_sub(before)
         );
         anyhow::ensure!(
-            udp.min_sent
-                .is_some_and(|min| (31..=min).contains(&udp.received)),
-            "protected WHIP/WHEP Opus output grew: {udp:?}",
+            [udp.sent, udp.received]
+                .into_iter()
+                .all(|bytes| (31..=1_232).contains(&bytes)),
+            "protected WHIP/WHEP Opus exceeded the UDP limit or was not observed: {udp:?}",
         );
 
         assert_decoded_opus(first.context("first authenticated WHEP Opus frame")?)?;

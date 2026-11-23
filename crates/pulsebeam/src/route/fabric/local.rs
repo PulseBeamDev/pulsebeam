@@ -69,6 +69,7 @@ pub struct OutputEvidence {
     pub entry: bool,
     pub reset_after: Option<u64>,
     pub dd: Option<(u64, Qualified)>,
+    pub(crate) output_position: u64,
     pub(crate) ingress: Option<NonZeroU64>,
 }
 
@@ -192,6 +193,40 @@ pub struct Offers {
     pub suspended: usize,
     pub awaiting_entry: usize,
     pub(crate) dd_structure: Option<crate::rtp::normalize::StreamFacts>,
+    pub(crate) dd_sample: DecodeTargetSample,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum DecodeTargetSample {
+    #[default]
+    None,
+    Unknown,
+    Bytes([u64; crate::rtp::monitor::MAX_LADDER_TARGETS]),
+}
+
+impl DecodeTargetSample {
+    fn record(&mut self, qualified: Option<&Qualified>, payload_bytes: usize) {
+        if *self == Self::Unknown {
+            return;
+        }
+        let Some(qualified) = qualified else {
+            *self = Self::Unknown;
+            return;
+        };
+        let payload_bytes = u64::try_from(payload_bytes).unwrap_or(u64::MAX);
+        let mut bytes = match *self {
+            Self::Bytes(bytes) => bytes,
+            _ => [0; crate::rtp::monitor::MAX_LADDER_TARGETS],
+        };
+        for (target, total) in bytes.iter_mut().enumerate() {
+            if (qualified.active_targets & (1 << target)) != 0
+                && qualified.descriptor.is_in_decode_target(target)
+            {
+                *total = total.saturating_add(payload_bytes);
+            }
+        }
+        *self = Self::Bytes(bytes);
+    }
 }
 
 impl Offers {
@@ -341,10 +376,13 @@ struct Branch {
     filter: Option<Box<FilteredBranch>>,
     dd_reset: Option<u64>,
     filtered_structure: Option<u64>,
+    omitted: u64,
+    last_omitted: Option<u64>,
 }
 
 struct Queued {
     sequence: u64,
+    output_position: u64,
     repair_only: Option<RepairRequest>,
     hops: u8,
     ingress: Option<NonZeroU64>,
@@ -436,6 +474,8 @@ impl SourceFanout {
             filter,
             dd_reset: None,
             filtered_structure: None,
+            omitted: 0,
+            last_omitted: None,
         }))
     }
 
@@ -1067,6 +1107,7 @@ impl SourceFanout {
                 }
                 branch.queue.push_back(Queued {
                     sequence,
+                    output_position: sequence,
                     repair_only: Some(request),
                     hops,
                     ingress,
@@ -1352,7 +1393,7 @@ impl SourceFanout {
                 now.into(),
                 input.arrival,
                 input.ingress_ntp32,
-                input.sequence,
+                input.position,
                 media,
                 |sequence| originals.get(&sequence).map(|frozen| &frozen.packet),
             )
@@ -1534,7 +1575,12 @@ impl SourceFanout {
             .is_none_or(|old| old < sequence)
             .then(|| qualified.as_ref().and_then(dd_structure))
             .flatten();
-        if original.is_none_or(|frozen| frozen.live_arrival.is_none()) {
+        let new_live = original.is_none_or(|frozen| frozen.live_arrival.is_none());
+        let mut dd_sample = DecodeTargetSample::None;
+        if new_live && self.emission.selects_dd_encoding() && !ordered {
+            dd_sample.record(qualified.as_ref().map(|(dd, _)| dd), image.payload().len());
+        }
+        if new_live {
             self.retire_before(oldest);
             if let Some(frozen) = self.fates.get_mut(&sequence) {
                 frozen.live_arrival = Some(arrival);
@@ -1565,11 +1611,12 @@ impl SourceFanout {
         }
         let mut report = Offers {
             dd_structure,
+            dd_sample,
             ..Offers::default()
         };
         for branch in self.branches.values_mut() {
             branch.discard_stale(now, &self.fates, |_| true);
-            branch.offer(now, work, ingress, qualified.as_ref(), &mut report);
+            branch.offer(now, work, ingress, qualified.as_ref(), false, &mut report);
         }
         Ok(report)
     }
@@ -1619,6 +1666,12 @@ impl SourceFanout {
                 .qualify_position(position, &frozen.packet, self.media_identity.as_deref())
                 .ok()
                 .flatten();
+            if self.emission.selects_dd_encoding() {
+                report.dd_sample.record(
+                    qualified.as_ref().map(|(dd, _)| dd),
+                    frozen.packet.payload().len(),
+                );
+            }
             if let Some(facts) = qualified.as_ref().and_then(dd_structure) {
                 report.dd_structure = Some(facts);
             }
@@ -1633,6 +1686,7 @@ impl SourceFanout {
                     work,
                     frozen.live_ingress,
                     qualified.as_ref(),
+                    true,
                     &mut report,
                 );
             }
@@ -1771,6 +1825,7 @@ impl SourceFanout {
             entry: queued.entry,
             reset_after: branch.dd_reset,
             dd,
+            output_position: queued.output_position,
             ingress: queued.ingress,
         };
         let result = write(queued.sequence, packet, projected)?;
@@ -1799,12 +1854,18 @@ impl Branch {
         work: LiveWork,
         ingress: Option<NonZeroU64>,
         evidence: Option<&(Qualified, FrameStatus)>,
+        ordered: bool,
         report: &mut Offers,
     ) {
         let LiveWork { sequence, hops, .. } = work;
-        if self.filter.is_some() && self.dd_reset.is_some_and(|fence| sequence <= fence) {
+        if self.last_omitted.is_some_and(|fence| sequence <= fence)
+            || self.filter.is_some() && self.dd_reset.is_some_and(|fence| sequence <= fence)
+        {
             return;
         }
+        let Some(output_position) = sequence.checked_sub(self.omitted) else {
+            return;
+        };
         let queue = &mut self.queue;
         let mut filtered = None;
         let frame = evidence.and_then(|(q, status)| match status {
@@ -1824,6 +1885,7 @@ impl Branch {
                 }
                 queue.push_back(Queued {
                     sequence,
+                    output_position,
                     repair_only: None,
                     hops,
                     ingress,
@@ -1878,7 +1940,15 @@ impl Branch {
         let count = match (outcome, filtered) {
             (LiveOffer::Enqueued, _) => &mut report.enqueued,
             (LiveOffer::Duplicate, _) => &mut report.duplicates,
-            (LiveOffer::Refused, Some(Decision::Omitted)) => &mut report.omitted,
+            (LiveOffer::Refused, Some(Decision::Omitted)) => {
+                // Only ordered, qualified omissions are known not to be loss.
+                // Freeze the projection when queuing; never renumber admitted work.
+                if ordered {
+                    self.omitted = self.omitted.saturating_add(1);
+                    self.last_omitted = Some(sequence);
+                }
+                &mut report.omitted
+            }
             (LiveOffer::Refused, Some(Decision::Suspended)) => &mut report.suspended,
             (LiveOffer::Refused, Some(Decision::AwaitingEntry)) => &mut report.awaiting_entry,
             (LiveOffer::Refused, Some(Decision::Fenced)) => return,

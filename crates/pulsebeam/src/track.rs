@@ -588,18 +588,33 @@ impl TrackMonitor {
         }
     }
 
-    pub(crate) fn measure_fabric_structure(
+    pub(crate) fn restart_fabric_loss_window(&mut self, ssrc: Ssrc, now: Instant) {
+        if let Some(layer) = self
+            .encodings
+            .iter_mut()
+            .find(|layer| layer.encoding == SourceEncoding::Ssrc(ssrc))
+        {
+            layer.monitor.restart_loss_window(now);
+        }
+    }
+
+    pub(crate) fn measure_fabric_dd(
         &mut self,
         ssrc: Ssrc,
         rid: Option<Rid>,
-        facts: StreamFacts,
+        now: Instant,
+        facts: Option<StreamFacts>,
+        sample: crate::route::fabric::local::DecodeTargetSample,
     ) {
         if let Some(encoding) = self
             .encodings
             .iter_mut()
             .find(|encoding| encoding.encoding.matches(ssrc, rid))
         {
-            encoding.apply_stream_facts(facts);
+            if let Some(facts) = facts {
+                encoding.apply_stream_facts(facts);
+            }
+            encoding.monitor.measure_fabric_targets(now, sample);
         }
     }
 
@@ -625,7 +640,7 @@ impl TrackMonitor {
         let Some(encoding) = self.encodings.get_mut(index) else {
             return false;
         };
-        encoding.monitor.process_packet(packet);
+        encoding.monitor.process_transport_packet(packet);
         let stats = encoding.monitor.stats();
         !stats.is_inactive() && stats.observed_height == 0 && stats.decode_target_heights[0] == 0
     }

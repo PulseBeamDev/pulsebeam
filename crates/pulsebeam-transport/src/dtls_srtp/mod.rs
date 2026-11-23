@@ -339,7 +339,7 @@ pub enum NetworkEnvelope {
 impl NetworkEnvelope {
     fn secure_body_limit(&self) -> Option<usize> {
         match self {
-            Self::Udp { .. } => None,
+            Self::Udp { .. } => Some(pulsebeam_dtls::IPV6_MIN_MTU_UDP_PAYLOAD_BYTES),
             Self::IceTcp { .. } => Some(usize::from(u16::MAX)),
         }
     }
@@ -1267,6 +1267,13 @@ impl Transport {
         rtp: Option<PreparedRtpIdentity>,
         classification: TransmitKind,
     ) -> Result<(), TransportError> {
+        if path
+            .envelope
+            .secure_body_limit()
+            .is_some_and(|limit| bytes.len() > limit)
+        {
+            return Err(TransportError::Protocol);
+        }
         if matches!(path.envelope, NetworkEnvelope::IceTcp { .. }) {
             let length = u16::try_from(bytes.len()).map_err(|_| TransportError::Protocol)?;
             let mut frame = length.to_be_bytes().to_vec();
@@ -1735,8 +1742,14 @@ mod tests {
         assert!(left.negotiated_security().is_some());
         assert_eq!(
             left.selected.as_ref().unwrap().envelope.secure_body_limit(),
-            None
+            Some(1_232)
         );
+        let tag_bytes = left.rtp_wire_bytes(12).unwrap() - 12;
+        assert_eq!(left.rtp_wire_bytes(1_232 - tag_bytes), Ok(1_232));
+        assert!(matches!(
+            left.rtp_wire_bytes(1_233 - tag_bytes),
+            Err(SrtpError::OutputTooLarge)
+        ));
         assert_eq!(
             NetworkEnvelope::IceTcp {
                 local: address(4000),
@@ -1795,9 +1808,22 @@ mod tests {
         while left.poll_prepared().is_some() {}
         left.transmissions.assert_storage();
         let compound_control = control.repeat(60 * 1024 / control.len());
+        assert_eq!(
+            left.send_rtcp(&compound_control),
+            Err(TransportError::Protocol)
+        );
+        assert!(left.poll_prepared().is_none());
+        let udp = std::mem::replace(
+            &mut left.selected.as_mut().unwrap().envelope,
+            NetworkEnvelope::IceTcp {
+                local: address(4000),
+                remote: address(4001),
+            },
+        );
         left.send_rtcp(&compound_control).unwrap();
         assert!(left.transmissions.capacity() < queue_capacity);
         assert!(left.poll_prepared().unwrap().bytes.len() > compound_control.len());
+        left.selected.as_mut().unwrap().envelope = udp;
         left.transmissions.assert_storage();
         drop(caller_owned);
         drop(caller_clone);

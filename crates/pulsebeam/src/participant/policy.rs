@@ -1,5 +1,4 @@
 use crate::media::{Mid, Pt, Rid, Ssrc};
-use crate::rtp::MediaTime;
 use pulsebeam_rtc::{CompiledRtpBinding, MediaKind};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -8,7 +7,6 @@ pub(crate) struct VideoPolicy {
     pub minimum_height: u32,
     pub minimum_fps: u32,
     pub priority: u32,
-    pub playout_delay: Option<(MediaTime, MediaTime)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -113,7 +111,7 @@ pub(crate) struct PublicationExecution {
 #[derive(Clone, Copy)]
 pub(crate) struct ReceiverBinding {
     pub available: bool,
-    pub rtp: Option<(MediaKind, bool)>,
+    pub rtp: Option<MediaKind>,
 }
 
 #[derive(Clone, Copy)]
@@ -131,6 +129,5 @@ pub(crate) struct ReceiverRtpConfiguration {
     pub primary: Ssrc,
     pub payload_type: Pt,
     pub kind: MediaKind,
-    pub supports_playout_delay: bool,
     pub video: Option<VideoPolicy>,
 }

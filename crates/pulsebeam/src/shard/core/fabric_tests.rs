@@ -1677,7 +1677,6 @@ fn shard_mailbox_preserves_fabric_image_and_fences_rebound_sources() {
                     connection_id: owner.connection_id,
                     handle: publisher,
                 });
-        sink.publish_track_packet(Some(source_track), crate::rtp::RtpPacket::default());
         sink.publish_fabric_packet(FabricPublication {
             reliable: None,
             source,
@@ -1686,7 +1685,7 @@ fn shard_mailbox_preserves_fabric_image_and_fences_rebound_sources() {
             packet: large.clone(),
         });
     }
-    assert_eq!(producer.flush_stream_buffers(retry_at, 8), 2);
+    assert_eq!(producer.flush_stream_buffers(retry_at, 8), 1);
     // Move the receiving shard and its live mailbox together, with work
     // outstanding. Execution placement must not change routing identity.
     let (mut execution, mut rx) = std::thread::scope(|scope| {
@@ -2151,7 +2150,6 @@ fn exact_installed_plan_and_endpoint_incarnations_fence_local_candidate_handoff(
         Profile::Opus,
         crate::rtp::fabric_ingress::ExtensionForm::OneByte,
         &[],
-        None,
     )
     .unwrap();
     let mut leg = SenderLeg::new(

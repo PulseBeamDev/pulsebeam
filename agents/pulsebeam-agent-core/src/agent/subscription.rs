@@ -68,7 +68,7 @@ impl Agent {
         owner: u64,
     ) -> Result<AudioSubscriptionState, AgentError> {
         let owner = crate::TrackOwner(owner);
-        let (selector, playout_delay) = self
+        let selector = self
             .resources
             .audio_view(owner)
             .ok_or(crate::TrackResourceError::Released)?;
@@ -102,7 +102,6 @@ impl Agent {
             accepted_revision,
             rejected_revision,
             selector: selector.into(),
-            playout_delay: playout_delay.into(),
             local_enabled: true,
             closed: false,
             source_status,
@@ -724,7 +723,6 @@ impl From<&crate::VideoObservation> for crate::ffi::VideoObservation {
             min_height: value.min_height,
             min_fps: value.min_fps,
             priority: value.priority,
-            playout_delay: value.playout_delay.into(),
         }
     }
 }

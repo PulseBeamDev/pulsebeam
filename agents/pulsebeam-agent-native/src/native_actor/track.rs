@@ -187,15 +187,10 @@ pub struct RemoteAudioTrack {
 }
 
 impl RemoteAudioTrack {
-    pub fn subscribe(
-        &self,
-        configuration: agent_core::ffi::AudioSubscriptionConfig,
-    ) -> Result<Subscription, Error> {
+    pub fn subscribe(&self) -> Result<Subscription, Error> {
         let selector = self.address.selector()?;
-        self.address.claim(
-            selector,
-            control::SubscriptionConfiguration::Audio(configuration.playout_delay.into()),
-        )
+        self.address
+            .claim(selector, control::SubscriptionConfiguration::Audio)
     }
 }
 

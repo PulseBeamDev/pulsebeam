@@ -97,7 +97,6 @@ pub(super) fn install_provisioned_nodes(
     ips: &[IpAddr],
     edges: &[(usize, usize)],
     seed: u64,
-    exercise_media_repair: bool,
 ) -> anyhow::Result<Vec<(NodeId, NonZeroU64)>> {
     let nodes: Vec<_> = ips
         .iter()
@@ -142,7 +141,6 @@ pub(super) fn install_provisioned_nodes(
                         class: NetworkClass::Wan,
                     },
                     fabric_wan: true,
-                    wan_opus_source_budget: exercise_media_repair,
                     relay_from: (index != 0 && index != viewer_index && other == viewer_index)
                         .then_some(left_id.0),
                     authority_epoch: [91; 16],
@@ -163,14 +161,8 @@ pub(super) fn install_provisioned_nodes(
         sim.host(ip, move || {
             let options = options.clone();
             async move {
-                let builder = sfu_node_builder(ip, pulsebeam_runtime::rand::seeded_rng(seed), 1)
-                    .with_cluster(options);
-                let builder = if exercise_media_repair {
-                    builder.with_local_rtp_v1()
-                } else {
-                    builder
-                };
-                builder
+                sfu_node_builder(ip, pulsebeam_runtime::rand::seeded_rng(seed), 1)
+                    .with_cluster(options)
                     .run(tokio_util::sync::CancellationToken::new())
                     .await
                     .map_err(Into::into)
@@ -230,14 +222,7 @@ fn prove_provisioned_cluster(
         .rng_seed(seed)
         .build();
 
-    let identities = install_provisioned_nodes(
-        &mut sim,
-        root.path(),
-        &ips,
-        edges,
-        seed,
-        exercise_media_repair,
-    )?;
+    let identities = install_provisioned_nodes(&mut sim, root.path(), &ips, edges, seed)?;
     let left_id = identities[0];
     let right_id = identities[identities.len() - 1];
     let witness = Arc::new(Mutex::new(None));
@@ -774,13 +759,13 @@ async fn prove_payload(
             .room(ROOM.into())?
             .participant(PUBLISHER.into())?
             .audio(AUDIO.into())?
-            .subscribe(Default::default())?;
+            .subscribe()?;
         listener.join(ROOM.into())?;
         let remote_audio = viewer
             .room(ROOM.into())?
             .participant(PUBLISHER.into())?
             .audio(AUDIO.into())?
-            .subscribe(Default::default())?;
+            .subscribe()?;
         prove_wan_opus_repair(
             &origin,
             AUDIO,
@@ -1464,17 +1449,18 @@ async fn prove_wan_opus_repair(
         .context("stock Opus packet")?
         .clone();
     anyhow::ensure!(original.payload[0] & 3 == 0, "single-frame stock Opus");
-    // Reframe one stock 20 ms frame with Opus code 3 padding to exercise the
-    // full Native encoded input without changing its audio or adding Fabric bytes.
+    // Fill the qualified Native UDP layout without changing the decoded audio.
+    const UDP_CAP: usize = 1_232;
+    const NATIVE_OPUS_PAYLOAD: usize = UDP_CAP - 40;
     let mut payload = vec![original.payload[0] | 3, 0x41];
-    let mut remaining = 1_200 - original.payload.len() - 1;
+    let mut remaining = NATIVE_OPUS_PAYLOAD - original.payload.len() - 1;
     while remaining > 255 {
         payload.push(255);
         remaining -= 255;
     }
     payload.push(u8::try_from(remaining - 1)?);
     payload.extend_from_slice(&original.payload[1..]);
-    payload.resize(1_200, 0);
+    payload.resize(NATIVE_OPUS_PAYLOAD, 0);
     original.payload = payload;
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -1507,15 +1493,14 @@ async fn prove_wan_opus_repair(
         routing_counter("fabric_rtp_egress_too_large"),
     ))??;
     let wire = observation.peaks();
-    let native_max_wire = wire.sent;
     drop(observation);
     // Only this one Opus packet shape is in flight during the observation window.
     let wan = wan_opus_wire_peak();
     anyhow::ensure!(
-        wire.min_sent.is_some_and(|min| {
-            (1_217..=min).contains(&wan) && (1_217..=min).contains(&wire.received)
-        }),
-        "full stock Opus WAN and subscriber writes must not grow beyond the publisher: endpoints={wire:?}, WAN={wan}"
+        ([wire.sent, wire.received, wan])
+            .into_iter()
+            .all(|bytes| (1_217..=UDP_CAP).contains(&bytes)),
+        "boundary-size Opus must fit each protected UDP leg: endpoints={wire:?}, WAN={wan}"
     );
 
     let mut repair_wire = None;
@@ -1564,7 +1549,7 @@ async fn prove_wan_opus_repair(
     anyhow::ensure!(
         [wire.sent, wire.received]
             .into_iter()
-            .all(|bytes| (31..=native_max_wire).contains(&bytes)),
+            .all(|bytes| (31..=UDP_CAP).contains(&bytes)),
         "expected protected Native Opus within the stock endpoint envelope during WAN repair: {wire:?}"
     );
     publication.close().await?;

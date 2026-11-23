@@ -78,11 +78,7 @@ pub enum Op {
     DeclareData(Delivery),
     SendData(Delivery, u8),
     ReplaceData(Delivery),
-    Audio {
-        pinned: Vec<u8>,
-        automatic: bool,
-        fixed_ms: Option<u16>,
-    },
+    Audio { pinned: Vec<u8>, automatic: bool },
     AudioProgress,
     Pressure,
     Receive(Vec<u8>), // 0 is anchor, 1..=3 are symbolic publication incarnations.
@@ -180,7 +176,6 @@ impl History {
                 Op::Audio {
                     pinned: vec![0],
                     automatic: false,
-                    fixed_ms: None,
                 },
                 Op::AudioProgress,
             ],
@@ -195,7 +190,6 @@ impl History {
             Op::Audio {
                 pinned: vec![0],
                 automatic: true,
-                fixed_ms: None,
             },
             Op::AudioProgress,
         ]);
@@ -274,16 +268,7 @@ impl History {
                         return Err("reserved or reused data tag".into());
                     }
                 }
-                Op::Audio {
-                    pinned,
-                    automatic,
-                    fixed_ms,
-                } => {
-                    if fixed_ms.is_some() {
-                        return Err(
-                            "native history profile does not support fixed audio playout".into(),
-                        );
-                    }
+                Op::Audio { pinned, automatic } => {
                     let mut seen = BTreeSet::new();
                     for target in pinned {
                         if *target > 3
@@ -382,14 +367,9 @@ impl History {
                 Op::DeclareData(mode) => format!("declare-data {}", mode.name()),
                 Op::SendData(mode, tag) => format!("send-data {} {tag}", mode.name()),
                 Op::ReplaceData(mode) => format!("replace-data {}", mode.name()),
-                Op::Audio {
-                    pinned,
-                    automatic,
-                    fixed_ms,
-                } => format!(
-                    "audio {} {}{}",
+                Op::Audio { pinned, automatic } => format!(
+                    "audio {} adaptive{}",
                     if *automatic { "auto" } else { "manual" },
-                    fixed_ms.map_or_else(|| "adaptive".into(), |delay| delay.to_string()),
                     pinned
                         .iter()
                         .map(|target| format!(" {target}"))
@@ -462,16 +442,11 @@ impl History {
                 ["op", "declare-data", mode] => Op::DeclareData(Delivery::parse(mode)?),
                 ["op", "send-data", mode, tag] => Op::SendData(Delivery::parse(mode)?, byte(tag)?),
                 ["op", "replace-data", mode] => Op::ReplaceData(Delivery::parse(mode)?),
-                ["op", "audio", automatic, delay, pinned @ ..] => Op::Audio {
+                ["op", "audio", automatic, "adaptive", pinned @ ..] => Op::Audio {
                     automatic: match *automatic {
                         "auto" => true,
                         "manual" => false,
                         _ => return Err("invalid audio fill policy".into()),
-                    },
-                    fixed_ms: if *delay == "adaptive" {
-                        None
-                    } else {
-                        Some(delay.parse().map_err(|_| "invalid audio delay")?)
                     },
                     pinned: pinned
                         .iter()
@@ -1012,23 +987,16 @@ fn reduction_retains_the_reached_claim_not_a_different_harness_error() {
 }
 
 #[test]
-fn audio_history_rejects_invalid_targets_unsupported_delays_and_vacuous_progress() {
+fn audio_history_rejects_invalid_targets_and_vacuous_progress() {
     let base = History {
         claim: Claim::Exploration,
         ops: vec![Op::Join(0)],
     };
-    for (pinned, automatic, fixed_ms) in [
-        (vec![0], false, Some(0)),
-        (vec![0], false, Some(100)),
-        (vec![0], false, Some(1001)),
-        (vec![4], false, None),
-        (vec![0, 0], true, None),
-    ] {
+    for pinned in [vec![4], vec![0, 0]] {
         let mut invalid = base.clone();
         invalid.ops.push(Op::Audio {
             pinned,
-            automatic,
-            fixed_ms,
+            automatic: false,
         });
         assert!(invalid.validate().is_err());
     }
@@ -1037,7 +1005,6 @@ fn audio_history_rejects_invalid_targets_unsupported_delays_and_vacuous_progress
         Op::Audio {
             pinned: vec![],
             automatic: false,
-            fixed_ms: None,
         },
         Op::AudioProgress,
     ]);
@@ -1047,7 +1014,6 @@ fn audio_history_rejects_invalid_targets_unsupported_delays_and_vacuous_progress
         Op::Audio {
             pinned: vec![1],
             automatic: false,
-            fixed_ms: None,
         },
         Op::Leave(0),
         Op::AudioProgress,

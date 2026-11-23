@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -8,14 +7,6 @@ use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
-#[derive(Clone, Default, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Observation {
-    packets: u64,
-    with_extension: u64,
-    first_value: Option<Vec<u8>>,
-}
-
 #[derive(Clone, Copy, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RtpPeaks {
@@ -23,48 +14,20 @@ struct RtpPeaks {
     sfu_to_browser: usize,
 }
 
-#[derive(Default)]
-struct Observations {
-    extension: Option<u8>,
-    by_ssrc: HashMap<u32, Observation>,
-    peaks: RtpPeaks,
-}
-
-impl Observations {
-    fn record(&mut self, packet: &[u8], from_sfu: bool) -> Result<(), &'static str> {
+impl RtpPeaks {
+    fn record(&mut self, packet: &[u8], from_sfu: bool) {
+        // STUN, DTLS and RTCP are relayed but are not RTP evidence.
         if let [first, second, ..] = packet
             && first >> 6 == 2
             && !(64..=95).contains(&(second & 127))
         {
             let peak = if from_sfu {
-                &mut self.peaks.sfu_to_browser
+                &mut self.sfu_to_browser
             } else {
-                &mut self.peaks.browser_to_sfu
+                &mut self.browser_to_sfu
             };
             *peak = (*peak).max(packet.len());
         }
-        if from_sfu
-            && let Some(extension) = self.extension
-            && let Some((ssrc, value)) = inspect_rtp(packet, extension)?
-        {
-            let observation = self.by_ssrc.entry(ssrc).or_default();
-            observation.packets = observation.packets.saturating_add(1);
-            if let Some(value) = value {
-                observation.with_extension = observation.with_extension.saturating_add(1);
-                observation
-                    .first_value
-                    .get_or_insert_with(|| value.to_vec());
-            }
-        }
-        Ok(())
-    }
-
-    fn observation(&mut self, ssrc: u32, extension: u8) -> io::Result<Observation> {
-        if extension == 0 || self.extension.is_some_and(|current| current != extension) {
-            return Err(io::Error::other("invalid or changed relay extension"));
-        }
-        self.extension = Some(extension);
-        Ok(self.by_ssrc.get(&ssrc).cloned().unwrap_or_default())
     }
 }
 
@@ -75,7 +38,7 @@ pub struct Relays {
 
 struct Relay {
     task: JoinHandle<()>,
-    observations: Arc<Mutex<Observations>>,
+    observations: Arc<Mutex<RtpPeaks>>,
     error: Arc<Mutex<Option<String>>>,
 }
 
@@ -92,7 +55,7 @@ impl Relays {
         let socket = UdpSocket::bind((destination.ip(), 0)).await?;
         let address = socket.local_addr()?;
         let port = address.port();
-        let observations = Arc::new(Mutex::new(Observations::default()));
+        let observations = Arc::new(Mutex::new(RtpPeaks::default()));
         let captured = Arc::clone(&observations);
         let error = Arc::new(Mutex::new(None));
         let failure = Arc::clone(&error);
@@ -107,20 +70,12 @@ impl Relays {
                         .ok_or_else(|| io::Error::other("oversized datagram"))?;
                     if source == destination {
                         if let Some(browser) = browser {
-                            captured
-                                .lock()
-                                .await
-                                .record(packet, true)
-                                .map_err(io::Error::other)?;
+                            captured.lock().await.record(packet, true);
                             socket.send_to(packet, browser).await?;
                         }
                     } else if browser.is_none_or(|peer| peer == source) {
                         browser = Some(source);
-                        captured
-                            .lock()
-                            .await
-                            .record(packet, false)
-                            .map_err(io::Error::other)?;
+                        captured.lock().await.record(packet, false);
                         socket.send_to(packet, destination).await?;
                     }
                 }
@@ -154,103 +109,12 @@ impl Relays {
 
     pub async fn peaks(&self, id: usize) -> io::Result<Vec<u8>> {
         let relay = self.healthy(id).await?;
-        Ok(serde_json::to_vec(&relay.observations.lock().await.peaks)?)
+        Ok(serde_json::to_vec(&*relay.observations.lock().await)?)
     }
-
-    pub async fn observation(&self, id: usize, ssrc: u32, extension: u8) -> io::Result<Vec<u8>> {
-        let relay = self.healthy(id).await?;
-        let observation = relay
-            .observations
-            .lock()
-            .await
-            .observation(ssrc, extension)?;
-        Ok(serde_json::to_vec(&observation)?)
-    }
-}
-
-// SRTP encrypts the payload, not these negotiated RTP header extensions.
-// Non-RTP traffic (STUN, DTLS, RTCP) is forwarded but never counted as evidence.
-type PacketExtension<'a> = (u32, Option<&'a [u8]>);
-
-fn inspect_rtp(packet: &[u8], wanted: u8) -> Result<Option<PacketExtension<'_>>, &'static str> {
-    let Some(&first) = packet.first() else {
-        return Ok(None);
-    };
-    if first >> 6 != 2 {
-        return Ok(None);
-    }
-    let second = *packet.get(1).ok_or("truncated RTP/RTCP")?;
-    if (192..=223).contains(&second) {
-        return Ok(None);
-    }
-    let ssrc = u32::from_be_bytes(
-        packet
-            .get(8..12)
-            .ok_or("truncated RTP header")?
-            .try_into()
-            .map_err(|_| "invalid SSRC")?,
-    );
-    let header_len = usize::from(first & 0x0f)
-        .saturating_mul(4)
-        .saturating_add(12);
-    let tail = packet.get(header_len..).ok_or("truncated CSRCs")?;
-    if first & 0x10 == 0 {
-        return Ok(Some((ssrc, None)));
-    }
-    let header = tail.get(..4).ok_or("truncated extension header")?;
-    let profile = u16::from_be_bytes(
-        header
-            .get(..2)
-            .ok_or("missing profile")?
-            .try_into()
-            .map_err(|_| "invalid profile")?,
-    );
-    let words = u16::from_be_bytes(
-        header
-            .get(2..4)
-            .ok_or("missing length")?
-            .try_into()
-            .map_err(|_| "invalid length")?,
-    );
-    let mut extensions = tail
-        .get(4..usize::from(words).saturating_mul(4).saturating_add(4))
-        .ok_or("truncated extensions")?;
-    if profile != 0xbede && profile & 0xfff0 != 0x1000 {
-        return Err("unsupported RTP extension profile");
-    }
-    let mut found = None;
-    while let Some((&tag, rest)) = extensions.split_first() {
-        extensions = rest;
-        if tag == 0 {
-            continue;
-        }
-        let (id, size) = if profile == 0xbede {
-            if tag >> 4 == 15 {
-                break;
-            }
-            (tag >> 4, usize::from(tag & 0x0f).saturating_add(1))
-        } else if profile & 0xfff0 == 0x1000 {
-            let (&size, rest) = extensions.split_first().ok_or("missing two-byte length")?;
-            extensions = rest;
-            (tag, usize::from(size))
-        } else {
-            return Err("unsupported RTP extension profile");
-        };
-        let value = extensions.get(..size).ok_or("truncated extension value")?;
-        extensions = extensions.get(size..).ok_or("truncated extension value")?;
-        if id == wanted {
-            if found.is_some() {
-                return Err("duplicate playout extension");
-            }
-            found = Some(value);
-        }
-    }
-    Ok(Some((ssrc, found)))
 }
 
 #[cfg(all(test, feature = "browser-tests"))]
 mod tests {
-    use super::inspect_rtp;
 
     #[tokio::test]
     async fn rtp_relay_shutdown_cancels_open_http_handlers() {
@@ -292,41 +156,16 @@ mod tests {
     }
 
     #[test]
-    fn rtp_relay_parses_both_extension_formats_and_absence() {
-        let mut packet = vec![0x90, 96, 0, 1, 0, 0, 0, 0, 0, 0, 0, 42];
-        packet.extend([0xbe, 0xde, 0, 1, 0x72, 0, 0xa0, 10]);
-        let mut observations = super::Observations::default();
-        observations.record(&packet, false).unwrap();
-        assert!(observations.by_ssrc.is_empty());
-        assert_eq!(observations.peaks.browser_to_sfu, packet.len());
-        assert_eq!(observations.peaks.sfu_to_browser, 0);
-        assert_eq!(observations.observation(42, 7).unwrap().packets, 0);
-        observations.record(&packet, true).unwrap();
-        assert_eq!(observations.peaks.sfu_to_browser, packet.len());
-        let measured = observations.observation(42, 7).unwrap();
-        assert_eq!(measured.packets, 1);
-        assert_eq!(measured.with_extension, 1);
-        assert_eq!(measured.first_value, Some(vec![0, 0xa0, 10]));
-        assert!(observations.observation(42, 8).is_err());
-        assert!(observations.observation(42, 0).is_err());
-        assert_eq!(
-            inspect_rtp(&packet, 7).unwrap(),
-            Some((42, Some(&[0, 0xa0, 10][..])))
-        );
-        assert_eq!(inspect_rtp(&packet, 8).unwrap(), Some((42, None)));
-        packet.truncate(12);
-        packet.extend([0x10, 0, 0, 2, 7, 3, 0, 0xa0, 10, 0, 0, 0]);
-        assert_eq!(
-            inspect_rtp(&packet, 7).unwrap(),
-            Some((42, Some(&[0, 0xa0, 10][..])))
-        );
-        packet.pop();
-        assert!(inspect_rtp(&packet, 7).is_err());
-        assert_eq!(inspect_rtp(&[22, 0, 0], 7).unwrap(), None);
-        assert_eq!(inspect_rtp(&[0x80, 200], 7).unwrap(), None);
-        assert_eq!(
-            inspect_rtp(&[0x80, 96, 0, 1, 0, 0, 0, 0, 0, 0, 0, 42], 7).unwrap(),
-            Some((42, None))
-        );
+    fn rtp_relay_tracks_directional_rtp_peaks_only() {
+        let mut peaks = super::RtpPeaks::default();
+        let mut packet = [0_u8; 32];
+        packet[0] = 0x80;
+        packet[1] = 96;
+        peaks.record(&packet, false);
+        peaks.record(&packet[..16], true);
+        packet[1] = 200;
+        peaks.record(&packet, true);
+        assert_eq!(peaks.browser_to_sfu, 32);
+        assert_eq!(peaks.sfu_to_browser, 16);
     }
 }

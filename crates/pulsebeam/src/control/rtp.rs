@@ -77,9 +77,6 @@ pub(crate) fn capabilities() -> wire::RtpCapabilities {
             wire::RtpHeaderExtensionType::RtpHeaderExtensionAudioLevel
                 .as_str()
                 .into(),
-            wire::RtpHeaderExtensionType::RtpHeaderExtensionPlayoutDelay
-                .as_str()
-                .into(),
             wire::RtpHeaderExtensionType::RtpHeaderExtensionDependencyDescriptor
                 .as_str()
                 .into(),

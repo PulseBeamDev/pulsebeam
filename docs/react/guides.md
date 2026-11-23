@@ -103,15 +103,12 @@ component that called `useSubscribe` closes that subscription. Replacing a Watch
 page does not close subscriptions held independently outside those UI mounts.
 
 ```tsx
-import { PlayoutDelay } from "@pulsebeam/react";
-
 const subscription = useSubscribe(remote, {
   visible: true,
   height: 360,
   minHeight: 180,
   priority: pinned ? 200 : 10,
   minFps: 15,
-  playoutDelay: PlayoutDelay.Fixed.new({ minMs: 100, maxMs: 200 }),
 });
 
 <Video

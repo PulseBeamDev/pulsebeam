@@ -371,11 +371,6 @@ fn data_v1_publication_keeps_its_exact_transport_in_the_execution_plan() {
     .unwrap();
     let work = session.take_preparation().unwrap().unwrap();
     assert!(
-        matches!(session.compile_execution(&work, None, |_| None), Err(error)
-        if error.code() == wire::FailureCode::Unsupported)
-    );
-    session.data_v1_enabled = true;
-    assert!(
         matches!(session.compile_execution(&work, None, |_| None).unwrap().into_action(),
         ExecutionAction::Prepare { resource: crate::control::native::PreparedResource::Publication(Publication::Data(data)), .. }
             if data.parameters == parameters)
@@ -1069,7 +1064,6 @@ fn execution_attempts_and_grants_fence_stale_work_and_expired_commits() {
 #[test]
 fn terminal_lifetimes_release_rows_queues_and_byte_funding_without_history() {
     let mut session = session();
-    session.enable_data_v1();
     drain(&mut session);
     let baseline = session.retained_bytes;
     for index in 0..512 {
@@ -2458,11 +2452,6 @@ fn fabric_receiver_offers_are_versioned_and_rotate_with_the_authenticated_source
                 .map(|offer| (offer.source, offer.branch)),
         )
     };
-    assert_eq!(offer(&mut model, &first), (0, None));
-    model.enable_data_v1();
-    let reliable =
-        Track::native_data_publication(meta.clone(), DataLane::Ordered, NonZeroU64::new(12), None);
-    assert_eq!(offer(&mut model, &reliable), (0, None));
     assert_eq!(offer(&mut model, &legacy), (0, None));
     assert_eq!(offer(&mut model, &first), (1, Some((10, 1))));
     assert_eq!(offer(&mut model, &first), (1, Some((10, 1))));
@@ -2470,7 +2459,6 @@ fn fabric_receiver_offers_are_versioned_and_rotate_with_the_authenticated_source
     assert_eq!(offer(&mut model, &legacy), (3, None));
     assert_eq!(offer(&mut model, &first), (4, Some((10, 3))));
     let mut other_subscriber = session();
-    other_subscriber.enable_data_v1();
     input(&mut other_subscriber, vec![present(1, 1, subscription)]).unwrap();
     assert_eq!(offer(&mut other_subscriber, &first), (1, Some((10, 4))));
     assert_eq!(offer(&mut model, &first), (4, Some((10, 3))));
@@ -2547,7 +2535,6 @@ fn logical_subscription_keeps_one_reservation_across_scoped_receiver_replacement
     use wire::confirmed_state::Value;
 
     let mut model = session();
-    model.enable_data_v1();
     let room = RoomId::new("source-room").unwrap();
     let publisher = ParticipantId::new("publisher").unwrap();
     let grant = Grant::new(

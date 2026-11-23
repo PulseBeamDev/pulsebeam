@@ -422,7 +422,6 @@ enum Command {
     #[cfg(test)]
     AudioSubscription {
         selector: agent_core::TrackSelector,
-        playout_delay: agent_core::PlayoutDelay,
         response: oneshot::Sender<Result<Subscription, Error>>,
     },
     ObserveSubscription {
@@ -648,11 +647,7 @@ impl Agent {
     ) -> Result<Subscription, Error> {
         let (response, result) = oneshot::channel();
         self.commands
-            .send(Command::AudioSubscription {
-                selector,
-                playout_delay: agent_core::PlayoutDelay::Adaptive,
-                response,
-            })
+            .send(Command::AudioSubscription { selector, response })
             .await
             .map_err(|_| Error::Closed)?;
         result.await.map_err(|_| Error::Closed)?
@@ -1377,13 +1372,9 @@ where
                 }
             }
             #[cfg(test)]
-            Command::AudioSubscription {
-                selector,
-                playout_delay,
-                response,
-            } => {
+            Command::AudioSubscription { selector, response } => {
                 if !response.is_closed() {
-                    let result = self.claim_configured_audio_subscription(selector, playout_delay);
+                    let result = self.claim_audio_subscription(selector);
                     let _ = response.send(result);
                 }
             }

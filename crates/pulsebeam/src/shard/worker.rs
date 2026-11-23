@@ -16,7 +16,6 @@ use std::{
 use std::{sync::Arc, time::Duration};
 
 use crate::clock::WallAnchor;
-use crate::route::MediaDelivery;
 
 use pulsebeam_queue as mailbox;
 use pulsebeam_runtime::net::{self, RecvPacketBatch};
@@ -25,7 +24,7 @@ use pulsebeam_runtime::time::Instant;
 use crate::{
     entity::ParticipantId,
     id::ShardId,
-    participant::{ConnectionConfig, RoutedTrackPacket},
+    participant::ConnectionConfig,
     shard::metrics::ShardMetrics,
     shard::recorder::{ShardRecorder, ShardStatsReport},
     track::Track,
@@ -184,8 +183,6 @@ pub(crate) enum ShardCommand {
     },
 }
 
-pub(crate) type MediaPayload = RoutedTrackPacket;
-
 /// Everything one shard sends another: the data plane.
 ///
 /// Best-effort by construction. Cross-node this becomes a UDP datagram, so
@@ -193,7 +190,7 @@ pub(crate) type MediaPayload = RoutedTrackPacket;
 /// the control plane ([`ShardCommand`] / [`ShardEvent`]) and never this way.
 #[allow(
     clippy::large_enum_variant,
-    reason = "the payload enum carries materialized TrackPacket values and owned SCTP bytes so cross-shard payloads remain core-local"
+    reason = "typed shard work retains owned payloads for core-local processing"
 )]
 #[derive(Clone, Debug)]
 pub(crate) enum ShardFrame {
@@ -201,13 +198,6 @@ pub(crate) enum ShardFrame {
         batch: RecvPacketBatch,
         address: crate::route::NodeTransportAddress,
         source_shard: ShardId,
-    },
-    /// Forward payload, addressed by the destination's own route. `PublicationKey`
-    /// validates that the route still names the intended stable entity; the
-    /// destination resolves its own local handle from the route entry.
-    Media {
-        delivery: MediaDelivery,
-        payload: MediaPayload,
     },
     Fabric(crate::route::fabric::ShardOffer),
     FabricDataExpectation(crate::route::fabric::ShardDataExpectation),
@@ -340,7 +330,6 @@ pub(crate) fn send_link_frame(
         ShardFrame::Ingress { batch, .. } => {
             (batch.received_at.monotonic, Some(batch.received_at.wall))
         }
-        ShardFrame::Media { payload, .. } => (payload.packet.arrival_ts, None),
         ShardFrame::Fabric(offer) => (offer.arrival, None),
         ShardFrame::FabricDataExpectation(notice) => {
             if tx.local_delivery_tag()
@@ -395,13 +384,6 @@ pub(super) fn bind_received_frame(
     let tagged_route =
         || crate::link::delivery_address(received.tag).filter(|address| address.shard() == shard);
     match &mut received.packet {
-        ShardFrame::Media { delivery, .. } => {
-            let Some(address) = tagged_route() else {
-                return false;
-            };
-            delivery.address = address;
-            true
-        }
         ShardFrame::Fabric(offer) => tagged_route() == Some(offer.binding.destination),
         ShardFrame::FabricDataExpectation(notice) => {
             tagged_route() == Some(notice.binding.destination)
@@ -576,11 +558,9 @@ impl ShardWorker {
         metrics: Arc<ShardMetrics>,
         stats_tx: Option<mailbox::Sender<Box<ShardStatsReport>>>,
         wall: WallAnchor,
-        local_rtp_v1: bool,
     ) -> Self {
         let shard_count = frame_txs.len();
-        let core = ShardCore::new(shard_id, max_gso_segments, shard_count, wall, update_rx)
-            .with_local_rtp_v1(local_rtp_v1);
+        let core = ShardCore::new(shard_id, max_gso_segments, shard_count, wall, update_rx);
         let router = LinkTransport {
             shard_id,
             frame_txs,
@@ -737,20 +717,8 @@ impl ShardWorker {
             if !bind_received_frame(self.router.shard_id, &mut received) {
                 continue;
             }
-            let at = if matches!(&received.packet, ShardFrame::Media { .. }) {
-                self.router
-                    .clock_origin
-                    .checked_add(Duration::from_nanos(
-                        received.received_at.monotonic.as_nanos(),
-                    ))
-                    .unwrap_or(now)
-            } else {
-                // Reverse deduplication uses execution time; socket ingress
-                // already carries its original observation in the owned batch.
-                now
-            };
             self.core
-                .on_shard_frames(std::iter::once(received.packet), at, &self.router);
+                .on_shard_frames(std::iter::once(received.packet), now, &self.router);
         }
         if frames == SHARD_FRAME_BUDGET {
             self.tick_budget_hit("frames");

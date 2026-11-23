@@ -195,6 +195,7 @@ pub struct AuthenticatedRtp<'a> {
 #[derive(Clone, Copy)]
 pub(crate) struct RtpProtection {
     pub bytes: usize,
+    pub index: Option<u64>,
     pub direct_full_tag: bool,
 }
 
@@ -224,6 +225,14 @@ impl<'a> AuthenticatedRtp<'a> {
             payload_type: self.wire.payload_type(),
             marker: self.wire.marker(),
         }
+    }
+
+    /// SRTP packet index of the primary, never the independent RTX index.
+    pub fn authenticated_primary_index(&self) -> Option<u64> {
+        if self.is_repair {
+            return None;
+        }
+        self.protection.and_then(|protection| protection.index)
     }
 
     /// Protected size of this exact RTP datagram, before SRTP unprotection.

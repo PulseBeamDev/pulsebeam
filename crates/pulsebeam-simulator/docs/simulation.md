@@ -244,14 +244,10 @@ seconds. These are recovery proof bounds, not new media-quality SLOs.
 ### Cross-lane inputs and bounded discovery
 
 Concrete inputs declare source ownership, data ownership/delivery modes and
-audio requests. Audio selects pinned speakers and automatic fill with supported
-adaptive playout; fresh native decode is a separate operation, not inferred from
-Mapping. The native profile does not negotiate audio RTP playout-delay. Fixed
-audio requests are rejected before changing accepted state, rather than dropping
-media or treating a minimum-only setter as a full min/max policy. The existing
-native runtime world checks per-track and selector-policy rejection followed by
-real audio decode; fixed-buffer service proof remains on video. Known quiet fixtures use fresh decoded sample progress without a
-universal energy floor or invented PCM source attribution.
+audio requests. Audio selects pinned speakers and automatic fill. Fresh native
+decode is a separate operation, not inferred from Mapping. Known quiet fixtures
+use fresh decoded sample progress without a universal energy floor or invented
+PCM source attribution.
 
 Pressure is bounded application work: four actual desired-state submissions
 (coalescing is allowed), or eight actual native PCM producer submissions with

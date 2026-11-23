@@ -39,7 +39,6 @@ pub struct AudioSubscriptionState {
     pub accepted_revision: Option<u64>,
     pub rejected_revision: Option<u64>,
     pub selector: TrackSelector,
-    pub playout_delay: super::PlayoutDelay,
     pub local_enabled: bool,
     pub closed: bool,
     pub source_status: SubscriptionSourceStatus,

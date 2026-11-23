@@ -80,7 +80,7 @@ fn media_keeps_both_extension_forms_and_minimum_padding() {
 }
 
 #[test]
-fn protected_wan_primary_does_not_grow_beyond_publisher_datagram() {
+fn protected_wan_primary_can_grow_within_the_path_envelope() {
     let window = Window::new(Profile::Opus, 0, 0, NonZeroU32::new(11).unwrap(), 0).unwrap();
     let packet = FabricPacket::new(
         Header {
@@ -95,66 +95,18 @@ fn protected_wan_primary_does_not_grow_beyond_publisher_datagram() {
     )
     .unwrap();
     let mut out = [0; 64];
-    let too_small = packet
-        .clone()
-        .with_source_protected_bytes(NonZeroU16::new(30).unwrap());
-    assert_eq!(
-        window.write(1, &too_small, &mut out),
-        Err(WireError::Oversize)
-    );
-    let exact = packet.with_source_protected_bytes(NonZeroU16::new(31).unwrap());
-    assert_eq!(window.write(1, &exact, &mut out), Ok(15));
+    let packet = packet.with_source_protected_bytes(NonZeroU16::new(30).unwrap());
+    assert_eq!(window.write(1, &packet, &mut out), Ok(15));
 }
 
 #[test]
-fn opus_window_preserves_publisher_budget_in_existing_extension_word() {
-    let legacy = Window::new(Profile::Opus, 0, 3, NonZeroU32::new(11).unwrap(), 1 << 4).unwrap();
-    let window = legacy.with_opus_source_budget().unwrap();
+fn retired_opus_budget_window_revision_is_not_accepted() {
+    let window = Window::new(Profile::Opus, 0, 3, NonZeroU32::new(11).unwrap(), 1 << 4).unwrap();
+    let mut tuple = window.to_tuple();
+    tuple[2] = 1;
     assert_eq!(
-        Window::from_tuple(window.to_tuple(), window.emission()),
-        Ok(window)
-    );
-    assert_ne!(window.to_tuple(), legacy.to_tuple());
-    let packet = FabricPacket::new(
-        Header {
-            profile: Profile::Opus,
-            marker: true,
-            sequence: 1,
-            timestamp: 960,
-            ingress_ntp32: 0,
-        },
-        &[Extension {
-            kind: ExtensionKind::AudioLevel,
-            value: &[0x81],
-        }],
-        vec![0xf8; 1_200].into_boxed_slice(),
-    )
-    .unwrap()
-    .with_source_protected_bytes(NonZeroU16::new(1_240).unwrap());
-    let mut out = [0; MAX_WAN_RTP_BYTES];
-    assert_eq!(window.write(1, &packet, &mut out), Ok(MAX_WAN_RTP_BYTES));
-    assert_eq!(&out[12..20], &[0xbe, 0xde, 0, 1, 0x40, 0x81, 0xa0, 4]);
-    let (_, received) = window.decode(&out).unwrap();
-    assert!(received.into_owned().same_content(&packet));
-    assert_eq!(
-        window.decode(&out).unwrap().1.source_protected_bytes(),
-        packet.source_protected_bytes()
-    );
-    assert!(legacy.decode(&out).is_err());
-    out[19] = 0;
-    assert_eq!(window.decode(&out), Err(WireError::ExtensionValue));
-    assert_eq!(legacy.write(1, &packet, &mut out), Ok(MAX_WAN_RTP_BYTES));
-    assert_eq!(
-        window.decode(&out).unwrap().1.source_protected_bytes(),
-        None
-    );
-    let repair = window
-        .repair_window(1, NonZeroU32::new(12).unwrap())
-        .unwrap();
-    assert_eq!(repair.write(1, &packet, &mut out), Ok(MAX_WAN_RTP_BYTES));
-    assert_eq!(
-        repair.decode(&out).unwrap().1.source_protected_bytes(),
-        packet.source_protected_bytes()
+        Window::from_tuple(tuple, window.emission()),
+        Err(WireError::Window)
     );
 }
 

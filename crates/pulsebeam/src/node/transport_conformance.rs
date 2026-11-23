@@ -16,7 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const CONNECT: Duration = Duration::from_secs(30);
 const DELIVERY: Duration = Duration::from_secs(30);
 const CLEANUP: Duration = Duration::from_secs(10);
-const PROTECTED_UDP_CEILING: u16 = 1_216;
+const PROTECTED_UDP_CEILING: u16 = pulsebeam_core::fabric::MAX_UDP_PAYLOAD_BYTES;
 const ROOM: &str = "dual-stack-transport";
 const TOPIC: &str = "dual-stack-probe";
 const A_TO_B: &[u8] = b"application-owned IPv4 to IPv6 probe";

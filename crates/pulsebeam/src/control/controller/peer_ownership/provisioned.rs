@@ -49,7 +49,6 @@ enum Transport {
         peer: pulsebeam_link::NetworkPeer,
         generation: NonZeroU64,
         host: crate::link::wan_host::Provisioner,
-        opus_source_budget: bool,
     },
 }
 
@@ -65,13 +64,12 @@ impl Transport {
                 peer,
                 generation,
                 host,
-                opus_source_budget,
             } => {
                 let id = links.reserve_wan_peer()?;
                 let (commands, lane) =
                     host.open(peer.clone(), id, *generation, links.clock_origin())?;
                 links
-                    .attach_wan_host(commands, *opus_source_budget)
+                    .attach_wan_host(commands)
                     .map_err(|_| pulsebeam_link::LinkError::Capacity)?;
                 links.identify_peer(id, remote);
                 Ok((id, lane))
@@ -1331,7 +1329,6 @@ impl ControllerActor {
                 peer: spec.transport,
                 generation: spec.local.1,
                 host,
-                opus_source_budget: spec.wan_opus_source_budget,
             }
         } else {
             Transport::ReverseDtls(spec.transport)

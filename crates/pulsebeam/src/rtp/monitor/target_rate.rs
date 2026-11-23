@@ -32,12 +32,14 @@ impl TargetRates {
         bytes: u64,
         eligible: [bool; MAX_LADDER_TARGETS],
     ) {
+        self.record_bytes(now, eligible.map(|present| if present { bytes } else { 0 }));
+    }
+
+    pub(super) fn record_bytes(&mut self, now: Instant, bytes: [u64; MAX_LADDER_TARGETS]) {
         self.poll(now);
         self.start.get_or_insert(now);
-        for (total, present) in self.bytes.iter_mut().zip(eligible) {
-            if present {
-                *total = total.saturating_add(bytes);
-            }
+        for (total, bytes) in self.bytes.iter_mut().zip(bytes) {
+            *total = total.saturating_add(bytes);
         }
     }
 

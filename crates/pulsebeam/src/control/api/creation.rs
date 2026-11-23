@@ -140,7 +140,6 @@ impl<'a> CreationResponse<'a> {
         connection: ConnectionId,
         capabilities: &'a RtpCapabilities,
         answer: &'a str,
-        data_profile: crate::control::native::DataProfile,
     ) -> Self {
         Self {
             location,
@@ -149,7 +148,6 @@ impl<'a> CreationResponse<'a> {
                 connection,
                 capabilities,
                 answer,
-                data_profile,
             )),
         }
     }

@@ -82,11 +82,6 @@ pub mod rtp_extensions {
     /// so this is only our local preference.
     pub const VIDEO_LAYERS_ALLOCATION: u8 = 12;
 
-    /// Playout delay (`playout-delay`). Sent on egress RTP to bound the
-    /// receiver's jitter buffer for fixed receive playout bounds. 6 is
-    /// free of the str0m defaults above.
-    pub const PLAYOUT_DELAY: u8 = 6;
-
     /// AV1 Dependency Descriptor. Not 13 (Chrome's usual id) because that is
     /// str0m's default video-orientation, which registering over would evict;
     /// str0m swaps ids to match the offerer, so both survive Chrome's 13. Must

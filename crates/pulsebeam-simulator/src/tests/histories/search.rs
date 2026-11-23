@@ -27,11 +27,7 @@ fn features(history: &History, applied: usize) -> BTreeSet<String> {
             Op::Leave(i) => format!("leave:{i}"),
             Op::Crash(i) => format!("crash:{i}"),
             Op::Receive(targets) => format!("video:{targets:?}"),
-            Op::Audio {
-                pinned,
-                automatic,
-                fixed_ms,
-            } => format!("audio:{pinned:?}:{automatic}:{fixed_ms:?}"),
+            Op::Audio { pinned, automatic } => format!("audio:{pinned:?}:{automatic}"),
             Op::DeclareData(mode) => format!("declare:{}", mode.name()),
             Op::ReplaceData(mode) => format!("replace:{}", mode.name()),
             Op::SendData(mode, _) => format!("send:{}", mode.name()),

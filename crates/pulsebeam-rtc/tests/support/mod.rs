@@ -1709,10 +1709,6 @@ impl<M> PeerFixture<M> {
     /// Observe transport submission only. Authenticated receipt is asserted separately.
     pub fn receive_video_wire_header(&mut self) -> FixtureRtpHeader {
         assert!(self.video_source.is_some());
-        assert!(
-            self.extension_ids.playout.is_some(),
-            "negotiated video playout extension"
-        );
         self.connection_idle = false;
         for _ in 0..2_000 {
             if let Some(header) = self.headers.pop_front() {

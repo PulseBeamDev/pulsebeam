@@ -12,7 +12,6 @@ export {
   DataEvent,
   ErrorCode,
   LogLevel,
-  PlayoutDelay,
 } from "@pulsebeam/web";
 export type {
   Agent,
@@ -21,7 +20,6 @@ export type {
   AgentUpdates,
   AgentError,
   ErrorInfo,
-  AudioSubscriptionConfig,
   CatalogPublicationInfo,
   CatalogPublicationKind,
   DataPublishOptions,

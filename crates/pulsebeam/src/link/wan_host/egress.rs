@@ -363,13 +363,6 @@ impl WanHost {
                         window.ssrc(),
                         input.emission(),
                     )
-                    .and_then(|expected| {
-                        if window.carries_opus_source_budget() {
-                            expected.with_opus_source_budget()
-                        } else {
-                            Ok(expected)
-                        }
-                    })
                     .ok()
                         == Some(window)
             }

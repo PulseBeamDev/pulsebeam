@@ -1511,7 +1511,6 @@ fn logical_offer_selects_exact_identity_without_discovery_and_gates_pending_disa
             min_height: 0,
             min_fps: 0,
             priority: 0,
-            playout_delay: crate::PlayoutDelay::default(),
         }],
         ..Default::default()
     };

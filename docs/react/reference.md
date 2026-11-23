@@ -57,10 +57,10 @@ changes configure the existing publication. Borrowed sources survive cleanup.
 Data publication takes no source and returns `DataPublication`.
 
 `useSubscribe(remoteTrack, options?)` accepts room-pinned video, audio, or data
-refs. Media options are the SDK's complete `VideoObservation` or
-`AudioSubscriptionConfig`, not partial playback hints. Omit options to use SDK
-defaults. Changes configure the existing subscription; omitting options restores its SDK
-defaults. Data returns `DataSubscription` with its typed `next()` event API.
+refs. Video options are the SDK's complete `VideoObservation`; changes configure
+the existing video subscription, and omitting options restores its defaults.
+Audio takes no options and uses the browser's default buffering. Data returns
+`DataSubscription` with its typed `next()` event API.
 Changed target scope closes the old handle and returns null until its replacement
 exists. Unmount and Strict Mode replay close owned resources and cursors.
 
@@ -145,7 +145,6 @@ may be empty before permission is granted.
 ```tsx
 const video = useSubscribe(remoteVideo, {
   visible: true, height: 360, minHeight: 180, minFps: 15, priority: 100,
-  playoutDelay: { mode: "adaptive" },
 });
 const audio = useSubscribe(remoteAudio);
 

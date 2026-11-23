@@ -508,20 +508,9 @@ fn settings(enabled: bool) -> state::ResourceSettings {
     }
 }
 
-fn delay(value: crate::PlayoutDelay) -> Option<state::PlayoutDelay> {
-    match value {
-        crate::PlayoutDelay::Adaptive => None,
-        crate::PlayoutDelay::Fixed { min_ms, max_ms } => {
-            Some(state::PlayoutDelay { min_ms, max_ms })
-        }
-    }
-}
-
-fn audio_options(buffering: crate::PlayoutDelay) -> Option<state::resource_settings::Receive> {
+fn audio_options() -> Option<state::resource_settings::Receive> {
     Some(state::resource_settings::Receive::Audio(
-        state::AudioReceiveOptions {
-            playout_delay: delay(buffering),
-        },
+        state::AudioReceiveOptions {},
     ))
 }
 
@@ -886,7 +875,6 @@ pub(super) fn reconcile(
                 min_height: (video.min_height != 0).then_some(video.min_height),
                 min_fps: (video.min_fps != 0).then_some(video.min_fps),
                 priority: (video.priority != 0).then_some(video.priority),
-                playout_delay: delay(video.playout_delay),
             },
         ));
         if let Some(selector) = &video.selector {
@@ -922,16 +910,7 @@ pub(super) fn reconcile(
         .pinned
         .iter()
         .cloned()
-        .map(|id| {
-            let buffering = desired
-                .audio
-                .playout_delays
-                .get(&id)
-                .copied()
-                .unwrap_or_default();
-            (id, buffering)
-        })
-        .collect::<BTreeMap<_, _>>();
+        .collect::<BTreeSet<_>>();
     let mut occupied = BTreeSet::new();
     let mut named = BTreeMap::new();
     for resource in session.state.resources() {
@@ -955,20 +934,20 @@ pub(super) fn reconcile(
             && want.offer.is_none()
             && !occupied.contains(index)
             && let Some(source) = &want.source
-            && let Some(buffering) = audio.remove(source)
+            && audio.remove(source)
         {
             occupied.insert(*index);
-            assigned.push((*index, source.clone(), buffering));
+            assigned.push((*index, source.clone()));
         }
     }
     for (resource, live) in session.state.owned() {
         if let Resource::Reception(MediaSlot::RemoteAudio(index)) = resource
             && !occupied.contains(index)
             && let Some(track) = live.track.as_ref()
-            && let Some(buffering) = audio.remove(&track.publication_id)
+            && audio.remove(&track.publication_id)
         {
             occupied.insert(*index);
-            assigned.push((*index, track.publication_id.clone(), buffering));
+            assigned.push((*index, track.publication_id.clone()));
         }
     }
     let free = |occupied: &mut BTreeSet<u32>| {
@@ -978,10 +957,10 @@ pub(super) fn reconcile(
         occupied.insert(index);
         Ok::<_, SignalingError>(index)
     };
-    for (id, buffering) in audio {
-        assigned.push((free(&mut occupied)?, id, buffering));
+    for id in audio {
+        assigned.push((free(&mut occupied)?, id));
     }
-    for (index, id, buffering) in assigned {
+    for (index, id) in assigned {
         let slot = MediaSlot::RemoteAudio(index);
         let resource = Resource::Reception(slot.clone());
         if let Some(want) = media_want(session, resource.clone(), &slot, Some(&id)) {
@@ -996,7 +975,7 @@ pub(super) fn reconcile(
                 source_room,
                 state::TrackKind::Audio,
                 binding,
-                audio_options(buffering),
+                audio_options(),
             );
             if receiver_spec_available(session, &slot, &resource, &spec) {
                 wanted.insert(resource, spec);
@@ -1010,18 +989,7 @@ pub(super) fn reconcile(
         };
         let slot = MediaSlot::RemoteAudio(index);
         let resource = Resource::LogicalReception(slot.clone());
-        let buffering = desired
-            .audio
-            .selector_delays
-            .get(selector)
-            .copied()
-            .unwrap_or_default();
-        let spec = logical_subscription(
-            selector,
-            state::TrackKind::Audio,
-            audio_options(buffering),
-            None,
-        );
+        let spec = logical_subscription(selector, state::TrackKind::Audio, audio_options(), None);
         reconcile_logical_media(session, &mut media, &slot, &resource, &spec)?;
         wanted.insert(resource, spec);
     }

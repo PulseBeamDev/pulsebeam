@@ -391,6 +391,11 @@ impl StreamMonitor {
     }
 
     pub fn process_packet(&mut self, packet: &RtpPacket) {
+        self.process_transport_packet(packet);
+        self.record_target_cost(packet);
+    }
+
+    pub(crate) fn process_transport_packet(&mut self, packet: &RtpPacket) {
         let was_inactive = self.stats.is_inactive();
         let may_activate = !self.vla_inactive;
         self.last_packet_at = packet.arrival_ts;
@@ -412,7 +417,6 @@ impl StreamMonitor {
             self.publish_health();
         }
         self.bwe.record(packet);
-        self.record_target_cost(packet);
 
         if was_inactive && may_activate {
             self.window_highest_seq = None;
@@ -429,7 +433,19 @@ impl StreamMonitor {
         } else if seq > self.window_highest_seq.unwrap_or(0) {
             self.window_highest_seq = Some(seq);
         }
-        self.window_actual_packets = self.window_actual_packets.saturating_add(1);
+        if seq >= self.window_start_seq {
+            self.window_actual_packets = self.window_actual_packets.saturating_add(1);
+        }
+    }
+
+    pub(crate) fn restart_loss_window(&mut self, now: Instant) {
+        self.window_highest_seq = None;
+        self.window_start_seq = 0;
+        self.window_actual_packets = 0;
+        self.window_start_ts = now;
+        self.quality_transition_since = None;
+        self.quality_transition_target = None;
+        self.quality_transition_last_evidence = None;
     }
 
     fn record_target_cost(&mut self, packet: &RtpPacket) {
@@ -454,6 +470,25 @@ impl StreamMonitor {
             self.stats.measured_decode_target_bps = self.target_rates.costs;
         } else {
             self.reset_target_rates();
+        }
+    }
+
+    pub(crate) fn measure_fabric_targets(
+        &mut self,
+        now: Instant,
+        sample: crate::route::fabric::local::DecodeTargetSample,
+    ) {
+        use crate::route::fabric::local::DecodeTargetSample;
+        if self.vla_inactive || self.stats.decode_target_count() < 2 {
+            return;
+        }
+        match sample {
+            DecodeTargetSample::None => (),
+            DecodeTargetSample::Unknown => self.reset_target_rates(),
+            DecodeTargetSample::Bytes(bytes) => {
+                self.target_rates.record_bytes(now, bytes);
+                self.stats.measured_decode_target_bps = self.target_rates.costs;
+            }
         }
     }
 
@@ -1948,6 +1983,27 @@ mod test {
             "seq gap during pause must not spike smoothed_loss_ratio; got {:.3}",
             monitor.smoothed_loss_ratio
         );
+    }
+
+    #[test]
+    fn explicit_ingress_resume_keeps_history_without_counting_the_pause() {
+        let shared = StreamStats::new(false, 0, 0);
+        let mut monitor = StreamMonitor::new(TrackKind::Video, "resume".into(), shared);
+        let now = Instant::now();
+        monitor.process_transport_packet(&packet(100, now));
+        monitor.smoothed_loss_ratio = 0.1;
+
+        let resumed = now + Duration::from_millis(250);
+        monitor.restart_loss_window(resumed);
+        assert_eq!(monitor.smoothed_loss_ratio, 0.1);
+        monitor.process_transport_packet(&packet(200, resumed));
+        monitor.process_transport_packet(&packet(120, resumed));
+        assert_eq!(monitor.window_actual_packets, 1);
+        for i in 1..100 {
+            monitor.process_transport_packet(&packet(200 + i, resumed + Duration::from_millis(i)));
+        }
+        monitor.poll(resumed + LOSS_MEASUREMENT_WINDOW, false);
+        assert!(monitor.smoothed_loss_ratio < 0.1);
     }
 
     /// Anti-oscillation: alternating clean / lossy windows must keep quality

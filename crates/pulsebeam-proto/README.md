@@ -122,10 +122,8 @@ rewriting client desire or rolling back unrelated resources. Rejection does not
 settle a newer target and is distinct from malformed-wire or fatal transport
 failure.
 
-Stock native and browser audio do not negotiate RTP playout-delay, so use
-adaptive audio. The native resource receiver rejects fixed audio with
-`FailureCode::Unsupported` before changing accepted receive state. A local
-minimum-delay setter does not implement the full min/max interval.
+Receivers use their WebRTC implementation's default buffering. Receive
+options do not signal playout bounds.
 
 Run `./bazel test //crates/pulsebeam-proto:unit_tests` for focused verification,
 then the root `./bazel test //:check` and `./bazel test //:test` gates.

@@ -548,6 +548,8 @@ pub async fn bind_udp_socket(
     };
     options.reuse_port = true;
     options.max_datagram_bytes = pulsebeam_udp::MAX_DATAGRAM_BYTES;
+    options.nonfragmenting_max_datagram_bytes =
+        std::num::NonZeroU16::new(pulsebeam_core::fabric::MAX_UDP_PAYLOAD_BYTES);
     let io = super::udp_sim::HostIo::new(socket, member, mode)?;
     pulsebeam_udp::simulation::from_io(options, Box::new(io))
 }

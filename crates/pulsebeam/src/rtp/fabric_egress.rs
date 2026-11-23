@@ -61,7 +61,6 @@ pub struct EndpointHints {
     hints: ArrayVec<Hint, 7>,
     dependency: Option<Hint>,
     vad: Vad,
-    playout_override: Option<[u8; 3]>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -69,7 +68,6 @@ pub enum InvalidMapping {
     Id,
     AmbiguousMeaning,
     AudioLevel,
-    PlayoutDelay,
 }
 
 #[derive(Clone, Copy)]
@@ -85,8 +83,6 @@ struct WriteLayout<'a> {
     scope: pulsebeam_rtc::MediaScope,
     dd: Option<&'a [u8]>,
     answer_fid: Option<[u32; 2]>,
-    max_primary_wire_bytes: Option<usize>,
-    playout: Option<&'a pulsebeam_rtc::RtpExtension>,
 }
 
 /// Candidate state for a single negotiated output sender.
@@ -97,7 +93,6 @@ pub struct SenderLeg<B> {
     dd: Option<OutputMapper<B>>,
     dd_reset: Option<(B, u64)>,
     answer_fid: Option<[u32; 2]>,
-    source_bounded: bool,
     strict_dd: bool,
 }
 
@@ -123,7 +118,6 @@ impl SenderLeg<crate::shard::router::FabricLocalBranch> {
             dd: None,
             dd_reset: None,
             answer_fid: None,
-            source_bounded: false,
             strict_dd: false,
         }
     }
@@ -131,11 +125,6 @@ impl SenderLeg<crate::shard::router::FabricLocalBranch> {
     /// Select only for a qualified whole-source video leg and applied answer FID.
     pub(crate) fn with_answer_fid(mut self, pair: [u32; 2]) -> Self {
         self.answer_fid = Some(pair);
-        self
-    }
-
-    pub(crate) fn with_source_wire_budget(mut self) -> Self {
-        self.source_bounded = true;
         self
     }
 
@@ -162,8 +151,7 @@ impl SenderLeg<crate::shard::router::FabricLocalBranch> {
         at: std::time::Instant,
         branch: crate::shard::router::FabricLocalBranch,
         source: SourceMetadata,
-        (sequence, packet, evidence): CandidatePacket<'_, '_>,
-        playout: Option<&pulsebeam_rtc::RtpExtension>,
+        (_, packet, evidence): CandidatePacket<'_, '_>,
     ) -> Result<(), AdmissionError> {
         let OutputLeg {
             mid,
@@ -181,7 +169,7 @@ impl SenderLeg<crate::shard::router::FabricLocalBranch> {
             .prepare(
                 branch,
                 timeline::Input {
-                    sequence,
+                    sequence: evidence.output_position,
                     timestamp: packet.header().timestamp,
                 },
                 at,
@@ -208,44 +196,13 @@ impl SenderLeg<crate::shard::router::FabricLocalBranch> {
         {
             return Err(AdmissionError::Rtc(pulsebeam_rtc::WriteError::InvalidRtp));
         }
-        let mut leg = self.output;
-        if self.source_bounded
-            && packet.header().profile == Profile::Opus
-            && let Some(bytes) = packet
-                .source_protected_bytes()
-                .or_else(|| packet.wan_received_bytes())
-        {
-            leg.max_wire_bytes = usize::from(bytes.get());
+        let leg = self.output;
+        if self.strict_dd && (evidence.mode == Mode::Whole || evidence.dd.is_none()) {
+            return Err(AdmissionError::DependencyDescriptor(
+                output::Rejected::Bootstrap,
+            ));
         }
-        let max_primary_wire_bytes = if self.strict_dd {
-            if evidence.mode == Mode::Whole || evidence.dd.is_none() {
-                return Err(AdmissionError::DependencyDescriptor(
-                    output::Rejected::Bootstrap,
-                ));
-            }
-            Some(usize::from(
-                packet
-                    .source_protected_bytes()
-                    .ok_or(AdmissionError::Rtc(pulsebeam_rtc::WriteError::RtpTooLarge))?
-                    .get(),
-            ))
-        } else {
-            None
-        };
         let mut enqueue = |dd: Option<&[u8]>| {
-            let max_primary_wire_bytes = if dd.is_some()
-                && self.answer_fid.is_some()
-                && packet.header().profile == Profile::Av1
-            {
-                Some(usize::from(
-                    packet
-                        .source_protected_bytes()
-                        .ok_or(pulsebeam_rtc::WriteError::RtpTooLarge)?
-                        .get(),
-                ))
-            } else {
-                max_primary_wire_bytes
-            };
             self.hints.queue_rtp(
                 rtc,
                 at,
@@ -254,8 +211,6 @@ impl SenderLeg<crate::shard::router::FabricLocalBranch> {
                     scope,
                     dd,
                     answer_fid: self.answer_fid,
-                    max_primary_wire_bytes,
-                    playout,
                 },
                 source,
                 output,
@@ -388,13 +343,7 @@ impl EndpointHints {
         profile: Profile,
         form: ExtensionForm,
         mappings: &[Mapping<'_>],
-        playout_override: Option<[u8; 3]>,
     ) -> Result<Self, InvalidMapping> {
-        if let Some(override_bytes) = playout_override {
-            ExtensionKind::PlayoutDelay
-                .validate(profile, &override_bytes)
-                .map_err(|_| InvalidMapping::PlayoutDelay)?;
-        }
         let mut ids = [false; 256];
         let mut hints = ArrayVec::<Hint, 7>::new();
         let mut dependency = None;
@@ -446,7 +395,6 @@ impl EndpointHints {
             hints,
             dependency,
             vad,
-            playout_override,
         })
     }
 
@@ -477,8 +425,6 @@ impl EndpointHints {
             scope,
             dd,
             answer_fid,
-            max_primary_wire_bytes,
-            playout,
         }: WriteLayout<'_>,
         source: SourceMetadata,
         output: timeline::Projected,
@@ -505,8 +451,7 @@ impl EndpointHints {
             projected
                 .values
                 .len()
-                .saturating_add(usize::from(dd.is_some()))
-                .saturating_add(usize::from(playout.is_some())),
+                .saturating_add(usize::from(dd.is_some())),
         );
         if let Some(value) = dd {
             let hint = self
@@ -526,9 +471,6 @@ impl EndpointHints {
                 .iter()
                 .find(|hint| hint.id == id)
                 .ok_or(WriteError::InvalidRtp)?;
-            if hint.kind == ExtensionKind::PlayoutDelay && playout.is_some() {
-                continue;
-            }
             if rtc.rtp_egress_extension_id(mid, leg.primary, &hint.uri) != Some(id) {
                 return Err(WriteError::InvalidRtp);
             }
@@ -537,7 +479,6 @@ impl EndpointHints {
                 value: bytes::Bytes::copy_from_slice(value),
             });
         }
-        extensions.extend(playout.cloned());
         let clock = RtpClockAnchor {
             timestamp: output.anchor_timestamp,
             wallclock: output.wallclock,
@@ -552,18 +493,13 @@ impl EndpointHints {
         };
         let policy = BoundedRtp {
             max_wire_bytes: leg.max_wire_bytes,
-            max_primary_wire_bytes,
+            max_primary_wire_bytes: None,
             clock: Some(clock),
             scope: Some(scope),
             replace_queued: leg.replace_queued,
         };
         match answer_fid {
-            Some(pair) if max_primary_wire_bytes.is_some() => {
-                rtc.write_rtp_bounded_matched_primary(at, mid, leg.primary, write, policy, pair)
-            }
-            Some(pair) => {
-                rtc.write_rtp_bounded_answer_fid(at, mid, leg.primary, write, policy, pair)
-            }
+            Some(pair) => rtc.write_fabric_rtp_bounded(at, mid, leg.primary, write, policy, pair),
             None => rtc.write_rtp_bounded(at, mid, leg.primary, write, policy),
         }
         .map_err(|rejected| rejected.reason)
@@ -585,11 +521,6 @@ impl EndpointHints {
                 ExtensionKind::AbsoluteCaptureTime => capture(source.capture, ext.value),
                 ExtensionKind::AudioLevel if source.vad == Vad::Off && self.vad == Vad::On => None,
                 ExtensionKind::VideoLayersAllocation if !source.same_topology => None,
-                ExtensionKind::PlayoutDelay => Some(Value::Borrowed(
-                    self.playout_override
-                        .as_ref()
-                        .map_or(ext.value, |value| value.as_slice()),
-                )),
                 _ => Some(Value::Borrowed(ext.value)),
             };
             if let Some(value) = value {

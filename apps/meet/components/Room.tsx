@@ -2,7 +2,6 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AgentStatus,
   LogLevel,
-  PlayoutDelay,
   Audio,
   Data,
   usePublish,
@@ -41,16 +40,6 @@ import { useMeetMedia } from "./MeetMediaProvider";
 import { useChat } from "@/hooks/chat";
 import { reactionEmojis, useReaction } from "@/hooks/reaction";
 import { useVideoLayout } from "@/hooks/video-layout";
-
-const latencyModes: Record<
-  string,
-  { minMs: number; maxMs: number } | undefined
-> = {
-  Auto: undefined,
-  Smooth: { minMs: 400, maxMs: 800 },
-  Balanced: { minMs: 100, maxMs: 200 },
-  Zero: { minMs: 0, maxMs: 0 },
-};
 
 function RoomVideo({
   track,
@@ -147,7 +136,6 @@ function ActiveRoom({
   const [reactionAnchor, setReactionAnchor] = useState<HTMLElement | null>(
     null,
   );
-  const [latencyMode, setLatencyMode] = useState("Auto");
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
   const [chatOpen, setChatOpen] = useState(false);
@@ -306,9 +294,6 @@ function ActiveRoom({
               minHeight: 0,
               minFps: 15,
               priority: track === spotlight ? 200 : 10,
-              playoutDelay: latencyModes[latencyMode]
-                ? PlayoutDelay.Fixed.new(latencyModes[latencyMode]!)
-                : PlayoutDelay.Adaptive.new(),
             }
           : undefined
       }
@@ -449,20 +434,6 @@ function ActiveRoom({
         <Stack spacing={2} sx={{ p: 2, width: "min(340px, 95vw)" }}>
           <Typography variant="h6">Call settings</Typography>
           <DeviceSettings />
-          <TextField
-            select
-            size="small"
-            fullWidth
-            label="Latency"
-            value={latencyMode}
-            onChange={(event) => setLatencyMode(event.target.value)}
-          >
-            {Object.keys(latencyModes).map((mode) => (
-              <MenuItem key={mode} value={mode}>
-                {mode}
-              </MenuItem>
-            ))}
-          </TextField>
         </Stack>
       </Popover>
       {(capture.error || devices.error) && (

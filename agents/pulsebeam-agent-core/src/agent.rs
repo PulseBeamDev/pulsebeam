@@ -653,14 +653,6 @@ impl Agent {
                 self.resources.claim_audio_subscription(owner, selector)?;
                 ResourceResult::Owned { owner: owner.id() }
             }
-            ResourceCommand::ConfigureAudio {
-                owner,
-                playout_delay,
-            } => {
-                self.resources
-                    .configure_audio(TrackOwner(owner), playout_delay)?;
-                ResourceResult::Updated
-            }
             ResourceCommand::ClaimAudioPolicy { policy } => {
                 if self.declared.audio.has_demand() {
                     return Err(TrackResourceError::AlreadyOwned.into());

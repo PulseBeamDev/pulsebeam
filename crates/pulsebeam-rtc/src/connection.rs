@@ -585,6 +585,37 @@ impl RtcConnection {
         )
     }
 
+    /// Permit MID omission at the wire ceiling for an exact FID already known
+    /// to the receiver on direct UDP. Other paths retain MID.
+    #[allow(
+        clippy::result_large_err,
+        reason = "return the original packet on rejection"
+    )]
+    pub fn write_fabric_rtp_bounded(
+        &mut self,
+        at: Instant,
+        mid: &str,
+        primary: Option<u32>,
+        packet: RtpWrite,
+        policy: crate::BoundedRtp,
+        pair: [u32; 2],
+    ) -> Result<(), RejectedRtp> {
+        if policy.scope.is_none() {
+            return Err(RejectedRtp {
+                reason: WriteError::InvalidState,
+                packet,
+            });
+        }
+        let fid = self
+            .transport
+            .direct_udp_rtp_epoch()
+            .map(|_| AnswerFidBudget {
+                pair,
+                source_primary_plaintext_bytes: None,
+            });
+        self.write_rtp_bounded_with_fid(at, mid, primary, packet, policy, fid)
+    }
+
     /// Preserve negotiated extensions while allowing MID omission for an exact
     /// FID already known to the receiver on direct UDP. The caller must supply
     /// the matched protected primary size and the pair from the receive binding.
@@ -1397,11 +1428,12 @@ impl RtcConnection {
                 path_epoch,
                 bytes,
                 protected_bytes,
-                metadata: _,
+                metadata,
                 ecn,
             } => {
                 let protection = crate::rtp::RtpProtection {
                     bytes: protected_bytes,
+                    index: metadata.authenticated_index,
                     direct_full_tag: self.transport.direct_udp_rtp_epoch() == Some(path_epoch)
                         && protected_bytes.checked_sub(bytes.len()) == Some(16),
                 };

@@ -390,11 +390,6 @@ fn co_occurring_metadata_is_not_stripped_to_fit() {
             "http://www.webrtc.org/experiments/rtp-hdrext/color-space",
             ExtensionKind::ColorSpace,
         ),
-        (
-            17,
-            "http://www.webrtc.org/experiments/rtp-hdrext/playout-delay",
-            ExtensionKind::PlayoutDelay,
-        ),
     ];
     let mut extmap = binding.receive_extensions.into_vec();
     binding
@@ -424,11 +419,9 @@ fn co_occurring_metadata_is_not_stripped_to_fit() {
         (13, vla.as_slice()),
         (14, &[1][..]),
         (16, &[0; 28][..]),
-        (17, &[0; 3][..]),
     ];
-    // 257 DD + 18 ACT + 3 CVO + 257 VLA + 3 content + 30 HDR + 5 delay
-    // = 573 extension bytes, padded to 576 after the 16-byte RTP prefix.
-    let budget = MAX_WAN_RTP_BYTES.checked_sub(16 + 576).unwrap();
+    // 257 DD + 18 ACT + 3 CVO + 257 VLA + 3 content + 30 HDR.
+    let budget = MAX_WAN_RTP_BYTES.checked_sub(16 + 568).unwrap();
     let now = Instant::now();
     let oversized = [0; MAX_WAN_RTP_BYTES];
     let input = Wire {
@@ -487,7 +480,7 @@ fn prove_endpoint_identity(peer_repair: bool) {
         |arrival: ShardInstant, sequence, bytes: Option<&[u8]>, protected_bytes| MediaIngress {
             arrival: arrival.into(),
             ingress_ntp32: 1,
-            sequence,
+            position: Position::LowSequence(sequence),
             protected_bytes: NonZeroU16::new(protected_bytes),
             media: bytes.map(|payload| OwnedCopy {
                 payload: payload.into(),

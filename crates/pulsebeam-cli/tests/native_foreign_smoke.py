@@ -216,7 +216,6 @@ async def witness(endpoint, token, reader_token, catalog_token, room, package):
         received_interest = agent.room(room).participant("publisher").video("production-camera").subscribe(
             core.VideoObservation(
                 visible=True, height=96, min_height=0, min_fps=0, priority=1,
-                playout_delay=core.PlayoutDelay.ADAPTIVE(),
             ),
         )
         received = received_interest.frames()
@@ -234,12 +233,9 @@ async def witness(endpoint, token, reader_token, catalog_token, room, package):
         received.close()
         await received_interest.close()
         assert bytes(frame.frame.data) == retained, "owned pixels changed after reader and subscription close"
-        interest = agent.room(room).participant("absent-publisher").audio("microphone").subscribe(
-            core.AudioSubscriptionConfig(playout_delay=core.PlayoutDelay.ADAPTIVE()),
-        )
+        interest = agent.room(room).participant("absent-publisher").audio("microphone").subscribe()
         video_preferences = core.VideoObservation(
             visible=True, height=720, min_height=0, min_fps=0, priority=1,
-            playout_delay=core.PlayoutDelay.ADAPTIVE(),
         )
         video_interest = agent.room(room).participant("absent-publisher").video("camera").subscribe(
             video_preferences,

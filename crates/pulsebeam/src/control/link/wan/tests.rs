@@ -55,8 +55,8 @@ async fn wan_host_receives_only_controller_scoped_commits_and_fences_on_peer_clo
         let (commands, receiver_lane) = provisioner
             .open(inbound.clone(), right, NonZeroU64::MIN, origin)
             .unwrap();
-        links.attach_wan_host(sender_commands, false).unwrap();
-        links.attach_wan_host(commands, false).unwrap();
+        links.attach_wan_host(sender_commands).unwrap();
+        links.attach_wan_host(commands).unwrap();
         (left, sender_lane, right, receiver_lane)
     };
     let (sender_peer, mut sender_lane, peer, mut receiver_lane) = initiate(&mut links);

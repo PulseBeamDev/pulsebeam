@@ -77,15 +77,6 @@ fn named_resources_project_their_own_prejoin_configuration() {
             },
         })
         .unwrap();
-    agent
-        .resource(ResourceCommand::ConfigureAudio {
-            owner: audio,
-            playout_delay: agent_core::PlayoutDelay::Fixed {
-                min_ms: 100,
-                max_ms: 200,
-            },
-        })
-        .unwrap();
 
     let Some(ResourceState::Video(state)) = ResourceKind::Video.state(&agent, video) else {
         panic!("expected video projection")
@@ -115,13 +106,6 @@ fn named_resources_project_their_own_prejoin_configuration() {
             state.selector.track_id.as_str()
         ),
         ("room", "alice", "microphone")
-    );
-    assert_eq!(
-        state.playout_delay,
-        agent_core::ffi::PlayoutDelay::Fixed {
-            min_ms: 100,
-            max_ms: 200
-        }
     );
     assert!(!state.closed);
     let Some(ResourceState::DataPublication(state)) =

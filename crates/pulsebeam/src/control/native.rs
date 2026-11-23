@@ -24,28 +24,6 @@ pub(crate) use session::{
     NativeSession, OutputError, Preparation, failure,
 };
 
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) enum DataProfile {
-    Legacy,
-    FabricLive,
-    #[default]
-    FabricReliable,
-}
-
-impl DataProfile {
-    pub(super) const fn delivery_modes(self) -> &'static [wire::DataDelivery] {
-        use wire::DataDelivery::{Latest, Lossy, Ordered};
-        match self {
-            Self::FabricLive => &[Latest, Lossy],
-            Self::Legacy | Self::FabricReliable => &[Latest, Lossy, Ordered],
-        }
-    }
-
-    pub(super) fn version(self) -> Option<u32> {
-        (self != Self::Legacy).then_some(u32::from(pulsebeam_proto::data_endpoint::DATA_V1))
-    }
-}
-
 pub(crate) struct ResolvedSource<'a> {
     pub(crate) track: &'a Track,
     pub(crate) publisher: &'a ParticipantId,
@@ -284,12 +262,10 @@ fn enabled(spec: &wire::ResourceSpec) -> bool {
 
 pub(crate) fn receiver_policy(
     spec: &wire::ResourceSpec,
-    rtp: Option<(MediaKind, bool)>,
+    rtp: Option<MediaKind>,
 ) -> Result<ReceiverPolicy, wire::FailureCode> {
     let video = match rtp {
-        Some((kind, supports_playout_delay)) => {
-            policy::receiver_settings(kind, supports_playout_delay, spec)?
-        }
+        Some(kind) => policy::receiver_settings(kind, spec)?,
         None => None,
     };
     Ok(ReceiverPolicy {

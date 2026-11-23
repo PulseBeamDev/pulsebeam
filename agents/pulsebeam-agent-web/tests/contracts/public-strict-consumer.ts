@@ -4,7 +4,6 @@ import {
   Catalog,
   DataDelivery,
   DataEvent,
-  PlayoutDelay,
   VideoSource,
   WatchStatus,
   type AgentConfig,
@@ -42,7 +41,6 @@ const videoOptions: VideoObservation = {
   minHeight: 0,
   minFps: 15,
   priority: 10,
-  playoutDelay: PlayoutDelay.Fixed.new({ minMs: 100, maxMs: 200 }),
 };
 const reception = remote.video("camera").subscribe(videoOptions);
 const output = await reception.playbackOutput();

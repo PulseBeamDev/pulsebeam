@@ -225,15 +225,10 @@ async def witness():
             raise AssertionError("unallocated input accepted a frame")
         closed_before_admission = remote_video.subscribe(core.VideoObservation(
             visible=False, height=0, min_height=0, min_fps=0, priority=1,
-            playout_delay=core.PlayoutDelay.ADAPTIVE(),
         ))
         assert not inspect.isawaitable(closed_before_admission)
         await closed_before_admission.close()
         assert closed_before_admission.is_closed()
-        explicit_audio = remote_audio.subscribe(core.AudioSubscriptionConfig(
-            playout_delay=core.PlayoutDelay.ADAPTIVE(),
-        ))
-        await explicit_audio.close()
         video_subscription = remote_video.subscribe()
         assert not inspect.isawaitable(video_subscription)
         audio_subscription = remote_audio.subscribe()
@@ -244,9 +239,7 @@ async def witness():
         assert isinstance(audio_state, core.AudioSubscriptionState)
         assert video_state.configuration == core.VideoObservation(
             visible=True, height=0, min_height=0, min_fps=0, priority=0,
-            playout_delay=core.PlayoutDelay.ADAPTIVE(),
         )
-        assert audio_state.playout_delay.is_ADAPTIVE()
         video_updates = video_subscription.updates()
         audio_updates = audio_subscription.updates()
         assert isinstance(video_updates, native.VideoSubscriptionUpdates)

@@ -227,7 +227,6 @@ fn run(claim: &'static str, shards: usize, admission: bool) {
     let client = subnet_ip(subnet, 2);
     sim.host(server, move || async move {
         sfu_node_builder(server, pulsebeam_runtime::rand::seeded_rng(seed), shards)
-            .with_local_data_v1()
             .run(tokio_util::sync::CancellationToken::new())
             .await
             .map_err(Into::into)

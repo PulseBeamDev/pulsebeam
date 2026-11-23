@@ -229,7 +229,6 @@ fn screen_camera_viewer_room() -> Room {
 #[test]
 fn low_priority_minimum_precedes_high_priority_target_test() {
     use super::common::harness::{SourceInputTier, VideoSubscription};
-    use pulsebeam_agent_native::agent_core::PlayoutDelay;
     let fixture = native_temporal_ladder();
     for seed in QOS_SEEDS {
         LocalNodeSim::new()
@@ -261,7 +260,7 @@ fn low_priority_minimum_precedes_high_priority_target_test() {
                     targets: [("camera", 180, 200), ("protected", 720, 10)].into_iter()
                         .map(|(publisher, min_height, priority)| VideoSubscription {
                             participant_id: publisher.into(), height: 720, min_height, min_fps: 15,
-                            priority, playout_delay: PlayoutDelay::Fixed { min_ms: 0, max_ms: 0 },
+                            priority,
                             ..Default::default()
                         }).collect(),
                 },
@@ -311,7 +310,7 @@ fn low_priority_minimum_precedes_high_priority_target_test() {
                     targets: [("camera", 200), ("protected", 10)].into_iter()
                         .map(|(publisher, priority)| VideoSubscription {
                             participant_id: publisher.into(), height: 720, min_height: 720, min_fps: 15,
-                            priority, playout_delay: PlayoutDelay::Fixed { min_ms: 0, max_ms: 0 },
+                            priority,
                             ..Default::default()
                         }).collect(),
                 },
@@ -1086,7 +1085,6 @@ fn native_temporal_ladder() -> std::sync::Arc<super::common::media::NativeVideoF
 fn clean_native_source_windows_bound_motion_and_updates_test() {
     use super::common::harness::VideoSubscription;
     use super::common::native_origin::SourceService::{CameraMotion, SparseUpdates};
-    use pulsebeam_agent_native::agent_core::PlayoutDelay;
     let camera_fixture = native_temporal_ladder();
     let full_temporal_index = camera_fixture.temporal_layers() - 1;
     let mut plan = vec![Step::WaitForPublication {
@@ -1094,95 +1092,87 @@ fn clean_native_source_windows_bound_motion_and_updates_test() {
         publisher: "camera",
         timeout: Duration::from_secs(5),
     }];
-    for buffer in [0, 120] {
-        plan.extend([
-            Step::SubscribeToConfigured {
-                description: "Request the supplied full-rate representation with explicit fixed buffering",
-                participant: "screen",
-                targets: vec![VideoSubscription {
-                    participant_id: "camera".into(), height: 720, min_height: 720,
-                    min_fps: 30, priority: 100,
-                    playout_delay: PlayoutDelay::Fixed { min_ms: buffer, max_ms: buffer },
-                    ..Default::default()
-                }],
-            },
-            Step::WaitForSourceVideo {
-                description: "Actual upper-temporal native output establishes full-rate dependency readiness within five seconds plus fixed buffering",
-                participant: "screen", publisher: "camera", min_resolution: (1280, 720),
-                temporal_index: Some(full_temporal_index), timeout: Duration::from_secs(5),
-            },
-            Step::MeasureSourceWindow {
-                description: "Full-size native motion sustains fresh output across temporal tiers despite allowed drops",
-                participant: "screen", publisher: "camera", encodings: &["f"], duration: Duration::from_secs(1),
-                service: CameraMotion,
-            },
-        ]);
-        if buffer == 0 {
-            plan.extend([
-                Step::SubscribeToConfigured {
-                    description: "Establish the separate native call before replacing its owner",
-                    participant: "replacement",
-                    targets: vec![VideoSubscription {
-                        participant_id: "camera".into(), height: 720, min_height: 720, min_fps: 30,
-                        playout_delay: PlayoutDelay::Fixed { min_ms: 0, max_ms: 0 },
-                        ..Default::default()
-                    }],
-                },
-                Step::WaitForSourceVideo {
-                    description: "The owner being replaced has an actual established native receiver",
-                    participant: "replacement", publisher: "camera", min_resolution: (1280, 720),
-                    temporal_index: Some(full_temporal_index), timeout: Duration::from_secs(5),
-                },
-                Step::BeginHeldReconnect {
-                    description: "Keep the replacement native bootstrap HTTP future pending",
-                    participant: "replacement", timeout: Duration::from_secs(5),
-                },
-                Step::MeasureSourceWindow {
-                    description: "The unrelated established call sustains fresh motion while replacement is held",
-                    participant: "screen", publisher: "camera", encodings: &["f"],
-                    duration: Duration::from_secs(4), service: CameraMotion,
-                },
-                Step::ReleaseHeldReconnect {
-                    description: "Release only after the complete source interval and its deadlines, at the five-second hold boundary",
-                    participant: "replacement", held_for: Duration::from_secs(5),
-                },
-                Step::SubscribeToConfigured {
-                    description: "Reapply the same full-rate request to the replacement application owner",
-                    participant: "replacement",
-                    targets: vec![VideoSubscription {
-                        participant_id: "camera".into(), height: 720, min_height: 720, min_fps: 30,
-                        playout_delay: PlayoutDelay::Fixed { min_ms: 0, max_ms: 0 },
-                        ..Default::default()
-                    }],
-                },
-                Step::WaitForSourceVideo {
-                    description: "A first current native picture returns within the thirty-second restoration budget",
-                    participant: "replacement", publisher: "camera", min_resolution: (1280, 720),
-                    temporal_index: Some(full_temporal_index), timeout: Duration::from_secs(30),
-                },
-                Step::WaitSinceBootstrapRelease {
-                    description: "End the declared restoration phase exactly thirty seconds after release, not thirty seconds after first output",
-                    participant: "replacement", duration: Duration::from_secs(30),
-                },
-                Step::MeasureSourceWindow {
-                    description: "At the restoration boundary start a fresh motion window on the recovered owner",
-                    participant: "replacement", publisher: "camera", encodings: &["f"],
-                    duration: Duration::from_secs(1), service: CameraMotion,
-                },
-                Step::Disconnect {
-                    description: "Retire the completed replacement workload before the remaining buffering and sparse-update checks",
-                    participant: "replacement",
-                },
-            ]);
-        }
-    }
     plan.extend([
         Step::SubscribeToConfigured {
-            description: "Receive the intentionally uniform one-fps source with fixed buffering",
+            description: "Request the supplied full-rate representation",
+            participant: "screen",
+            targets: vec![VideoSubscription {
+                participant_id: "camera".into(), height: 720, min_height: 720,
+                min_fps: 30, priority: 100,
+                ..Default::default()
+            }],
+        },
+        Step::WaitForSourceVideo {
+            description: "Actual upper-temporal native output establishes full-rate dependency readiness within five seconds",
+            participant: "screen", publisher: "camera", min_resolution: (1280, 720),
+            temporal_index: Some(full_temporal_index), timeout: Duration::from_secs(5),
+        },
+        Step::MeasureSourceWindow {
+            description: "Full-size native motion sustains fresh output across temporal tiers despite allowed drops",
+            participant: "screen", publisher: "camera", encodings: &["f"], duration: Duration::from_secs(1),
+            service: CameraMotion,
+        },
+    ]);
+    plan.extend([
+        Step::SubscribeToConfigured {
+            description: "Establish the separate native call before replacing its owner",
+            participant: "replacement",
+            targets: vec![VideoSubscription {
+                participant_id: "camera".into(), height: 720, min_height: 720, min_fps: 30,
+                ..Default::default()
+            }],
+        },
+        Step::WaitForSourceVideo {
+            description: "The owner being replaced has an actual established native receiver",
+            participant: "replacement", publisher: "camera", min_resolution: (1280, 720),
+            temporal_index: Some(full_temporal_index), timeout: Duration::from_secs(5),
+        },
+        Step::BeginHeldReconnect {
+            description: "Keep the replacement native bootstrap HTTP future pending",
+            participant: "replacement", timeout: Duration::from_secs(5),
+        },
+        Step::MeasureSourceWindow {
+            description: "The unrelated established call sustains fresh motion while replacement is held",
+            participant: "screen", publisher: "camera", encodings: &["f"],
+            duration: Duration::from_secs(4), service: CameraMotion,
+        },
+        Step::ReleaseHeldReconnect {
+            description: "Release only after the complete source interval and its deadlines, at the five-second hold boundary",
+            participant: "replacement", held_for: Duration::from_secs(5),
+        },
+        Step::SubscribeToConfigured {
+            description: "Reapply the same full-rate request to the replacement application owner",
+            participant: "replacement",
+            targets: vec![VideoSubscription {
+                participant_id: "camera".into(), height: 720, min_height: 720, min_fps: 30,
+                ..Default::default()
+            }],
+        },
+        Step::WaitForSourceVideo {
+            description: "A first current native picture returns within the thirty-second restoration budget",
+            participant: "replacement", publisher: "camera", min_resolution: (1280, 720),
+            temporal_index: Some(full_temporal_index), timeout: Duration::from_secs(30),
+        },
+        Step::WaitSinceBootstrapRelease {
+            description: "End the declared restoration phase exactly thirty seconds after release, not thirty seconds after first output",
+            participant: "replacement", duration: Duration::from_secs(30),
+        },
+        Step::MeasureSourceWindow {
+            description: "At the restoration boundary start a fresh motion window on the recovered owner",
+            participant: "replacement", publisher: "camera", encodings: &["f"],
+            duration: Duration::from_secs(1), service: CameraMotion,
+        },
+        Step::Disconnect {
+            description: "Retire the completed replacement workload before the sparse-update checks",
+            participant: "replacement",
+        },
+    ]);
+    plan.extend([
+        Step::SubscribeToConfigured {
+            description: "Receive the intentionally uniform one-fps source",
             participant: "camera",
             targets: vec![VideoSubscription {
                 participant_id: "screen".into(), height: 180, min_height: 180, min_fps: 1,
-                playout_delay: PlayoutDelay::Fixed { min_ms: 120, max_ms: 120 },
                 ..Default::default()
             }],
         },
@@ -1210,7 +1200,6 @@ fn clean_native_source_windows_bound_motion_and_updates_test() {
             participant: "screen",
             targets: vec![VideoSubscription {
                 participant_id: "camera".into(), height: 0,
-                playout_delay: PlayoutDelay::Fixed { min_ms: 120, max_ms: 120 },
                 ..Default::default()
             }],
         },
@@ -1223,7 +1212,7 @@ fn clean_native_source_windows_bound_motion_and_updates_test() {
             participant: "screen",
         },
         Step::WaitForSourceVideo {
-            description: "The explicit light update, not a later dark receipt, reaches native pixels within five seconds plus buffering",
+            description: "The explicit light update, not a later dark receipt, reaches native pixels within five seconds",
             participant: "camera", publisher: "screen", min_resolution: (320, 180),
             temporal_index: None, timeout: Duration::from_secs(5),
         },

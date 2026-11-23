@@ -38,9 +38,9 @@ impl Profile {
 /// Pinned DTLS 1.3 AES-128-GCM profile: five header bytes (no CID), one
 /// inner content-type byte and a sixteen-byte tag. Dimpl 0.9.0 adds no padding.
 pub const SINGLE_RECORD_OVERHEAD: usize = 5 + 1 + 16;
-// Pinned Native Opus RTP layout (1,200 payload + 12 RTP + 8 audio-level)
-// protected with the full 16-byte GCM tag.
-pub const FABRIC_WAN_DATAGRAM_BYTES: usize = 1_200 + 12 + 8 + 16;
+/// Complete UDP payload at the IPv6 minimum MTU, before any extra path overhead.
+pub const IPV6_MIN_MTU_UDP_PAYLOAD_BYTES: usize = 1_280 - 40 - 8;
+pub const FABRIC_WAN_DATAGRAM_BYTES: usize = IPV6_MIN_MTU_UDP_PAYLOAD_BYTES;
 pub const FABRIC_WAN_BOOTSTRAP_BYTES: usize = 1200;
 
 struct SingleRecordState {

@@ -188,7 +188,6 @@ pub(in crate::participant::core) fn participant_with_capabilities(
         signaling,
         sources: BTreeMap::new(),
     };
-    participant.signaling.enable_data_v1();
     participant.handle_event(
         Instant::now(),
         Event::DataChannel(DataChannelEvent::Opened {
@@ -350,7 +349,6 @@ pub(in crate::participant::core) fn confirmations_for(
 #[test]
 fn data_v1_publisher_does_not_stage_or_acknowledge_a_pending_sctp_installation() {
     let mut participant = participant();
-    participant.signaling.enable_data_v1();
     let mut sink = MockParticipantSink::new();
     let mut spec = declaration();
     let Some(resource_spec::Declaration::Publication(publication)) = &mut spec.declaration else {

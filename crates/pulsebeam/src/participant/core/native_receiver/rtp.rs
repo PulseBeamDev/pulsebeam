@@ -8,7 +8,6 @@ pub(super) struct RtpReceiver {
     pub(super) video_options: Option<VideoPolicy>,
     pub(super) kind: MediaKind,
     pub(super) fabric_profile: Option<pulsebeam_core::fabric::Profile>,
-    pub(super) supports_playout_delay: bool,
     pending: Option<CompiledRtpBinding>,
     mid: Mid,
     rid: Option<crate::media::Rid>,
@@ -52,7 +51,6 @@ impl RtpReceiver {
             fabric_profile,
             video_options: configuration.video,
             kind: configuration.kind,
-            supports_playout_delay: configuration.supports_playout_delay,
             pending: Some(configuration.binding),
             mid: configuration.mid,
             rid: configuration.rid,
@@ -60,10 +58,6 @@ impl RtpReceiver {
             fid,
             payload_type: configuration.payload_type,
         }
-    }
-
-    pub(super) fn playout_delay(&self) -> Option<(crate::rtp::MediaTime, crate::rtp::MediaTime)> {
-        self.video_options.as_ref()?.playout_delay
     }
 
     pub(super) fn mid(&self) -> Mid {

@@ -3,7 +3,6 @@
 use super::decoder::PixelSample;
 use super::provenance::{AuthenticatedSourceEvent, SourceLedger};
 use anyhow::{Context, Result, ensure};
-use pulsebeam_agent_native::agent_core::PlayoutDelay;
 use pulsebeam_agent_native::{NativeReceiverInfo, OutputFrame, RemoteFrame};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -71,27 +70,18 @@ pub enum SourceService {
 #[derive(Clone, Copy, Debug)]
 pub struct SourceTiming {
     pub period: Duration,
-    pub playout: PlayoutDelay,
+    pub buffering_allowance: Duration,
     pub service: SourceService,
 }
 
 impl SourceTiming {
-    pub fn fixed_buffer(playout: PlayoutDelay) -> Result<Duration> {
-        let PlayoutDelay::Fixed { min_ms, max_ms } = playout else {
-            anyhow::bail!("strict source age needs explicit fixed playout, not adaptive");
-        };
-        let maximum = max_ms.min(2_000).max(min_ms.min(2_000));
-        Ok(Duration::from_millis(u64::from((maximum + 5) / 10 * 10)))
-    }
-
     pub fn deadline(self) -> Result<Duration> {
         ensure!(!self.period.is_zero(), "source period is not declared");
-        // Scenario age budgets, not end-to-end guarantees implied by Fixed.
         let age_budget = match self.service {
             SourceService::CameraMotion => Duration::from_millis(250),
             SourceService::SparseUpdates => self.period,
         };
-        Self::fixed_buffer(self.playout)?
+        self.buffering_allowance
             .checked_add(age_budget)
             .context("source deadline overflow")
     }
@@ -1015,10 +1005,7 @@ mod tests {
             end: start + period * count,
             timing: SourceTiming {
                 period,
-                playout: PlayoutDelay::Fixed {
-                    min_ms: buffer,
-                    max_ms: buffer,
-                },
+                buffering_allowance: Duration::from_millis(u64::from(buffer)),
                 service: SourceService::SparseUpdates,
             },
         };
@@ -1228,40 +1215,15 @@ mod tests {
     }
 
     #[test]
-    fn source_deadline_normalizes_fixed_policy_without_inventing_an_adaptive_bound() {
-        for (min_ms, max_ms, expected) in [
-            (0, 0, 0),
-            (0, 14, 10),
-            (0, 15, 20),
-            (100, 50, 100),
-            (3000, 500, 2000),
-            (0, 5000, 2000),
-        ] {
-            let timing = SourceTiming {
-                period: Duration::from_millis(20),
-                playout: PlayoutDelay::Fixed { min_ms, max_ms },
-                service: SourceService::CameraMotion,
-            };
-            assert_eq!(
-                SourceTiming::fixed_buffer(timing.playout).unwrap(),
-                Duration::from_millis(expected)
-            );
-            assert_eq!(
-                timing.deadline().unwrap(),
-                Duration::from_millis(expected + 250)
-            );
-        }
+    fn source_deadline_applies_the_scenario_buffering_allowance() {
         let mut timing = SourceTiming {
-            period: Duration::from_secs(1),
-            playout: PlayoutDelay::Adaptive,
-            service: SourceService::SparseUpdates,
+            period: Duration::from_millis(20),
+            buffering_allowance: Duration::from_millis(120),
+            service: SourceService::CameraMotion,
         };
-        assert!(timing.deadline().is_err());
-        timing.playout = PlayoutDelay::Fixed {
-            min_ms: 120,
-            max_ms: 120,
-        };
-        assert_eq!(timing.deadline().unwrap(), Duration::from_millis(1120));
+        assert_eq!(timing.deadline().unwrap(), Duration::from_millis(370));
+        timing.service = SourceService::SparseUpdates;
+        assert_eq!(timing.deadline().unwrap(), Duration::from_millis(140));
         timing.period = Duration::MAX;
         assert!(timing.deadline().is_err());
         timing.period = Duration::ZERO;

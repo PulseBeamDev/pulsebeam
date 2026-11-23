@@ -1143,7 +1143,7 @@ enum PendingDriverOp {
     PublishData(String, TopicMode, Vec<u8>),
     /// (pinned participant ids, auto)
     SetAudioIntent(Vec<String>, bool),
-    SetAudioRequest(Vec<String>, bool, Option<u16>, Arc<AtomicBool>),
+    SetAudioRequest(Vec<String>, bool, Arc<AtomicBool>),
     ProducerPressure(Arc<Mutex<Option<(usize, usize)>>>),
 }
 
@@ -1193,7 +1193,7 @@ impl OperationQueue {
                     .retain(|(_, op)| !matches!(op, PendingDriverOp::SetSubscriptions(_)));
             }
             PendingDriverOp::SetAudioIntent(pinned, automatic)
-            | PendingDriverOp::SetAudioRequest(pinned, automatic, _, _) => {
+            | PendingDriverOp::SetAudioRequest(pinned, automatic, _) => {
                 self.intent.audio.clone_from(pinned);
                 self.intent.automatic_audio = *automatic;
             }
@@ -1747,8 +1747,8 @@ async fn run_participant(
                             PendingDriverOp::SetAudioIntent(participants, automatic) => {
                                 client.ctx.set_audio_intent(&participants, automatic).await?
                             }
-                            PendingDriverOp::SetAudioRequest(participants, automatic, delay, receipt) => {
-                                let complete = client.ctx.set_audio_request(&participants, automatic, delay).await?;
+                            PendingDriverOp::SetAudioRequest(participants, automatic, receipt) => {
+                                let complete = client.ctx.set_audio_intent(&participants, automatic).await?;
                                 if complete { receipt.store(true, Ordering::Release); }
                                 complete
                             }
@@ -3181,13 +3181,8 @@ async fn execute_plan(
             } => {
                 let start = Instant::now();
                 get_handle(handles, participant, description)?.native_origin_interval = start;
-                let request = source_request(handles, participant, publisher)?;
-                let buffer = match request.playout_delay {
-                    pulsebeam_agent_native::agent_core::PlayoutDelay::Adaptive => Duration::ZERO,
-                    fixed => super::native_origin::SourceTiming::fixed_buffer(fixed)?,
-                };
                 let mut pending = None;
-                tokio::time::timeout(*timeout + buffer, async {
+                tokio::time::timeout(*timeout, async {
                     loop {
                         match current_source_proof(handles, participant, publisher, start, *temporal_index).and_then(|proof| {
                             anyhow::ensure!(proof.dimensions.0 >= min_resolution.0 && proof.dimensions.1 >= min_resolution.1, "source representation not visible yet: {:?}, required {min_resolution:?}", proof.dimensions);
@@ -3201,7 +3196,7 @@ async fn execute_plan(
                         }
                         tokio::time::sleep(Duration::from_millis(5)).await;
                     }
-                }).await.with_context(|| format!("{description}: no genuine new source output within {timeout:?} plus {buffer:?}: {pending:?}"))?;
+                }).await.with_context(|| format!("{description}: no genuine new source output within {timeout:?}: {pending:?}"))?;
             }
             Step::MeasureSourceWindow {
                 description,
@@ -3266,7 +3261,7 @@ async fn execute_plan(
                         .context("source interval overflow")?,
                     timing: super::native_origin::SourceTiming {
                         period,
-                        playout: request.playout_delay,
+                        buffering_allowance: Duration::ZERO,
                         service: *service,
                     },
                 };
@@ -6045,7 +6040,6 @@ pub struct LocalNodeSim {
     tcp_only: bool,
     udp_only: bool,
     num_shards: usize,
-    local_rtp_v1: bool,
     link: LinkProfile,
     ip_version: turmoil::IpVersion,
     predeclare_topics: bool,
@@ -6069,7 +6063,6 @@ impl LocalNodeSim {
             // exercise reliable-stream framing only in explicit TCP scenarios.
             udp_only: true,
             num_shards: DEFAULT_SIM_SHARDS,
-            local_rtp_v1: false,
             link: LinkProfile::default(),
             ip_version: turmoil::IpVersion::V4,
             predeclare_topics: true,
@@ -6150,11 +6143,6 @@ impl LocalNodeSim {
     /// reaches is chosen by the `SO_REUSEPORT` group, which hashes its 4-tuple
     /// exactly as the kernel does — so a plan that sets this is also exercising
     /// the demuxer's shard check and the arrival path a real deployment uses.
-    pub fn with_local_rtp_v1(mut self) -> Self {
-        self.local_rtp_v1 = true;
-        self
-    }
-
     pub fn with_shards(mut self, n: usize) -> Self {
         assert!(n > 0, "a simulation node must have at least one shard");
         self.num_shards = n;
@@ -6246,7 +6234,6 @@ impl LocalNodeSim {
         let tcp_only = self.tcp_only;
         let udp_only = self.udp_only;
         let num_shards = self.num_shards;
-        let local_rtp_v1 = self.local_rtp_v1;
         let mut name_to_ip = PlanIps::new();
         name_to_ip.insert("server", server_ip);
         let mut endpoints = BTreeMap::new();
@@ -6283,11 +6270,8 @@ impl LocalNodeSim {
             let startup_tx = startup_tx.clone();
             async move {
                 let rng = pulsebeam_runtime::rand::seeded_rng(seed);
-                let mut builder = sfu_node_builder(server_ip, rng, num_shards);
-                if local_rtp_v1 {
-                    builder = builder.with_local_rtp_v1();
-                }
-                builder = builder.with_sim_startup_notification(startup_tx);
+                let mut builder = sfu_node_builder(server_ip, rng, num_shards)
+                    .with_sim_startup_notification(startup_tx);
                 if tcp_only {
                     builder = builder.tcp_only();
                 } else if udp_only {

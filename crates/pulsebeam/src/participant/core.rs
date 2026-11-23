@@ -21,7 +21,7 @@ use crate::control::{NegotiatedResources, controller::SignalingProtocol};
 use crate::entity::{self, PublicationKey, TrackKind};
 use crate::id::ShardId;
 use crate::keys::TrackHandle;
-use crate::log::{LogCtx, plog_debug, plog_info, plog_trace, plog_warn};
+use crate::log::{LogCtx, plog_debug, plog_info, plog_warn};
 use crate::participant::data_fabric::{self, Lease as FabricDataLease};
 use crate::participant::downstream::SlotConfig;
 use crate::participant::effect::ParticipantEffect;
@@ -169,8 +169,36 @@ struct BoundFabricIngress {
     ingress: RtpIngressShadow,
     publisher_source: Option<FabricSourceHandle>,
     geometry_refresh_at: Option<Instant>,
+    loss_measurement: FabricLossMeasurement,
     #[cfg(test)]
     observation: Option<(u32, Observation)>,
+}
+
+#[derive(Default)]
+enum FabricLossMeasurement {
+    #[default]
+    Continuous,
+    AwaitingPrimary,
+    ResumedAt(u16),
+}
+
+impl FabricLossMeasurement {
+    fn observe_primary(&mut self, sequence: u16) {
+        if matches!(self, Self::AwaitingPrimary) {
+            *self = Self::ResumedAt(sequence);
+        }
+    }
+
+    fn admits(&mut self, sequence: u16) -> bool {
+        match *self {
+            Self::Continuous => true,
+            Self::ResumedAt(first) if sequence.wrapping_sub(first) < (1 << 15) => {
+                *self = Self::Continuous;
+                true
+            }
+            Self::AwaitingPrimary | Self::ResumedAt(_) => false,
+        }
+    }
 }
 
 impl BoundFabricIngress {
@@ -197,6 +225,10 @@ impl BoundFabricIngress {
             self.observe(now, wall, rtp);
             return;
         };
+        if !rtp.is_repair && !rtp.wire_payload().is_empty() {
+            self.loss_measurement
+                .observe_primary(rtp.wire_header().sequence);
+        }
         let stamp = crate::clock::NtpTime::from_system_time(wall).middle32();
         if let Ok(Some(input)) = self.ingress.prepare(stamp, rtp) {
             events.publish_fabric_media(source, input);
@@ -282,7 +314,6 @@ pub struct Connection {
     native_terminal: bool,
     native_channel: Option<crate::media::ChannelId>,
     renewal_pending: bool,
-    playout_reconnect_sent: bool,
     authorization_expiry: Option<pulsebeam_core::auth::AuthorizationExpiry>,
     authorization_revision: u64,
     last_slow_poll: Instant,
@@ -324,7 +355,6 @@ impl Connection {
             native_terminal: false,
             native_channel: None,
             renewal_pending: false,
-            playout_reconnect_sent: false,
             authorization_expiry: cfg.authorization_expiry,
             authorization_revision: u64::from(cfg.authorization_expiry.is_some()),
             last_slow_poll: now,
@@ -779,22 +809,13 @@ impl Connection {
                     pt,
                 } => (pkt, publication_id, mid, None, ssrc, pt, MediaKind::Audio),
             };
-            let seq_no = pkt.seq_no;
-            let playout_delay = if self.native_receivers.owns_mid(mid) {
-                if !self
+            if self.native_receivers.owns_mid(mid)
+                && !self
                     .native_receivers
                     .can_write_rtp(mid, publication_id, ssrc, pt)
-                {
-                    return true;
-                }
-                self.native_receivers.playout_delay(mid)
-            } else {
-                let Ok(delay) = self.downstream.playout_delay_to_stamp(publication_id, mid) else {
-                    self.send_playout_reconnect();
-                    return true;
-                };
-                delay
-            };
+            {
+                return true;
+            }
             let result = self.transport.apply_rtp_command(RtpWriteCommand {
                 pkt,
                 publication_id,
@@ -804,12 +825,8 @@ impl Connection {
                 pt,
                 kind,
                 now,
-                playout_delay,
             });
             match result {
-                AppliedMutation::RtpWritten if playout_delay.is_some() => {
-                    self.downstream.record_playout_delay_stamp(mid, rid, seq_no);
-                }
                 AppliedMutation::KeyframeUnavailable { mid, encoding } => {
                     debug_assert!(self.pending_keyframe_requests.remove(&(mid, encoding)));
                 }
@@ -1157,7 +1174,7 @@ impl Connection {
                 attributes: None,
             });
         }
-        let Ok(hints) = EndpointHints::new(profile, form, &mappings, None) else {
+        let Ok(hints) = EndpointHints::new(profile, form, &mappings) else {
             return false;
         };
         let [.., a, b, c, d, e, f] = *self.connection_id.as_bytes();
@@ -1173,13 +1190,12 @@ impl Connection {
             OutputLeg {
                 mid,
                 primary: Some(primary),
-                max_wire_bytes: 1_216,
+                max_wire_bytes: usize::MAX,
                 replace_queued: false,
             },
             hints,
             timeline,
-        )
-        .with_source_wire_budget();
+        );
         if requires_dd {
             leg = leg.with_required_dd_evidence(u16::from_be_bytes([a, b]));
         }
@@ -1238,14 +1254,8 @@ impl Connection {
         let previous = output.leg.committed_branch();
         let profile = packet.1.header().profile;
         output.leg.stage_branch(branch);
-        let playout_delay = self.native_receivers.playout_delay(mid);
-        self.transport.queue_fabric_rtp(
-            &mut output.leg,
-            branch,
-            output.source,
-            packet,
-            playout_delay,
-        )?;
+        self.transport
+            .queue_fabric_rtp(&mut output.leg, branch, output.source, packet)?;
         if previous != Some(branch) {
             use pulsebeam_core::fabric::Profile;
             let profile = match profile {
@@ -1276,9 +1286,7 @@ impl Connection {
         now: Instant,
     ) -> Result<(), crate::rtp::fabric_egress::AdmissionError> {
         self.advance_rtc_clock(now, now);
-        let playout_delay = self.native_receivers.playout_delay(leg.output().mid);
-        self.transport
-            .queue_fabric_rtp(leg, branch, source, packet, playout_delay)
+        self.transport.queue_fabric_rtp(leg, branch, source, packet)
     }
 
     pub(crate) fn matches_network_repair(
@@ -1897,6 +1905,7 @@ impl Connection {
             ingress,
             publisher_source,
             geometry_refresh_at: None,
+            loss_measurement: FabricLossMeasurement::default(),
             #[cfg(test)]
             observation: None,
         }));
@@ -1919,11 +1928,13 @@ impl Connection {
         !self.fenced_fabric_sources.contains(&source) && self.fabric_io_authorized()
     }
 
-    pub(crate) fn measure_fabric_structure(
+    pub(crate) fn measure_fabric_dd(
         &mut self,
         source: FabricSourceHandle,
         encoding: crate::route::fabric::RtpSourceEncoding,
-        facts: crate::rtp::normalize::StreamFacts,
+        now: Instant,
+        facts: Option<crate::rtp::normalize::StreamFacts>,
+        sample: crate::route::fabric::local::DecodeTargetSample,
     ) {
         let primary = *encoding.primary;
         if self
@@ -1935,7 +1946,7 @@ impl Connection {
         {
             track
                 .monitor
-                .measure_fabric_structure(encoding.primary, encoding.rid, facts);
+                .measure_fabric_dd(encoding.primary, encoding.rid, now, facts, sample);
         }
     }
 
@@ -2060,7 +2071,7 @@ impl Connection {
                 let Ok(rid) = rid.as_deref().map(crate::media::Rid::new).transpose() else {
                     return;
                 };
-                self.handle_incoming_rtp(packet, mid, rid, events);
+                self.measure_incoming_dd_rtp(packet, mid, rid);
             }
             Event::SenderReport(report) => self.handle_sender_report(report),
             Event::EncodingDiscovered(info) => {
@@ -2120,11 +2131,6 @@ impl Connection {
             Event::BandwidthEstimate(available) => self
                 .downstream
                 .update_bitrate(now, crate::bitrate::Bitrate::from(available.as_bps())),
-            Event::ReceiverReport(report) => {
-                if let Some((mid, sequence)) = self.transport.receiver_report(report) {
-                    self.downstream.handle_egress_stats(mid, None, sequence);
-                }
-            }
             Event::DataChannel(DataChannelEvent::Opened {
                 channel: cid,
                 config: cfg,
@@ -2251,17 +2257,6 @@ impl Connection {
             }
             return;
         }
-    }
-
-    fn send_playout_reconnect(&mut self) {
-        if self.playout_reconnect_sent {
-            return;
-        }
-        self.playout_reconnect_sent = true;
-        if let Some(handoff) = &self.native_handoff {
-            let _ = handoff.fact(Fact::ReconstructionRequired);
-        }
-        self.disconnect(DisconnectReason::SignalingOutput);
     }
 
     fn owns_data_channel(&self, channel: crate::media::ChannelId) -> bool {
@@ -2422,143 +2417,37 @@ impl Connection {
         });
     }
 
-    fn handle_incoming_rtp(
+    fn measure_incoming_dd_rtp(
         &mut self,
         rtp: pulsebeam_rtc::RtpPacket,
         mid: Mid,
         rid: Option<crate::media::Rid>,
-        events: &mut impl ParticipantSink,
     ) {
-        if !self.media_ingress_authorized() {
-            return;
-        }
-        let fabric_binding = self
-            .media_ingress
-            .get(&rtp.header.ssrc)
-            .and_then(|binding| binding.publisher_source);
-        if self.native_rtp.owns_encoding(rtp.header.ssrc) {
-            if self.authorization_expiry.is_none() {
-                return;
-            }
-            let Some(route) = self.native_rtp.ingress_route(rtp.header.ssrc, mid, rid) else {
-                return;
-            };
-            if self.native_rtp.requires_dd_fabric(rtp.header.ssrc) {
-                if fabric_binding.is_some_and(|source| self.fabric_source_authorized(source))
-                    && let Some(incoming) = self.transport.convert_rtp(rtp, mid, rid)
-                    && let Some(track) = self.upstream.track_mut(route.upstream_slot)
-                    && track.monitor.measure_fabric(rid, &incoming.packet)
-                    && self
-                        .media_ingress
-                        .get_mut(&*route.ssrc)
-                        .is_some_and(|binding| {
-                            binding.geometry_refresh_due(incoming.packet.arrival_ts)
-                        })
-                {
-                    // An owned ceiling cannot select an encoding until its height
-                    // is known. Request a fresh frame from the exact active source.
-                    self.enqueue_remote_keyframe(
-                        (route.publication_id, route.encoding),
-                        KeyframeRequestKind::Pli,
-                    );
-                }
-            } else if fabric_binding.is_none()
-                && !self.native_rtp.requires_fabric(rtp.header.ssrc)
-                && let Some(incoming) = self.transport.convert_rtp(rtp, mid, rid)
-            {
-                self.handle_incoming_rtp_after_lookup(route, incoming, events);
-            }
-            return;
-        }
-        if fabric_binding.is_some() {
-            return;
-        }
-        if self.upstream.slot_for_mid(mid).is_none() {
-            return;
-        }
-        plog_trace!(self.log_ctx(), "tracing:rtp_event={}", rtp.header.sequence);
-        let ssrc: Ssrc = rtp.header.ssrc.into();
-        let cached = self.upstream.route_for_ssrc(ssrc);
-        if cached.is_some_and(|route| route.mid != mid || (route.rid.is_some() && route.rid != rid))
+        let ssrc = rtp.header.ssrc;
+        let sequence = rtp.header.sequence;
+        if !self.media_ingress_authorized()
+            || self.authorization_expiry.is_none()
+            || !self.native_rtp.requires_dd_fabric(ssrc)
         {
             return;
         }
-        let incoming = if let Some(route) = cached.filter(|route| route.rid == rid) {
-            self.transport
-                .convert_rtp(rtp, route.mid, route.rid)
-                .map(|incoming| (route, incoming))
-        } else {
-            // Once per stream in a healthy participant. A rate proportional to
-            // the packet rate means the table is evicting live routes.
-            metrics::counter!("upstream_route_miss").increment(1);
-            #[cfg(feature = "sim")]
-            crate::sim_metrics::record_routing_counter("upstream_route_miss");
-            self.transport
-                .convert_rtp(rtp, mid, rid)
-                .and_then(|incoming| {
-                    let (upstream_slot, publication_id) =
-                        self.upstream.slot_for_mid(incoming.mid)?;
-                    let route = IncomingRtpRoute {
-                        ssrc,
-                        mid: incoming.mid,
-                        rid: incoming.rid,
-                        encoding: incoming.rid.into(),
-                        upstream_slot,
-                        publication_id,
-                        fanout: self.upstream.track_fanout(publication_id),
-                    };
-                    self.upstream.cache_route(route);
-                    Some((route, incoming))
-                })
-        };
-        let Some((route, incoming)) = incoming else {
-            return;
-        };
-        self.handle_incoming_rtp_after_lookup(route, incoming, events);
-    }
-
-    fn handle_incoming_rtp_after_lookup(
-        &mut self,
-        route: IncomingRtpRoute,
-        incoming: crate::participant::transport::RtpIngress,
-        events: &mut impl ParticipantSink,
-    ) {
-        let processed = self.upstream.handle_incoming_rtp(
-            route.upstream_slot,
-            route.mid,
-            route.rid.as_ref(),
-            incoming.packet,
-            None,
-        );
-        if !processed.valid_route {
-            self.upstream.remove_route(route.ssrc);
-            return;
-        }
-        self.forward_processed_rtp(
-            route.publication_id,
-            route.encoding,
-            route.fanout,
-            processed,
-            events,
-        );
-    }
-
-    fn forward_processed_rtp(
-        &mut self,
-        publication_id: PublicationKey,
-        encoding: SourceEncoding,
-        fanout: Option<TrackHandle>,
-        processed: track::ProcessedRtp,
-        events: &mut impl ParticipantSink,
-    ) {
-        if processed.request_keyframe {
-            self.enqueue_remote_keyframe((publication_id, encoding), KeyframeRequestKind::Pli);
-        }
-        if let Some(packet) = processed.first {
-            events.publish_track_packet(fanout, packet);
-        }
-        for packet in processed.remaining {
-            events.publish_track_packet(fanout, packet);
+        if self
+            .media_ingress
+            .get(&ssrc)
+            .and_then(|binding| binding.publisher_source)
+            .is_some_and(|source| self.fabric_source_authorized(source))
+            && let Some(route) = self.native_rtp.ingress_route(ssrc, mid, rid)
+            && let Some(incoming) = self.transport.convert_rtp(rtp, mid, rid)
+            && let Some(binding) = self.media_ingress.get_mut(&ssrc)
+            && binding.loss_measurement.admits(sequence)
+            && let Some(track) = self.upstream.track_mut(route.upstream_slot)
+            && track.monitor.measure_fabric(rid, &incoming.packet)
+            && binding.geometry_refresh_due(incoming.packet.arrival_ts)
+        {
+            self.enqueue_remote_keyframe(
+                (route.publication_id, route.encoding),
+                KeyframeRequestKind::Pli,
+            );
         }
     }
 
@@ -2879,7 +2768,9 @@ mod rtc_clock_tests {
         );
         let mut sink = crate::participant::event::test_utils::MockParticipantSink::new();
 
-        participant.send_playout_reconnect();
+        participant.record_native_resource_observation(
+            crate::participant::policy::ResourceObservation::Ended { binding: 1 },
+        );
         assert!(controller.failed());
         assert_eq!(ready.try_recv().unwrap(), unrelated);
         assert!(ready.try_recv().is_err());
@@ -3091,7 +2982,7 @@ mod upstream_route_table_tests {
     }
 
     #[test]
-    fn late_rid_and_authorization_fences_preserve_current_fanout() {
+    fn authorization_and_late_removal_fence_only_the_old_fabric_binding() {
         let now = Instant::now();
         let participant_id = crate::entity::fixture_participant_id();
         let connection_id = entity::ConnectionId::new();
@@ -3125,71 +3016,12 @@ mod upstream_route_table_tests {
                 .upstream
                 .add_published_track(0, mid, TrackKind::Video, || (track, descriptor))
         );
-        let slot = connection.upstream.slot_for_mid(mid).unwrap().0;
         let mut handles = slotmap::SlotMap::<TrackHandle, ()>::with_key();
         let old = handles.insert(());
         let current = handles.insert(());
         connection.apply(
             ParticipantEffect::TrackPublished { publication_id },
             Some(old),
-        );
-        connection.upstream.cache_route(IncomingRtpRoute {
-            ssrc: 77u32.into(),
-            mid,
-            rid: None,
-            encoding: SourceEncoding::Rid(None),
-            upstream_slot: slot,
-            publication_id,
-            fanout: Some(old),
-        });
-        connection
-            .transport
-            .register_encoding(pulsebeam_rtc::EncodingInfo {
-                mid: mid.as_str().into(),
-                ssrc: 77,
-                kind: MediaKind::Video,
-                rid: None,
-                payloads: Box::new([pulsebeam_rtc::RtpPayloadInfo {
-                    payload_type: 96,
-                    name: "h264".into(),
-                    clock_rate: 90_000,
-                }]),
-            });
-        let mut sink = crate::participant::event::test_utils::MockParticipantSink::new();
-        let mut builder = crate::rtp::test_utils::H264StreamBuilder::new(77, 1000, 90_000, now);
-        for authorized in [true, false, true] {
-            connection.authorization_expiry = (!authorized)
-                .then(|| pulsebeam_core::auth::AuthorizationExpiry::from_unix_seconds(0));
-            let before = sink.publish_track_packet_calls.len();
-            for packet in builder.keyframe(2) {
-                let incoming = pulsebeam_rtc::RtpPacket {
-                    arrival: packet.arrival_ts.into(),
-                    header: pulsebeam_rtc::RtpHeader {
-                        sequence: u16::try_from(*packet.seq_no).unwrap(),
-                        timestamp: u32::try_from(packet.rtp_ts.numer()).unwrap(),
-                        ssrc: 77,
-                        payload_type: 96,
-                        marker: packet.marker,
-                    },
-                    payload: bytes::Bytes::copy_from_slice(&packet.payload),
-                    extensions: Vec::new(),
-                };
-                connection.handle_incoming_rtp(incoming, mid, Some(rid), &mut sink);
-            }
-            if authorized {
-                assert!(sink.publish_track_packet_calls.len() > before);
-            } else {
-                assert_eq!(sink.publish_track_packet_calls.len(), before);
-            }
-        }
-        let cached = connection.upstream.route_for_ssrc(77u32.into()).unwrap();
-        assert_eq!(cached.rid, Some(rid));
-        assert_eq!(cached.encoding, SourceEncoding::Rid(Some(rid)));
-        assert!(!sink.publish_track_packet_calls.is_empty());
-        assert!(
-            sink.publish_track_packet_calls
-                .iter()
-                .all(|handle| *handle == old)
         );
 
         let shadow = || {
@@ -3264,14 +3096,6 @@ mod upstream_route_table_tests {
         assert_eq!(
             connection.upstream.track_for_fanout(current),
             Some(publication_id)
-        );
-        assert_eq!(
-            connection
-                .upstream
-                .route_for_ssrc(77u32.into())
-                .unwrap()
-                .fanout,
-            Some(current)
         );
     }
 

@@ -111,15 +111,12 @@ pub struct VideoSubscription {
     pub min_height: u32,
     pub min_fps: u32,
     pub priority: u32,
-    pub playout_delay: PlayoutDelay,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AudioSubscription {
     pub pinned: Vec<String>,
     pub selected: Vec<TrackSelector>,
-    pub playout_delays: BTreeMap<String, PlayoutDelay>,
-    pub selector_delays: BTreeMap<TrackSelector, PlayoutDelay>,
 }
 
 impl AudioSubscription {
@@ -133,16 +130,6 @@ pub struct TrackSelector {
     pub room: String,
     pub participant_id: String,
     pub track_id: String,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum PlayoutDelay {
-    #[default]
-    Adaptive,
-    Fixed {
-        min_ms: u32,
-        max_ms: u32,
-    },
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
@@ -354,8 +341,6 @@ pub enum ValidationError {
     Duplicate { field: &'static str, value: String },
     #[error("local publication binding conflicts with a reserved slot or track ID: {0}")]
     PublicationBinding(String),
-    #[error("audio playout policy refers to an unpinned track: {0}")]
-    UnknownAudioTrack(String),
     #[error("retry policy is invalid")]
     RetryPolicy,
     #[error("topic name is invalid: {0}")]
@@ -470,18 +455,6 @@ impl DesiredState {
                 return Err(ValidationError::Duplicate {
                     field: "audio selector",
                     value: alloc::format!("{}:{}", selector.participant_id, selector.track_id),
-                });
-            }
-        }
-        for publication_id in self.audio.playout_delays.keys() {
-            if !pins.contains(publication_id) {
-                return Err(ValidationError::UnknownAudioTrack(publication_id.clone()));
-            }
-        }
-        for selector in self.audio.selector_delays.keys() {
-            if !selectors.contains(selector) {
-                return Err(ValidationError::Identifier {
-                    field: "audio selector playout policy",
                 });
             }
         }

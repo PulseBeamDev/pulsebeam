@@ -44,9 +44,6 @@ fn capabilities() -> wire::RtpCapabilities {
             wire::RtpHeaderExtensionType::RtpHeaderExtensionTransportCcDraft01
                 .as_str()
                 .into(),
-            wire::RtpHeaderExtensionType::RtpHeaderExtensionPlayoutDelay
-                .as_str()
-                .into(),
             wire::RtpHeaderExtensionType::RtpHeaderExtensionDependencyDescriptor
                 .as_str()
                 .into(),
@@ -659,7 +656,6 @@ fn admitted_source_keeps_birth_identity_demand_and_cutoff_independent_of_desire(
             }]),
         };
         participant.handle_event(now, Event::EncodingDiscovered(info), &mut sink);
-        let published_before = sink.publish_track_packet_calls.len();
         let mut builder = crate::rtp::test_utils::H264StreamBuilder::new(ssrc, 1000, 90_000, now);
         let encoding = track::SourceEncoding::Ssrc(ssrc.into());
         assert_eq!(
@@ -680,16 +676,11 @@ fn admitted_source_keeps_birth_identity_demand_and_cutoff_independent_of_desire(
                 payload: bytes::Bytes::copy_from_slice(&packet.payload),
                 extensions: Vec::new(),
             };
-            participant.handle_incoming_rtp(incoming, Mid::from("camera"), None, &mut sink);
+            participant.measure_incoming_dd_rtp(incoming, Mid::from("camera"), None);
         }
         assert_eq!(
             participant.native_rtp.fabric_measurement_slot(ssrc),
             Some(video_slot)
-        );
-        assert_eq!(
-            sink.publish_track_packet_calls.len(),
-            published_before,
-            "source {ssrc} cannot fall back to legacy forwarding without authenticated DD"
         );
         participant.enqueue_remote_keyframe((video_id, encoding), KeyframeRequestKind::Pli);
     }
@@ -713,7 +704,6 @@ fn admitted_source_keeps_birth_identity_demand_and_cutoff_independent_of_desire(
             .keyframe_mid(video_id, track::SourceEncoding::Rid(None)),
         None
     );
-    assert!(sink.publish_track_packet_calls.is_empty());
     let video_binding = participant.native_rtp.publications[&7]
         .binding
         .description()

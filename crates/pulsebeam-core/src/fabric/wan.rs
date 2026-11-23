@@ -5,7 +5,7 @@
 //! extensions. The header has V=2, P=0, CC=0, optional X, M, PT=96+H, low
 //! sequence bits, timestamp and SSRC. Fields are big-endian. An RFC 8285 block
 //! uses ascending IDs 2–9 and minimum zero padding. The full RTP plaintext is
-//! limited to 1,200 bytes before the 16-byte SRTP tag. No format sniffing.
+//! limited to 1,216 bytes before the 16-byte SRTP tag. No format sniffing.
 //!
 //! Association authorization, SRTP, DATA record projection and DD context are
 //! caller-owned. The literal vectors in `wan/tests.rs` pin this layout.
@@ -25,7 +25,6 @@ const WINDOW_MASK: u64 = WINDOW_SPAN - 1;
 const HOP_PT: u8 = 96;
 pub const FEEDBACK_SSRC: u32 = 0x0a0b_0c0d;
 const KNOWN_EXTENSIONS: u16 = 0x03fc;
-const SOURCE_BUDGET_ID: u8 = 10;
 const GCM_TAG_BYTES: usize = 16;
 
 /// Immutable wire facts for one installed forward or repair window. The owner
@@ -37,31 +36,11 @@ pub struct Window {
     profile: Profile,
     forms: u8,
     emission: u16,
-    source_budget: bool,
 }
 
 impl Window {
     pub fn from_tuple(tuple: [u8; WINDOW_TUPLE_BYTES], emission: u16) -> Result<Self, WireError> {
-        let [
-            3,
-            1,
-            revision @ (0 | 1),
-            profile,
-            a,
-            b,
-            c,
-            d,
-            e,
-            f,
-            g,
-            h,
-            forms,
-            i,
-            j,
-            k,
-            l,
-        ] = tuple
-        else {
+        let [3, 1, 0, profile, a, b, c, d, e, f, g, h, forms, i, j, k, l] = tuple else {
             return Err(WireError::Window);
         };
         let profile = match profile {
@@ -73,17 +52,13 @@ impl Window {
         };
         let start = u64::from_be_bytes([a, b, c, d, e, f, g, h]);
         let ssrc = u32::from_be_bytes([i, j, k, l]);
-        let window = Self::new(
+        Self::new(
             profile,
             start,
             forms,
             NonZeroU32::new(ssrc).ok_or(WireError::RouteKey)?,
             emission,
-        )?;
-        match revision {
-            0 => Ok(window),
-            _ => window.with_opus_source_budget(),
-        }
+        )
     }
 
     pub fn new(
@@ -115,17 +90,7 @@ impl Window {
             profile,
             forms,
             emission,
-            source_budget: false,
         })
-    }
-
-    /// Only use on an Opus window with explicit peer support for this revision.
-    pub fn with_opus_source_budget(mut self) -> Result<Self, WireError> {
-        if self.profile != Profile::Opus {
-            return Err(WireError::Window);
-        }
-        self.source_budget = true;
-        Ok(self)
     }
 
     pub const fn to_tuple(self) -> [u8; WINDOW_TUPLE_BYTES] {
@@ -138,23 +103,7 @@ impl Window {
         let [a, b, c, d, e, f, g, h] = self.start.to_be_bytes();
         let [i, j, k, l] = self.ssrc.get().to_be_bytes();
         [
-            3,
-            1,
-            self.source_budget as u8,
-            profile,
-            a,
-            b,
-            c,
-            d,
-            e,
-            f,
-            g,
-            h,
-            self.forms,
-            i,
-            j,
-            k,
-            l,
+            3, 1, 0, profile, a, b, c, d, e, f, g, h, self.forms, i, j, k, l,
         ]
     }
 
@@ -163,15 +112,13 @@ impl Window {
         if ssrc == self.ssrc {
             return Err(WireError::RouteKey);
         }
-        let mut repair = Self::new(
+        Self::new(
             self.profile,
             Self::start_for(position),
             self.forms,
             ssrc,
             self.emission,
-        )?;
-        repair.source_budget = self.source_budget;
-        Ok(repair)
+        )
     }
 
     pub const fn ssrc(self) -> NonZeroU32 {
@@ -192,10 +139,6 @@ impl Window {
 
     pub const fn profile(self) -> Profile {
         self.profile
-    }
-
-    pub const fn carries_opus_source_budget(self) -> bool {
-        self.source_budget
     }
 
     pub const fn emission(self) -> u16 {
@@ -248,7 +191,7 @@ impl Window {
         if hops == MAX_HOPS {
             return Err(WireError::NetworkHop);
         }
-        let (form, optional, payload, source_delta) = if *first == 0x90 {
+        let (form, optional, payload) = if *first == 0x90 {
             let [a, b, c, d, rest @ ..] = body else {
                 return Err(WireError::ExtensionLayout);
             };
@@ -257,26 +200,13 @@ impl Window {
             let (block, payload) = rest
                 .split_at_checked(block_len)
                 .ok_or(WireError::ExtensionLayout)?;
-            let (optional, source_delta) = self.optional_bytes(form, block)?;
-            (form, optional, payload, source_delta)
+            (form, self.optional_bytes(form, block)?, payload)
         } else {
-            (Form::One, &[][..], body, None)
+            (Form::One, &[][..], body)
         };
         self.profile.validate_payload(payload.len())?;
         let protected = bytes.len().saturating_add(GCM_TAG_BYTES);
         let wan_received_bytes = u16::try_from(protected).ok().and_then(NonZeroU16::new);
-        let source_protected_bytes = if let Some(delta) = source_delta {
-            if wan_size(optional.len(), payload.len()) != bytes.len() {
-                return Err(WireError::ExtensionLayout);
-            }
-            let source = protected.saturating_add(usize::from(delta));
-            Some(
-                NonZeroU16::new(u16::try_from(source).map_err(|_| WireError::Oversize)?)
-                    .ok_or(WireError::Oversize)?,
-            )
-        } else {
-            None
-        };
         Ok((
             position,
             FabricPacket {
@@ -291,7 +221,7 @@ impl Window {
                 form,
                 optional,
                 payload,
-                source_protected_bytes,
+                source_protected_bytes: None,
                 wan_received_bytes,
             },
         ))
@@ -322,15 +252,6 @@ impl Window {
         }
         let payload = packet.payload();
         let len = check_wan_size(optional.len(), payload.len())?;
-        // The WAN profile seals this RTP image with a full GCM tag and no MKI.
-        let protected = len.saturating_add(GCM_TAG_BYTES);
-        if packet
-            .source_protected_bytes()
-            .or_else(|| packet.wan_received_bytes())
-            .is_some_and(|source| protected > usize::from(source.get()))
-        {
-            return Err(WireError::Oversize);
-        }
         let header_len = wan_size(optional.len(), 0);
         let (rtp, payload_out) = output
             .get_mut(..len)
@@ -367,26 +288,6 @@ impl Window {
                 .ok_or(WireError::OutputTooSmall)?;
             dst.copy_from_slice(optional);
             pad.fill(0);
-            if self.source_budget
-                && let Some(delta) = packet
-                    .source_protected_bytes()
-                    .and_then(|source| usize::from(source.get()).checked_sub(protected))
-                    .and_then(|delta| u8::try_from(delta).ok())
-                    .filter(|&delta| delta != 0)
-            {
-                match (packet.form, pad) {
-                    (Form::One, [first, value, ..]) => {
-                        *first = SOURCE_BUDGET_ID << 4;
-                        *value = delta;
-                    }
-                    (Form::Two, [id, len, value, ..]) => {
-                        *id = SOURCE_BUDGET_ID;
-                        *len = 1;
-                        *value = delta;
-                    }
-                    _ => {}
-                }
-            }
         }
         payload_out.copy_from_slice(payload);
         Ok(len)
@@ -401,7 +302,7 @@ impl Window {
             != 0
     }
 
-    fn optional_bytes(self, form: Form, block: &[u8]) -> Result<(&[u8], Option<u8>), WireError> {
+    fn optional_bytes(self, form: Form, block: &[u8]) -> Result<&[u8], WireError> {
         if !self.allows_form(form) {
             return Err(WireError::ExtensionLayout);
         }
@@ -412,18 +313,6 @@ impl Window {
             let (id, value, next) = form.read_element(rest)?;
             if id <= last {
                 return Err(WireError::ExtensionLayout);
-            }
-            if self.source_budget && id == SOURCE_BUDGET_ID {
-                let [delta @ 1..=u8::MAX] = value else {
-                    return Err(WireError::ExtensionValue);
-                };
-                if last == 1 || next.iter().any(|byte| *byte != 0) {
-                    return Err(WireError::ExtensionLayout);
-                }
-                let optional = block
-                    .get(..block.len().saturating_sub(rest.len()))
-                    .ok_or(WireError::ExtensionLayout)?;
-                return Ok((optional, Some(*delta)));
             }
             self.check_extension(id, value)?;
             needs_two |= value.len() > 16;
@@ -439,7 +328,6 @@ impl Window {
         }
         block
             .get(..block.len().saturating_sub(rest.len()))
-            .map(|optional| (optional, None))
             .ok_or(WireError::ExtensionLayout)
     }
 

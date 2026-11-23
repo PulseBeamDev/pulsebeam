@@ -170,43 +170,16 @@
       throw error;
     }
   };
-  const packetEvidence = async (
-    peer,
-    receiver,
-    accept = (observation) => observation.packets >= 4,
-  ) => {
-    const relay = relays.get(peer);
-    if (!relay) throw new Error("receiver has no packet relay");
-    const ids = new Set(
-      peer.remoteDescription.sdp.split(/\r?\n/).flatMap((line) => {
-        const match = line.match(
-          /^a=extmap:(\d+)(?:\/\w+)? http:\/\/www.webrtc.org\/experiments\/rtp-hdrext\/playout-delay$/,
-        );
-        return match ? [Number(match[1])] : [];
-      }),
-    );
-    if (ids.size !== 1)
-      throw new Error(`ambiguous negotiated playout extension: ${[...ids]}`);
-    const extension = [...ids][0];
+  const receiverSsrc = async (peer, receiver) => {
+    if (peer.remoteDescription.sdp.includes("/playout-delay"))
+      throw new Error("receiver negotiated a removed RTP extension");
     const stats = await receiver.getStats();
     const inbound = [...stats.values()].filter(
       (entry) => entry.type === "inbound-rtp" && entry.kind === "video",
     );
-    if (inbound.length !== 1)
-      throw new Error(`expected one inbound video SSRC, got ${inbound.length}`);
-    for (let attempt = 0; attempt < 100; attempt++) {
-      const response = await fetch(
-        `/__test/rtp-relay/${relay.id}/${inbound[0].ssrc}?extension=${extension}`,
-      );
-      if (!response.ok) throw new Error(await response.text());
-      const observation = await response.json();
-      if (accept(observation))
-        return { relay: relay.id, ssrc: inbound[0].ssrc, ...observation };
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-    throw new Error(
-      `no captured RTP for relay ${relay.id}, SSRC ${inbound[0].ssrc}`,
-    );
+    if (inbound.length !== 1 || inbound[0].packetsReceived < 1)
+      throw new Error("expected a live inbound video SSRC");
+    return inbound[0].ssrc;
   };
   const rtpPeak = async (peer, direction) => {
     const relay = relays.get(peer);
@@ -215,8 +188,8 @@
     if (!response.ok) throw new Error(await response.text());
     const bytes = (await response.json())[direction];
     assert(
-      Number.isInteger(bytes) && bytes > 0 && bytes <= 1216,
-      `observed protected RTP ${direction} UDP peak must fit 1216 bytes, got ${bytes}`,
+      Number.isInteger(bytes) && bytes > 0 && bytes <= 1232,
+      `observed protected RTP ${direction} UDP peak must fit 1232 bytes, got ${bytes}`,
     );
   };
   const peerForTrack = (track) =>
@@ -224,14 +197,7 @@
       peer.getReceivers().some((receiver) => receiver.track === track),
     );
   const { attachMedia } = await import("/sdk/dist/internal/react.js");
-  const {
-    Agent,
-    AgentStatus,
-    VideoSource,
-    AudioSource,
-    DataEvent,
-    PlayoutDelay,
-  } = pulsebeam;
+  const { Agent, AgentStatus, VideoSource, AudioSource, DataEvent } = pulsebeam;
   const presentationFailures = [];
   const present = (subscription, element) =>
     attachMedia(
@@ -242,19 +208,13 @@
       (error) => presentationFailures.push(String(error)),
       (error) => presentationFailures.push(String(error)),
     );
-  const videoOptions = (
-    playoutDelay = PlayoutDelay.Adaptive.new(),
-    priority = 100,
-    minHeight = 1,
-  ) => ({
+  const videoOptions = (priority = 100, minHeight = 1) => ({
     visible: true,
     height: 240,
     minHeight,
     minFps: 1,
     priority,
-    playoutDelay,
   });
-  const fixedDelay = PlayoutDelay.Fixed.new({ minMs: 100, maxMs: 100 });
   const sender = new Agent({
     endpoint,
     token: "__SENDER_TOKEN__",
@@ -596,7 +556,7 @@
       .room(receiver.state().room)
       .participant("web-sender");
     const remoteVideo = pinnedPublisher.video("camera");
-    videoSubscription = remoteVideo.subscribe(videoOptions(fixedDelay));
+    videoSubscription = remoteVideo.subscribe(videoOptions());
     attachment = present(videoSubscription, video);
     await until(
       () => presentedTrack()?.readyState === "live",
@@ -657,7 +617,7 @@
     video.style.cssText =
       "position:fixed;left:30px;top:20px;width:220px;height:160px";
     videoSubscription.configure({
-      ...videoOptions(fixedDelay, 90, 2),
+      ...videoOptions(90, 2),
       height: 320,
     });
     await deliverDuringView(5);
@@ -697,12 +657,7 @@
     await steadyIterator.close();
     steadyIterator = undefined;
 
-    const fixedRtp = await packetEvidence(fixedPeer, fixedReceiver);
-    assert(
-      fixedRtp.withExtension > 0 &&
-        fixedRtp.firstValue?.join(",") === "0,160,10",
-      "actual SSRC carries negotiated fixed playout extension",
-    );
+    const previousSsrc = await receiverSsrc(fixedPeer, fixedReceiver);
     const spectrum = new Float32Array(1024);
     const audible = () => {
       const track = currentAudio();
@@ -721,17 +676,9 @@
     await until(audible, "explicit audio output plays the real decoded tone");
     const previousAudioOutput = currentAudio();
     videoSubscription.configure(videoOptions());
-    const packetsWithoutDelay = fixedRtp.packets - fixedRtp.withExtension;
-    await packetEvidence(
-      fixedPeer,
-      fixedReceiver,
-      (observation) =>
-        observation.packets - observation.withExtension >=
-        packetsWithoutDelay + 4,
-    );
     assert(
       presentedTrack() === fixedTrack && fixedTrack.readyState === "live",
-      "mutable playout settings preserve the installed receiver",
+      "mutable video settings preserve the installed receiver",
     );
     const retired = fixedPeer
       .getTransceivers()
@@ -787,14 +734,8 @@
       "fresh current-incarnation video and decoded audio",
     );
     const currentPresentation = video.srcObject.getVideoTracks()[0];
-    const defaultRtp = await packetEvidence(peer, rtpReceiver);
-    assert(
-      defaultRtp.relay === fixedRtp.relay &&
-        defaultRtp.ssrc !== fixedRtp.ssrc &&
-        defaultRtp.withExtension === 0 &&
-        defaultRtp.firstValue === null,
-      "fresh SSRC has no obsolete playout extension",
-    );
+    const currentSsrc = await receiverSsrc(peer, rtpReceiver);
+    assert(currentSsrc !== previousSsrc, "fresh receiver uses a fresh SSRC");
     const allocatedSender = [...peers]
       .flatMap((observedPeer) => observedPeer.getSenders())
       .find(
@@ -970,10 +911,9 @@
         !video.paused,
       "re-added sources deliver fresh decoded/renderable video and real decoded tone",
     );
-    const freshRtp = await packetEvidence(fixedPeer, freshReceiver);
+    const freshSsrc = await receiverSsrc(fixedPeer, freshReceiver);
     assert(
-      freshRtp.relay === defaultRtp.relay &&
-        freshRtp.ssrc !== defaultRtp.ssrc &&
+      freshSsrc !== currentSsrc &&
         current.readyState === "ended" &&
         previousVideoTransceiver.mid === null &&
         previousAudioTrack.readyState === "ended" &&

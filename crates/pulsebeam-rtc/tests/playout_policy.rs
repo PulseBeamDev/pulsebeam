@@ -1,40 +1,38 @@
 #![allow(
-    clippy::arithmetic_side_effects,
     clippy::disallowed_types,
     clippy::expect_used,
-    reason = "native fixture asserts explicit extension bytes, not playback policy"
+    reason = "fixture probes a removed RTP extension"
 )]
 
 mod support;
 
-use pulsebeam_rtc::{PlayoutDelay, RtpExtension};
+use pulsebeam_rtc::{RtpExtension, WriteError};
 use support::{PeerFixture, rtp_write};
 
 #[test]
-fn omitted_zero_and_explicit_playout_bounds_remain_caller_owned_wire_values() {
+fn playout_delay_is_not_negotiated_or_written() {
+    const URI: &str = "http://www.webrtc.org/experiments/rtp-hdrext/playout-delay";
     let mut fixture = PeerFixture::connected_video();
+    assert_eq!(
+        fixture
+            .connection
+            .rtp_egress_extension_id(&fixture.sender_mid, None, URI),
+        None
+    );
     let source = fixture.send_source(&[0x65, 0x88, 0x84]);
-    for (index, delay) in [
-        None,
-        Some(PlayoutDelay::ZERO),
-        Some(PlayoutDelay::from_ticks(2, 40).unwrap()),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let mut packet = rtp_write(source.clone(), u64::try_from(index).unwrap() + 1);
-        packet.extensions.retain(|value| {
-            value.uri.as_ref() != "http://www.webrtc.org/experiments/rtp-hdrext/playout-delay"
-        });
-        if let Some(delay) = delay {
-            packet.extensions.push(RtpExtension {
-                uri: "http://www.webrtc.org/experiments/rtp-hdrext/playout-delay".into(),
-                value: delay.to_bytes().to_vec().into(),
-            });
-        }
-        fixture.write_rtp(packet).expect("explicit RTP extension");
-        let header = fixture.receive_video_wire_packet();
-        assert_eq!(header.ext_vals.play_delay_min, delay.map(PlayoutDelay::min));
-        assert_eq!(header.ext_vals.play_delay_max, delay.map(PlayoutDelay::max));
-    }
+    let mut packet = rtp_write(source, 1);
+    packet.extensions.push(RtpExtension {
+        uri: URI.into(),
+        value: vec![0, 0, 0].into(),
+    });
+    let rejected = fixture.write_rtp(packet).expect_err("removed extension");
+    assert_eq!(rejected.reason, WriteError::InvalidRtp);
+    let mut packet = rejected.packet;
+    packet
+        .extensions
+        .retain(|extension| extension.uri.as_ref() != URI);
+    fixture.write_rtp(packet).expect("ordinary video packet");
+    let header = fixture.receive_video_wire_packet();
+    assert_eq!(header.ext_vals.play_delay_min, None);
+    assert_eq!(header.ext_vals.play_delay_max, None);
 }

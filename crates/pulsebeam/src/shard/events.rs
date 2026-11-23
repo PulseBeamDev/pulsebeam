@@ -4,7 +4,6 @@ use super::worker::ShardEvent;
 use crate::entity::{ConnectionId, ParticipantId};
 use crate::keys::ParticipantHandle;
 use crate::keys::TrackHandle;
-use crate::participant::TrackPacket;
 #[cfg(test)]
 use crate::participant::event::FabricPublication;
 use crate::participant::event::{FabricDataPosition, FabricSubscriberFeedback, ParticipantSink};
@@ -89,7 +88,6 @@ pub enum ShardInternalEvent {
 }
 
 pub(super) enum QueuedPublication {
-    Legacy(TrackHandle, TrackPacket),
     #[cfg(test)]
     Fabric {
         publisher: ParticipantHandle,
@@ -207,18 +205,6 @@ impl EventPipeline {
 
     pub(super) fn pop_publication(&mut self) -> Option<QueuedPublication> {
         self.track_queue.pop_front()
-    }
-
-    #[cfg(test)]
-    fn pop_packet(&mut self) -> Option<(TrackHandle, TrackPacket)> {
-        match self.pop_publication()? {
-            QueuedPublication::Legacy(key, packet) => Some((key, packet)),
-            QueuedPublication::Fabric { .. }
-            | QueuedPublication::FabricData { .. }
-            | QueuedPublication::FabricMedia { .. } => {
-                panic!("expected a legacy track packet")
-            }
-        }
     }
 
     pub fn pop_shard_event(&mut self) -> Option<ShardEvent> {
@@ -392,14 +378,6 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
     }
 
     #[inline]
-    fn publish_track_packet(&mut self, fanout: Option<TrackHandle>, packet: TrackPacket) {
-        let Some(key) = fanout else {
-            return;
-        };
-        self.pipeline
-            .push_packet(QueuedPublication::Legacy(key, packet));
-    }
-
     #[cfg(test)]
     fn publish_fabric_packet(&mut self, publication: FabricPublication) {
         self.pipeline.push_packet(QueuedPublication::Fabric {
@@ -526,7 +504,28 @@ mod tests {
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See crates/pulsebeam/docs/thread-per-core.md.
     use super::*;
-    use crate::rtp::RtpPacket;
+    use pulsebeam_core::fabric::{FabricPacket, Header, Profile};
+
+    fn packet(sequence: u32) -> FabricPublication {
+        FabricPublication {
+            source: Default::default(),
+            arrival: pulsebeam_runtime::time::Instant::now(),
+            sequence: u64::from(sequence),
+            reliable: None,
+            packet: FabricPacket::new(
+                Header {
+                    profile: Profile::Opus,
+                    marker: false,
+                    sequence,
+                    timestamp: 480,
+                    ingress_ntp32: 0,
+                },
+                &[],
+                Box::<[u8]>::from([0xf8, 0xff, 0xfe]),
+            )
+            .unwrap(),
+        }
+    }
 
     fn identity() -> ParticipantBinding {
         ParticipantBinding {
@@ -536,18 +535,17 @@ mod tests {
         }
     }
 
-    /// RTP from every track kind uses the same queue and carries only its TrackHandle.
     #[test]
     fn every_event_lands_in_its_own_queue() {
         let mut pipeline = EventPipeline::with_capacity(4);
         let who = identity();
 
         let mut sink = pipeline.participant_sink(who);
-        sink.publish_track_packet(Some(TrackHandle::default()), RtpPacket::default());
+        sink.publish_fabric_packet(packet(1));
         sink.exit();
 
         assert!(
-            pipeline.pop_packet().is_some(),
+            pipeline.pop_publication().is_some(),
             "RTP went to the track queue"
         );
         assert!(
@@ -555,8 +553,8 @@ mod tests {
             "lifecycle went to participant events"
         );
 
-        assert!(pipeline.pop_packet().is_none(), "and nothing crossed");
-        assert!(pipeline.pop_packet().is_none());
+        assert!(pipeline.pop_publication().is_none());
+        assert!(pipeline.pop_participant_event().is_none());
     }
 
     #[test]
@@ -580,19 +578,15 @@ mod tests {
     #[test]
     fn the_rtp_packet_queue_is_bounded_and_preserves_order() {
         let mut pipeline = EventPipeline::with_capacity(2);
-        let key = TrackHandle::default();
         let mut sink = pipeline.participant_sink(identity());
-        for seq in 1..=3u64 {
-            sink.publish_track_packet(
-                Some(key),
-                RtpPacket {
-                    seq_no: seq.into(),
-                    ..Default::default()
-                },
-            );
+        for sequence in 1..=3 {
+            sink.publish_fabric_packet(packet(sequence));
         }
-        let drained: Vec<_> = std::iter::from_fn(|| pipeline.pop_packet())
-            .map(|(_, packet)| *packet.seq_no)
+        let drained: Vec<_> = std::iter::from_fn(|| pipeline.pop_publication())
+            .map(|queued| match queued {
+                QueuedPublication::Fabric { publication, .. } => publication.sequence,
+                _ => panic!("expected a typed Fabric packet"),
+            })
             .collect();
         assert_eq!(drained, vec![1, 2]);
     }
@@ -616,9 +610,9 @@ mod tests {
 
         pipeline
             .participant_sink(who)
-            .publish_track_packet(Some(TrackHandle::default()), RtpPacket::default());
-        assert!(pipeline.has_pending(), "so is a track packet");
-        assert!(pipeline.pop_packet().is_some());
+            .publish_fabric_packet(packet(1));
+        assert!(pipeline.has_pending(), "so is a Fabric packet");
+        assert!(pipeline.pop_publication().is_some());
         assert!(!pipeline.has_pending(), "and draining it clears the flag");
     }
 }

@@ -688,20 +688,12 @@ fn video_views_share_capacity_aggregate_visible_demand_and_preserve_incumbents()
         min_height: 180,
         min_fps: 15,
         priority: 2,
-        playout_delay: PlayoutDelay::Fixed {
-            min_ms: 20,
-            max_ms: 80,
-        },
     };
     resources.observe_video(first, observation.clone()).unwrap();
     observation.height = 720;
     observation.min_height = 240;
     observation.min_fps = 30;
     observation.priority = 1;
-    observation.playout_delay = PlayoutDelay::Fixed {
-        min_ms: 30,
-        max_ms: 120,
-    };
     resources
         .observe_video(second, observation.clone())
         .unwrap();
@@ -716,10 +708,6 @@ fn video_views_share_capacity_aggregate_visible_demand_and_preserve_incumbents()
             min_height: 240,
             min_fps: 30,
             priority: 2,
-            playout_delay: PlayoutDelay::Fixed {
-                min_ms: 20,
-                max_ms: 120
-            },
         }]
     );
     let mut unbounded = observation.clone();
@@ -945,30 +933,7 @@ fn hidden_video_demand_does_not_allocate_and_withdrawal_retains_logical_interest
         resources.observe_video(audio, VideoObservation::default()),
         Err(TrackResourceError::WrongKind)
     );
-    assert_eq!(
-        resources.configure_audio(
-            audio,
-            PlayoutDelay::Fixed {
-                min_ms: 2,
-                max_ms: 1
-            }
-        ),
-        Err(TrackResourceError::InvalidPlayoutDelay)
-    );
-    let fixed = PlayoutDelay::Fixed {
-        min_ms: 0,
-        max_ms: 0,
-    };
-    assert_eq!(
-        resources.configure_audio(audio, fixed),
-        Err(TrackResourceError::AlreadyOwned)
-    );
     resources.release(shared);
-    resources.configure_audio(audio, fixed).unwrap();
-    assert_eq!(
-        resources.audio_projection().selector_delays[&selector],
-        fixed
-    );
     let request = resources.begin_media_observation(audio).unwrap();
     let pending = issue(&mut resources, request, None);
     assert!(!pending.closed);
@@ -1022,10 +987,6 @@ fn hidden_video_demand_does_not_allocate_and_withdrawal_retains_logical_interest
     );
     assert!(resources.audio_source_authorized(policy_owner, "audio-one", None));
     assert!(!resources.audio_source_authorized(named, "audio-one", None));
-    assert_eq!(
-        resources.configure_audio(named, fixed),
-        Err(TrackResourceError::AlreadyOwned)
-    );
     let mut audio_target = target("audio-one", 55, "audio-receiver");
     audio_target.binding.slot = crate::MediaSlot::RemoteAudio(0);
     audio_target.binding.kind = MediaKind::Audio;
@@ -1062,10 +1023,6 @@ fn hidden_video_demand_does_not_allocate_and_withdrawal_retains_logical_interest
         .unwrap();
     assert!(resources.audio_source_authorized(policy_owner, "audio-two", None));
     assert!(!resources.audio_source_authorized(policy_owner, "audio-one", Some(&selector)));
-    assert_eq!(
-        resources.configure_audio(policy_owner, fixed),
-        Err(TrackResourceError::WrongKind)
-    );
     resources.release(policy_owner);
     let remaining = resources.audio_projection();
     assert!(remaining.pinned.is_empty());

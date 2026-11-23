@@ -116,7 +116,7 @@ impl NativeReceivers {
             .map(|receiver| crate::participant::policy::ReceiverBinding {
                 available: receiver.installed() && !receiver.retiring,
                 rtp: match &receiver.transport {
-                    ReceiveTransport::Rtp(rtp) => Some((rtp.kind, rtp.supports_playout_delay)),
+                    ReceiveTransport::Rtp(rtp) => Some(rtp.kind),
                     ReceiveTransport::Sctp { .. } => None,
                 },
             })
@@ -198,17 +198,6 @@ impl NativeReceivers {
             && rtp.ssrc() == ssrc
             && rtp.payload_type() == pt
             && self.receiver_ready(receiver)
-    }
-
-    pub(super) fn playout_delay(
-        &self,
-        mid: Mid,
-    ) -> Option<(crate::rtp::MediaTime, crate::rtp::MediaTime)> {
-        let receiver = self.receivers.get(self.mids.get(&mid)?)?;
-        match &receiver.transport {
-            ReceiveTransport::Rtp(rtp) => rtp.playout_delay(),
-            ReceiveTransport::Sctp { .. } => None,
-        }
     }
 
     fn receiver_ready(&self, receiver: &Receiver) -> bool {

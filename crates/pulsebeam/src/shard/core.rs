@@ -6,10 +6,10 @@ use pulsebeam_runtime::time::Instant;
 use slotmap::SecondaryMap;
 
 use crate::clock::WallAnchor;
+use crate::route::NodeTransportAddress;
 #[cfg(test)]
 use crate::route::fabric::local::OwnedPacket;
 use crate::route::fabric::local::{Emission, Offers, PacketView, Rejection};
-use crate::route::{MediaDelivery, NodeTransportAddress};
 use crate::shard::events::{ParticipantBindingEvent, ParticipantEvent, ParticipantLifecycleEvent};
 use crate::{
     id::ShardId,
@@ -22,14 +22,14 @@ use crate::{
         dirty::DirtyTracker,
         events::EventPipeline,
         participants::ParticipantRegistry,
-        router::{FabricLocalBranch, FabricSourceHandle, Origin, ShardRuntime},
+        router::{FabricLocalBranch, FabricSourceHandle, ShardRuntime},
         timer::TimerWheel,
         updates::ShardUpdateApplication,
     },
 };
 
 pub(crate) use super::router::IngressTransport;
-use super::worker::{MediaPayload, ShardCommand, ShardEvent, ShardFrame};
+use super::worker::{ShardCommand, ShardEvent, ShardFrame};
 
 const PARTICIPANT_CAPACITY_HINT: usize = 64;
 
@@ -101,7 +101,6 @@ pub(crate) struct ShardExecution {
     pub(super) runtime: ShardRuntime,
     pending_publisher_lookups: Vec<PendingPublisherLookup>,
     plans: SecondaryMap<crate::keys::TrackHandle, crate::shard::router::InstalledTrackPlan>,
-    local_rtp_v1: bool,
     timers: TimerWheel,
     dirty: DirtyTracker,
     udp_send_batch: GsoSendBatch,
@@ -122,11 +121,6 @@ impl ShardCore {
             execution: ShardExecution::new(shard_id, max_gso_segments, shard_count, wall),
             updates: ShardUpdateApplication::new(shard_id, update_rx),
         }
-    }
-
-    pub(super) fn with_local_rtp_v1(mut self, enabled: bool) -> Self {
-        self.execution.local_rtp_v1 = enabled;
-        self
     }
 
     pub(crate) fn observe_execution_time(&mut self, at: net::ReceiveTime) -> net::ReceiveTime {
@@ -349,7 +343,6 @@ impl ShardExecution {
             pending_publisher_lookups: Vec::new(),
             runtime,
             plans: SecondaryMap::new(),
-            local_rtp_v1: false,
             timers: TimerWheel::new(PARTICIPANT_CAPACITY_HINT),
             dirty: DirtyTracker::with_capacity(PARTICIPANT_CAPACITY_HINT),
             udp_send_batch: GsoSendBatch::preallocated(),
@@ -619,9 +612,7 @@ impl ShardExecution {
                     pulsebeam_core::fabric::Profile::Data => identity
                         .data_publisher()
                         .and_then(|publisher| self.data_publisher_source(publisher)),
-                    pulsebeam_core::fabric::Profile::Opus
-                        if cfg!(feature = "sim") && self.local_rtp_v1 =>
-                    {
+                    pulsebeam_core::fabric::Profile::Opus if cfg!(feature = "sim") => {
                         self.rtp_publisher_source(identity)
                     }
                     _ => None,
@@ -1930,17 +1921,39 @@ impl ShardExecution {
         now: Instant,
         report: &Offers,
     ) {
-        if report.awaiting_entry != 0 || report.suspended != 0 {
-            let registry = &mut self.registry;
-            if let Some((branch, destination)) =
-                self.runtime.awaiting_fabric_refresh(source, |destination| {
-                    registry
-                        .resolve_mut(destination)
-                        .is_some_and(|owner| owner.fabric_io_authorized())
-                })
-            {
-                self.request_fabric_refresh(destination, branch, now);
-            }
+        if let Some((branch, destination)) = self.awaiting_fabric_refresh(source, report) {
+            self.request_fabric_refresh(destination, branch, now);
+        }
+    }
+
+    fn awaiting_fabric_refresh(
+        &mut self,
+        source: FabricSourceHandle,
+        report: &Offers,
+    ) -> Option<(FabricLocalBranch, ParticipantHandle)> {
+        if report.awaiting_entry == 0 && report.suspended == 0 {
+            return None;
+        }
+        let registry = &mut self.registry;
+        self.runtime.awaiting_fabric_refresh(source, |destination| {
+            registry
+                .resolve_mut(destination)
+                .is_some_and(|owner| owner.fabric_io_authorized())
+        })
+    }
+
+    fn send_shard_fabric_refresh(
+        &mut self,
+        destination: ParticipantHandle,
+        branch: FabricLocalBranch,
+        now: Instant,
+        router: &impl IngressTransport,
+    ) {
+        if let Some(binding) = self
+            .runtime
+            .prepare_shard_fabric_refresh(branch, destination, now)
+        {
+            router.send_frame(binding.origin, ShardFrame::FabricRefresh(binding));
         }
     }
 
@@ -2152,78 +2165,93 @@ impl ShardExecution {
             {
                 continue;
             }
-            match self.admit_fabric(
-                branch,
-                destination,
-                now,
-                |receiver, sequence, packet, evidence| {
-                    receiver
-                        .queue_bound_fabric_rtp(
-                            branch,
-                            (sequence, &packet, evidence),
-                            video_source,
-                            now,
-                        )
-                        .map(|replaced| (packet.header().profile, replaced))
-                },
-            ) {
-                Ok(Some((_profile, replaced))) => {
-                    if let Some(branch) = replaced {
-                        self.retire_bound_fabric_rtp(destination, branch);
-                    }
-                    if let Some(receiver) = self.registry.resolve_mut(destination) {
-                        self.dirty.mark(destination, receiver);
-                        #[cfg(feature = "sim")]
-                        {
-                            crate::sim_metrics::record_routing_counter("fabric_rtp_enqueued");
-                            if receiver.has_whep_output() {
-                                crate::sim_metrics::record_routing_counter(
-                                    "fabric_whep_rtp_enqueued",
-                                );
-                            }
-                            if self.runtime.is_shard_fabric_source(source) {
-                                crate::sim_metrics::record_routing_counter(
-                                    "fabric_rtp_shard_enqueued",
-                                );
-                                use pulsebeam_core::fabric::Profile;
-                                match _profile {
-                                    Profile::Opus => crate::sim_metrics::record_routing_counter(
-                                        "fabric_rtp_opus_shard_enqueued",
-                                    ),
-                                    Profile::H264 => crate::sim_metrics::record_routing_counter(
-                                        "fabric_rtp_h264_shard_enqueued",
-                                    ),
-                                    _ => {}
+            // One ordered DD offer can release a burst. Each successful
+            // admission consumes one item from this bounded queue.
+            loop {
+                match self.admit_fabric(
+                    branch,
+                    destination,
+                    now,
+                    |receiver, sequence, packet, evidence| {
+                        receiver
+                            .queue_bound_fabric_rtp(
+                                branch,
+                                (sequence, &packet, evidence),
+                                video_source,
+                                now,
+                            )
+                            .map(|replaced| (packet.header().profile, replaced))
+                    },
+                ) {
+                    Ok(Some((_profile, replaced))) => {
+                        if let Some(branch) = replaced {
+                            self.retire_bound_fabric_rtp(destination, branch);
+                        }
+                        if let Some(receiver) = self.registry.resolve_mut(destination) {
+                            self.dirty.mark(destination, receiver);
+                            #[cfg(feature = "sim")]
+                            {
+                                crate::sim_metrics::record_routing_counter("fabric_rtp_enqueued");
+                                if receiver.has_whep_output() {
+                                    crate::sim_metrics::record_routing_counter(
+                                        "fabric_whep_rtp_enqueued",
+                                    );
                                 }
-                            } else if matches!(
-                                self.runtime.fabric_handoff_owner(branch, destination),
-                                Some(crate::shard::router::FabricOwner::Local(_))
-                            ) {
-                                use pulsebeam_core::fabric::Profile;
-                                match _profile {
-                                    Profile::Opus => crate::sim_metrics::record_routing_counter(
-                                        "fabric_rtp_opus_local_enqueued",
-                                    ),
-                                    Profile::H264 => crate::sim_metrics::record_routing_counter(
-                                        "fabric_rtp_h264_local_enqueued",
-                                    ),
-                                    _ => {}
+                                if self.runtime.is_shard_fabric_source(source) {
+                                    crate::sim_metrics::record_routing_counter(
+                                        "fabric_rtp_shard_enqueued",
+                                    );
+                                    use pulsebeam_core::fabric::Profile;
+                                    match _profile {
+                                        Profile::Opus => {
+                                            crate::sim_metrics::record_routing_counter(
+                                                "fabric_rtp_opus_shard_enqueued",
+                                            );
+                                        }
+                                        Profile::H264 => {
+                                            crate::sim_metrics::record_routing_counter(
+                                                "fabric_rtp_h264_shard_enqueued",
+                                            );
+                                        }
+                                        _ => {}
+                                    }
+                                } else if matches!(
+                                    self.runtime.fabric_handoff_owner(branch, destination),
+                                    Some(crate::shard::router::FabricOwner::Local(_))
+                                ) {
+                                    use pulsebeam_core::fabric::Profile;
+                                    match _profile {
+                                        Profile::Opus => {
+                                            crate::sim_metrics::record_routing_counter(
+                                                "fabric_rtp_opus_local_enqueued",
+                                            );
+                                        }
+                                        Profile::H264 => {
+                                            crate::sim_metrics::record_routing_counter(
+                                                "fabric_rtp_h264_local_enqueued",
+                                            );
+                                        }
+                                        _ => {}
+                                    }
                                 }
                             }
                         }
                     }
-                }
-                Ok(None) => {}
-                Err(reason) => {
-                    #[cfg(feature = "sim")]
-                    if reason
-                        == crate::rtp::fabric_egress::AdmissionError::Rtc(
-                            pulsebeam_rtc::WriteError::RtpTooLarge,
-                        )
-                    {
-                        crate::sim_metrics::record_routing_counter("fabric_rtp_egress_too_large");
+                    Ok(None) => break,
+                    Err(reason) => {
+                        #[cfg(feature = "sim")]
+                        if reason
+                            == crate::rtp::fabric_egress::AdmissionError::Rtc(
+                                pulsebeam_rtc::WriteError::RtpTooLarge,
+                            )
+                        {
+                            crate::sim_metrics::record_routing_counter(
+                                "fabric_rtp_egress_too_large",
+                            );
+                        }
+                        tracing::debug!(?reason, "Could not enqueue local Fabric RTP");
+                        break;
                     }
-                    tracing::debug!(?reason, "Could not enqueue local Fabric RTP");
                 }
             }
         }
@@ -2461,48 +2489,6 @@ impl ShardExecution {
             .is_some_and(|p| p.fabric_io_authorized())
     }
 
-    fn on_media_frame(
-        &mut self,
-        delivery: MediaDelivery,
-        payload: MediaPayload,
-        now: Instant,
-        _router: &impl IngressTransport,
-    ) {
-        let MediaDelivery {
-            address,
-            playout_ntp32,
-        } = delivery;
-        let Some(action) = self.runtime.routes.resolve(address) else {
-            return;
-        };
-        let entry = self.runtime.routes.accounting_mut(address, self.wall.ntp());
-        let Ok(playout) = entry.expander.expand(playout_ntp32) else {
-            return;
-        };
-
-        let crate::route::RouteAction::Forward { target: key } = action else {
-            debug_assert!(false, "a media envelope must resolve to a forward route");
-            return;
-        };
-        if self.runtime.publication_id(key) != Some(payload.publication_id) {
-            record_routing_drop("packet", "identity", "remote");
-            return;
-        }
-        let Some(plan) = self.plans.get(key) else {
-            record_routing_drop("packet", "plan", "remote");
-            return;
-        };
-        let mut payload = payload;
-        payload.set_remote_timing(self.wall.to_instant(playout), now);
-        let mut ctx = crate::shard::router::ForwardingContext {
-            registry: &mut self.registry,
-            dirty: &mut self.dirty,
-            wall: &self.wall,
-        };
-        self.runtime
-            .route_packet_with_plan(key, Origin::Remote, payload.packet, plan, &mut ctx);
-    }
-
     #[cfg(test)]
     pub(crate) fn on_udp_batch(&mut self, batch: net::RecvPacketBatch) {
         let Some(address) = self.registry.demux(&batch) else {
@@ -2576,8 +2562,7 @@ impl ShardExecution {
                 break;
             };
             processed = processed.saturating_add(1);
-            let (track_handle, packet) = match queued {
-                QueuedPublication::Legacy(track, packet) => (track, packet),
+            match queued {
                 QueuedPublication::FabricMedia {
                     publisher,
                     source,
@@ -2589,12 +2574,20 @@ impl ShardExecution {
                             .offer_fabric_media(source, publisher, now, &input)
                         {
                             Ok(report) => {
-                                if let Some(facts) = report.dd_structure
+                                use crate::route::fabric::local::DecodeTargetSample;
+                                if (report.dd_structure.is_some()
+                                    || report.dd_sample != DecodeTargetSample::None)
                                     && let Some((_, encoding)) =
                                         self.runtime.fabric_dd_source(source)
                                     && let Some(owner) = self.registry.resolve_mut(publisher)
                                 {
-                                    owner.measure_fabric_structure(source, encoding, facts);
+                                    owner.measure_fabric_dd(
+                                        source,
+                                        encoding,
+                                        now,
+                                        report.dd_structure,
+                                        report.dd_sample,
+                                    );
                                 }
                                 self.drain_fabric_rtp(source, now);
                                 self.refresh_after_fabric_offer(source, now, &report);
@@ -2635,23 +2628,7 @@ impl ShardExecution {
                     let _ = self.offer_fabric_publication(publisher, now, publication);
                     continue;
                 }
-            };
-            let Some(plan) = self.plans.get(track_handle) else {
-                record_routing_drop("packet", "plan", "local");
-                continue;
-            };
-            let mut ctx = crate::shard::router::ForwardingContext {
-                registry: &mut self.registry,
-                dirty: &mut self.dirty,
-                wall: &self.wall,
-            };
-            self.runtime.route_packet_with_plan(
-                track_handle,
-                Origin::Local,
-                packet,
-                plan,
-                &mut ctx,
-            );
+            }
         }
         processed
     }
@@ -2772,10 +2749,12 @@ impl ShardExecution {
                         if self.fabric_io_authorized(destination) {
                             self.reset_fabric_output(destination, branch);
                             match self.runtime.fabric_handoff_owner(branch, destination) {
-                                Some(crate::shard::router::FabricOwner::Shard(binding)) => {
-                                    router.send_frame(
-                                        binding.origin,
-                                        ShardFrame::FabricRefresh(binding),
+                                Some(crate::shard::router::FabricOwner::Shard(_)) => {
+                                    self.send_shard_fabric_refresh(
+                                        destination,
+                                        branch,
+                                        now(),
+                                        router,
                                     );
                                 }
                                 Some(crate::shard::router::FabricOwner::Local(_)) => {
@@ -2946,9 +2925,6 @@ impl ShardExecution {
                 }
                 self.on_owned_udp_batch(batch, address, source_shard);
             }
-            ShardFrame::Media { delivery, payload } => {
-                self.on_media_frame(delivery, payload, now, router);
-            }
             ShardFrame::Fabric(offer) => {
                 let binding = offer.binding;
                 let data = offer.packet.header().profile == pulsebeam_core::fabric::Profile::Data;
@@ -2957,6 +2933,11 @@ impl ShardExecution {
                 {
                     if !data {
                         self.drain_fabric_rtp(source, now);
+                        if let Some((branch, destination)) =
+                            self.awaiting_fabric_refresh(source, &report)
+                        {
+                            self.send_shard_fabric_refresh(destination, branch, now, router);
+                        }
                     } else if report.enqueued != 0 {
                         self.drain_fabric_data(source, now);
                     }

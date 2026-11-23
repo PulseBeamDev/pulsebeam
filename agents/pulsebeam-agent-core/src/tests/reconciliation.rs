@@ -38,13 +38,6 @@ fn whole_state_churn_reduces_once_without_physical_work_or_wire_revisions() {
     let mut changed = native_media::scoped_desired(2);
     changed.video[0].height = 1080;
     changed.video[0].priority = 4;
-    changed.audio.selector_delays.insert(
-        changed.audio.selected[0].clone(),
-        PlayoutDelay::Fixed {
-            min_ms: 10,
-            max_ms: 40,
-        },
-    );
     changed.publications[0].track_id = "temporary-camera".into();
     changed
         .topics

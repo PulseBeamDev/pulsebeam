@@ -1357,6 +1357,16 @@ fn dd_switch_packet(
     frame_number: u16,
     attach: bool,
 ) -> OwnedPacket {
+    dd_test_packet(writer, sequence, frame_number, attach, false)
+}
+
+fn dd_test_packet(
+    writer: &mut DependencyDescriptorWriter,
+    sequence: u32,
+    frame_number: u16,
+    attach: bool,
+    omitted: bool,
+) -> OwnedPacket {
     use pulsebeam_core::{
         dd::{
             DdFields, DecodeTargetIndication, DependencyDescriptor, FrameDependencyTemplate,
@@ -1364,26 +1374,32 @@ fn dd_switch_packet(
         },
         fabric::Extension,
     };
-    let template = FrameDependencyTemplate {
+    let base = FrameDependencyTemplate {
         dtis: [DecodeTargetIndication::Switch].into_iter().collect(),
         ..Default::default()
     };
-    let structure = TemplateDependencyStructure {
-        template_id_offset: 5,
-        decode_target_count: 1,
-        templates: [template.clone()].into_iter().collect(),
+    let enhancement = FrameDependencyTemplate {
+        temporal_id: 1,
+        dtis: [DecodeTargetIndication::NotPresent].into_iter().collect(),
         ..Default::default()
     };
     let mut raw = [0; MAX_DD_LEN];
     let descriptor = DependencyDescriptor {
         start_of_frame: true,
         end_of_frame: true,
-        template_id: 5,
+        template_id: if omitted { 6 } else { 5 },
         frame_number,
-        attached_structure: attach.then(|| Box::new(structure)),
+        attached_structure: attach.then(|| {
+            Box::new(TemplateDependencyStructure {
+                template_id_offset: 5,
+                decode_target_count: 1,
+                templates: [base.clone(), enhancement.clone()].into_iter().collect(),
+                ..Default::default()
+            })
+        }),
         active_decode_targets: None,
         fields: DdFields::empty(),
-        frame_dependencies: template,
+        frame_dependencies: if omitted { enhancement } else { base },
         resolution: None,
     };
     let len = writer.write(&descriptor, &mut raw).unwrap();
@@ -1471,6 +1487,54 @@ fn filtered_gap_suspends_without_holding_opaque_whole_source() {
         fanout.take(now, full_branch, whole).unwrap().payload(),
         b"no DD"
     );
+}
+
+#[test]
+fn ordered_filter_compacts_only_qualified_omissions() {
+    let emission = Emission::new(Profile::H264, &[ExtensionKind::DependencyDescriptor]).unwrap();
+    let mut fanout = SourceFanout::new(emission);
+    let mut destinations = SlotMap::with_key();
+    let destination = destinations.insert(());
+    let branch = fanout
+        .install_filtered_branch(destination, emission, DecodeTarget::new(0).unwrap())
+        .unwrap();
+    let now = Instant::now();
+    let mut writer = DependencyDescriptorWriter::new();
+    for (sequence, attach, omit) in [(100, true, false), (101, false, true), (102, false, false)] {
+        let packet = dd_test_packet(&mut writer, u32::from(sequence), sequence, attach, omit);
+        let report = fanout.offer(now, now, u64::from(sequence), packet).unwrap();
+        assert_eq!(report.omitted, usize::from(omit));
+        let selected_bytes = if omit { 0 } else { 6 };
+        assert_eq!(
+            report.dd_sample,
+            DecodeTargetSample::Bytes([selected_bytes, 0, 0])
+        );
+    }
+    let take = |fanout: &mut SourceFanout, at, expected| {
+        assert_eq!(
+            fanout
+                .admit_with_evidence(
+                    at,
+                    branch,
+                    destination,
+                    |_| true,
+                    |position, _, evidence| {
+                        Ok::<_, std::convert::Infallible>((position, evidence.output_position))
+                    }
+                )
+                .unwrap(),
+            Some(expected)
+        );
+    };
+    take(&mut fanout, now, (100, 100));
+    take(&mut fanout, now, (102, 101));
+
+    // Advance past an unknown, not deliberately omitted, position.
+    let packet = dd_test_packet(&mut writer, 104, 104, true, false);
+    fanout.offer(now, now, 104, packet.clone()).unwrap();
+    let later = now + DD_REORDER_WAIT;
+    fanout.offer(later, now, 104, packet).unwrap();
+    take(&mut fanout, later, (104, 103));
 }
 
 #[test]

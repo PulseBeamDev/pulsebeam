@@ -9,9 +9,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use pulsebeam_agent_core::{DataEvent, ffi as core_ffi};
-use pulsebeam_agent_native::ffi::{
-    Agent, AudioSubscription, EventUpdate, NativeEvent, SnapshotUpdate, VideoSubscription,
-};
+use pulsebeam_agent_native::ffi::{Agent, AudioSubscription, SnapshotUpdate, VideoSubscription};
 use pulsebeam_agent_native::{
     Agent as RuntimeAgent, AsyncHttpClient, AudioInput, Config, H264Frame, Host, InputFrame,
     MediaStreamUpdate, OpusFrame, OutputFrame, ReceiveMode, VideoInput,
@@ -735,7 +733,6 @@ fn native_joined_recovery_moves_to_a_distinct_controller_attempt() {
         &[issuer_ip, receiver_ip],
         &[(0, 1)],
         seed,
-        false,
     )
     .unwrap();
     let witness = Arc::new(Mutex::new(None));
@@ -1328,7 +1325,9 @@ async fn roomless_presence_scenario(client_ip: IpAddr, server_ip: IpAddr) -> any
         .room("stage".into())?
         .participant("present-publisher".into())?
         .data("events".into())?
-        .subscribe(None)?;
+        .subscribe(Some(core_ffi::DataSubscribeOptions {
+            delivery: Some(core_ffi::DataDelivery::Latest),
+        }))?;
     let local = viewer
         .audio("microphone".into())?
         .publish(Default::default())?;
@@ -1591,13 +1590,12 @@ async fn run_peer(
             min_height: 0,
             min_fps: 0,
             priority: 1,
-            playout_delay: core_ffi::PlayoutDelay::Adaptive,
         }))?;
     let audio_subscription = agent
         .room(room.as_str().to_owned())?
         .participant(remote.to_owned())?
         .audio("microphone".into())?
-        .subscribe(Default::default())?;
+        .subscribe()?;
     let (initial, remote_video_id, remote_audio_id) = wait_remote_media(
         &agent,
         &video_subscription,
@@ -1643,56 +1641,15 @@ async fn run_peer(
         .await?;
     owned_data.exchange(&barriers.before_media, 1).await?;
 
-    let accepted = agent.snapshot();
-    let errors = agent.events();
-    // Backend rejection is per resource; unrelated accepted video stays desired.
-    let fixed = core_ffi::PlayoutDelay::Fixed {
-        min_ms: 100,
-        max_ms: 100,
-    };
-    audio_subscription
-        .configure(core_ffi::AudioSubscriptionConfig {
-            playout_delay: fixed,
-        })
-        .await?;
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match errors.next().await {
-                EventUpdate::Event {
-                    event:
-                        NativeEvent::Core {
-                            notification: core_ffi::Notification::ServerError { .. },
-                        },
-                } => return anyhow::Ok(()),
-                EventUpdate::Event { .. } => {}
-                EventUpdate::Lagged { skipped } => {
-                    anyhow::bail!("rejection observation lost {skipped} events")
-                }
-                EventUpdate::Closed => anyhow::bail!("rejection observation closed"),
-            }
-        }
-    })
-    .await
-    .map_err(|_| anyhow::anyhow!("unsupported fixed audio was not rejected"))??;
-    let rejected = agent.snapshot();
-    anyhow::ensure!(
-        rejected.desired_revision == accepted.desired_revision && !audio_subscription.is_closed(),
-        "owned audio configuration changed the declaration revision or ended its parent"
-    );
-    anyhow::ensure!(
-        rejected.generation == accepted.generation
-            && rejected.connection == core_ffi::ConnectionState::Connected,
-        "unsupported audio reset the established session"
-    );
     let unchanged_video = video_subscription.state();
     anyhow::ensure!(
         unchanged_video.source_status == core_ffi::SubscriptionSourceStatus::Available
             && unchanged_video.source_track_id.as_deref() == Some(remote_video_id.as_str())
             && unchanged_video.admission == core_ffi::PublicationAdmissionStatus::Admitted
             && unchanged_video.execution == core_ffi::PublicationExecution::Installed,
-        "unsupported audio disturbed unchanged video binding"
+        "audio and DATA setup disturbed unchanged video binding"
     );
-    // The existing exchange must decode fresh audio and video after rejection.
+    // The existing exchange must decode fresh audio and video.
     let first = exchange(
         &barriers.before_reconnect,
         &agent,
@@ -1753,11 +1710,6 @@ async fn run_peer(
             && retired.get() == 0,
         "payload reuse replaced the native peer"
     );
-    audio_subscription
-        .configure(core_ffi::AudioSubscriptionConfig {
-            playout_delay: core_ffi::PlayoutDelay::Adaptive,
-        })
-        .await?;
 
     let first_expected = first.retained.clone();
     let retired_video_input = video.clone();
