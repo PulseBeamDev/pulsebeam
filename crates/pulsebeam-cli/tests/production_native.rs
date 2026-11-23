@@ -255,7 +255,7 @@ async fn production_native_i420(receiver_room: &str) -> Result<()> {
     let publication = publisher
         .video("production-camera".into())?
         .publish(Default::default())?;
-    publication.set_source(Some(&camera)).await?;
+    let _pipe = camera.pipe_to(&publication)?;
     let subscription = subscriber
         .room(ROOM.into())?
         .participant("publisher".into())?

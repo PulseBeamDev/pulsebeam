@@ -3,7 +3,6 @@ import {
   AgentStatus,
   AgentUpdates,
   ErrorCode,
-  AudioDemand,
   AudioSubscriptionConfig,
   DataUpdate,
   PlayoutDelay,
@@ -149,10 +148,11 @@ if (videoPublication instanceof Promise || !videoPublication.state().configurati
   throw new Error("zero-argument publish was not synchronous with RFC enabled default");
 }
 if (false) {
-  // @ts-expect-error An audio source is not a video publication source.
-  await videoPublication.setSource(audioSource);
+  // @ts-expect-error An audio source cannot pipe into a video publication.
+  audioSource.pipeTo(videoPublication);
+  // @ts-expect-error The legacy publication source setter is not exported.
+  videoPublication.setSource(videoSource);
 }
-await videoPublication.setSource(videoSource);
 const publicationUpdates = videoPublication.updates();
 const initialPublication = videoPublication.state();
 if (!PublicationUpdates.instanceOf(publicationUpdates) ||
@@ -188,10 +188,11 @@ await videoPublication.configure(PublicationConfig.create({ enabled: true }));
 if (!videoPublication.state().configuration.enabled) throw new Error("latest configuration setter was lost");
 await videoPublication.configure(PublicationConfig.create({ enabled: false }));
 if (videoPublication.state().configuration.enabled) throw new Error("latest configuration setter was lost");
-await videoPublication.setSource(undefined);
-await videoPublication.setSource(videoSource);
-if ("ready" in videoPublication || "ready" in videoSource) {
-  throw new Error("legacy readiness alias is still exported");
+const videoPipe = videoSource.pipeTo(videoPublication);
+await videoPipe.close();
+const rebound = videoSource.pipeTo(videoPublication);
+if ("setSource" in videoPublication || "ready" in videoPublication || "ready" in videoSource) {
+  throw new Error("legacy publication API is still exported");
 }
 await videoPublication.close();
 if (videoSource.isClosed() ||
@@ -200,8 +201,10 @@ if (videoSource.isClosed() ||
   throw new Error("publication close transferred producer ownership");
 }
 publicationUpdates.close();
+rebound.uniffiDestroy();
+videoPipe.uniffiDestroy();
 const videoReplacement = sameVideo.publish(publicationConfig);
-await videoReplacement.setSource(videoSource);
+const replacementPipe = videoSource.pipeTo(videoReplacement);
 const feedback = videoSource.feedback();
 const siblingFeedback = videoSource.feedback();
 if (!FeedbackStream.instanceOf(feedback)) throw new Error("feedback is not a generated object");
@@ -218,11 +221,12 @@ siblingFeedback.uniffiDestroy();
 await videoSource.close();
 if (videoReplacement.isClosed()) throw new Error("source stop closed publication ownership");
 await videoReplacement.close();
+replacementPipe.uniffiDestroy();
 const audioPublication = localAudio.publish();
 if (audioPublication instanceof Promise || !audioPublication.state().configuration.enabled) {
   throw new Error("zero-argument audio publish was not synchronous with RFC enabled default");
 }
-await audioPublication.setSource(audioSource);
+const audioPipe = audioSource.pipeTo(audioPublication);
 const audioPublicationUpdates = audioPublication.updates();
 const initialAudioPublication = await audioPublicationUpdates.next();
 if (!initialAudioPublication || initialAudioPublication.admission.status !== PublicationAdmissionStatus.Pending) {
@@ -265,11 +269,7 @@ if (!videoState.configuration.visible || videoState.configuration.height !== 0 |
     (await audioUpdates.next())?.observationRevision !== audioState.observationRevision) {
   throw new Error("subscription defaults or current-first state were lost");
 }
-const audioSelection = await agent.selectAudio(AudioDemand.create({
-  pinned: [], selected: [], playoutDelays: [], selectorDelays: [],
-}));
-await audioSelection.close();
-if (audioSubscription.isClosed()) throw new Error("selection close retired named audio demand");
+if ("selectAudio" in agent) throw new Error("collection audio selection is still exported");
 const frameReaders: (VideoFrames | AudioFrames)[] = [];
 const pendingFrames: Promise<unknown>[] = [];
 for (const [subscription, Reader] of [
@@ -453,7 +453,10 @@ dataUpdates.uniffiDestroy();
 siblingDataUpdates.uniffiDestroy();
 dataPublication.uniffiDestroy();
 replacementData.uniffiDestroy();
-const finalAudioPublication = await pendingAudioPublication;
+let finalAudioPublication = await pendingAudioPublication;
+while (finalAudioPublication && !finalAudioPublication.closed) {
+  finalAudioPublication = await audioPublicationUpdates.next();
+}
 if (!finalAudioPublication?.closed || await audioPublicationUpdates.next() !== undefined ||
     !audioPublication.state().closed) {
   throw new Error("terminal Agent close did not finish a retained publication cursor");
@@ -470,9 +473,9 @@ if (finalState?.status !== AgentStatus.Closed ||
 stateUpdates.close();
 stateUpdates.close();
 stateUpdates.uniffiDestroy();
-audioSelection.uniffiDestroy();
 audioSubscription.uniffiDestroy();
 videoSubscription.uniffiDestroy();
+audioPipe.uniffiDestroy();
 audioPublication.uniffiDestroy();
 videoReplacement.uniffiDestroy();
 videoPublication.uniffiDestroy();

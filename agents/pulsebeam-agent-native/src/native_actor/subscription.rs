@@ -93,22 +93,6 @@ impl Subscription {
     }
 
     pub async fn observe(&self, mode: ReceiveMode) -> Result<RemoteMedia, Error> {
-        self.observe_target(None, mode).await
-    }
-
-    pub async fn observe_source(
-        &self,
-        source: String,
-        mode: ReceiveMode,
-    ) -> Result<RemoteMedia, Error> {
-        self.observe_target(Some(source), mode).await
-    }
-
-    async fn observe_target(
-        &self,
-        source: Option<String>,
-        mode: ReceiveMode,
-    ) -> Result<RemoteMedia, Error> {
         if self.is_closed() {
             return Err(Error::Closed);
         }
@@ -124,7 +108,6 @@ impl Subscription {
             .commands
             .send(Command::ObserveSubscription {
                 owner: self.inner.owner,
-                source,
                 mode,
                 response,
             })
@@ -154,20 +137,6 @@ impl Subscription {
         self.resource(ResourceCommand::ConfigureAudio {
             owner: self.inner.owner,
             playout_delay,
-        })
-        .await
-    }
-
-    pub async fn configure_audio_policy(
-        &self,
-        policy: agent_core::AudioSubscription,
-    ) -> Result<(), Error> {
-        if self.is_closed() {
-            return Err(Error::Closed);
-        }
-        self.resource(ResourceCommand::ConfigureAudioPolicy {
-            owner: self.inner.owner,
-            policy,
         })
         .await
     }
@@ -260,19 +229,6 @@ where
         Ok(subscription)
     }
 
-    pub(super) fn claim_audio_policy(
-        &mut self,
-        policy: agent_core::AudioSubscription,
-    ) -> Result<Subscription, Error> {
-        let ResourceResult::Owned { owner } = self
-            .core
-            .resource(ResourceCommand::ClaimAudioPolicy { policy })?
-        else {
-            return Err(Error::Rtc("Core did not claim an audio policy".into()));
-        };
-        Ok(self.subscription_handle(owner))
-    }
-
     fn subscription_handle(&mut self, owner: u64) -> Subscription {
         let inner = Arc::new(SubscriptionLease {
             owner,
@@ -289,19 +245,16 @@ where
     pub(super) fn observe_subscription(
         &mut self,
         owner: u64,
-        source: Option<String>,
         mode: ReceiveMode,
         response: oneshot::Sender<Result<RemoteMedia, Error>>,
     ) {
         if response.is_closed() {
             return;
         }
-        let command = match source {
-            Some(source) => ResourceCommand::BeginAudioSourceObservation { owner, source },
-            None => ResourceCommand::BeginMediaObservation { owner },
-        };
-        let result = self.core.resource(command);
-        match result {
+        match self
+            .core
+            .resource(ResourceCommand::BeginMediaObservation { owner })
+        {
             Ok(ResourceResult::MediaObservation(id)) => {
                 self.observations.insert(
                     id,

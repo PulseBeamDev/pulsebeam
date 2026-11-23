@@ -60,12 +60,8 @@ export type {
   DataPublicationUpdates,
   DataSubscriptionUpdates,
 } from "@pulsebeam/web";
-export { Data, SelectAudio } from "./ownership.js";
-export type {
-  SelectAudioProps,
-  DataProps,
-  PublicationSource,
-} from "./ownership.js";
+export { Data } from "./ownership.js";
+export type { DataProps, PublicationSource } from "./ownership.js";
 export { Video, Audio } from "./playback.js";
 export type { VideoProps, AudioProps, PlaybackError } from "./playback.js";
 export { useDevices, useCapture, MediaCaptureError } from "./capture.js";

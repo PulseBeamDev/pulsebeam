@@ -737,8 +737,8 @@ impl SimClientBuilder {
         };
         let audio_publication = if let Some(source) = &audio_source {
             let publication = agent.audio("audio".into())?.publish(Default::default())?;
-            publication.set_source(Some(source)).await?;
-            Some(publication)
+            let pipe = source.pipe_to(&publication)?;
+            Some((publication, pipe))
         } else {
             None
         };
@@ -748,7 +748,6 @@ impl SimClientBuilder {
             topics: self.initial_topics,
             ..DesiredState::default()
         };
-        let audio_policy = agent.select_audio(AudioSubscription::default()).await?;
         agent.replace_desired(desired.clone()).await?;
         agent.join(room.as_str().to_owned())?;
 
@@ -837,7 +836,7 @@ impl SimClientBuilder {
             video_source,
             audio_source,
             video_source_config: source_profile,
-            audio_policy,
+            audio_subscriptions: BTreeMap::new(),
             video_subscriptions: BTreeMap::new(),
             retained_video_subscriptions: None,
         };
@@ -3658,11 +3657,14 @@ pub struct ClientContext {
     video_publication: Option<pulsebeam_agent_native::Publication>,
     video_pipe: Option<pulsebeam_agent_native::Pipe>,
     retained_video_owners: Option<RetainedVideoOwners>,
-    audio_publication: Option<pulsebeam_agent_native::Publication>,
+    audio_publication: Option<(
+        pulsebeam_agent_native::Publication,
+        pulsebeam_agent_native::Pipe,
+    )>,
     video_source: Option<ProducerInput>,
     audio_source: Option<ProducerInput>,
     video_source_config: VideoSourceConfig,
-    audio_policy: pulsebeam_agent_native::Subscription,
+    audio_subscriptions: BTreeMap<TrackSelector, pulsebeam_agent_native::Subscription>,
     video_subscriptions: BTreeMap<TrackSelector, VideoInterest>,
     retained_video_subscriptions:
         Option<BTreeMap<TrackSelector, pulsebeam_agent_native::Subscription>>,
@@ -4273,15 +4275,49 @@ impl ClientContext {
             .iter()
             .filter_map(|(selector, delay)| delay.map(|delay| (selector.clone(), delay)))
             .collect();
-        audio.selected = sources.into_iter().map(|(selector, _)| selector).collect();
+        audio.selected = sources
+            .iter()
+            .map(|(selector, _)| selector.clone())
+            .collect();
+        let obsolete: Vec<_> = self
+            .audio_subscriptions
+            .keys()
+            .filter(|selector| !audio.selected.contains(selector))
+            .cloned()
+            .collect();
+        for selector in obsolete {
+            if let Some(subscription) = self.audio_subscriptions.remove(&selector) {
+                subscription.close().await?;
+            }
+        }
+        for (selector, delay) in sources {
+            let delay = delay.unwrap_or_default();
+            if let Some(subscription) = self.audio_subscriptions.get(&selector) {
+                let previous = self
+                    .desired
+                    .audio
+                    .selector_delays
+                    .get(&selector)
+                    .copied()
+                    .unwrap_or_default();
+                if previous != delay {
+                    subscription.configure_audio(delay).await?;
+                }
+            } else {
+                let subscription = self
+                    .agent
+                    .room(selector.room.clone())?
+                    .participant(selector.participant_id.clone())?
+                    .audio(selector.track_id.clone())?
+                    .subscribe(
+                        pulsebeam_agent_native::agent_core::ffi::AudioSubscriptionConfig {
+                            playout_delay: delay.into(),
+                        },
+                    )?;
+                self.audio_subscriptions.insert(selector, subscription);
+            }
+        }
         if self.desired.audio != audio || self.automatic_audio != automatic {
-            self.audio_policy
-                .configure_audio_policy(AudioSubscription {
-                    selected: audio.selected.clone(),
-                    selector_delays: audio.selector_delays.clone(),
-                    ..Default::default()
-                })
-                .await?;
             self.desired.audio = audio;
             self.automatic_audio = automatic;
             self.desired.revision = self.desired.revision.saturating_add(1);
@@ -4574,6 +4610,7 @@ impl SimClient {
             ctx.audio_publication
                 .as_ref()
                 .expect("audio publication")
+                .0
                 .ready()
                 .await?;
             self.join_set.spawn(run_capture_generation(
@@ -4831,25 +4868,39 @@ impl SimClient {
             }
             let (_, _, source) = &key;
             let source = source.clone();
-            let publication = self
+            let Some((publication, participant)) = self.ctx.catalog.get(&source) else {
+                continue;
+            };
+            let Some(room) = self.ctx.snapshots.borrow().room_id.clone() else {
+                continue;
+            };
+            let Some(subscription) = self
                 .ctx
-                .catalog
-                .get(&source)
-                .map(|(entry, _)| entry.clone());
-            let policy = self.ctx.audio_policy.clone();
+                .audio_subscriptions
+                .get(&TrackSelector {
+                    room,
+                    participant_id: participant.clone(),
+                    track_id: publication.track_id.clone(),
+                })
+                .cloned()
+            else {
+                continue;
+            };
+            let publication = publication.clone();
             let log = self.ctx.audio_rx.clone();
             let mode = self.media.audio_receive_mode;
             let snapshots = self.ctx.agent.snapshots();
             let corrupt = self.media.corrupt_audio_payload;
             let receivers = self.ctx.owned_receivers.clone();
             let task = self.join_set.spawn(async move {
-                let remote = match policy.observe_source(source.clone(), mode).await {
+                let remote = match subscription.observe(mode).await {
                     Ok(remote) => remote,
                     Err(pulsebeam_agent_native::Error::Closed) => return,
                     Err(error) => panic!("native audio observation failed: {error}"),
                 };
-                assert_eq!(remote.source_track_id(), Some(source.as_str()));
-                if remote.generation() != generation {
+                if remote.generation() != generation
+                    || remote.source_track_id() != Some(source.as_str())
+                {
                     return;
                 }
                 if mode == pulsebeam_agent_native::ReceiveMode::Encoded {
@@ -4860,7 +4911,7 @@ impl SimClient {
                     &remote,
                     &snapshots.borrow(),
                     MediaKind::Audio,
-                    publication.as_ref(),
+                    Some(&publication),
                 );
                 let mut decoders = HashMap::<NativeAudioStream, OpusReceiver>::new();
                 loop {

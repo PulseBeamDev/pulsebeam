@@ -7,10 +7,7 @@ import {
 } from "../../unit-javascript/remote-catalog.js";
 import { DataRegistry } from "../../unit-javascript/data.js";
 import { ResourceOwners } from "../../unit-javascript/resources.js";
-import {
-  subscribeVideo,
-  selectAudio,
-} from "../../unit-javascript/reception.js";
+import { subscribeVideo } from "../../unit-javascript/reception.js";
 
 function fixture() {
   const listeners = new Set();
@@ -330,54 +327,5 @@ test("invalid initial subscription configuration retires its claim in the same t
     },
   );
   assert.deepEqual(commands, ["claimVideo", "observeVideo", "release"]);
-  await resources.close();
-});
-
-test("audio selection reattachment claims the latest explicit policy", async () => {
-  const resources = new ResourceOwners((error) => {
-    throw error;
-  });
-  resources.activate({
-    async resource(command) {
-      return this.resource_now(command);
-    },
-    resource_now(command) {
-      return command.op === "claimAudioPolicy" ? { owner: 1n } : undefined;
-    },
-  });
-  const initial = {
-    pinned: [],
-    selected: [],
-    playoutDelays: [],
-  };
-  const selection = await selectAudio(resources, initial);
-  const next = {
-    ...initial,
-    selected: [{ room: "room", participantId: "alice", trackId: "microphone" }],
-  };
-  await selection.configure(next);
-  let configured;
-  const applied = new Promise((resolve) => {
-    configured = resolve;
-  });
-  const commands = [];
-  resources.activate({
-    async resource(command) {
-      if (command.op !== "release") return this.resource_now(command);
-    },
-    resource_now(command) {
-      commands.push(command);
-      if (command.op === "claimAudioPolicy") return { owner: 2n };
-      if (command.op === "configureAudioPolicy") configured();
-    },
-  });
-  await applied;
-  assert.deepEqual(commands[0], { op: "claimAudioPolicy", policy: next });
-  assert.deepEqual(commands[1], {
-    op: "configureAudioPolicy",
-    owner: 2n,
-    policy: next,
-  });
-  await selection.close();
   await resources.close();
 });

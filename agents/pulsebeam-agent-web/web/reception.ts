@@ -18,7 +18,6 @@ import type {
 import type {
   AudioSubscriptionUpdates,
   VideoSubscriptionUpdates,
-  AudioDemand,
   AudioSubscriptionConfig,
   TrackSelector,
   VideoObservation,
@@ -192,29 +191,10 @@ class Subscription<C> {
   }
 }
 
-async function acquire<T extends { close(): Promise<void> }>(
-  value: T,
-): Promise<T> {
-  try {
-    await initialized.get(value)!;
-    return value;
-  } catch (error) {
-    await value.close();
-    throw error;
-  }
-}
-
-export function claimVideoSubscription(
-  resources: ResourceOwners,
-  selector: TrackSelector,
-  configuration: VideoObservation,
-) {
-  const subscription = new VideoSubscription(
-    resources,
-    selector,
-    configuration,
-  );
-  return { subscription, ready: initialized.get(subscription)! };
+export function videoSubscriptionInitialized(
+  subscription: VideoSubscription,
+): Promise<void> {
+  return initialized.get(subscription)!;
 }
 
 export function subscribeVideo(
@@ -231,13 +211,6 @@ export function subscribeAudio(
 ): AudioSubscription {
   return new AudioSubscription(resources, selector, configuration);
 }
-export async function selectAudio(
-  resources: ResourceOwners,
-  policy: AudioDemand,
-): Promise<AudioSelection> {
-  return acquire(new AudioSelection(resources, policy));
-}
-
 type ViewBinding = (
   element: HTMLVideoElement,
   failed: (error: unknown) => void,
@@ -388,19 +361,5 @@ export class AudioSubscription extends Subscription<AudioSubscriptionConfig> {
   }
   observe(signal?: AbortSignal): Promise<MediaObservation> {
     return this.observeSource(undefined, signal);
-  }
-}
-
-export class AudioSelection extends Subscription<AudioDemand> {
-  constructor(resources: ResourceOwners, policy: AudioDemand) {
-    super(
-      resources,
-      (value) => ({ op: "claimAudioPolicy", policy: value }),
-      policy,
-      (owner, value) => ({ op: "configureAudioPolicy", owner, policy: value }),
-    );
-  }
-  observeSource(source: string): Promise<MediaObservation> {
-    return super.observeSource(source);
   }
 }

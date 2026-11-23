@@ -1,14 +1,14 @@
 use super::{Agent, Arc, ErrorCode, ErrorInfo, WebAgentError};
-use agent_core::{ffi, observer};
+use agent_core::ffi;
 
 fn invalid_address() -> ErrorInfo {
-    ErrorInfo::new(ErrorCode::InvalidArgument, "Invalid video source address")
+    ErrorInfo::new(ErrorCode::InvalidArgument, "Invalid remote source address")
 }
 
 #[derive(uniffi::Object)]
 pub struct RoomRef {
-    agent: Arc<Agent>,
-    room: String,
+    pub(super) agent: Arc<Agent>,
+    pub(super) room: String,
 }
 
 impl RoomRef {
@@ -32,7 +32,7 @@ impl RoomRef {
 
 #[derive(uniffi::Object)]
 pub struct Participant {
-    agent: Arc<Agent>,
+    pub(super) agent: Arc<Agent>,
     room: String,
     id: String,
 }
@@ -40,127 +40,161 @@ pub struct Participant {
 #[uniffi::export]
 impl Participant {
     pub fn video(&self, label: String) -> Result<Arc<RemoteVideoTrack>, WebAgentError> {
+        RemoteVideoTrack::new(self, label)
+    }
+
+    pub fn audio(&self, label: String) -> Result<Arc<RemoteAudioTrack>, WebAgentError> {
+        RemoteAudioTrack::new(self, label)
+    }
+}
+
+impl Participant {
+    pub(super) fn selector(
+        &self,
+        label: String,
+    ) -> Result<agent_core::TrackSelector, WebAgentError> {
         let selector = agent_core::TrackSelector {
             room: self.room.clone(),
             participant_id: self.id.clone(),
             track_id: label,
         };
         selector.validate().map_err(|_| invalid_address())?;
-        Ok(Arc::new(RemoteVideoTrack {
+        Ok(selector)
+    }
+}
+
+macro_rules! subscription {
+    ($track:ident, $subscription:ident, $state:ident, $observer:ident, $cursor:ident,
+     $options:ident, $claim:ident, $configuration:expr) => {
+        #[derive(uniffi::Object)]
+        pub struct $track {
             #[cfg(target_arch = "wasm32")]
-            agent: self.agent.clone(),
+            agent: Arc<Agent>,
             #[cfg(target_arch = "wasm32")]
-            selector,
-        }))
-    }
+            selector: agent_core::TrackSelector,
+        }
+
+        impl $track {
+            fn new(participant: &Participant, label: String) -> Result<Arc<Self>, WebAgentError> {
+                let selector = participant.selector(label)?;
+                #[cfg(not(target_arch = "wasm32"))]
+                let _ = selector;
+                Ok(Arc::new(Self {
+                    #[cfg(target_arch = "wasm32")]
+                    agent: participant.agent.clone(),
+                    #[cfg(target_arch = "wasm32")]
+                    selector,
+                }))
+            }
+        }
+
+        #[uniffi::export]
+        impl $track {
+            #[uniffi::method(default(options = None))]
+            pub fn subscribe(
+                &self,
+                options: Option<ffi::$options>,
+            ) -> Result<Arc<$subscription>, WebAgentError> {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let (owner, observer) = self
+                        .agent
+                        .runtime
+                        .$claim(self.selector.clone(), ($configuration)(options))?;
+                    Ok(Arc::new($subscription {
+                        agent: self.agent.clone(),
+                        owner,
+                        observer,
+                    }))
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let _ = options;
+                    Err(super::browser_required())
+                }
+            }
+        }
+
+        #[derive(uniffi::Object)]
+        pub struct $subscription {
+            #[cfg(target_arch = "wasm32")]
+            agent: Arc<Agent>,
+            #[cfg(target_arch = "wasm32")]
+            owner: u64,
+            #[cfg(target_arch = "wasm32")]
+            observer: std::rc::Rc<agent_core::observer::$observer>,
+        }
+
+        #[uniffi::export]
+        impl $subscription {
+            pub fn state(&self) -> Result<ffi::$state, WebAgentError> {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    Ok(self.observer.state())
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                Err(super::browser_required())
+            }
+
+            pub fn updates(&self) -> Result<Arc<$cursor>, WebAgentError> {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let cursor = self.observer.updates().map_err(|_| {
+                        ErrorInfo::new(ErrorCode::CapacityExceeded, "Observer capacity exceeded")
+                    })?;
+                    Ok(Arc::new($cursor { cursor }))
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                Err(super::browser_required())
+            }
+
+            pub async fn close(&self) -> Result<(), WebAgentError> {
+                #[cfg(target_arch = "wasm32")]
+                if !self.observer.state().closed {
+                    self.agent.runtime.release_media_owner(self.owner)?;
+                }
+                Ok(())
+            }
+        }
+
+        state_cursor!($cursor, $state);
+    };
 }
 
-#[derive(uniffi::Object)]
-pub struct RemoteVideoTrack {
-    #[cfg(target_arch = "wasm32")]
-    agent: Arc<Agent>,
-    #[cfg(target_arch = "wasm32")]
-    selector: agent_core::TrackSelector,
-}
-
-#[uniffi::export]
-impl RemoteVideoTrack {
-    #[uniffi::method(default(options = None))]
-    pub fn subscribe(
-        &self,
-        options: Option<ffi::VideoObservation>,
-    ) -> Result<Arc<VideoSubscription>, WebAgentError> {
-        #[cfg(target_arch = "wasm32")]
-        {
-            let configuration = options.unwrap_or_else(|| ffi::VideoObservation {
-                visible: true,
-                ..Default::default()
-            });
-            let (owner, observer) = self
-                .agent
-                .runtime
-                .claim_video(self.selector.clone(), configuration.into())?;
-            Ok(Arc::new(VideoSubscription {
-                agent: self.agent.clone(),
-                owner,
-                observer,
-            }))
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let _ = options;
-            Err(super::browser_required())
-        }
-    }
-}
-
-#[derive(uniffi::Object)]
-pub struct VideoSubscription {
-    #[cfg(target_arch = "wasm32")]
-    agent: Arc<Agent>,
-    #[cfg(target_arch = "wasm32")]
-    owner: u64,
-    #[cfg(target_arch = "wasm32")]
-    observer: std::rc::Rc<observer::VideoSubscriptionStateObserver>,
-}
-
-#[uniffi::export]
-impl VideoSubscription {
-    pub fn state(&self) -> Result<ffi::VideoSubscriptionState, WebAgentError> {
-        #[cfg(target_arch = "wasm32")]
-        {
-            Ok(self.observer.state())
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        Err(super::browser_required())
-    }
-
-    pub fn updates(&self) -> Result<Arc<VideoSubscriptionUpdates>, WebAgentError> {
-        #[cfg(target_arch = "wasm32")]
-        {
-            let cursor = self.observer.updates().map_err(|_| {
-                ErrorInfo::new(ErrorCode::CapacityExceeded, "Observer capacity exceeded")
-            })?;
-            Ok(Arc::new(VideoSubscriptionUpdates { cursor }))
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        Err(super::browser_required())
-    }
-
-    pub async fn playback_output(&self) -> Result<Arc<WebVideoOutput>, WebAgentError> {
-        #[cfg(target_arch = "wasm32")]
-        {
-            let observation = self
-                .agent
-                .runtime
-                .observe_video(self.owner)
-                .await
-                .map_err(|_| {
-                    if self.observer.state().closed {
-                        ErrorInfo::new(ErrorCode::Closed, "Video subscription is closed")
-                    } else {
-                        ErrorInfo::new(ErrorCode::NotReady, "Video output is unavailable")
-                    }
-                })?;
-            WebVideoOutput::new(observation).map(Arc::new)
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        Err(super::browser_required())
-    }
-
-    pub async fn close(&self) -> Result<(), WebAgentError> {
-        #[cfg(target_arch = "wasm32")]
-        if !self.observer.state().closed {
-            self.agent.runtime.close_video(self.owner)?;
-        }
-        Ok(())
-    }
-}
+subscription!(
+    RemoteVideoTrack,
+    VideoSubscription,
+    VideoSubscriptionState,
+    VideoSubscriptionStateObserver,
+    VideoSubscriptionUpdates,
+    VideoObservation,
+    claim_video,
+    |options: Option<ffi::VideoObservation>| options
+        .unwrap_or_else(|| ffi::VideoObservation {
+            visible: true,
+            ..Default::default()
+        })
+        .into()
+);
+subscription!(
+    RemoteAudioTrack,
+    AudioSubscription,
+    AudioSubscriptionState,
+    AudioSubscriptionStateObserver,
+    AudioSubscriptionUpdates,
+    AudioSubscriptionConfig,
+    claim_audio,
+    |options: Option<ffi::AudioSubscriptionConfig>| options
+        .unwrap_or_default()
+        .playout_delay
+        .into()
+);
 
 #[cfg(target_arch = "wasm32")]
 mod playback {
-    use super::{ErrorCode, ErrorInfo, WebAgentError, WebVideoOutput};
+    use super::{ErrorCode, ErrorInfo, WebAgentError};
     use crate::browser::media_observation::BrowserMediaObservation;
+    use std::cell::Cell;
     use wasm_bindgen::{JsValue, prelude::wasm_bindgen};
     use web_sys::MediaStreamTrack;
 
@@ -172,86 +206,109 @@ mod playback {
         fn release(handle: u64, kind: &str) -> Result<bool, JsValue>;
     }
 
-    impl WebVideoOutput {
+    pub(super) struct Output {
+        observation: BrowserMediaObservation,
+        handle: Cell<Option<u64>>,
+    }
+
+    impl Output {
         pub(super) fn new(observation: BrowserMediaObservation) -> Result<Self, WebAgentError> {
             let track = observation
                 .track()
-                .ok_or_else(|| ErrorInfo::new(ErrorCode::Closed, "Video output is closed"))?;
+                .ok_or_else(|| ErrorInfo::new(ErrorCode::Closed, "Playback output is closed"))?;
             let handle = retain(&track, "track").map_err(|_| {
                 ErrorInfo::new(
                     ErrorCode::Internal,
-                    "Could not register browser video output",
+                    "Could not register browser playback output",
                 )
             })?;
             Ok(Self {
                 observation,
-                handle: std::cell::Cell::new(Some(handle)),
+                handle: Cell::new(Some(handle)),
             })
         }
 
-        pub(super) fn release_handle(&self) {
+        pub(super) fn track(&self) -> Option<crate::ffi::WebMediaTrack> {
+            if self.observation.is_closed() {
+                self.release_handle();
+            }
+            self.handle.get().map(crate::ffi::WebMediaTrack)
+        }
+
+        pub(super) async fn close(&self) {
+            self.release_handle();
+            self.observation.close_local().await;
+        }
+
+        fn release_handle(&self) {
             if let Some(handle) = self.handle.take() {
                 let _ = release(handle, "track");
             }
         }
     }
 
-    impl Drop for WebVideoOutput {
+    impl Drop for Output {
         fn drop(&mut self) {
             self.release_handle();
         }
     }
 }
 
-#[derive(uniffi::Object)]
-pub struct WebVideoOutput {
-    #[cfg(target_arch = "wasm32")]
-    observation: crate::browser::media_observation::BrowserMediaObservation,
-    #[cfg(target_arch = "wasm32")]
-    handle: std::cell::Cell<Option<u64>>,
-}
-
-#[uniffi::export]
-impl WebVideoOutput {
-    pub fn track(&self) -> Option<super::WebMediaTrack> {
-        #[cfg(target_arch = "wasm32")]
-        {
-            (!self.observation.is_closed())
-                .then(|| self.handle.get())
-                .flatten()
-                .map(super::WebMediaTrack)
+macro_rules! playback_output {
+    ($subscription:ident, $output:ident) => {
+        #[uniffi::export]
+        impl $subscription {
+            pub async fn playback_output(&self) -> Result<Arc<$output>, WebAgentError> {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let observation = self
+                        .agent
+                        .runtime
+                        .observe_exact_media(self.owner)
+                        .await
+                        .map_err(|_| {
+                            if self.observer.state().closed {
+                                ErrorInfo::new(ErrorCode::Closed, "Media subscription is closed")
+                            } else {
+                                ErrorInfo::new(
+                                    ErrorCode::NotReady,
+                                    "Playback output is unavailable",
+                                )
+                            }
+                        })?;
+                    Ok(Arc::new($output {
+                        output: playback::Output::new(observation)?,
+                    }))
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                Err(super::browser_required())
+            }
         }
-        #[cfg(not(target_arch = "wasm32"))]
-        None
-    }
 
-    pub async fn close(&self) {
-        #[cfg(target_arch = "wasm32")]
-        {
-            self.release_handle();
-            self.observation.close_local().await;
+        #[derive(uniffi::Object)]
+        pub struct $output {
+            #[cfg(target_arch = "wasm32")]
+            output: playback::Output,
         }
-    }
+
+        #[uniffi::export]
+        impl $output {
+            pub fn track(&self) -> Option<super::WebMediaTrack> {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    self.output.track()
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                None
+            }
+
+            pub async fn close(&self) {
+                #[cfg(target_arch = "wasm32")]
+                self.output.close().await;
+            }
+        }
+    };
 }
 
-#[derive(uniffi::Object)]
-pub struct VideoSubscriptionUpdates {
-    cursor: observer::VideoSubscriptionUpdates,
-}
-
-#[uniffi::export]
-impl VideoSubscriptionUpdates {
-    pub async fn next(&self) -> Result<Option<ffi::VideoSubscriptionState>, WebAgentError> {
-        let next = self.cursor.next().map_err(|_| {
-            ErrorInfo::new(
-                ErrorCode::Conflict,
-                "An observation read is already pending",
-            )
-        })?;
-        Ok(next.await)
-    }
-
-    pub fn close(&self) {
-        self.cursor.close();
-    }
-}
+playback_output!(VideoSubscription, WebVideoOutput);
+playback_output!(AudioSubscription, WebAudioOutput);

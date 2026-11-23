@@ -14,11 +14,7 @@ import type {
   DataSubscriptionState as ObservedDataSubscriptionState,
 } from "./schema.js";
 import type { AudioPublication, VideoPublication } from "./media.js";
-import type {
-  AudioSelection,
-  AudioSubscription,
-  VideoSubscription,
-} from "./reception.js";
+import type { AudioSubscription, VideoSubscription } from "./reception.js";
 
 import type { Delivery } from "./track.js";
 import type { LocalDataTrack, RemoteDataTrack } from "./data.js";
@@ -483,7 +479,6 @@ export interface Agent {
   audio(trackId: string): LocalAudioTrack;
   data<D extends Delivery>(trackId: string, delivery: D): LocalDataTrack<D>;
   room(name: string): RoomRef;
-  selectAudio(policy: AudioDemand): Promise<AudioSelection>;
   /** Synchronously replace the desired room; Core owns admission and recovery. */
   join(room: string): void;
   renew(token: string): void;

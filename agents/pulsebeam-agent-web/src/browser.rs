@@ -33,10 +33,10 @@ use crate::sender_config::{
     EncodingConfig, SenderConfig, media_kind_name, normalize_sender_config,
 };
 
-mod catalog;
+pub(crate) mod catalog;
 pub(crate) mod media_observation;
 mod preparation;
-mod publication;
+pub(crate) mod publication;
 mod resource_state;
 pub use publication::{
     BrowserPipe, BrowserPipeUpdates, BrowserPublicationObserver, BrowserPublicationUpdates,
@@ -53,7 +53,7 @@ fn same_js_object<T: AsRef<JsValue>>(left: &T, right: &T) -> bool {
     left == right
 }
 
-fn input_is_live(track: &MediaStreamTrack) -> bool {
+pub(crate) fn input_is_live(track: &MediaStreamTrack) -> bool {
     Reflect::get(track.as_ref(), &JsValue::from_str("readyState"))
         .ok()
         .and_then(|value| value.as_string())
@@ -703,18 +703,81 @@ impl BrowserRuntime {
         ),
         agent_core::ffi::ErrorInfo,
     > {
+        use agent_core::ResourceCommand;
+        self.claim_observed_resource(ResourceCommand::ClaimVideo { selector }, |owner| {
+            self.apply_resource(ResourceCommand::ObserveVideo { owner, observation })?;
+            self.video_state_observer(owner)
+        })
+    }
+
+    #[cfg(feature = "uniffi")]
+    pub(crate) fn claim_audio(
+        &self,
+        selector: agent_core::TrackSelector,
+        playout_delay: agent_core::PlayoutDelay,
+    ) -> Result<
+        (
+            u64,
+            Rc<agent_core::observer::AudioSubscriptionStateObserver>,
+        ),
+        agent_core::ffi::ErrorInfo,
+    > {
+        use agent_core::ResourceCommand;
+        self.claim_observed_resource(
+            ResourceCommand::ClaimAudioSubscription { selector },
+            |owner| {
+                self.apply_resource(ResourceCommand::ConfigureAudio {
+                    owner,
+                    playout_delay,
+                })?;
+                self.audio_state_observer(owner)
+            },
+        )
+    }
+
+    #[cfg(feature = "uniffi")]
+    pub(crate) fn claim_data_publication(
+        &self,
+        spec: agent_core::TrackSpec,
+    ) -> Result<
+        (u64, Rc<agent_core::observer::DataPublicationStateObserver>),
+        agent_core::ffi::ErrorInfo,
+    > {
+        self.claim_observed_resource(
+            agent_core::ResourceCommand::DeclareDataPublication { spec },
+            |owner| self.data_publication_state_observer(owner),
+        )
+    }
+
+    #[cfg(feature = "uniffi")]
+    pub(crate) fn claim_data_subscription(
+        &self,
+        spec: agent_core::TrackSpec,
+        source: agent_core::TrackSelector,
+    ) -> Result<
+        (u64, Rc<agent_core::observer::DataSubscriptionStateObserver>),
+        agent_core::ffi::ErrorInfo,
+    > {
+        self.claim_observed_resource(
+            agent_core::ResourceCommand::ReceiveData { spec, source },
+            |owner| self.data_subscription_state_observer(owner),
+        )
+    }
+
+    #[cfg(feature = "uniffi")]
+    fn claim_observed_resource<T>(
+        &self,
+        command: agent_core::ResourceCommand,
+        observe: impl FnOnce(u64) -> Result<T, agent_core::ffi::ErrorInfo>,
+    ) -> Result<(u64, T), agent_core::ffi::ErrorInfo> {
         use agent_core::{ResourceCommand, ResourceResult, ffi};
-        let ResourceResult::Owned { owner } =
-            self.apply_resource(ResourceCommand::ClaimVideo { selector })?
-        else {
+        let ResourceResult::Owned { owner } = self.apply_resource(command)? else {
             return Err(ffi::ErrorInfo::new(
                 ffi::ErrorCode::Internal,
-                "Unexpected video subscription declaration result",
+                "Unexpected resource declaration result",
             ));
         };
-        let result = self
-            .apply_resource(ResourceCommand::ObserveVideo { owner, observation })
-            .and_then(|_| self.video_state_observer(owner));
+        let result = observe(owner);
         if result.is_err() {
             let _ = self.apply_resource(ResourceCommand::Release { owner });
         }
@@ -722,7 +785,7 @@ impl BrowserRuntime {
     }
 
     #[cfg(feature = "uniffi")]
-    pub(crate) async fn observe_video(
+    pub(crate) async fn observe_exact_media(
         &self,
         owner: u64,
     ) -> Result<media_observation::BrowserMediaObservation, JsValue> {
@@ -730,7 +793,7 @@ impl BrowserRuntime {
     }
 
     #[cfg(feature = "uniffi")]
-    pub(crate) fn close_video(&self, owner: u64) -> Result<(), agent_core::ffi::ErrorInfo> {
+    pub(crate) fn release_media_owner(&self, owner: u64) -> Result<(), agent_core::ffi::ErrorInfo> {
         if !self.inner.is_closed() {
             self.apply_resource(agent_core::ResourceCommand::Release { owner })?;
         }
@@ -801,27 +864,8 @@ impl BrowserRuntime {
     }
 
     pub fn configure_publication(&self, owner: u64, enabled: bool) -> Result<(), JsValue> {
-        let actor = self.inner.actor.borrow().clone().ok_or_else(|| {
-            operation_error_value(agent_core::ffi::ErrorInfo::new(
-                agent_core::ffi::ErrorCode::Closed,
-                "Browser runtime is closed",
-            ))
-        })?;
-        let result = actor
-            .resource_now(agent_core::ResourceCommand::SetPublicationMuted {
-                owner,
-                muted: !enabled,
-            })
-            .map_err(operation_error_value)?;
-        let host = BrowserHost::new(&self.inner);
-        if let agent_core::ResourceResult::PublicationInputState(state) = result {
-            host.publication_input_state(&state);
-        }
-        if let Some(notification) = self.inner.prepare_current_publication(owner) {
-            notification.notify();
-        }
-        host.notify_prepared_pipe_states();
-        Ok(())
+        self.configure_publication_state(owner, enabled)
+            .map_err(operation_error_value)
     }
 
     pub fn resource_now(&self, command: JsValue) -> Result<JsValue, JsValue> {
@@ -1135,44 +1179,53 @@ impl BrowserRuntime {
 
     pub fn publication(&self, owner: u64) -> Result<BrowserPublicationObserver, JsValue> {
         let observer = self
-            .inner
-            .publication_observers
-            .borrow()
-            .get(&owner)
-            .cloned()
-            .ok_or_else(|| js_error("publication owner is not active"))?;
+            .publication_state_observer(owner)
+            .map_err(operation_error_value)?;
         Ok(BrowserPublicationObserver { observer })
     }
 
     pub fn create_owned_publication_pipe(&self, owner: u64) -> Result<BrowserPipe, JsValue> {
-        self.inner.ensure_open().map_err(|_| {
-            operation_error_value(agent_core::ffi::ErrorInfo::new(
-                agent_core::ffi::ErrorCode::Closed,
-                "Browser runtime is closed",
-            ))
-        })?;
-        let actor = self
-            .inner
-            .actor
-            .borrow()
-            .clone()
-            .ok_or_else(|| js_error("runtime actor is not initialized"))?;
-        let result = actor
-            .resource_now(agent_core::ResourceCommand::AttachPublicationInput { owner })
-            .map_err(operation_error_value)?;
-        let agent_core::ResourceResult::PublicationInput {
+        self.attach_publication_pipe(owner)
+            .map_err(operation_error_value)
+    }
+
+    pub fn snapshot(&self) -> JsValue {
+        snapshot_value(&self.inner.snapshot())
+    }
+
+    pub fn diagnostics(&self) -> JsValue {
+        let value = Object::new();
+        set(&value, "peers", self.inner.peers.borrow().len());
+        set(&value, "requests", self.inner.requests.borrow().len());
+        set(&value, "timers", self.inner.timers.borrow().len());
+        set(&value, "closed", self.inner.is_closed());
+        set(&value, "lastError", self.inner.last_error.borrow().clone());
+        value.into()
+    }
+}
+
+impl BrowserRuntime {
+    pub(crate) fn attach_publication_pipe(
+        &self,
+        owner: u64,
+    ) -> Result<BrowserPipe, agent_core::ffi::ErrorInfo> {
+        use agent_core::{ResourceCommand, ResourceResult, ffi};
+        let actor = self.inner.intent_actor()?;
+        let internal = |message| ffi::ErrorInfo::new(ffi::ErrorCode::Internal, message);
+        let result = actor.resource_now(ResourceCommand::AttachPublicationInput { owner })?;
+        let ResourceResult::PublicationInput {
             operation,
             state: _,
         } = result
         else {
-            return Err(js_error("Core did not reserve a publication input"));
+            return Err(internal("Core did not reserve a publication input"));
         };
         let input = operation
             .input()
-            .ok_or_else(|| js_error("Core did not allocate a publication input ID"))?;
+            .ok_or_else(|| internal("Core did not allocate a publication input ID"))?;
         let initial = actor
             .pipe_state(input)
-            .ok_or_else(|| js_error("Core pipe state is unavailable"))?;
+            .ok_or_else(|| internal("Core pipe state is unavailable"))?;
         let observer = Rc::new(agent_core::observer::PipeStateObserver::new(initial));
         self.inner
             .pipe_observers
@@ -1194,61 +1247,79 @@ impl BrowserRuntime {
         Ok(pipe)
     }
 
-    pub fn snapshot(&self) -> JsValue {
-        snapshot_value(&self.inner.snapshot())
-    }
-
-    pub fn diagnostics(&self) -> JsValue {
-        let value = Object::new();
-        set(&value, "peers", self.inner.peers.borrow().len());
-        set(&value, "requests", self.inner.requests.borrow().len());
-        set(&value, "timers", self.inner.timers.borrow().len());
-        set(&value, "closed", self.inner.is_closed());
-        set(&value, "lastError", self.inner.last_error.borrow().clone());
-        value.into()
-    }
-}
-
-impl BrowserRuntime {
     fn claim_publication_spec(&self, spec: agent_core::TrackSpec) -> Result<JsValue, JsValue> {
-        self.inner.ensure_open().map_err(|_| {
-            operation_error_value(agent_core::ffi::ErrorInfo::new(
-                agent_core::ffi::ErrorCode::Closed,
-                "Browser runtime is closed",
-            ))
+        self.claim_media_publication(spec)
+            .map(resources::result)
+            .map_err(operation_error_value)
+    }
+
+    pub(crate) fn configure_publication_state(
+        &self,
+        owner: u64,
+        enabled: bool,
+    ) -> Result<(), agent_core::ffi::ErrorInfo> {
+        let actor = self.inner.intent_actor()?;
+        let result = actor.resource_now(agent_core::ResourceCommand::SetPublicationMuted {
+            owner,
+            muted: !enabled,
         })?;
+        let host = BrowserHost::new(&self.inner);
+        if let agent_core::ResourceResult::PublicationInputState(state) = result {
+            host.publication_input_state(&state);
+        }
+        if let Some(notification) = self.inner.prepare_current_publication(owner) {
+            notification.notify();
+        }
+        host.notify_prepared_pipe_states();
+        Ok(())
+    }
+
+    pub(crate) fn claim_media_publication(
+        &self,
+        spec: agent_core::TrackSpec,
+    ) -> Result<agent_core::ResourceResult, agent_core::ffi::ErrorInfo> {
+        use agent_core::{ResourceCommand, ResourceResult, ffi};
+        let actor = self.inner.intent_actor()?;
         let kind = spec.media_kind().ok_or_else(|| {
-            operation_error_value(agent_core::ffi::ErrorInfo::new(
-                agent_core::ffi::ErrorCode::InvalidArgument,
+            ffi::ErrorInfo::new(
+                ffi::ErrorCode::InvalidArgument,
                 "Expected a media publication declaration",
-            ))
+            )
         })?;
-        let actor = self.inner.actor.borrow().clone().ok_or_else(|| {
-            operation_error_value(agent_core::ffi::ErrorInfo::new(
-                agent_core::ffi::ErrorCode::Closed,
-                "Browser runtime is closed",
-            ))
-        })?;
-        let result = actor
-            .resource_now(agent_core::ResourceCommand::ClaimPublication { spec })
-            .map_err(operation_error_value)?;
-        let agent_core::ResourceResult::Publication {
+        let result = actor.resource_now(ResourceCommand::ClaimPublication { spec })?;
+        let ResourceResult::Publication {
             owner,
             slot,
             after_generation,
         } = &result
         else {
-            return Err(operation_error_value(agent_core::ffi::ErrorInfo::new(
-                agent_core::ffi::ErrorCode::Internal,
+            return Err(ffi::ErrorInfo::new(
+                ffi::ErrorCode::Internal,
                 "Unexpected publication declaration result",
-            )));
+            ));
         };
         self.inner
             .register_publication(*owner, slot, kind, *after_generation);
         if let Some(notification) = self.inner.prepare_current_publication(*owner) {
             notification.notify();
         }
-        Ok(resources::result(result))
+        Ok(result)
+    }
+
+    pub(crate) fn publication_state_observer(
+        &self,
+        owner: u64,
+    ) -> Result<Rc<agent_core::observer::PublicationStateObserver>, agent_core::ffi::ErrorInfo>
+    {
+        use agent_core::ffi;
+        self.inner
+            .publication_observers
+            .borrow()
+            .get(&owner)
+            .cloned()
+            .ok_or_else(|| {
+                ffi::ErrorInfo::new(ffi::ErrorCode::Closed, "Publication owner is not active")
+            })
     }
 }
 

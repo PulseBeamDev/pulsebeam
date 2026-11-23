@@ -76,12 +76,7 @@ pub struct BrowserCatalogWatch {
 #[wasm_bindgen]
 impl BrowserCatalogWatch {
     pub fn state(&self) -> JsValue {
-        if let Some(runtime) = self.runtime.upgrade() {
-            let notifications = runtime.prepare_current_catalogs();
-            for notification in notifications {
-                notification();
-            }
-        }
+        self.refresh();
         self.shared.value()
     }
 
@@ -117,6 +112,33 @@ impl BrowserCatalogWatch {
         if let Some(notification) = notification {
             notification();
         }
+    }
+}
+
+impl BrowserCatalogWatch {
+    fn refresh(&self) {
+        if let Some(runtime) = self.runtime.upgrade() {
+            for notification in runtime.prepare_current_catalogs() {
+                notification();
+            }
+        }
+    }
+
+    #[cfg(feature = "uniffi")]
+    pub(crate) fn current_state(&self) -> ffi::WatchState {
+        self.refresh();
+        self.shared.observer.state()
+    }
+
+    #[cfg(feature = "uniffi")]
+    pub(crate) fn open_updates(&self) -> Result<observer::WatchUpdates, ffi::ErrorInfo> {
+        self.refresh();
+        self.shared.observer.updates().map_err(|_| {
+            ffi::ErrorInfo::new(
+                ffi::ErrorCode::CapacityExceeded,
+                "Watch observer capacity exceeded",
+            )
+        })
     }
 }
 
@@ -160,25 +182,21 @@ impl BrowserRuntime {
         limit: u32,
         cursor: Vec<u8>,
     ) -> Result<BrowserCatalogWatch, JsValue> {
-        if self.inner.is_closed() {
-            return Err(operation_error_value(ffi::ErrorInfo::new(
-                ffi::ErrorCode::Closed,
-                "Watch runtime is closed",
-            )));
-        }
+        self.open_watch(room, ffi::WatchConfig { limit, cursor })
+            .map_err(operation_error_value)
+    }
+}
+
+impl BrowserRuntime {
+    pub(crate) fn open_watch(
+        &self,
+        room: String,
+        options: ffi::WatchConfig,
+    ) -> Result<BrowserCatalogWatch, ffi::ErrorInfo> {
         let (owner, state) = self
             .inner
-            .actor
-            .borrow()
-            .as_ref()
-            .ok_or_else(|| {
-                operation_error_value(ffi::ErrorInfo::new(
-                    ffi::ErrorCode::Closed,
-                    "Actor is not running",
-                ))
-            })?
-            .open_catalog_watch(room, ffi::WatchConfig { limit, cursor })
-            .map_err(operation_error_value)?;
+            .intent_actor()?
+            .open_catalog_watch(room, options)?;
         let shared = Rc::new(CatalogObserver::new(state));
         self.inner
             .catalog_observers

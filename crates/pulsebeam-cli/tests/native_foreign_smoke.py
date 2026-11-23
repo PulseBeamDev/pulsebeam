@@ -2,6 +2,7 @@
 
 import asyncio
 import importlib
+import math
 import os
 from pathlib import Path
 import shutil
@@ -96,7 +97,7 @@ async def witness(endpoint, token, reader_token, catalog_token, room, package):
             )], dependency_descriptor=True,
         ))
         publication = agent.video("foreign-camera").publish()
-        await publication.set_source(camera)
+        _pipe = camera.pipe_to(publication)
         agent.join(room)
         await asyncio.gather(joined(agent), joined(reader))
         changed_page = await catalog_page(lambda participants: any(
@@ -208,23 +209,10 @@ async def witness(endpoint, token, reader_token, catalog_token, room, package):
         await video_interest.close()
         assert video_interest.is_closed(), "foreign video interest did not close"
         assert not interest.is_closed(), "video close ended the independent audio interest"
-        audio_policy = core.AudioDemand(
-            pinned=["absent-source"], selected=[],
-            playout_delays=[], selector_delays=[],
-        )
-        all_audio = await agent.select_audio(audio_policy)
-        audio_policy.pinned = []
-        await all_audio.configure(audio_policy)
-        try:
-            await all_audio.observe_source("absent-source", native.ReceiveMode.DECODED)
-        except native.NativeError.Closed:
-            pass
-        else:
-            raise AssertionError("inactive audio policy authorized an exact-source observation")
-        assert not all_audio.is_closed(), "refused observation ended its audio policy"
-        await all_audio.close()
-        assert all_audio.is_closed(), "foreign audio policy did not close"
-        assert not interest.is_closed(), "policy close ended the independent named audio interest"
+        sibling_audio = agent.room(room).participant("another-publisher").audio("microphone").subscribe()
+        await sibling_audio.close()
+        assert sibling_audio.state().closed, "second exact audio interest did not close"
+        assert not interest.is_closed(), "audio close ended an independent named audio interest"
         await interest.close()
         assert interest.is_closed(), "foreign audio interest did not close"
         try:
@@ -290,10 +278,24 @@ async def publish_live(endpoint, token, room, package):
         )], dependency_descriptor=True,
     ))
     publication = agent.video("camera").publish()
-    await publication.set_source(camera)
+    _pipe = camera.pipe_to(publication)
+    microphone = await agent.create_audio_input()
+    audio = agent.audio("microphone").publish()
+    _audio_pipe = microphone.pipe_to(audio)
     data = agent.data("frame-events", core.TopicMode.ORDERED).publish()
     agent.join(room)
-    await admitted_publication(core, publication)
+    await asyncio.gather(admitted_publication(core, publication), admitted_publication(core, audio))
+
+    async def tone():
+        sample_rate = 48_000
+        samples = [round(8000 * math.sin(2 * math.pi * 1000 * index / sample_rate)) for index in range(480)]
+        timestamp = await microphone.capture_time_us()
+        while True:
+            await microphone.submit(native.InputFrame.PCM(frame=native.PcmFrame(
+                sample_rate_hz=sample_rate, channels=1, samples=samples, timestamp_us=timestamp,
+            )))
+            timestamp += 10_000
+            await asyncio.sleep(0.01)
 
     async def frames():
         sequence = 0
@@ -308,17 +310,20 @@ async def publish_live(endpoint, token, room, package):
             # Live source cadence, not a retry of an accepted frame or payload.
             await asyncio.sleep(1 / 30)
 
-    pump = asyncio.create_task(frames())
+    pumps = [asyncio.create_task(frames()), asyncio.create_task(tone())]
     stop = asyncio.create_task(asyncio.to_thread(sys.stdin.readline))
     try:
-        done, _ = await asyncio.wait([pump, stop], return_when=asyncio.FIRST_COMPLETED)
+        done, _ = await asyncio.wait([*pumps, stop], return_when=asyncio.FIRST_COMPLETED)
         for task in done:
             task.result()
     finally:
-        pump.cancel()
-        await asyncio.gather(pump, return_exceptions=True)
+        for pump in pumps:
+            pump.cancel()
+        await asyncio.gather(*pumps, return_exceptions=True)
         await publication.close()
+        await audio.close()
         await camera.close()
+        await microphone.close()
         await agent.close()
 
 

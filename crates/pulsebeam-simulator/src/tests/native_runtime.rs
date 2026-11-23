@@ -1624,12 +1624,12 @@ async fn run_peer(
     let mut video = agent.create_video_input(Default::default()).await?;
     let mut audio = agent.create_audio_input().await?;
     let mut video_owner = agent.video("camera".into())?.publish(Default::default())?;
-    video_owner.set_source(Some(video.clone())).await?;
+    let initial_video_pipe = video.pipe_to(&video_owner)?;
     let mut audio_owner = agent
         .audio("microphone".into())?
         .publish(Default::default())?;
-    audio_owner.set_source(Some(audio.clone())).await?;
-    video_owner.set_source(None).await?;
+    let _audio_pipe = audio.pipe_to(&audio_owner)?;
+    initial_video_pipe.close().await?;
     let video_updates = video_owner.updates()?;
     let pending_video = video_updates
         .next()
@@ -1701,7 +1701,7 @@ async fn run_peer(
             && !video.is_closed(),
         "input-free publication was not admitted idle before the first frame"
     );
-    video_owner.set_source(Some(video.clone())).await?;
+    let _video_pipe = video.pipe_to(&video_owner)?;
     video_owner.ready().await?;
     anyhow::ensure!(
         video_owner.state().admission.publication_id == admitted_video.admission.publication_id,
@@ -1958,11 +1958,11 @@ async fn run_peer(
     video = agent.create_video_input(Default::default()).await?;
     audio = agent.create_audio_input().await?;
     video_owner = agent.video("camera".into())?.publish(Default::default())?;
-    video_owner.set_source(Some(video.clone())).await?;
+    let video_pipe = video.pipe_to(&video_owner)?;
     audio_owner = agent
         .audio("microphone".into())?
         .publish(Default::default())?;
-    audio_owner.set_source(Some(audio.clone())).await?;
+    let audio_pipe = audio.pipe_to(&audio_owner)?;
     video_owner.ready().await?;
     audio_owner.ready().await?;
     barriers.before_reconnect.wait().await;
@@ -1990,8 +1990,10 @@ async fn run_peer(
     let replaced_audio_input = audio;
     video = agent.create_video_input(Default::default()).await?;
     audio = agent.create_audio_input().await?;
-    video_owner.set_source(Some(video.clone())).await?;
-    audio_owner.set_source(Some(audio.clone())).await?;
+    video_pipe.close().await?;
+    audio_pipe.close().await?;
+    let _replacement_video_pipe = video.pipe_to(&video_owner)?;
+    let _replacement_audio_pipe = audio.pipe_to(&audio_owner)?;
     video_owner.ready().await?;
     audio_owner.ready().await?;
     anyhow::ensure!(
@@ -2387,7 +2389,7 @@ async fn prove_takeover(config: Config, host: NativeHost, room: &str) -> anyhow:
     let publication = old
         .video("takeover-camera".into())?
         .publish(Default::default())?;
-    publication.set_source(Some(video.clone())).await?;
+    let _pipe = video.pipe_to(&publication)?;
     predecessor.join(room.to_owned())?;
     let first = wait_connected(&old, None).await?;
     let updates = publication.updates()?;
@@ -2484,7 +2486,7 @@ async fn prove_held_creation_takeover(
     let publication = old
         .video("held-camera".into())?
         .publish(Default::default())?;
-    publication.set_source(Some(video.clone())).await?;
+    let _pipe = video.pipe_to(&publication)?;
     let snapshots = old.snapshots();
     let connected = Rc::new(Cell::new(false));
     let superseded = Rc::new(Cell::new(false));

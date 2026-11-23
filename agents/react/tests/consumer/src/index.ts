@@ -3,7 +3,6 @@ import {
   Data,
   usePublish,
   useSubscribe,
-  SelectAudio,
   Video,
   useAgent,
   useCapture,
@@ -71,7 +70,6 @@ Video({
   ),
   onPlaybackError: (failure: PlaybackError) => void failure.retry(),
 });
-SelectAudio({ agent, policy: { pinned: ["voice"] } });
 Audio({ source: useSubscribe(remote.audio("microphone")) });
 // @ts-expect-error Logical refs cannot implicitly create a receive owner.
 Video({ source: remote.video("camera") });

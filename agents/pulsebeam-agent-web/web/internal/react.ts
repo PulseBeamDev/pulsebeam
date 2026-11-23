@@ -5,7 +5,6 @@ export { attachMedia } from "../media-attachment.js";
 export type { BorrowedMediaAttachment } from "../media-attachment.js";
 export {
   attachRemoteAudio,
-  attachRemoteVideo,
   validateReceiveOptions,
 } from "../remote-catalog.js";
 export type { ManagedAgent } from "../agent.js";

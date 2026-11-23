@@ -17,7 +17,41 @@ use std::sync::Arc;
 
 use agent_core::ffi::{AgentState, ErrorCode, ErrorInfo};
 
+macro_rules! state_cursor {
+    ($name:ident, $state:ident) => {
+        state_cursor!($name, $state, $name);
+    };
+    ($name:ident, $state:ident, $core:ident) => {
+        #[derive(uniffi::Object)]
+        pub struct $name {
+            cursor: agent_core::observer::$core,
+        }
+
+        #[uniffi::export]
+        impl $name {
+            pub async fn next(&self) -> Result<Option<agent_core::ffi::$state>, WebAgentError> {
+                let next = self.cursor.next().map_err(|_| {
+                    ErrorInfo::new(
+                        ErrorCode::Conflict,
+                        "An observation read is already pending",
+                    )
+                })?;
+                Ok(next.await)
+            }
+
+            pub fn close(&self) {
+                self.cursor.close();
+            }
+        }
+    };
+}
+
+mod catalog;
+mod data;
+mod pipe;
+mod publication;
 mod video;
+use publication::{LocalAudioTrack, LocalVideoTrack};
 use video::RoomRef;
 
 #[derive(uniffi::Record)]
@@ -93,6 +127,14 @@ impl Agent {
         }
     }
 
+    pub fn video(self: Arc<Self>, label: String) -> Result<Arc<LocalVideoTrack>, WebAgentError> {
+        LocalVideoTrack::new(self, label)
+    }
+
+    pub fn audio(self: Arc<Self>, label: String) -> Result<Arc<LocalAudioTrack>, WebAgentError> {
+        LocalAudioTrack::new(self, label)
+    }
+
     pub fn room(self: Arc<Self>, name: String) -> Result<Arc<RoomRef>, WebAgentError> {
         RoomRef::new(self, name).map(Arc::new)
     }
@@ -114,34 +156,14 @@ impl Agent {
     pub fn updates(&self) -> Result<Arc<AgentUpdates>, WebAgentError> {
         #[cfg(target_arch = "wasm32")]
         {
-            let updates = self.runtime.open_updates().map_err(|_| {
+            let cursor = self.runtime.open_updates().map_err(|_| {
                 ErrorInfo::new(ErrorCode::CapacityExceeded, "Observer capacity exceeded")
             })?;
-            Ok(Arc::new(AgentUpdates { updates }))
+            Ok(Arc::new(AgentUpdates { cursor }))
         }
         #[cfg(not(target_arch = "wasm32"))]
         Err(browser_required())
     }
 }
 
-#[derive(uniffi::Object)]
-pub struct AgentUpdates {
-    updates: agent_core::observer::AgentUpdates,
-}
-
-#[uniffi::export]
-impl AgentUpdates {
-    pub async fn next(&self) -> Result<Option<AgentState>, WebAgentError> {
-        let next = self.updates.next().map_err(|_| {
-            ErrorInfo::new(
-                ErrorCode::Conflict,
-                "An observation read is already pending",
-            )
-        })?;
-        Ok(next.await)
-    }
-
-    pub fn close(&self) {
-        self.updates.close();
-    }
-}
+state_cursor!(AgentUpdates, AgentState);

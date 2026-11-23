@@ -23,13 +23,13 @@ try {
     dependencyDescriptor: true,
   });
   const publication = agent.video("node-camera").publish();
-  await publication.setSource(camera);
   const publicationUpdates = publication.updates();
   assert(PublicationUpdates.instanceOf(publicationUpdates));
   const pendingPublication = publication.state();
   assert.equal(pendingPublication.admission.status, PublicationAdmissionStatus.Pending);
   assert.equal(pendingPublication.admission.demand, PublicationDemand.Unknown);
   assert.equal((await publicationUpdates.next()).observationRevision, pendingPublication.observationRevision);
+  const pipe = camera.pipeTo(publication);
   agent.join(room);
   try {
     while (true) {
@@ -114,6 +114,7 @@ try {
   await interest.close();
   assert.deepEqual(new Uint8Array(pixels.data), retained);
   await publication.close();
+  pipe.uniffiDestroy();
   assert.equal(publication.state().closed, true);
   assert.equal((await publicationUpdates.next()).closed, true);
   assert.equal(await publicationUpdates.next(), undefined);

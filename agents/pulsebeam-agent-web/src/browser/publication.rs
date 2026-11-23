@@ -56,18 +56,28 @@ impl BrowserPipe {
         track: web_sys::MediaStreamTrack,
         config: JsValue,
     ) -> Result<(), JsValue> {
-        if self.closed.get() || self.observer.state().status == ffi::PipeStatus::Closed {
-            return Err(operation_error_value(ffi::ErrorInfo::new(
-                ffi::ErrorCode::Closed,
-                "Pipe is closed",
-            )));
-        }
         let config: super::SenderConfig = serde_wasm_bindgen::from_value(config).map_err(|_| {
             operation_error_value(ffi::ErrorInfo::new(
                 ffi::ErrorCode::InvalidArgument,
                 "Invalid sender configuration",
             ))
         })?;
+        self.install_input(track, config).await
+    }
+}
+
+impl BrowserPipe {
+    pub(crate) async fn install_input(
+        &self,
+        track: web_sys::MediaStreamTrack,
+        config: super::SenderConfig,
+    ) -> Result<(), JsValue> {
+        if self.closed.get() || self.observer.state().status == ffi::PipeStatus::Closed {
+            return Err(operation_error_value(ffi::ErrorInfo::new(
+                ffi::ErrorCode::Closed,
+                "Pipe is closed",
+            )));
+        }
         let inner = self.inner.upgrade().ok_or_else(|| {
             operation_error_value(ffi::ErrorInfo::new(
                 ffi::ErrorCode::Closed,
@@ -77,7 +87,7 @@ impl BrowserPipe {
         inner
             .replace_owned_input(
                 Some(track),
-                config.clone(),
+                config,
                 super::PublicationInputRequest {
                     owner: self.owner,
                     muted: None,
@@ -99,8 +109,28 @@ impl BrowserPipe {
         }
         Ok(())
     }
+}
 
+#[wasm_bindgen]
+impl BrowserPipe {
     pub fn state(&self) -> JsValue {
+        pipe_state_value(&self.current_state())
+    }
+
+    pub fn updates(&self) -> Result<BrowserPipeUpdates, JsValue> {
+        self.open_updates()
+            .map(|updates| BrowserPipeUpdates { updates })
+            .map_err(operation_error_value)
+    }
+
+    #[wasm_bindgen(unchecked_return_type = "Promise<void>")]
+    pub fn close(&self) -> Result<js_sys::Promise, JsValue> {
+        self.close_pipe().map_err(operation_error_value)
+    }
+}
+
+impl BrowserPipe {
+    pub(crate) fn current_state(&self) -> ffi::PipeState {
         let state = self.actor.pipe_state(self.input);
         let closed = state.is_none();
         if let Ok(notification) = self
@@ -109,23 +139,20 @@ impl BrowserPipe {
         {
             notification.notify();
         }
-        pipe_state_value(&self.observer.state())
+        self.observer.state()
     }
 
-    pub fn updates(&self) -> Result<BrowserPipeUpdates, JsValue> {
-        self.observer
-            .updates()
-            .map(|updates| BrowserPipeUpdates { updates })
-            .map_err(|_| {
-                operation_error_value(ffi::ErrorInfo::new(
-                    ffi::ErrorCode::CapacityExceeded,
-                    "Pipe observer capacity exceeded",
-                ))
-            })
+    pub(crate) fn open_updates(&self) -> Result<observer::PipeUpdates, ffi::ErrorInfo> {
+        self.current_state();
+        self.observer.updates().map_err(|_| {
+            ffi::ErrorInfo::new(
+                ffi::ErrorCode::CapacityExceeded,
+                "Pipe observer capacity exceeded",
+            )
+        })
     }
 
-    #[wasm_bindgen(unchecked_return_type = "Promise<void>")]
-    pub fn close(&self) -> Result<js_sys::Promise, JsValue> {
+    pub(crate) fn close_pipe(&self) -> Result<js_sys::Promise, ffi::ErrorInfo> {
         if let Some(closing) = self.closing.borrow().as_ref() {
             return Ok(closing.clone());
         }
@@ -137,7 +164,7 @@ impl BrowserPipe {
             Ok(agent_core::ResourceResult::PublicationInput { operation, .. }) => Some(operation),
             Ok(_) => None,
             Err(info) if info.code == ffi::ErrorCode::Closed => None,
-            Err(info) => return Err(operation_error_value(info)),
+            Err(info) => return Err(info),
         };
         self.closed.set(true);
         if let Some(inner) = self.inner.upgrade() {

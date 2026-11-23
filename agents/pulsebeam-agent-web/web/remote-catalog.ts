@@ -8,7 +8,8 @@ import {
 import type { MediaHost, MediaAttachment } from "./remote-media.js";
 import { attachMedia } from "./media-attachment.js";
 import {
-  claimVideoSubscription,
+  videoSubscriptionInitialized,
+  type VideoSubscription,
   defaultVideoObservation,
   defaultAudioSubscription,
   subscribeAudio,
@@ -95,7 +96,6 @@ export function watchCatalog(
 }
 
 const MAX_UINT32 = 0xffff_ffff;
-const videoOwners = new WeakMap<RemoteVideoTrack, VideoHandle>();
 const audioCatalogs = new WeakMap<object, RemoteCatalog>();
 
 export interface RemoteAudioAttachment {
@@ -155,9 +155,7 @@ class VideoHandle implements RemoteVideoTrack {
     readonly room: string,
     readonly participantId: string,
     readonly trackId: string,
-  ) {
-    videoOwners.set(this, this);
-  }
+  ) {}
   get id(): string | null {
     return this.catalog.resolve(
       this.room,
@@ -339,7 +337,6 @@ export class RemoteCatalog {
             handle.subscribe(configuration),
         });
         this.#publicVideos.set(handle, value);
-        videoOwners.set(value, handle);
       }
       return value;
     };
@@ -539,53 +536,31 @@ export class RemoteCatalog {
   }
 }
 
-export function attachRemoteVideo(
-  source: RemoteVideoTrack,
-  element: HTMLVideoElement,
-  onPlaybackBlocked?: PlaybackCallback,
-  options: Pick<RemoteMediaAttachmentOptions, "autoPlay"> & {
-    readonly preferences?: ReceiveOptions;
-  } = {},
-): RemoteVideoAttachment {
-  const handle = videoOwners.get(source);
-  if (!handle) throw new TypeError("invalid remote video source");
-  if (handle.catalog.closed)
-    throw new ResourceError("closed", "agent is closed");
-  return attachVideoHandle(handle, element, onPlaybackBlocked, options);
+export function videoAttachmentConfiguration(
+  options: ReceiveOptions,
+): VideoObservation {
+  const preferences = validateReceiveOptions(options);
+  return {
+    visible: true,
+    height: 0,
+    minHeight: preferences.minHeight ?? 0,
+    minFps: preferences.minFps ?? 0,
+    priority: preferences.priority ?? 0,
+    playoutDelay: preferences.playoutDelay
+      ? { mode: "fixed", ...preferences.playoutDelay }
+      : { mode: "adaptive" },
+  };
 }
 
-function attachVideoHandle(
-  handle: VideoHandle,
+export function attachSubscribedVideo(
+  subscription: VideoSubscription,
   element: HTMLVideoElement,
-  onPlaybackBlocked: PlaybackCallback | undefined,
-  options: Pick<RemoteMediaAttachmentOptions, "autoPlay"> & {
-    readonly preferences?: ReceiveOptions;
-  },
+  onPlaybackBlocked?: PlaybackCallback,
+  options: Pick<RemoteMediaAttachmentOptions, "autoPlay"> = {},
 ): RemoteVideoAttachment {
   if (!(element instanceof HTMLVideoElement))
     throw new TypeError("remote attachment requires a video element");
-  const configuration = (options: ReceiveOptions): VideoObservation => {
-    const preferences = validateReceiveOptions(options);
-    return {
-      visible: true,
-      height: 0,
-      minHeight: preferences.minHeight ?? 0,
-      minFps: preferences.minFps ?? 0,
-      priority: preferences.priority ?? 0,
-      playoutDelay: preferences.playoutDelay
-        ? { mode: "fixed", ...preferences.playoutDelay }
-        : { mode: "adaptive" },
-    };
-  };
-  const claim = claimVideoSubscription(
-    handle.catalog.owners,
-    {
-      room: handle.room,
-      participantId: handle.participantId,
-      trackId: handle.trackId,
-    },
-    configuration(options.preferences ?? {}),
-  );
+  const ready = videoSubscriptionInitialized(subscription);
   const report = (error: unknown, retry: () => Promise<void>) =>
     onPlaybackBlocked?.(
       {
@@ -596,32 +571,32 @@ function attachVideoHandle(
       retry,
     );
   const attachment = attachMedia(
-    claim.subscription,
+    subscription,
     "video",
     element,
     options.autoPlay ?? true,
     report,
-    (error) => report(error, () => claim.ready),
-    claim.ready,
+    (error) => report(error, () => ready),
+    ready,
   );
   let closing: Promise<void> | undefined;
   return {
-    ready: claim.ready,
+    ready: ready,
     setAutoPlay: attachment.setAutoPlay,
     setPreferences: (next) => {
       if (closing) return;
-      const value = configuration(next);
-      void claim.subscription
+      const value = videoAttachmentConfiguration(next);
+      void subscription
         .configure(value)
         .catch((error: unknown) =>
-          report(error, () => claim.subscription.configure(value)),
+          report(error, () => subscription.configure(value)),
         );
     },
     retryPlayback: attachment.retryPlayback,
     close: () =>
       (closing ??= Promise.allSettled([
         attachment.close(),
-        claim.subscription.close(),
+        subscription.close(),
       ]).then(() => {})),
   };
 }

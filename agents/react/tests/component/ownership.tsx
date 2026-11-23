@@ -11,7 +11,6 @@ import {
   Audio,
   Data,
   useSubscribe,
-  SelectAudio,
   useAgent,
   type Agent,
   type DataEvent,
@@ -182,7 +181,6 @@ export async function ownershipAdapters() {
       source: boolean;
       enabled: boolean;
       duplicate: boolean;
-      selection: boolean;
     }>,
   ) => void;
   let duplicateFailure: Error | undefined;
@@ -206,7 +204,6 @@ export async function ownershipAdapters() {
       source: false,
       enabled: true,
       duplicate: false,
-      selection: false,
     });
     update = (patch) => setState((before) => ({ ...before, ...patch }));
     const equivalent = agent;
@@ -221,12 +218,6 @@ export async function ownershipAdapters() {
     return (
       <>
         <Audio source={audio} />
-        {state.selection && (
-          <SelectAudio
-            agent={equivalent}
-            policy={{ pinned: state.enabled ? ["voice"] : [] }}
-          />
-        )}
         <Data
           track={messages}
           onEvent={(event) => {
@@ -309,7 +300,7 @@ export async function ownershipAdapters() {
   assert.equal(runtime.ownedReplacements.at(-1)?.track, null);
   assert.equal(native.readyState, "live");
 
-  await flush(() => update({ source: true, duplicate: true, selection: true }));
+  await flush(() => update({ source: true, duplicate: true }));
   await flush();
   assert.ok(duplicateFailure instanceof ResourceOwnershipError);
   assert.deepEqual(
@@ -318,20 +309,6 @@ export async function ownershipAdapters() {
     "independent views share an explicit subscription",
   );
   assert.equal(runtime.claimedPublications.size, 1);
-  assert.equal(runtime.audioSelections.size, 1);
-  const selection = [...runtime.audioSelections.keys()][0]!;
-  assert.deepEqual(runtime.audioSelections.get(selection).pinned, []);
-  await flush(() => update({ enabled: true }));
-  assert.deepEqual([...runtime.audioSelections.keys()], [selection]);
-  assert.deepEqual(runtime.audioSelections.get(selection).pinned, ["voice"]);
-  await flush(() => update({ selection: false }));
-  assert.equal(runtime.audioSelections.size, 0);
-  assert.equal(
-    [...runtime.audioSubscriptions.keys()][0],
-    audioOwner,
-    "selection withdrawal does not close explicit reception",
-  );
-
   await flush(() => root.unmount());
   assert.equal(runtime.claimedPublications.size, 0);
   assert.equal(runtime.audioOwner, undefined);

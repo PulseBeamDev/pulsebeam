@@ -38,14 +38,12 @@ export type {
 } from "./data.js";
 export type { AudioPublication, Pipe, VideoPublication } from "./media.js";
 export { AudioSource, VideoSource } from "./capture-source.js";
-export { attachRemoteVideo, attachRemoteAudio } from "./remote-catalog.js";
+export { attachRemoteAudio } from "./remote-catalog.js";
 export type {
-  RemoteVideoAttachment,
   RemoteAudioAttachment,
   RemoteAudioAttachmentOptions,
 } from "./remote-catalog.js";
 export type {
-  AudioSelection,
   AudioSubscription,
   MediaObservation,
   VideoSubscription,

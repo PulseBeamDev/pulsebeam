@@ -50,7 +50,7 @@ impl VideoSource {
 }
 
 macro_rules! publication {
-    ($name:ident, $source:ident) => {
+    ($name:ident) => {
         #[derive(uniffi::Object)]
         pub struct $name {
             runtime: RuntimePublication,
@@ -72,15 +72,6 @@ macro_rules! publication {
                     ),
                 })?;
                 Ok(Arc::new(PublicationUpdates { runtime: updates }))
-            }
-            pub async fn set_source(
-                &self,
-                source: Option<Arc<$source>>,
-            ) -> Result<(), NativeError> {
-                self.runtime
-                    .set_source(source.as_ref().map(|source| &source.runtime))
-                    .await
-                    .map_err(Into::into)
             }
             pub async fn configure(
                 &self,
@@ -105,8 +96,8 @@ macro_rules! publication {
     };
 }
 
-publication!(VideoPublication, VideoSource);
-publication!(AudioPublication, AudioSource);
+publication!(VideoPublication);
+publication!(AudioPublication);
 
 #[uniffi::export]
 impl AudioSource {
@@ -361,36 +352,6 @@ impl AudioSubscription {
     }
 }
 
-#[derive(uniffi::Object)]
-pub struct AudioSelection {
-    runtime: RuntimeSubscription,
-}
-
-#[uniffi::export(async_runtime = "tokio")]
-impl AudioSelection {
-    pub fn is_closed(&self) -> bool {
-        self.runtime.is_closed()
-    }
-    pub async fn configure(&self, policy: core_ffi::AudioDemand) -> Result<(), NativeError> {
-        self.runtime
-            .configure_audio_policy(policy.into())
-            .await
-            .map_err(Into::into)
-    }
-    pub async fn observe_source(
-        &self,
-        source: String,
-        mode: ReceiveMode,
-    ) -> Result<Arc<RemoteMediaReceiver>, NativeError> {
-        Ok(Arc::new(RemoteMediaReceiver {
-            runtime: self.runtime.observe_source(source, mode).await?,
-        }))
-    }
-    pub async fn close(&self) -> Result<(), NativeError> {
-        self.runtime.close().await.map_err(Into::into)
-    }
-}
-
 #[uniffi::export(async_runtime = "tokio")]
 impl Agent {
     pub fn video(&self, track_id: String) -> Result<Arc<LocalVideoTrack>, NativeError> {
@@ -414,14 +375,6 @@ impl Agent {
     pub async fn create_audio_input(&self) -> Result<Arc<AudioSource>, NativeError> {
         Ok(Arc::new(AudioSource {
             runtime: self.runtime.create_audio_input().await?,
-        }))
-    }
-    pub async fn select_audio(
-        &self,
-        policy: core_ffi::AudioDemand,
-    ) -> Result<Arc<AudioSelection>, NativeError> {
-        Ok(Arc::new(AudioSelection {
-            runtime: self.runtime.select_audio(policy.into()).await?,
         }))
     }
 }

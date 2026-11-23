@@ -113,14 +113,6 @@ async def witness():
         video_publication = local_video.publish()
         assert not inspect.isawaitable(video_publication)
         assert video_publication.state().configuration.enabled is True
-        pipe = video_source.pipe_to(video_publication)
-        assert not inspect.isawaitable(pipe)
-        assert isinstance(pipe, native.Pipe)
-        pipe_updates = pipe.updates()
-        initial_pipe = pipe.state()
-        assert isinstance(pipe_updates, native.PipeUpdates)
-        assert isinstance(initial_pipe.status, core.PipeStatus)
-        assert (await pipe_updates.next()).observation_revision >= initial_pipe.observation_revision
         publication_updates = video_publication.updates()
         initial_publication = video_publication.state()
         assert isinstance(publication_updates, native.PublicationUpdates)
@@ -149,6 +141,14 @@ async def witness():
         assert video_publication.state().configuration.enabled is True
         await video_publication.configure(core.PublicationConfig(enabled=False))
         assert video_publication.state().configuration.enabled is False
+        pipe = video_source.pipe_to(video_publication)
+        assert not inspect.isawaitable(pipe)
+        assert isinstance(pipe, native.Pipe)
+        pipe_updates = pipe.updates()
+        initial_pipe = pipe.state()
+        assert isinstance(pipe_updates, native.PipeUpdates)
+        assert isinstance(initial_pipe.status, core.PipeStatus)
+        assert (await pipe_updates.next()).observation_revision >= initial_pipe.observation_revision
         unrelated_data = local.publish()
         unrelated_data.close()
         assert unrelated_data.state().closed
@@ -170,7 +170,8 @@ async def witness():
         publication_updates.close()
         assert not video_source.is_closed(), "publication close stopped producer"
         video_replacement = same_video.publish(configuration)
-        await video_replacement.set_source(video_source)
+        assert not hasattr(video_replacement, "set_source")
+        replacement_pipe = video_source.pipe_to(video_replacement)
         feedback = video_source.feedback()
         sibling_feedback = video_source.feedback()
         pending_feedback = asyncio.create_task(feedback.next())
@@ -181,11 +182,12 @@ async def witness():
         await sibling_feedback.close()
         await video_source.close()
         assert not video_replacement.is_closed(), "source stop closed publication ownership"
+        await replacement_pipe.close()
         await video_replacement.close()
         audio_publication = local_audio.publish()
         assert not inspect.isawaitable(audio_publication)
         assert audio_publication.state().configuration.enabled is True
-        await audio_publication.set_source(audio_source)
+        audio_pipe = audio_source.pipe_to(audio_publication)
         audio_publication_updates = audio_publication.updates()
         initial_audio_publication = await audio_publication_updates.next()
         assert initial_audio_publication.admission.status == core.PublicationAdmissionStatus.PENDING
@@ -228,11 +230,8 @@ async def witness():
         assert isinstance(audio_updates, native.AudioSubscriptionUpdates)
         assert (await video_updates.next()).observation_revision == video_state.observation_revision
         assert (await audio_updates.next()).observation_revision == audio_state.observation_revision
-        audio_selection = await agent.select_audio(core.AudioDemand(
-            pinned=[], selected=[], playout_delays=[], selector_delays=[],
-        ))
-        await audio_selection.close()
-        assert not audio_subscription.is_closed(), "selection close retired named audio demand"
+        assert not hasattr(agent, "select_audio")
+        assert not hasattr(native, "AudioSelection")
         frame_readers = []
         pending_frames = []
         for subscription, reader_type in (
@@ -383,9 +382,12 @@ async def witness():
         video_updates.close()
         audio_updates.close()
         final_audio_publication = await pending_audio_publication
-        assert final_audio_publication.closed and audio_publication.state().closed
+        while final_audio_publication is not None and not final_audio_publication.closed:
+            final_audio_publication = await audio_publication_updates.next()
+        assert final_audio_publication is not None and audio_publication.state().closed
         assert await audio_publication_updates.next() is None
         audio_publication_updates.close()
+        assert audio_pipe.state().status == core.PipeStatus.CLOSED
         final_state = await state_updates.next()
         assert final_state.status == core.AgentStatus.CLOSED
         assert final_state.desired_credential_revision == renewed_state.desired_credential_revision

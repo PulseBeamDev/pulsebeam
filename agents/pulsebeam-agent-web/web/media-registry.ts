@@ -17,6 +17,9 @@ const MAX_HANDLE = (1n << 64n) - 1n;
 const values = new Map<bigint, Entry>();
 const handles = new WeakMap<MediaValue, bigint>();
 let nextHandle = 1n;
+let pendingInput:
+  | { readonly id: bigint; readonly track: MediaStreamTrack }
+  | undefined;
 
 function matches(value: unknown, kind: MediaKind): value is MediaValue {
   return kind === "track"
@@ -60,8 +63,30 @@ Object.defineProperty(globalThis, "__pulsebeamMediaRegistry", {
   configurable: false,
   enumerable: false,
   writable: false,
-  value: registry,
+  value: Object.freeze({
+    ...registry,
+    takeInput(id: bigint): MediaStreamTrack | undefined {
+      if (pendingInput?.id !== id) return undefined;
+      const { track } = pendingInput;
+      pendingInput = undefined;
+      return track;
+    },
+  }),
 });
+
+// The generated source factory consumes this synchronously before returning.
+export function lowerInputTrack(track: MediaStreamTrack): bigint {
+  if (!(track instanceof MediaStreamTrack))
+    throw new TypeError("expected a MediaStreamTrack");
+  if (nextHandle > MAX_HANDLE)
+    throw new RangeError("browser media handle space exhausted");
+  const input = { id: nextHandle++, track };
+  pendingInput = input;
+  queueMicrotask(() => {
+    if (pendingInput === input) pendingInput = undefined;
+  });
+  return input.id;
+}
 
 export function lowerMediaStreamTrack(value: MediaStreamTrack): bigint {
   return registry.retain(value, "track");

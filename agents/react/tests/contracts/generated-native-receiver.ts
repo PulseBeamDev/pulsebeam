@@ -1,6 +1,53 @@
-import { Agent, AgentError, AgentStatus, ErrorCode } from "@pulsebeam/web";
+import {
+  Agent,
+  AgentError,
+  AgentStatus,
+  ErrorCode,
+  PipeStatus,
+  PublicationAdmissionStatus,
+  VideoSource,
+  WatchStatus,
+} from "@pulsebeam/web";
 import { createElement } from "react";
 import { createRoot } from "react-dom/client";
+
+async function expectDecodedTone(track: MediaStreamTrack): Promise<void> {
+  const stream = new MediaStream([track]);
+  const decoder = document.createElement("audio");
+  decoder.muted = true;
+  decoder.srcObject = stream;
+  const context = new AudioContext();
+  try {
+    await Promise.all([decoder.play(), context.resume()]);
+    const analyser = context.createAnalyser();
+    analyser.smoothingTimeConstant = 0;
+    const sink = context.createGain();
+    sink.gain.value = 0;
+    context
+      .createMediaStreamSource(stream)
+      .connect(analyser)
+      .connect(sink)
+      .connect(context.destination);
+    const spectrum = new Float32Array(analyser.frequencyBinCount);
+    for (let attempt = 0; attempt < 150; attempt++) {
+      analyser.getFloatFrequencyData(spectrum);
+      let peak = 0;
+      for (let index = 1; index < spectrum.length; index++) {
+        if (spectrum[index] > spectrum[peak]) peak = index;
+      }
+      const frequency = (peak * context.sampleRate) / analyser.fftSize;
+      if (Math.abs(frequency - 1000) < 50 && spectrum[peak] > -65) return;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    throw new Error(
+      "generated audio output did not decode the native 1 kHz tone",
+    );
+  } finally {
+    decoder.pause();
+    decoder.srcObject = null;
+    await context.close();
+  }
+}
 
 export async function receiveGenerated(config: {
   endpoint: string;
@@ -56,6 +103,180 @@ export async function receiveGenerated(config: {
       updates.close();
       updates.uniffiDestroy();
     }
+    const catalog = room.watch();
+    const catalogUpdates = catalog.updates();
+    try {
+      const loading = catalog.state();
+      if (
+        loading.status !== WatchStatus.Loading ||
+        loading.room !== config.sourceRoom ||
+        loading.limit !== 100 ||
+        catalog.state() !== loading ||
+        (await catalogUpdates.next())?.observationRevision !==
+          loading.observationRevision
+      ) {
+        throw new Error("packed catalog missed its bounded initial state");
+      }
+      const pendingCatalog = catalogUpdates.next();
+      await catalog.close();
+      if (
+        (await pendingCatalog)?.status !== WatchStatus.Closed ||
+        (await catalogUpdates.next()) !== undefined
+      ) {
+        throw new Error("packed catalog missed terminal state");
+      }
+    } finally {
+      catalogUpdates.close();
+      await catalog.close();
+      catalogUpdates.uniffiDestroy();
+      catalog.uniffiDestroy();
+    }
+    const remoteAudio = participant.audio("microphone");
+    const audio = remoteAudio.subscribe();
+    const audioUpdates = audio.updates();
+    try {
+      const initialAudio = audio.state();
+      if (
+        initialAudio.closed ||
+        initialAudio.selector.room !== config.sourceRoom ||
+        initialAudio.selector.participantId !== "native-publisher" ||
+        initialAudio.selector.trackId !== "microphone" ||
+        audio.state() !== initialAudio ||
+        (await audioUpdates.next())?.observationRevision !==
+          initialAudio.observationRevision
+      ) {
+        throw new Error(
+          "packed audio subscription lost its exact source or initial state",
+        );
+      }
+      const pendingOutput = audio.playbackOutput().then(
+        (output) => ({ output }),
+        (error: unknown) => ({ error }),
+      );
+      const pendingAudio = audioUpdates.next();
+      await audio.close();
+      const result = await pendingOutput;
+      if ("output" in result) {
+        await result.output.close();
+        result.output.uniffiDestroy();
+        throw new Error(
+          "an absent exact audio source acquired playback output",
+        );
+      }
+      if (
+        !AgentError.Operation.instanceOf(result.error) ||
+        result.error.inner.info.code !== ErrorCode.Closed
+      ) {
+        throw new Error("closing exact audio did not end playback acquisition");
+      }
+      if (
+        !(await pendingAudio)?.closed ||
+        (await audioUpdates.next()) !== undefined
+      ) {
+        throw new Error("packed audio subscription missed terminal state");
+      }
+    } finally {
+      audioUpdates.close();
+      await audio.close();
+      audioUpdates.uniffiDestroy();
+      audio.uniffiDestroy();
+      remoteAudio.uniffiDestroy();
+    }
+    const localData = agent.data("pending-data");
+    const remoteData = participant.data("frame-events");
+    const publicationData = localData.publish();
+    const subscriptionData = remoteData.subscribe();
+    try {
+      for (const owner of [publicationData, subscriptionData]) {
+        const updates = owner.updates();
+        try {
+          const initial = owner.state();
+          if (
+            initial.admission !== PublicationAdmissionStatus.Pending ||
+            initial.closed ||
+            owner.state() !== initial ||
+            (await updates.next())?.observationRevision !==
+              initial.observationRevision
+          ) {
+            throw new Error("packed data owner missed coherent pending state");
+          }
+          const pending = updates.next();
+          await owner.close();
+          if (
+            !(await pending)?.closed ||
+            (await updates.next()) !== undefined
+          ) {
+            throw new Error("packed data owner missed terminal state");
+          }
+        } finally {
+          updates.close();
+          updates.uniffiDestroy();
+        }
+      }
+    } finally {
+      await publicationData.close();
+      await subscriptionData.close();
+      publicationData.uniffiDestroy();
+      subscriptionData.uniffiDestroy();
+      localData.uniffiDestroy();
+      remoteData.uniffiDestroy();
+    }
+    const local = agent.video("pending-camera");
+    const publication = local.publish();
+    const publicationUpdates = publication.updates();
+    try {
+      const initial = publication.state();
+      if (
+        initial.admission.status !== PublicationAdmissionStatus.Pending ||
+        publication.state() !== initial ||
+        (await publicationUpdates.next())?.observationRevision !==
+          initial.observationRevision
+      ) {
+        throw new Error("packed publication has no coherent pending state");
+      }
+      const track = document
+        .createElement("canvas")
+        .captureStream(5)
+        .getVideoTracks()[0];
+      const source = VideoSource.fromTrack(track);
+      const pipe = source.pipeTo(publication);
+      const pipeUpdates = pipe.updates();
+      try {
+        const current = await pipeUpdates.next();
+        if (!current || current.status === PipeStatus.Closed) {
+          throw new Error("packed pipe closed before input attachment");
+        }
+        await pipe.close();
+        if (
+          (await pipeUpdates.next())?.status !== PipeStatus.Closed ||
+          (await pipeUpdates.next()) !== undefined ||
+          track.readyState !== "live" ||
+          publication.state().closed
+        ) {
+          throw new Error("packed pipe close did not isolate borrowed capture");
+        }
+      } finally {
+        pipeUpdates.close();
+        await pipe.close();
+        await source.close();
+        pipeUpdates.uniffiDestroy();
+        pipe.uniffiDestroy();
+        source.uniffiDestroy();
+      }
+      await publication.close();
+      if (
+        !(await publicationUpdates.next())?.closed ||
+        (await publicationUpdates.next()) !== undefined
+      ) {
+        throw new Error("packed publication cursor missed terminal state");
+      }
+    } finally {
+      publicationUpdates.close();
+      await publication.close();
+      publicationUpdates.uniffiDestroy();
+      publication.uniffiDestroy();
+      local.uniffiDestroy();
+    }
     agent.join(config.room);
     const output = await reception.playbackOutput();
     try {
@@ -103,6 +324,30 @@ export async function receiveGenerated(config: {
     } finally {
       await output.close();
       output.uniffiDestroy();
+    }
+    const microphone = participant.audio("microphone");
+    const listening = microphone.subscribe();
+    try {
+      const audioOutput = await listening.playbackOutput();
+      try {
+        const track = audioOutput.track();
+        if (!track || track.kind !== "audio")
+          throw new Error("missing exact audio track");
+        await expectDecodedTone(track);
+        await audioOutput.close();
+        if (track.readyState !== "ended" || listening.state().closed) {
+          throw new Error(
+            "audio playback close did not isolate subscription ownership",
+          );
+        }
+      } finally {
+        await audioOutput.close();
+        audioOutput.uniffiDestroy();
+      }
+    } finally {
+      await listening.close();
+      listening.uniffiDestroy();
+      microphone.uniffiDestroy();
     }
     await reception.close();
     await agent.close();

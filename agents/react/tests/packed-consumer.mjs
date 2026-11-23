@@ -35,7 +35,6 @@ for (const name of [
   "useCapture",
   "usePublish",
   "useSubscribe",
-  "SelectAudio",
   "Data",
   "Video",
   "Audio",
@@ -44,6 +43,7 @@ for (const name of [
 }
 assert.equal("Publish" in sdk, false, "publication ownership belongs to hooks");
 assert.equal("track" in sdk, false, "React descriptor export was removed");
+assert.equal("SelectAudio" in sdk, false, "React collection audio was removed");
 assert.equal(
   "createAgent" in sdk,
   false,
@@ -55,6 +55,16 @@ const web = await import(
 assert.equal(typeof web.Agent, "function");
 assert.equal("createAgent" in web, false);
 assert.equal("track" in web, false, "Web descriptor export was removed");
+assert.equal(
+  "attachRemoteVideo" in web,
+  false,
+  "Web playback requires explicit reception",
+);
+assert.equal(
+  "AudioSelection" in web,
+  false,
+  "Web collection audio was removed",
+);
 assert.equal(typeof web.VideoSource.fromTrack, "function");
 assert.equal(typeof web.AudioSource.fromTrack, "function");
 assert.equal(

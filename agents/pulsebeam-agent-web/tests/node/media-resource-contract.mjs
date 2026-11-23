@@ -113,13 +113,6 @@ export async function mediaResourceContract(pulsebeam) {
     const audio = await participant.audio("microphone").subscribe({
       playoutDelay: { mode: "adaptive" },
     });
-    const selection = await agent.selectAudio({});
-    await selection.close();
-    assert.equal(
-      audio.isClosed(),
-      false,
-      "selection close cannot release named audio ownership",
-    );
     const pendingVideo = assert.rejects(video.observe(), { code: "closed" });
     const pendingAudio = assert.rejects(audio.observe(), { code: "closed" });
     const pendingPublication = agent.video("late").publish({ enabled: true });

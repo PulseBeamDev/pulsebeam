@@ -115,23 +115,6 @@ impl Publication {
         result.await.map_err(|_| Error::Closed)?
     }
 
-    pub async fn set_source(&self, producer: Option<&ProducerInput>) -> Result<(), Error> {
-        if self.is_closed() {
-            return Err(Error::Closed);
-        }
-        let (response, result) = oneshot::channel();
-        self.inner
-            .commands
-            .send(Command::BindProducer {
-                owner: self.inner.owner,
-                producer: producer.cloned(),
-                response,
-            })
-            .await
-            .map_err(|_| Error::Closed)?;
-        result.await.map_err(|_| Error::Closed)?
-    }
-
     pub async fn configure(
         &self,
         configuration: agent_core::ffi::PublicationConfig,

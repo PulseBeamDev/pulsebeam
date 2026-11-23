@@ -547,11 +547,11 @@ async fn spawn_agent(
         .await?;
     let microphone = agent.create_audio_input().await?;
     let camera_owner = agent.video("camera".into())?.publish(Default::default())?;
-    camera_owner.set_source(Some(&camera)).await?;
+    let _camera_pipe = camera.pipe_to(&camera_owner)?;
     let microphone_owner = agent
         .audio("microphone".into())?
         .publish(Default::default())?;
-    microphone_owner.set_source(Some(&microphone)).await?;
+    let _microphone_pipe = microphone.pipe_to(&microphone_owner)?;
     let mut snapshots = agent.snapshots();
     agent.join(room_name)?;
     wait_until_connected(&mut snapshots).await?;

@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   RemoteCatalog,
-  attachRemoteVideo,
+  attachSubscribedVideo,
+  videoAttachmentConfiguration,
 } from "../../unit-javascript/remote-catalog.js";
 import { DataRegistry } from "../../unit-javascript/data.js";
 import { attachMedia } from "../../unit-javascript/media-attachment.js";
@@ -110,14 +111,15 @@ test("production attachment reports controlled geometry and visibility to core",
   const parent = new Video();
   const small = new Video();
   small.parentElement = parent;
-  const first = attachRemoteVideo(handle, small, undefined, {
-    preferences: { minHeight: 720 },
-  });
+  const first = attachSubscribedVideo(
+    handle.subscribe(videoAttachmentConfiguration({ minHeight: 720 })),
+    small,
+  );
   await first.ready;
   assert.equal(demand[0].height, 240);
   const large = new Video();
   large.rect.height = 230;
-  const second = attachRemoteVideo(handle, large);
+  const second = attachSubscribedVideo(handle.subscribe(), large);
   await second.ready;
   assert.equal(demand.length, 2);
   assert.equal(demand[1].height, 460);
@@ -255,5 +257,5 @@ test("production attachment reports controlled geometry and visibility to core",
   await subscription.close();
   assert.deepEqual(demand, []);
   catalog.close();
-  assert.throws(() => attachRemoteVideo(handle, small), { code: "closed" });
+  assert.throws(() => handle.subscribe(), { code: "closed" });
 });

@@ -116,27 +116,10 @@ for (const track of capture.getTracks()) track.stop();
 
 ## Receive and present video
 
-For ordinary DOM playback, an attachment owns receive demand and presentation:
+Subscribe to the exact remote track before attaching playback:
 
 ```ts
-import { attachRemoteVideo } from "@pulsebeam/web";
-
-const element = document.querySelector("video")!;
-const presentation = attachRemoteVideo(remoteCamera, element, undefined, {
-  preferences: { minHeight: 360, minFps: 15, priority: 100 },
-});
-await presentation.ready;
-```
-
-The attachment follows element geometry and source replacement. It supports
-`setPreferences`, `retryPlayback`, and asynchronous `close`. Supply its playback
-error callback when the application needs to offer a trusted-gesture retry.
-Close the attachment when the element no longer owns receive demand.
-
-For custom media consumers, acquire a subscription explicitly:
-
-```ts
-const subscription = await remoteCamera.subscribe({
+const subscription = remoteCamera.subscribe({
   visible: true,
   height: 720,
   minHeight: 360,
@@ -145,41 +128,20 @@ const subscription = await remoteCamera.subscribe({
   playoutDelay: { mode: "fixed", minMs: 100, maxMs: 200 },
 });
 const observation = await subscription.observe();
-const receivedTrack: MediaStreamTrack | null = observation.track();
+const receivedTrack = observation.track();
+const element = document.querySelector("video")!;
+if (receivedTrack) {
+  element.srcObject = new MediaStream([receivedTrack]);
+  await element.play();
+}
 ```
 
 An observation follows one physical receiver incarnation, not every future track
 for that name. Reacquire an observation after source retirement. Closing an
 observation releases that observation, not its subscription. Await
 `observation.close()` and `subscription.close()` when their respective owners end.
-The DOM attachment performs this observation management for you.
-
-## Select audio separately from playback
-
-```ts
-import { attachRemoteAudio } from "@pulsebeam/web";
-
-const selection = await agent.selectAudio({
-  selected: [{ room: "conference-42", participantId: "alice", label: "microphone" }],
-});
-const playback = attachRemoteAudio(agent, {
-  onPlaybackError(failure) {
-    // Call failure.retry() directly from the application's user-gesture handler.
-    showEnableAudioButton(() => failure.retry());
-  },
-});
-await playback.ready;
-```
-
-`showEnableAudioButton` is application UI in this example. Audio selection owns
-receive policy; playback owns the decoded output route and autoplay recovery.
-Attaching playback does not implicitly select remote audio. Use
-`selection.configure(policy)` to replace the selected sources. To choose sources
-from the room roster, open a bounded room watch first.
-
-Close `playback` and `selection` independently when their owners end. A custom
-audio consumer can instead use `participant.audio(label).subscribe(...)` and
-source-scoped observations.
+Clear the element’s `srcObject` when detaching playback. If the browser blocks
+`play()`, offer a user gesture to retry.
 
 ## Send and receive bytes
 

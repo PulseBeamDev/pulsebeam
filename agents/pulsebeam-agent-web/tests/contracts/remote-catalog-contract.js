@@ -1,7 +1,6 @@
 (async () => {
-  const { RemoteCatalog, attachRemoteVideo } = await import(
-    "/dist/remote-catalog.js"
-  );
+  const { RemoteCatalog, attachSubscribedVideo, videoAttachmentConfiguration } =
+    await import("/dist/remote-catalog.js");
   const { DataRegistry } = await import("/dist/data.js");
   const { ResourceOwners } = await import("/dist/resources.js");
   const snapshot = {
@@ -86,9 +85,10 @@
       display: "block",
     });
     host.append(element);
-    const attachment = attachRemoteVideo(handle, element, undefined, {
-      preferences: { minHeight: 720 },
-    });
+    const attachment = attachSubscribedVideo(
+      handle.subscribe(videoAttachmentConfiguration({ minHeight: 720 })),
+      element,
+    );
     attachments.push(attachment);
     return { element, attachment };
   };

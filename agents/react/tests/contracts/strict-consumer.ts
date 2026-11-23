@@ -1,7 +1,6 @@
 import {
   Audio,
   Data,
-  SelectAudio,
   Video,
   useAgent,
   useCapture,
@@ -233,7 +232,6 @@ Video({ source: audioSubscription });
 // @ts-expect-error Playback does not select or own agent-wide audio reception.
 Audio({ agent });
 createElement(Video, { source: capture.video });
-createElement(SelectAudio, { agent, policy: { pinned: ["voice"] } });
 createElement(Audio, {
   source: useSubscribe(remoteAudio),
   onPlaybackError: (failure) => void failure.retry(),

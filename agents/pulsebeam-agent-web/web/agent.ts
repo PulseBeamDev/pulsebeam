@@ -9,7 +9,6 @@ import {
 } from "./reconciliation-snapshot.js";
 import { DataRegistry, type LocalDataTrack } from "./data.js";
 import { track, type Delivery } from "./track.js";
-import { selectAudio } from "./reception.js";
 import {
   AgentObservation,
   OperationError,
@@ -24,7 +23,6 @@ import type {
   AgentSnapshot,
   AgentState as DesiredState,
   AgentUpdates,
-  AudioDemand,
   ConnectionState,
   CredentialOutcome,
   LogLevel,
@@ -329,9 +327,6 @@ class AgentFacade implements AgentApi {
   }
   room(name: string): RoomRef {
     return this.#remote.room(name);
-  }
-  selectAudio(policy: AudioDemand) {
-    return selectAudio(this.#resources, policy);
   }
   isClosed(): boolean {
     return this.#closed;
@@ -812,8 +807,6 @@ export class Agent implements AgentApi {
   readonly data: AgentApi["data"] = (trackId, delivery) =>
     this.#raw.data(trackId, delivery);
   readonly room: AgentApi["room"] = (name) => this.#raw.room(name);
-  readonly selectAudio: AgentApi["selectAudio"] = (policy) =>
-    this.#raw.selectAudio(policy);
   readonly isClosed = () => this.#raw.isClosed();
   readonly join = (room: string) => this.#raw.join(room);
   readonly renew = (token: string) => this.#raw.renew(token);

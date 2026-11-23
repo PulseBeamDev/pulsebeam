@@ -94,12 +94,12 @@ use pulsebeam_agent_native::agent_core::ffi::PublicationConfig;
 let camera = agent.create_video_input(Default::default()).await?;
 let publication = agent.video("camera".into())?
     .publish(PublicationConfig { enabled: true })?;
-publication.set_source(Some(&camera)).await?;
+let pipe = camera.pipe_to(&publication)?;
 agent.join("conference-42".into())?;
 publication.ready().await?;
 // Capture owned I420 frames and submit them through camera.submit(frame).await.
 publication.configure(PublicationConfig { enabled: false }).await?;
-publication.set_source(None).await?;
+pipe.close().await?;
 publication.close().await?;
 camera.close().await?;
 ```
@@ -108,13 +108,13 @@ Generated `publish(options?)` returns a `VideoPublication` or `AudioPublication`
 synchronously without requiring input or waiting for admission. Omitting options
 enables the publication by default. Python uses
 `publication = agent.video(label).publish()`, followed by
-`await publication.set_source(source)` to attach an existing concrete
+`pipe = source.pipe_to(publication)` to attach an existing concrete
 `VideoSource` or `AudioSource`. Audio inputs use `create_audio_input`; native video inputs take
 `VideoSourceConfig`. No source objects are nested in configuration records.
 
-Keep the source alive independently of the publication. `set_source(None)`
-withdraws its borrow, `configure` changes enabled state, and `close` releases
-publication ownership. None stops an independently owned producer. Closing or
+Retain the pipe for as long as the publication borrows the source. Closing the
+pipe withdraws that borrow, `configure` changes enabled state, and closing the
+publication releases publication ownership. None stops an independently owned producer. Closing or
 dropping the final source handle stops that producer and makes dependent input
 unavailable without closing publication ownership. A replacement source and its
 retired predecessor have separate lifetimes. Native sources are Agent-bound;
@@ -192,34 +192,17 @@ stock native profile rejects fixed audio delay; adaptive is the default. Closing
 observations. Do not mix owned subscriptions with raw desired state for the
 same media kind.
 
-For explicit collection audio reception, retain `Agent::select_audio` with the
-shared Core `AudioSubscription` policy. Set explicit pinned IDs or named
-selections and their delay maps. Use a bounded room watch when the application
-needs to discover sources. `Subscription::configure_audio_policy` replaces that owner's policy.
-It can coexist with named adaptive subscriptions through the same Core receive
-reconciler. Non-adaptive policy delays require exclusive audio ownership.
-Reception still requires actual negotiated receiver facts.
-
-Use `Subscription::observe_source(source_id, mode)` for an exact opaque
-publication ID from an owned catalog page. Obtaining that metadata requires
-Discover independently of the audio policy's Subscribe permission. Public
-snapshots do not expose an audio mapping. This observes existing policy demand;
-it does not pin the source or create receive demand. Each returned
-observation ends permanently on source or receiver retirement. A fresh matching
-physical receiver requires a fresh observation, never a different source under
-the old handle. Removing a source from the policy ends that owner's observations
-without disturbing another owner's demand. Use `observe(mode)` only with a
-named parent; a collection policy does not identify one implicit source.
+To discover audio sources, use a bounded room watch with Discover permission.
+Then subscribe to each chosen participant and track with Subscribe permission.
 
 Generated callers use `room(name).participant(id).video(label).subscribe(core.VideoObservation)`
 or `room(name).participant(id).audio(label).subscribe(core.AudioSubscriptionConfig)` and the
 returned typed subscription's `observe(mode)`. Video preferences contain only
 display demand, not a receiver slot or publication ID. Explicitly visible video
 with height zero has no height ceiling; set `visible: false` to withdraw display
-demand. `configure(record)` updates each owner's configuration. Collection audio
-uses `select_audio(core.AudioDemand)` and a distinct `AudioSelection` with
-`configure` and `observe_source`; it is not audible playback. Headless native
-APIs do not fabricate capture devices or playback controls.
+demand. `configure(record)` updates each owner's configuration. Generated bindings
+require an exact audio source for each subscription. Headless native APIs do not
+fabricate capture devices or playback controls.
 
 ### Media delivery and retirement
 

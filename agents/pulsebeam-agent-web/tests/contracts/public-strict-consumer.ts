@@ -2,7 +2,6 @@ import {
   AudioSource,
   VideoSource,
   Agent,
-  attachRemoteVideo,
   attachRemoteAudio,
   ResourceOwnershipError,
   AgentStatus,
@@ -312,20 +311,9 @@ const observation = await subscription.observe();
 const observedTrack: MediaStreamTrack | null = observation.track();
 await observation.close();
 await subscription.close();
-const presentation = attachRemoteVideo(
-  remoteVideo,
-  document.createElement("video"),
-  undefined,
-  { preferences: { minHeight: 360 } },
-);
 const playback = attachRemoteAudio(agent);
-await presentation.ready;
 await playback.ready;
-const retiredPresentation: Promise<void> = presentation.close();
 await playback.close();
-void retiredPresentation;
-// @ts-expect-error Presentation does not require application receiver bookkeeping.
-presentation.setPublicationIds([]);
 
 const audioSubscription = remoteAudio.subscribe({
   playoutDelay: { mode: "adaptive" },
@@ -348,13 +336,8 @@ void [audioState, nextAudioState, audioStateTyped, audioUpdateTyped];
 const deferredAudioSubscription: Promise<unknown> = audioSubscription;
 void deferredAudioSubscription;
 await audioSubscription.close();
-const selection = await agent.selectAudio({ pinned: [] });
-await selection.configure({
-  selected: [
-    { room: "meeting", participantId: "alice", trackId: "microphone" },
-  ],
-});
-await selection.close();
+// @ts-expect-error Audio demand must identify an exact remote track.
+agent.selectAudio({ pinned: [] });
 void observedTrack;
 // @ts-expect-error Receive ownership is not a reactive callback subscription.
 remoteVideo.subscribe(() => {});

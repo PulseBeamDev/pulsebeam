@@ -334,11 +334,6 @@ enum Command {
         video: Option<VideoSourceConfig>,
         response: oneshot::Sender<Result<ProducerInput, Error>>,
     },
-    BindProducer {
-        owner: u64,
-        producer: Option<ProducerInput>,
-        response: oneshot::Sender<Result<(), Error>>,
-    },
     InstallPipe {
         producer: ProducerInput,
         input: PublicationInput,
@@ -429,13 +424,8 @@ enum Command {
         playout_delay: agent_core::PlayoutDelay,
         response: oneshot::Sender<Result<Subscription, Error>>,
     },
-    AudioPolicy {
-        policy: agent_core::AudioSubscription,
-        response: oneshot::Sender<Result<Subscription, Error>>,
-    },
     ObserveSubscription {
         owner: u64,
-        source: Option<String>,
         mode: ReceiveMode,
         response: oneshot::Sender<Result<RemoteMedia, Error>>,
     },
@@ -661,18 +651,6 @@ impl Agent {
                 playout_delay: agent_core::PlayoutDelay::Adaptive,
                 response,
             })
-            .await
-            .map_err(|_| Error::Closed)?;
-        result.await.map_err(|_| Error::Closed)?
-    }
-
-    pub async fn select_audio(
-        &self,
-        policy: agent_core::AudioSubscription,
-    ) -> Result<Subscription, Error> {
-        let (response, result) = oneshot::channel();
-        self.commands
-            .send(Command::AudioPolicy { policy, response })
             .await
             .map_err(|_| Error::Closed)?;
         result.await.map_err(|_| Error::Closed)?
@@ -1205,14 +1183,6 @@ where
                 let result = self.create_producer(video);
                 let _ = response.send(result);
             }
-            Command::BindProducer {
-                owner,
-                producer,
-                response,
-            } => {
-                let result = self.bind_producer(owner, producer);
-                let _ = response.send(result);
-            }
             Command::InstallPipe {
                 producer,
                 input,
@@ -1407,19 +1377,12 @@ where
                     let _ = response.send(result);
                 }
             }
-            Command::AudioPolicy { policy, response } => {
-                if !response.is_closed() {
-                    let result = self.claim_audio_policy(policy);
-                    let _ = response.send(result);
-                }
-            }
             Command::ObserveSubscription {
                 owner,
-                source,
                 mode,
                 response,
             } => {
-                self.observe_subscription(owner, source, mode, response);
+                self.observe_subscription(owner, mode, response);
             }
             #[cfg(test)]
             Command::PublicationInput { owner, response } => {
@@ -3480,19 +3443,11 @@ mod tests {
                     track_id: "microphone".into(),
                 };
                 let publication = microphone.publish(Default::default()).unwrap();
-                let mut binding = Box::pin(publication.set_source(Some(&source)));
-                assert!(
-                    std::future::poll_fn(|cx| {
-                        std::task::Poll::Ready(binding.as_mut().poll(cx))
-                    })
-                    .await
-                    .is_pending()
-                );
-                let registration = actor.commands.recv().await.unwrap();
+                let _pipe = source.pipe_to(&publication).unwrap();
+                let registration = actor.commands.try_recv().unwrap();
                 actor.command(registration);
-                let attachment = actor.commands.recv().await.unwrap();
+                let attachment = actor.commands.try_recv().unwrap();
                 actor.command(attachment);
-                binding.await.unwrap();
                 actor
                     .core
                     .command(AgentCommand::Join("producer-room".into()))
@@ -3526,6 +3481,13 @@ mod tests {
                 );
                 let command = actor.commands.recv().await.unwrap();
                 actor.command(command);
+                assert!(
+                    std::future::poll_fn(|cx| std::task::Poll::Ready(close.as_mut().poll(cx)))
+                        .await
+                        .is_pending()
+                );
+                let release = actor.commands.try_recv().unwrap();
+                actor.command(release);
                 close.await.unwrap();
                 assert!(matches!(bound_ready.await, Err(Error::Closed)));
                 actor.drain_effects();
@@ -3540,8 +3502,9 @@ mod tests {
                 send.await.unwrap();
 
                 let publication = actor.claim_publication(spec.clone()).unwrap();
-                let owner = *actor.publications.keys().next().unwrap();
-                actor.bind_producer(owner, Some(source.clone())).unwrap();
+                let _pipe = source.pipe_to(&publication).unwrap();
+                let attachment = actor.commands.try_recv().unwrap();
+                actor.command(attachment);
                 let (_other_agent, mut other_actor) = Agent::parts(
                     config(),
                     Host::new(Box::new(PendingHttp(Arc::new(AtomicBool::new(false))))),
@@ -3549,10 +3512,7 @@ mod tests {
                 )
                 .unwrap();
                 let foreign = other_actor.create_producer(None).unwrap();
-                assert!(matches!(
-                    actor.bind_producer(owner, Some(foreign)),
-                    Err(Error::Closed)
-                ));
+                assert!(foreign.pipe_to(&publication).is_err());
 
                 let mut sends = Vec::new();
                 for _ in 0..MEDIA_COMMANDS {
@@ -3598,7 +3558,9 @@ mod tests {
                 for send in sends {
                     assert!(matches!(send.await, Err(Error::Closed)));
                 }
-                actor.bind_producer(owner, Some(fresh.clone())).unwrap();
+                let _fresh_pipe = fresh.pipe_to(&publication).unwrap();
+                let attachment = actor.commands.try_recv().unwrap();
+                actor.command(attachment);
                 let mut send = Box::pin(fresh.submit(pcm()));
                 assert!(
                     std::future::poll_fn(|cx| std::task::Poll::Ready(send.as_mut().poll(cx)))
@@ -3862,13 +3824,15 @@ mod tests {
             .create_producer(Some(VideoSourceConfig::default()))
             .unwrap();
         let producer_owner = *actor.producers.keys().next().unwrap();
-        let _publication = actor
+        let publication = actor
             .claim_publication(agent_core::TrackSpec::Video {
                 track_id: "encoder".into(),
             })
             .unwrap();
-        let owner = *actor.publications.keys().next_back().unwrap();
-        actor.bind_producer(owner, Some(producer.clone())).unwrap();
+        let _pipe = producer.pipe_to(&publication).unwrap();
+        let attachment = actor.commands.try_recv().unwrap();
+        actor.command(attachment);
+        let owner = publication.inner.owner;
         let original = latest_control(&actor.core);
         let physical = PhysicalSource {
             inner: Arc::new(SourceLease {

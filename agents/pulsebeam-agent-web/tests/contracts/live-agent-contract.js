@@ -212,7 +212,10 @@
     [...peers].find((peer) =>
       peer.getReceivers().some((receiver) => receiver.track === track),
     );
-  const { attachRemoteVideo, Agent, VideoSource, AudioSource } = pulsebeam;
+  const { attachSubscribedVideo, videoAttachmentConfiguration } = await import(
+    "/dist/remote-catalog.js"
+  );
+  const { Agent, VideoSource, AudioSource } = pulsebeam;
   const sender = new Agent({
     endpoint,
     token: "__SENDER_TOKEN__",
@@ -548,14 +551,17 @@
       .room(receiver.roomId)
       .participant("web-sender");
     const remoteVideo = pinnedPublisher.video("camera");
-    attachment = attachRemoteVideo(remoteVideo, video, undefined, {
-      preferences: {
-        minHeight: 1,
-        minFps: 1,
-        priority: 100,
-        playoutDelay: { minMs: 100, maxMs: 100 },
-      },
-    });
+    attachment = attachSubscribedVideo(
+      remoteVideo.subscribe(
+        videoAttachmentConfiguration({
+          minHeight: 1,
+          minFps: 1,
+          priority: 100,
+          playoutDelay: { minMs: 100, maxMs: 100 },
+        }),
+      ),
+      video,
+    );
     await attachment.ready;
     await until(
       () => presentedTrack()?.readyState === "live",
@@ -637,13 +643,9 @@
       priority: 100,
       playoutDelay: { minMs: 100, maxMs: 100 },
     };
-    handoffAttachment = attachRemoteVideo(
-      remoteVideo,
+    handoffAttachment = attachSubscribedVideo(
+      remoteVideo.subscribe(videoAttachmentConfiguration(fixedPreferences)),
       handoffVideo,
-      undefined,
-      {
-        preferences: fixedPreferences,
-      },
     );
     await handoffAttachment.ready;
     await witnessView(handoffVideo, "overlapping presentation");
@@ -655,9 +657,10 @@
     await deliverDuringView(6);
     await witnessView(handoffVideo, "handoff retains live receiver");
 
-    attachment = attachRemoteVideo(remoteVideo, video, undefined, {
-      preferences: fixedPreferences,
-    });
+    attachment = attachSubscribedVideo(
+      remoteVideo.subscribe(videoAttachmentConfiguration(fixedPreferences)),
+      video,
+    );
     await attachment.ready;
     await witnessView(video, "remounted presentation");
     const handoffPresentation = handoffVideo.srcObject.getVideoTracks()[0];
@@ -740,9 +743,16 @@
       () => fixedTrack.readyState === "ended" && retired.mid === null,
       "retired receiver ends and its actual browser MID clears",
     );
-    attachment = attachRemoteVideo(remoteVideo, video, undefined, {
-      preferences: { minHeight: 1, minFps: 1, priority: 100 },
-    });
+    attachment = attachSubscribedVideo(
+      remoteVideo.subscribe(
+        videoAttachmentConfiguration({
+          minHeight: 1,
+          minFps: 1,
+          priority: 100,
+        }),
+      ),
+      video,
+    );
     await attachment.ready;
     await until(() => {
       const track = presentedTrack();
