@@ -394,6 +394,7 @@ impl RtpIngressShadow {
         if self.profile == Profile::Av1 && !packet.has_direct_full_tag_protection() {
             return Err(DropReason::Binding);
         }
+        let ready_at = Instant::now();
         let arrival = packet.arrival;
         let primary_index = packet.authenticated_primary_index();
         let protected_bytes = (!packet.is_repair)
@@ -405,6 +406,7 @@ impl RtpIngressShadow {
             .normalize_packet(packet)?
             .map(|(sequence, input)| MediaIngress {
                 arrival,
+                ready_at,
                 ingress_ntp32,
                 position: primary_index.map_or(
                     Position::LowSequence(sequence),
@@ -486,6 +488,7 @@ impl RtpIngressShadow {
 
 pub(crate) struct MediaIngress {
     pub arrival: Instant,
+    pub ready_at: Instant,
     pub ingress_ntp32: u32,
     pub position: Position,
     pub protected_bytes: Option<NonZeroU16>,

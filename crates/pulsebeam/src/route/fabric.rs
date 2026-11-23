@@ -202,6 +202,7 @@ impl LiveRelayChange {
 pub(crate) struct ShardOffer {
     pub binding: ShardBinding,
     pub arrival: Instant,
+    pub ready_at: Option<std::time::Instant>,
     pub sequence: u64,
     pub packet: local::OwnedPacket,
 }

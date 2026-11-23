@@ -1604,6 +1604,7 @@ fn shard_mailbox_preserves_fabric_image_and_fences_rebound_sources() {
     let offer = ShardOffer {
         binding,
         arrival: now,
+        ready_at: None,
         sequence: 1,
         packet: value.into_owned(),
     };

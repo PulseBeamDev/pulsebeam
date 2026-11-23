@@ -744,9 +744,7 @@ impl ShardRuntime {
         if !matches!(&bound.ingress, FabricIngress::Shard { members, .. } if !members.is_empty()) {
             return Err(Rejection::Binding);
         }
-        bound
-            .fanout
-            .offer(now, offer.arrival, offer.sequence, offer.packet)
+        bound.fanout.offer_from_shard(now, offer)
     }
 
     pub(super) fn install_live_network_child(
@@ -1988,6 +1986,7 @@ impl ShardRuntime {
                     destination.route.offer_fabric(ShardOffer {
                         binding: destination.binding,
                         arrival: frozen.work.arrival(),
+                        ready_at: frozen.ready_at,
                         sequence: frozen.work.sequence(),
                         packet: frozen.packet.clone().into_owned(),
                     })

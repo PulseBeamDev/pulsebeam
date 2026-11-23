@@ -479,6 +479,7 @@ fn prove_endpoint_identity(peer_repair: bool) {
     let input =
         |arrival: ShardInstant, sequence, bytes: Option<&[u8]>, protected_bytes| MediaIngress {
             arrival: arrival.into(),
+            ready_at: arrival.into(),
             ingress_ntp32: 1,
             position: Position::LowSequence(sequence),
             protected_bytes: NonZeroU16::new(protected_bytes),

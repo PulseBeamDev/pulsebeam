@@ -17,7 +17,7 @@ use pulsebeam_core::{
 use pulsebeam_runtime::time::{Duration, Instant};
 use slotmap::SlotMap;
 
-use super::{LiveAdmissions, LiveOffer, POSITIONS};
+use super::{LiveAdmissions, LiveOffer, POSITIONS, ShardOffer};
 use crate::keys::ParticipantHandle;
 
 mod reliable;
@@ -304,6 +304,7 @@ fn dd_structure(
 struct Frozen {
     packet: OwnedPacket,
     live_arrival: Option<Instant>,
+    ready_at: Option<std::time::Instant>,
     live_ingress: Option<NonZeroU64>,
     endpoint_original: bool,
 }
@@ -366,6 +367,7 @@ impl LiveWork {
 pub(crate) struct Transit<'a> {
     pub work: LiveWork,
     pub packet: PacketView<'a>,
+    pub ready_at: Option<std::time::Instant>,
 }
 
 struct Branch {
@@ -383,6 +385,7 @@ struct Branch {
 struct Queued {
     sequence: u64,
     output_position: u64,
+    queued_at: Instant,
     repair_only: Option<RepairRequest>,
     hops: u8,
     ingress: Option<NonZeroU64>,
@@ -1057,6 +1060,7 @@ impl SourceFanout {
                 Frozen {
                     packet,
                     live_arrival: None,
+                    ready_at: None,
                     live_ingress: None,
                     endpoint_original: false,
                 },
@@ -1108,6 +1112,7 @@ impl SourceFanout {
                 branch.queue.push_back(Queued {
                     sequence,
                     output_position: sequence,
+                    queued_at: now,
                     repair_only: Some(request),
                     hops,
                     ingress,
@@ -1355,6 +1360,7 @@ impl SourceFanout {
     /// Accept an owned canonical attempt from the installed source. The
     /// extended source sequence comes from the source owner, not the wire PT
     /// or the destination. A retry cannot refresh the first copy's lifetime.
+    #[cfg(test)]
     pub fn offer(
         &mut self,
         now: Instant,
@@ -1362,7 +1368,22 @@ impl SourceFanout {
         sequence: u64,
         packet: OwnedPacket,
     ) -> Result<Offers, Rejection> {
-        self.offer_from(now, arrival, sequence, Some(packet), None)
+        self.offer_from(now, arrival, sequence, Some(packet), None, None)
+    }
+
+    pub(crate) fn offer_from_shard(
+        &mut self,
+        now: Instant,
+        offer: ShardOffer,
+    ) -> Result<Offers, Rejection> {
+        self.offer_from(
+            now,
+            offer.arrival,
+            offer.sequence,
+            Some(offer.packet),
+            None,
+            offer.ready_at,
+        )
     }
 
     pub(crate) fn bind_media_identity(&mut self, identity: MediaIdentity) -> bool {
@@ -1431,7 +1452,14 @@ impl SourceFanout {
             Some(bytes) => packet.with_source_protected_bytes(bytes),
             None => packet,
         });
-        let report = self.offer_from(now, Instant::from_std(arrival), sequence, original, None)?;
+        let report = self.offer_from(
+            now,
+            Instant::from_std(arrival),
+            sequence,
+            original,
+            None,
+            Some(input.ready_at),
+        )?;
         let hops = self
             .fates
             .get(&sequence)
@@ -1455,6 +1483,7 @@ impl SourceFanout {
             Frozen {
                 packet,
                 live_arrival: None,
+                ready_at: None,
                 live_ingress: None,
                 endpoint_original: true,
             },
@@ -1506,7 +1535,7 @@ impl SourceFanout {
         sequence: u64,
     ) -> Result<Offers, Rejection> {
         self.endpoint_data(sequence).ok_or(Rejection::Stale)?;
-        self.offer_from(now, arrival, sequence, None, None)
+        self.offer_from(now, arrival, sequence, None, None, None)
     }
 
     fn offer_from(
@@ -1516,6 +1545,7 @@ impl SourceFanout {
         sequence: u64,
         packet: Option<OwnedPacket>,
         ingress: Option<NonZeroU64>,
+        ready_at: Option<std::time::Instant>,
     ) -> Result<Offers, Rejection> {
         if self.fenced {
             return Err(Rejection::Fenced);
@@ -1584,6 +1614,7 @@ impl SourceFanout {
             self.retire_before(oldest);
             if let Some(frozen) = self.fates.get_mut(&sequence) {
                 frozen.live_arrival = Some(arrival);
+                frozen.ready_at = ready_at;
                 frozen.live_ingress = ingress;
                 if !frozen.endpoint_original
                     && let Some(packet) = packet
@@ -1596,6 +1627,7 @@ impl SourceFanout {
                     Frozen {
                         packet: packet.ok_or(Rejection::Stale)?,
                         live_arrival: Some(arrival),
+                        ready_at,
                         live_ingress: ingress,
                         endpoint_original: false,
                     },
@@ -1702,7 +1734,7 @@ impl SourceFanout {
         ingress: NonZeroU64,
         packet: OwnedPacket,
     ) -> Result<(u64, Offers), Rejection> {
-        self.offer_from(now, arrival, sequence, Some(packet), Some(ingress))
+        self.offer_from(now, arrival, sequence, Some(packet), Some(ingress), None)
             .map(|offers| (sequence, offers))
     }
 
@@ -1747,6 +1779,7 @@ impl SourceFanout {
         Some(Transit {
             work: LiveWork::new(self.high?, sequence, frozen.live_arrival?, hops)?,
             packet: frozen.packet.arrival_view(hops)?,
+            ready_at: frozen.ready_at,
         })
     }
 
@@ -1791,11 +1824,10 @@ impl SourceFanout {
         else {
             return Ok(None);
         };
-        let Some(packet) = self
-            .fates
-            .get(&queued.sequence)
-            .and_then(|frozen| frozen.packet.arrival_view(queued.hops))
-        else {
+        let Some(frozen) = self.fates.get(&queued.sequence) else {
+            return Ok(None);
+        };
+        let Some(packet) = frozen.packet.arrival_view(queued.hops) else {
             return Ok(None);
         };
         let dd = queued.frame.and_then(|frame| {
@@ -1829,6 +1861,22 @@ impl SourceFanout {
             ingress: queued.ingress,
         };
         let result = write(queued.sequence, packet, projected)?;
+        if let Some(ready_at) = frozen.ready_at {
+            let enqueued = Instant::now();
+            metrics::histogram!("fabric_rtp_local_enqueue_delay_us").record(
+                enqueued
+                    .into_std()
+                    .saturating_duration_since(ready_at)
+                    .as_secs_f64()
+                    * 1e6,
+            );
+            metrics::histogram!("fabric_rtp_branch_age_us").record(
+                enqueued
+                    .saturating_duration_since(queued.queued_at)
+                    .as_secs_f64()
+                    * 1e6,
+            );
+        }
         branch.queue.pop_front();
         Ok(Some(result))
     }
@@ -1886,6 +1934,7 @@ impl Branch {
                 queue.push_back(Queued {
                     sequence,
                     output_position,
+                    queued_at: Instant::now(),
                     repair_only: None,
                     hops,
                     ingress,
@@ -1893,6 +1942,8 @@ impl Branch {
                     entry: kind == Enqueue::Enter,
                     frame,
                 });
+                metrics::histogram!("fabric_branch_depth_packets")
+                    .record(f64::from(u32::try_from(queue.len()).unwrap_or(u32::MAX)));
                 true
             };
             if let Some(filter) = &mut self.filter {
@@ -1952,7 +2003,10 @@ impl Branch {
             (LiveOffer::Refused, Some(Decision::Suspended)) => &mut report.suspended,
             (LiveOffer::Refused, Some(Decision::AwaitingEntry)) => &mut report.awaiting_entry,
             (LiveOffer::Refused, Some(Decision::Fenced)) => return,
-            (LiveOffer::Refused, _) => &mut report.full,
+            (LiveOffer::Refused, _) => {
+                metrics::counter!("fabric_branch_dropped_packets", "reason" => "full").increment(1);
+                &mut report.full
+            }
             _ => return,
         };
         *count = count.saturating_add(1);
@@ -1977,6 +2031,8 @@ impl Branch {
                     }
                 })
         }) {
+            metrics::counter!("fabric_branch_dropped_packets", "reason" => "stale_or_revoked")
+                .increment(1);
             self.discard_front();
         }
     }
