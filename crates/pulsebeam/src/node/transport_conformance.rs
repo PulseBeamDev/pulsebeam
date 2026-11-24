@@ -13,6 +13,9 @@ use serde_json::{Value, json};
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[path = "transport_conformance/quic.rs"]
+mod quic;
+
 const CONNECT: Duration = Duration::from_secs(30);
 const DELIVERY: Duration = Duration::from_secs(30);
 const CLEANUP: Duration = Duration::from_secs(10);

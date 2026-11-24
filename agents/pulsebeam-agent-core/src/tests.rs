@@ -212,6 +212,118 @@ fn quic_placement_fences_late_http_and_transport_outcomes() {
 }
 
 #[test]
+fn quic_transport_loss_recovers_joined_session_only_with_current_continuation() {
+    use crate::{QuicEffect, QuicEvent};
+    use pulsebeam_proto::state;
+
+    let mut agent = Agent::new_quic(config()).unwrap();
+    agent.command(AgentCommand::Join("stage".into())).unwrap();
+    let Effect::Http(HttpEffect::Request { operation, .. }) = next_effect(&mut agent) else {
+        panic!("initial placement")
+    };
+    let response = |owner: &str, port: u16| {
+        HttpResponse {
+        status: 200, headers: vec![], body: serde_json::to_vec(&serde_json::json!({"profile":"pulsebeam-rt-v1","owner":owner,"authority":{"host":"edge.example","port":port},"valid_for_ms":5000})).unwrap(),
+    }
+    };
+    agent
+        .handle(HostEvent::Http(HttpEvent::Response {
+            operation,
+            response: response("owner", 443),
+        }))
+        .unwrap();
+    let Effect::Quic(QuicEffect::Admit(initial)) = next_effect(&mut agent) else {
+        panic!("initial admission")
+    };
+    assert!(initial.successor.is_none());
+    let accepted = |generation, connection: &str| {
+        HostEvent::Quic(QuicEvent::Accepted {
+            generation,
+            connection_id: connection.into(),
+            participant_id: "alice".into(),
+            room: Some("stage".into()),
+            capabilities: state::RtpCapabilities {
+                codecs: vec![state::RtpCodecCapability {
+                    format: Some(state::CodecFormat::from(state::codec_format::Codec::Opus(
+                        state::OpusParameters::default(),
+                    ))),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        })
+    };
+    let first_id = "conn_00000000001R010000000000004";
+    agent
+        .handle(accepted(initial.generation, first_id))
+        .unwrap();
+    let proof = vec![1, 2, 3];
+    agent
+        .handle(HostEvent::Quic(QuicEvent::Control {
+            generation: initial.generation,
+            payload: state::codec::encode_quic_server(&state::ServerStateBatch {
+                records: vec![native_connection::confirmed(
+                    state::resource_key::Key::Session(true),
+                    0,
+                    state::confirmed_state::Value::Session(state::SessionState {
+                        authorization: Some(state::Authorization {
+                            revision: 1,
+                            expires_at_unix_seconds: 5000,
+                        }),
+                        successor_receipt: Some(state::SuccessorReceipt {
+                            proof: proof.clone(),
+                            expires_at_unix_seconds: 5000,
+                        }),
+                        ..Default::default()
+                    }),
+                )],
+                ..Default::default()
+            })
+            .unwrap(),
+        }))
+        .unwrap();
+    while agent.next_effect().is_some() {}
+    let loss = HostEvent::Quic(QuicEvent::TransportLost {
+        generation: initial.generation,
+        failure: Failure {
+            class: FailureClass::Transient,
+            message: "failed old path".into(),
+        },
+    });
+    agent.handle(loss.clone()).unwrap();
+    let effect = core::iter::from_fn(|| agent.next_effect())
+        .find_map(|effect| match effect {
+            Effect::Http(HttpEffect::Request {
+                operation, request, ..
+            }) => Some((operation, request)),
+            _ => None,
+        })
+        .expect("authenticated recovery placement");
+    let (operation, request) = effect;
+    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+    assert_eq!(body["owner"], "owner");
+    assert_eq!(body["successor_receipt"], "AQID");
+    agent
+        .handle(HostEvent::Http(HttpEvent::Response {
+            operation,
+            response: response("owner", 4443),
+        }))
+        .unwrap();
+    let Effect::Quic(QuicEffect::Admit(next)) = next_effect(&mut agent) else {
+        panic!("replacement admission")
+    };
+    assert_eq!(next.placement.port.get(), 4443);
+    assert_ne!(next.generation, initial.generation);
+    assert_eq!(next.successor, Some(proof));
+    let second_id = "conn_0065WZSB8G1XN31RDHP9883WVRC";
+    agent.handle(accepted(next.generation, second_id)).unwrap();
+    agent.handle(loss).unwrap();
+    assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
+    assert_eq!(agent.snapshot().generation, Some(next.generation));
+}
+
+#[test]
 fn log_level_applies_per_agent_verbosity() {
     assert!(LogLevel::Error.allows(log::Level::Error));
     assert!(!LogLevel::Error.allows(log::Level::Warn));

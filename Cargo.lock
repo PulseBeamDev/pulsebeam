@@ -3808,6 +3808,7 @@ dependencies = [
 name = "pulsebeam-agent-core"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "log",
  "pulsebeam-proto",
  "serde",

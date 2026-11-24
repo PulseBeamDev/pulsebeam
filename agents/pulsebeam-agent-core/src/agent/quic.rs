@@ -1,12 +1,16 @@
-use alloc::string::{String, ToString};
+use alloc::{
+    string::{String, ToString},
+    vec::Vec,
+};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use pulsebeam_proto::{
     prelude::Message,
     state::{self, validation},
 };
 
 use super::{
-    Agent, AgentConfig, AgentError, AttemptStage, Credential, Failure, FailureClass, NativeState,
-    Session, SessionIdentity, native,
+    Agent, AgentConfig, AgentError, AttemptMode, AttemptStage, Credential, Failure, FailureClass,
+    NativeState, Session, SessionIdentity, native,
 };
 use crate::placement::{self, PendingPlacement, PlacementError};
 use crate::{Effect, Generation, HttpResponse, OperationId, QuicAdmit, QuicEffect, QuicEvent};
@@ -15,8 +19,12 @@ pub(super) enum Attempt {
     Placing {
         work: PendingPlacement,
         credential: Credential,
+        successor: Option<Vec<u8>>,
     },
-    Dialing(Credential),
+    Dialing {
+        credential: Credential,
+        owner: String,
+    },
 }
 
 #[doc(hidden)]
@@ -176,11 +184,34 @@ impl Agent {
             token: self.config.token.clone(),
             revision: self.config_credential_revision,
         };
+        let continuation = if attempt.mode == AttemptMode::Replace && attempt.room.is_some() {
+            let Some((owner, receipt)) = self
+                .active
+                .as_ref()
+                .and_then(|active| active.quic_owner.as_ref())
+                .zip(self.joined_successor.as_ref())
+            else {
+                self.fail_attempt(Failure {
+                    class: FailureClass::ResourceExpired,
+                    message: "QUIC continuation unavailable; rejoin explicitly".into(),
+                });
+                return;
+            };
+            Some((
+                owner.clone(),
+                receipt.proof.clone(),
+                URL_SAFE_NO_PAD.encode(&receipt.proof),
+            ))
+        } else {
+            None
+        };
         let Ok(request) = placement::request(
             &self.config.endpoint,
             &credential.token,
             attempt.room.as_deref(),
-            None,
+            continuation
+                .as_ref()
+                .map(|(owner, _, encoded)| (owner.as_str(), encoded.as_str())),
         ) else {
             self.fail_attempt(Failure {
                 class: FailureClass::InvalidConfiguration,
@@ -188,14 +219,21 @@ impl Agent {
             });
             return;
         };
+        let (owner, successor) = continuation.map_or((None, None), |(owner, receipt, _)| {
+            (Some(owner), Some(receipt))
+        });
         let (work, effect) = PendingPlacement::issue(
             generation,
             self.ids.operation(),
             self.data_now,
             request,
-            None,
+            owner.as_deref(),
         );
-        attempt.quic = Some(Attempt::Placing { work, credential });
+        attempt.quic = Some(Attempt::Placing {
+            work,
+            credential,
+            successor,
+        });
         attempt.stage = AttemptStage::Acquiring;
         self.effects.push_back(Effect::Http(effect));
         if self.active.is_none() {
@@ -217,13 +255,21 @@ impl Agent {
         operation: OperationId,
         response: &HttpResponse,
     ) -> bool {
-        let Some(Attempt::Placing { work, credential }) = self.take_placement(operation) else {
+        let Some(Attempt::Placing {
+            work,
+            credential,
+            successor,
+        }) = self.take_placement(operation)
+        else {
             return false;
         };
         match work.complete(self.data_now, response) {
             Ok(placed) => {
                 if let Some(attempt) = self.attempt.as_mut() {
-                    attempt.quic = Some(Attempt::Dialing(credential.clone()));
+                    attempt.quic = Some(Attempt::Dialing {
+                        credential: credential.clone(),
+                        owner: placed.placement.owner.clone(),
+                    });
                     attempt.stage = AttemptStage::Requesting;
                     self.effects
                         .push_back(Effect::Quic(QuicEffect::Admit(QuicAdmit {
@@ -232,6 +278,7 @@ impl Agent {
                             placement: placed.placement,
                             deadline: placed.deadline,
                             token: credential.token,
+                            successor,
                         })));
                 }
                 self.update_attempt_state();
@@ -269,7 +316,7 @@ impl Agent {
             Some(Attempt::Placing { work, .. }) => {
                 self.effects.push_back(Effect::Http(work.cancel()));
             }
-            Some(Attempt::Dialing(_)) => {
+            Some(Attempt::Dialing { .. }) => {
                 self.effects
                     .push_back(Effect::Quic(QuicEffect::Close { generation }));
                 return true;
@@ -302,7 +349,7 @@ impl Agent {
         else {
             return Ok(());
         };
-        let Some(Attempt::Dialing(credential)) = attempt.quic.as_ref() else {
+        let Some(Attempt::Dialing { credential, owner }) = attempt.quic.as_ref() else {
             return Ok(());
         };
         let Some(connection_id) = crate::ConnectionId::from_native_response(connection_id) else {
@@ -346,6 +393,7 @@ impl Agent {
                 data_v1: true,
             },
         );
+        session.quic_owner = Some(owner.clone());
         session.reliable_data_enabled = true;
         self.attempt = None;
         self.activate_session(session, join_revision);
@@ -464,7 +512,19 @@ impl Agent {
                     active.generation == generation && !active.signaling_terminal
                 }) {
                     self.close_transport(generation);
-                    self.fail_terminal(failure);
+                    if failure.class != FailureClass::Transient {
+                        self.fail_terminal(failure);
+                    } else {
+                        self.fence_signaling(generation);
+                        if self.desired.connected
+                            && self.snapshot.terminal_failure.is_none()
+                            && self.attempt.is_none()
+                            && self.retry.is_none()
+                        {
+                            self.notify_failure(failure);
+                            self.start_attempt(AttemptMode::Replace);
+                        }
+                    }
                 }
             }
             QuicEvent::AdmissionFailed {
@@ -473,7 +533,7 @@ impl Agent {
             } => {
                 if self.attempt.as_ref().is_some_and(|attempt| {
                     attempt.generation == generation
-                        && matches!(attempt.quic, Some(Attempt::Dialing(_)))
+                        && matches!(attempt.quic, Some(Attempt::Dialing { .. }))
                 }) {
                     self.fail_attempt(failure);
                 }

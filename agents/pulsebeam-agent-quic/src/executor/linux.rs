@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     future::{Future, pending},
+    io,
     net::IpAddr,
     num::{NonZeroU16, NonZeroU32},
     pin::Pin,
@@ -634,6 +635,24 @@ impl LinuxAgent {
             self.received_opus.pop_front();
         }
         self.received_opus.push_back((generation, binding, frame));
+    }
+
+    /// Move the active QUIC association to a new same-family local socket.
+    /// This starts path validation, not a new admission. Keep driving Agent
+    /// turns for validation or normal authenticated recovery on transport loss.
+    pub async fn rebind(&mut self, local: IpAddr) -> io::Result<()> {
+        let generation = self.core.snapshot().generation.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotConnected, "no current QUIC association")
+        })?;
+        let socket = self
+            .sockets
+            .iter_mut()
+            .flatten()
+            .find(|socket| socket.generation() == generation)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "no current QUIC socket"))?;
+        socket.rebind(local).await?;
+        self.local = local;
+        Ok(())
     }
 
     pub fn snapshot(&self) -> &Snapshot {

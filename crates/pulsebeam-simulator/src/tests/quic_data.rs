@@ -338,6 +338,31 @@ fn quic_media_opus_uses_negotiated_rtp_binding_and_timing() {
 #[test]
 #[allow(
     clippy::expect_used,
+    reason = "failed-path fixture must recover within its virtual deadline"
+)]
+fn quic_mobility_replaces_failed_path_using_authenticated_placement() {
+    let host = pulsebeam_runtime::testing::test_host_ip("192.168.250.103");
+    // The blackholed UDP path is declared lost at the negotiated 15s idle timeout.
+    let mut sim = turmoil::Builder::new()
+        .simulation_duration(Duration::from_secs(25))
+        .build();
+    sim.client(host, async {
+        witness(Scenario::FailedPath).await?;
+        Ok(())
+    });
+    super::common::run_sim_or_timeout(&mut sim, Duration::from_secs(10))
+        .expect("authenticated QUIC replacement");
+}
+
+#[test]
+fn quic_mobility_preserves_media_and_generation_on_local_socket_replacement() {
+    let host = pulsebeam_runtime::testing::test_host_ip("192.168.250.103");
+    replay_scenario(host, Scenario::Mobility);
+}
+
+#[test]
+#[allow(
+    clippy::expect_used,
     reason = "mixed simulated Opus exchange must complete"
 )]
 fn quic_media_opus_exchanges_with_webrtc_encoded_endpoints() {
@@ -824,36 +849,53 @@ async fn reject_reliable_expectation(
     Ok(())
 }
 
+async fn sim_placement(
+    request: pulsebeam_agent_core::HttpRequest,
+) -> Option<pulsebeam_agent_core::HttpResponse> {
+    use super::common::client::create_http_client;
+    use pulsebeam_agent_core::{HttpMethod, HttpResponse};
+    if request.method != HttpMethod::Post {
+        return None;
+    }
+    let origin = request.uri.strip_prefix("https://")?;
+    let mut builder = http::Request::post(format!("http://{origin}"));
+    for header in request.headers {
+        builder = builder.header(header.name, header.value);
+    }
+    let response = create_http_client()
+        .execute(builder.body(request.body).ok()?)
+        .await
+        .ok()?;
+    let (parts, body) = response.into_parts();
+    Some(HttpResponse {
+        status: parts.status.as_u16(),
+        headers: Vec::new(),
+        body,
+    })
+}
+
 fn sim_quic_agent(
     address: SocketAddr,
     edge: SocketAddr,
     roots: RootCertStore,
     token: &str,
 ) -> Result<pulsebeam_agent_quic::executor::linux::LinuxAgent> {
-    use super::common::client::create_http_client;
-    use pulsebeam_agent_core::{AgentConfig, HttpMethod, HttpRequest, HttpResponse};
-    use pulsebeam_agent_quic::executor::linux::LinuxAgent;
-    async fn placement(request: HttpRequest) -> Option<HttpResponse> {
-        if request.method != HttpMethod::Post {
-            return None;
-        }
-        let origin = request.uri.strip_prefix("https://")?;
-        let mut builder = http::Request::post(format!("http://{origin}"));
-        for header in request.headers {
-            builder = builder.header(header.name, header.value);
-        }
-        let response = create_http_client()
-            .execute(builder.body(request.body).ok()?)
-            .await
-            .ok()?;
-        let (parts, body) = response.into_parts();
-        Some(HttpResponse {
-            status: parts.status.as_u16(),
-            headers: Vec::new(),
-            body,
-        })
-    }
+    sim_quic_agent_with_placement(address, edge, roots, token, sim_placement)
+}
 
+fn sim_quic_agent_with_placement<F, Fut>(
+    address: SocketAddr,
+    edge: SocketAddr,
+    roots: RootCertStore,
+    token: &str,
+    placement: F,
+) -> Result<pulsebeam_agent_quic::executor::linux::LinuxAgent>
+where
+    F: Fn(pulsebeam_agent_core::HttpRequest) -> Fut + 'static,
+    Fut: std::future::Future<Output = Option<pulsebeam_agent_core::HttpResponse>> + 'static,
+{
+    use pulsebeam_agent_core::AgentConfig;
+    use pulsebeam_agent_quic::executor::linux::LinuxAgent;
     Ok(LinuxAgent::new(
         AgentConfig {
             endpoint: format!("https://{address}"),
@@ -1103,6 +1145,171 @@ async fn mixed_exchange(
     Ok(())
 }
 
+async fn failed_path_exchange(
+    address: SocketAddr,
+    edge: SocketAddr,
+    roots: RootCertStore,
+    token: &str,
+) -> Result<()> {
+    use pulsebeam_agent_core::{AgentCommand, DesiredState, MediaKind, PublicationIntent};
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
+    use turmoil::net::UdpSocket;
+
+    let proxy = Rc::new(UdpSocket::bind(SocketAddr::new(edge.ip(), 0)).await?);
+    let proxy_port = proxy.local_addr()?.port();
+    let mtu = Rc::new(Cell::new(usize::from(transport::UDP_PAYLOAD_BYTES)));
+    let held = Rc::new(RefCell::new(None));
+    let (relay, path_mtu, delayed) = (proxy.clone(), mtu.clone(), held.clone());
+    let proxy_task = tokio::task::spawn_local(async move {
+        let mut peer = None;
+        let mut bytes = [0; 2048];
+        loop {
+            let (len, source) = relay.recv_from(&mut bytes).await?;
+            let payload = bytes.get(..len).context("QUIC proxy packet size")?;
+            if len > path_mtu.get() {
+                if source != edge && len > 1_000 && delayed.borrow().is_none() {
+                    delayed.replace(Some(payload.to_vec()));
+                }
+                continue;
+            }
+            if source == edge {
+                if let Some(peer) = peer {
+                    relay.send_to(payload, peer).await?;
+                }
+            } else {
+                peer = Some(source);
+                relay.send_to(payload, edge).await?;
+            }
+        }
+        #[allow(
+            unreachable_code,
+            reason = "transport proxy ends when the fixture aborts it"
+        )]
+        anyhow::Ok(())
+    });
+    let continuations = Rc::new(Cell::new(0_u32));
+    let seen = continuations.clone();
+    let mut agent = sim_quic_agent_with_placement(address, edge, roots, token, move |request| {
+        let seen = seen.clone();
+        async move {
+            let inputs: serde_json::Value = serde_json::from_slice(&request.body).ok()?;
+            let mut response = sim_placement(request).await?;
+            if response.status != 200 {
+                return Some(response);
+            }
+            let mut placement: serde_json::Value = serde_json::from_slice(&response.body).ok()?;
+            if let Some(owner) = inputs.get("owner").and_then(serde_json::Value::as_str) {
+                if inputs
+                    .get("successor_receipt")
+                    .and_then(serde_json::Value::as_str)
+                    .is_none()
+                    || placement.get("owner").and_then(serde_json::Value::as_str) != Some(owner)
+                {
+                    return None;
+                }
+                seen.set(seen.get().saturating_add(1));
+            } else {
+                *placement.get_mut("authority")?.get_mut("port")? = proxy_port.into();
+                response.body = serde_json::to_vec(&placement).ok()?;
+            }
+            Some(response)
+        }
+    })?;
+    agent.command(AgentCommand::ReplaceDesired(DesiredState {
+        revision: 1,
+        publications: vec![PublicationIntent {
+            slot: "voice".into(),
+            track_id: "voice".into(),
+            kind: MediaKind::Audio,
+            active: true,
+        }],
+        ..Default::default()
+    }))?;
+    agent.command(AgentCommand::Join("stage".into()))?;
+    let (initial_generation, initial_publication) = loop {
+        ensure!(
+            agent.snapshot().terminal_failure.is_none(),
+            "initial QUIC path: {:?}",
+            agent.snapshot().terminal_failure
+        );
+        if let Some(publication) = agent.opus_publication_id("voice") {
+            break (
+                agent
+                    .snapshot()
+                    .generation
+                    .context("initial QUIC generation")?,
+                publication.to_owned(),
+            );
+        }
+        agent
+            .turn()
+            .await
+            .map_err(|error| anyhow::anyhow!("first QUIC path: {error:?}"))?;
+    };
+    // A smaller old path holds one in-flight packet. Then it loses reachability entirely.
+    mtu.set(1_000);
+    let old_payload = [0xf8; 1024];
+    loop {
+        use pulsebeam_agent_quic::executor::linux::OpusSendError;
+        match agent.send_opus("voice", 960, false, &old_payload) {
+            Ok(()) => break,
+            Err(OpusSendError::Datagram(
+                DatagramAdmission::Full | DatagramAdmission::ControlTurn,
+            )) => {}
+            Err(error) => anyhow::bail!("old-path payload admission: {error:?}"),
+        }
+        agent
+            .turn()
+            .await
+            .map_err(|error| anyhow::anyhow!("old-path control turn: {error:?}"))?;
+    }
+    let wait_held = async {
+        while held.borrow().is_none() {
+            pulsebeam_runtime::time::sleep(Duration::from_millis(1)).await;
+        }
+    };
+    pulsebeam_runtime::select! {
+        result = pulsebeam_runtime::time::timeout(Duration::from_secs(2), wait_held) => result.context("no packet held by reduced old path MTU")?,
+        error = async { loop { if let Err(error) = agent.turn().await { break error; } } } => anyhow::bail!("old-path drive: {error:?}"),
+    }
+    mtu.set(0);
+    let replacement = loop {
+        ensure!(
+            agent.snapshot().terminal_failure.is_none(),
+            "replacement QUIC path: {:?}",
+            agent.snapshot().terminal_failure
+        );
+        if agent.snapshot().generation != Some(initial_generation)
+            && let Some(publication) = agent.opus_publication_id("voice")
+        {
+            ensure!(
+                publication != initial_publication,
+                "replacement reused retired media lifetime"
+            );
+            ensure!(
+                continuations.get() == 1,
+                "replacement did not use one accepted continuation"
+            );
+            break publication.to_owned();
+        }
+        agent
+            .turn()
+            .await
+            .map_err(|error| anyhow::anyhow!("replacement QUIC path: {error:?}"))?;
+    };
+    let stale = held.take().context("held old-path packet")?;
+    proxy.send_to(&stale, edge).await?;
+    // Allow the shard to process the old packet while the replacement remains live.
+    pulsebeam_runtime::time::sleep(Duration::from_millis(20)).await;
+    ensure!(agent.opus_publication_id("voice") == Some(replacement.as_str()));
+    proxy_task.abort();
+    let _ = proxy_task.await;
+    Ok(())
+}
+
 async fn prepare_agent_opus_publisher(
     address: SocketAddr,
     edge: SocketAddr,
@@ -1151,6 +1358,7 @@ async fn opus_exchange(
     roots: RootCertStore,
     publisher_token: &str,
     receiver_token: &str,
+    rebind: bool,
 ) -> Result<()> {
     use pulsebeam_agent_core::{AgentCommand, AudioSubscription, DesiredState};
     use pulsebeam_agent_quic::executor::linux::OpusSendError;
@@ -1186,8 +1394,15 @@ async fn opus_exchange(
         ),
         Err(OpusSendError::Datagram(DatagramAdmission::Size))
     ));
+    let generation = publisher
+        .snapshot()
+        .generation
+        .context("admitted QUIC generation")?;
     let mut previous: Option<(u16, u32)> = None;
     for (timestamp, marker) in [(960, true), (1920, false)] {
+        if rebind && previous.is_some() {
+            publisher.rebind(edge.ip()).await?;
+        }
         loop {
             match publisher.send_opus("voice", timestamp, marker, &[0xf8, 0xff, 0xfe]) {
                 Ok(()) => break,
@@ -1229,6 +1444,8 @@ async fn opus_exchange(
                 timing.0 == sequence.wrapping_add(1) && timing.1 == timestamp.wrapping_add(960)
             );
         }
+        ensure!(publisher.snapshot().generation == Some(generation));
+        ensure!(publisher.opus_publication_id("voice") == Some(publication_id.as_str()));
         previous = Some(timing);
     }
     Ok(())
@@ -1769,6 +1986,8 @@ enum Scenario {
         sctp_host: Option<std::net::IpAddr>,
     },
     Opus,
+    Mobility,
+    FailedPath,
     MixedOpus {
         host: std::net::IpAddr,
     },
@@ -1902,8 +2121,19 @@ async fn witness(scenario: Scenario) -> Result<()> {
             return mixed_h264_exchange(address, edge, roots, host, &credential, &subscriber_token)
                 .await;
         }
+        if let Scenario::FailedPath = scenario {
+            return failed_path_exchange(address, edge, roots, &credential).await;
+        }
         let Scenario::Data { delivery, .. } = scenario else {
-            return opus_exchange(address, edge, roots, &credential, &subscriber_token).await;
+            return opus_exchange(
+                address,
+                edge,
+                roots,
+                &credential,
+                &subscriber_token,
+                matches!(scenario, Scenario::Mobility),
+            )
+            .await;
         };
         let owner = issue(address, &credential, None).await?;
         let mut client = Client::new(edge, roots.clone()).await?;

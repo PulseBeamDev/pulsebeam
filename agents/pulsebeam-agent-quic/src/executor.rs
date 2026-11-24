@@ -107,7 +107,7 @@ impl Association {
                 room: admit.room.as_deref(),
                 owner: &admit.placement.owner,
                 token: &admit.token,
-                successor: None,
+                successor: admit.successor.as_deref(),
             },
             deadline,
         )

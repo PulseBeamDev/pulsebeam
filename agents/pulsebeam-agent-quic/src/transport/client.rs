@@ -54,12 +54,12 @@ impl ClientTransport {
         &mut self.connection
     }
 
-    /// The association owner must resolve the accepted binding before offering payload.
     /// Current maximum encoded application datagram size, including its envelope.
     pub fn datagram_limit(&mut self) -> Option<usize> {
         self.connection.datagrams().max_size()
     }
 
+    /// The association owner must resolve the accepted binding before offering payload.
     pub fn offer_datagram(&mut self, datagram: Datagram<'_>) -> Result<(), DatagramAdmission> {
         self.scheduler.offer_bound(&mut self.connection, datagram)
     }

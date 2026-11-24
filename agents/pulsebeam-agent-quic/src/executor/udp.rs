@@ -62,6 +62,30 @@ impl UdpAssociation {
         })
     }
 
+    pub(super) async fn rebind(&mut self, local: IpAddr) -> io::Result<()> {
+        if !matches!(self.association.stage, super::Stage::Active { .. }) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "QUIC association is not active",
+            ));
+        }
+        if local.is_ipv4() != self.socket.local_addr().is_ipv4() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "QUIC address family mismatch",
+            ));
+        }
+        let socket = socket::bind(SocketAddr::new(local, 0)).await?.activate()?;
+        self.socket = socket;
+        // A packet staged for the old socket cannot advance the new path.
+        self.egress = Egress::default();
+        self.association
+            .transport
+            .connection()
+            .handle_network_change(None, time::Instant::now().into_std());
+        Ok(())
+    }
+
     pub fn generation(&self) -> Generation {
         self.association.generation()
     }

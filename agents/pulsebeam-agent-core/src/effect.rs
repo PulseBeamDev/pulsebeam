@@ -64,6 +64,7 @@ pub struct QuicAdmit {
     pub placement: crate::placement::Placement,
     pub deadline: Duration,
     pub token: String,
+    pub successor: Option<Vec<u8>>,
 }
 
 #[derive(Clone, PartialEq, Eq)]

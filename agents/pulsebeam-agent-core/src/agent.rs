@@ -158,6 +158,7 @@ struct Session {
     media_wanted: BTreeMap<MediaSlot, native::MediaWant>,
     media_blocked: BTreeMap<MediaSlot, native::MediaWant>,
 
+    quic_owner: Option<String>,
     authorization_expires_at: Option<i64>,
     pending_renewal: Option<native::Renewal>,
     authorization_revision: u64,
@@ -205,6 +206,7 @@ impl Session {
             media_allocation: None,
             media_wanted: BTreeMap::new(),
             media_blocked: BTreeMap::new(),
+            quic_owner: None,
             authorization_expires_at: None,
             pending_renewal: None,
             authorization_revision: 0,

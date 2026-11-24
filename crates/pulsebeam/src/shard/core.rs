@@ -300,7 +300,11 @@ impl ShardCore {
     }
 
     pub(super) fn retire_quic_publication(&mut self, publication: crate::entity::PublicationKey) {
-        self.execution.runtime.retire_track(publication);
+        let execution = &mut self.execution;
+        if let Some(track) = execution.runtime.track_handle(publication) {
+            execution.plans.remove(track);
+            execution.runtime.retire_track(publication);
+        }
     }
 
     pub(super) fn ingest_quic_data(
@@ -1799,7 +1803,8 @@ impl ShardExecution {
 
     pub(super) fn apply_plan(&mut self, operation: &crate::shard_update::TrackPlanUpdate) -> usize {
         let Some(track_handle) = self.runtime.track_handle(operation.publication_id) else {
-            debug_assert!(false, "a track plan must target a live shard track");
+            // The QUIC owner fences a lost association immediately. A plan
+            // queued before the controller observes that cutoff is stale.
             return 0;
         };
         let previous = self
