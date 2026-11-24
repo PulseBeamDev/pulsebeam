@@ -3841,7 +3841,6 @@ dependencies = [
  "pulsebeam-agent-core",
  "pulsebeam-core",
  "pulsebeam-proto",
- "pulsebeam-runtime",
  "pulsebeam-udp",
  "rcgen",
  "reqwest",

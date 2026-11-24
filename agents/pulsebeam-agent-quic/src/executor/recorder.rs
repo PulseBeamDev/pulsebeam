@@ -1,7 +1,7 @@
 //! Bounded reference storage for an ordinary pinned encoded subscriber.
 //!
 //! The application subscribes with the normal Agent intent and supplies units
-//! from `LinuxAgent::next_h264` and `LinuxAgent::next_opus` to this sink. These
+//! from `Agent::next_h264` and `Agent::next_opus` to this sink. These
 //! are synchronous filesystem operations: keep them outside Agent turns. The
 //! sink does not mux, synchronize clocks, request retransmission, or promise
 //! crash durability. Stop on storage failure; a partial tail may remain.
@@ -12,7 +12,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use super::linux::{ReceivedH264, ReceivedOpus};
+use super::host::{ReceivedH264, ReceivedOpus};
 
 const INDEX: &str = "index.tsv";
 const HEADER: &str =

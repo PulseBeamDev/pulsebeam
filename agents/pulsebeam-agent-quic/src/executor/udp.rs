@@ -6,8 +6,8 @@ use std::{
 
 use noq_proto::ClientConfig;
 use pulsebeam_agent_core::{Generation, QuicAdmit, QuicEffect, QuicEvent};
-use pulsebeam_runtime::time;
 use pulsebeam_udp::UdpSocket;
+use tokio::time;
 
 use crate::transport::socket::{self, Egress, Flush};
 
@@ -19,7 +19,7 @@ pub enum OpenError {
     Admission(QuicEvent),
 }
 
-/// Linux UDP reactor owner for one association. It retains the committed packet
+/// UDP reactor owner for one association. It retains the committed packet
 /// across backpressure and cancellation of an in-progress wait.
 pub struct UdpAssociation {
     socket: UdpSocket,
@@ -185,7 +185,7 @@ impl UdpAssociation {
                     None => std::future::pending().await,
                 }
             };
-            pulsebeam_runtime::select! {
+            tokio::select! {
                 ready = socket.readable() => ready?,
                 ready = async {
                     if blocked { socket.writable().await } else { std::future::pending().await }

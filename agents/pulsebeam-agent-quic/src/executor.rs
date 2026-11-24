@@ -1,4 +1,4 @@
-//! Linux carrier execution for Core's generation-scoped QUIC effects.
+//! Native carrier execution for Core's generation-scoped QUIC effects.
 
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -37,7 +37,7 @@ use crate::{
     },
 };
 
-pub mod linux;
+pub mod host;
 pub mod recorder;
 pub mod udp;
 
@@ -762,6 +762,109 @@ mod tests {
             panic!("dial effect")
         };
         admit
+    }
+
+    #[cfg(all(feature = "portable-scalar", not(feature = "sim")))]
+    #[tokio::test]
+    #[allow(
+        clippy::disallowed_types,
+        reason = "Noq and rustls require shared immutable TLS configuration"
+    )]
+    async fn portable_scalar_association_reaches_verified_admission() {
+        use std::sync::Arc;
+
+        use crate::transport::{self, UDP_PAYLOAD_BYTES, listener::Listener};
+        use rustls::{
+            RootCertStore, pki_types::PrivatePkcs8KeyDer, time_provider::DefaultTimeProvider,
+        };
+        use tokio::{net::UdpSocket, time};
+
+        let identity = rcgen::generate_simple_self_signed(vec!["edge.example".into()]).unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(identity.cert.der().clone()).unwrap();
+        let config = transport::system_client_config(roots).unwrap();
+        let tls = transport::server_config(
+            vec![identity.cert.der().clone()],
+            PrivatePkcs8KeyDer::from(identity.signing_key.serialize_der()).into(),
+            Arc::new(DefaultTimeProvider),
+            Arc::new(noq_proto::StdSystemTime),
+            std::num::NonZeroUsize::MIN,
+        )
+        .unwrap();
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let mut admit = dial_effect();
+        admit.placement.port = NonZeroU16::new(address.port()).unwrap();
+        admit.placement.initial_dcid = transport::routing::mint(0);
+        let mut client = udp::UdpAssociation::connect(
+            time::Instant::now().into_std(),
+            address.ip(),
+            address.ip(),
+            config,
+            admit,
+        )
+        .await
+        .unwrap();
+        let client_work = async {
+            loop {
+                assert!(
+                    client.progress(false, |_| None).await.unwrap().is_none(),
+                    "client ended admission before the server received it"
+                );
+            }
+        };
+        let server_work = async {
+            let mut listener = Listener::on_shard(tls, 0).unwrap();
+            let mut bytes = [0; (UDP_PAYLOAD_BYTES as usize).saturating_add(1)];
+            let mut out = Vec::new();
+            loop {
+                let timer = async {
+                    if let Some(at) = listener.deadline() {
+                        time::sleep_until(time::Instant::from_std(at)).await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                };
+                let packet = tokio::select! {
+                    received = server.recv_from(&mut bytes) => Some(received.unwrap()),
+                    () = timer => None,
+                };
+                let now = time::Instant::now().into_std();
+                if let Some((size, source)) = packet {
+                    assert!(size <= usize::from(UDP_PAYLOAD_BYTES));
+                    if let Some(tx) = listener.receive(
+                        now,
+                        noq_proto::FourTuple::new(source, Some(address.ip())),
+                        None,
+                        &bytes[..size],
+                        &mut out,
+                    ) {
+                        server
+                            .send_to(&out[..tx.size], tx.destination)
+                            .await
+                            .unwrap();
+                    }
+                }
+                listener.begin_turn();
+                let mut received = None;
+                if let Some((_, Some(tx))) = listener.poll_one(now, &mut out, |_, peer| {
+                    received = peer.take_admit(now).unwrap();
+                }) {
+                    server
+                        .send_to(&out[..tx.size], tx.destination)
+                        .await
+                        .unwrap();
+                }
+                if let Some(body) = received {
+                    assert_eq!(Admit::decode(&body).unwrap().token, "token");
+                    break;
+                }
+            }
+        };
+        tokio::select! {
+            () = client_work => unreachable!(),
+            result = time::timeout(Duration::from_secs(2), server_work) => result.unwrap(),
+        }
     }
 
     #[test]

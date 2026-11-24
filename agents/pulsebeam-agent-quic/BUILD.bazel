@@ -46,25 +46,24 @@ rust_library(
 )
 
 [rust_library(
-    name = "executor" + ("-sim" if sim else ""),
+    name = "executor" + suffix,
     crate_name = "pulsebeam_agent_quic",
     crate_root = "src/lib.rs",
     srcs = glob(["src/**/*.rs"]),
     edition = crate_edition(),
-    crate_features = ["executor"] + (["sim"] if sim else []),
+    crate_features = ["executor"] + features,
     lint_config = ":lints",
     aliases = aliases(),
     deps = _TRANSPORT_DEPS + [
         "@crates//:reqwest",
         "@crates//:tokio",
-        "//agents/pulsebeam-agent-core:pulsebeam-agent-core" + ("-sim" if sim else ""),
-        "//crates/pulsebeam-core:pulsebeam-core-http" + ("-sim" if sim else ""),
+        "//agents/pulsebeam-agent-core:pulsebeam-agent-core" + ("-sim" if suffix == "-sim" else ""),
+        "//crates/pulsebeam-core:pulsebeam-core-http" + ("-sim" if suffix == "-sim" else ""),
         "//crates/pulsebeam-proto:pulsebeam-proto",
-        "//crates/pulsebeam-runtime:pulsebeam-runtime" + ("-sim" if sim else ""),
-        "//crates/pulsebeam-udp:pulsebeam-udp" + ("-sim" if sim else ""),
+        "//crates/pulsebeam-udp:pulsebeam-udp" + suffix,
     ],
     target_compatible_with = ["@platforms//os:linux"],
-) for sim in [False, True]]
+) for suffix, features in [("", []), ("-sim", ["sim"]), ("-portable", ["portable-scalar"])]]
 
 rust_test(
     name = "unit_tests",
@@ -75,5 +74,16 @@ rust_test(
     target_compatible_with = ["@platforms//os:linux"],
 )
 
+rust_test(
+    name = "portable_conformance",
+    crate = ":executor-portable",
+    crate_features = ["executor", "portable-scalar"],
+    aliases = aliases(normal = True, normal_dev = True),
+    deps = all_crate_deps(normal_dev = True),
+    args = ["--exact", "executor::tests::portable_scalar_association_reaches_verified_admission"],
+    target_compatible_with = ["@platforms//os:linux"],
+)
+
 rust_clippy_test(name = "clippy", targets = [":pulsebeam-agent-quic", ":executor", ":executor-sim", ":unit_tests"])
+rust_clippy_test(name = "portable_clippy", targets = [":executor-portable", ":portable_conformance"])
 rustfmt_test(name = "format", targets = [":pulsebeam-agent-quic", ":executor", ":unit_tests"])

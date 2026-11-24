@@ -11,7 +11,6 @@ noq-proto = { version = "=1.4.0", default-features = false, features = ["rustls"
 pulsebeam-agent-core = { path = "../pulsebeam-agent-core", optional = true }
 pulsebeam-core = { path = "../../crates/pulsebeam-core" }
 pulsebeam-proto = { path = "../../crates/pulsebeam-proto" }
-pulsebeam-runtime = { path = "../../crates/pulsebeam-runtime", optional = true }
 pulsebeam-udp = { path = "../../crates/pulsebeam-udp" }
 reqwest = { version = "0.13.4", optional = true }
 tokio = { workspace = true, optional = true }
@@ -22,8 +21,9 @@ rcgen = { version = "0.14.7", default-features = false, features = ["crypto", "a
 tokio.workspace = true
 
 [features]
-executor = ["dep:pulsebeam-agent-core", "dep:pulsebeam-runtime", "dep:reqwest", "dep:tokio"]
-sim = ["pulsebeam-udp/sim", "pulsebeam-runtime?/sim"]
+executor = ["dep:pulsebeam-agent-core", "dep:reqwest", "dep:tokio"]
+sim = ["pulsebeam-udp/sim"]
+portable-scalar = ["pulsebeam-udp/portable-scalar"]
 
 [lints]
 workspace = true

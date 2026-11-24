@@ -10,8 +10,8 @@ use std::{
 
 use noq_proto::ClientConfig;
 use pulsebeam_agent_core::{
-    Agent, AgentCommand, AgentConfig, AgentError, Effect, Failure, FailureClass, Generation,
-    HostEvent, HttpEffect, HttpEvent, HttpMethod, HttpRequest, HttpResponse, MediaKind,
+    Agent as CoreAgent, AgentCommand, AgentConfig, AgentError, Effect, Failure, FailureClass,
+    Generation, HostEvent, HttpEffect, HttpEvent, HttpMethod, HttpRequest, HttpResponse, MediaKind,
     Notification, OperationId, QuicEffect, QuicEvent, Snapshot, TimerEffect, TimerEvent, TimerId,
 };
 use pulsebeam_core::{
@@ -21,8 +21,8 @@ use pulsebeam_core::{
     },
     h264::{Depacketizer, MAX_ACCESS_UNIT_SIZE, Packetization, PacketizedChunk, Packetizer},
 };
-use pulsebeam_runtime::time::{self, Instant};
 use rustls::RootCertStore;
+use tokio::time::{self, Instant};
 
 use crate::{
     data_bindings::FabricOffer,
@@ -179,10 +179,10 @@ struct MediaSender {
     framer: Sender,
 }
 
-/// Caller-driven Linux Agent. Run its turns on the reactor that owns the UDP
+/// Caller-driven native Agent. Run its turns on the reactor that owns the UDP
 /// sockets. It does not dispatch a background task or retain an RTC host.
-pub struct LinuxAgent {
-    core: Agent,
+pub struct Agent {
+    core: CoreAgent,
     http: reqwest::Client,
     tls: ClientConfig,
     local: IpAddr,
@@ -201,13 +201,13 @@ pub struct LinuxAgent {
     sim: Option<SimServices>,
 }
 
-impl LinuxAgent {
+impl Agent {
     pub fn new(
         config: AgentConfig,
         local: IpAddr,
         quic_roots: RootCertStore,
     ) -> Result<Self, Error> {
-        let core = Agent::new_quic(config).map_err(Error::Core)?;
+        let core = CoreAgent::new_quic(config).map_err(Error::Core)?;
         let http = Self::placement_client().build().map_err(Error::Http)?;
         let tls = transport::system_client_config(quic_roots).map_err(Error::Tls)?;
         Ok(Self {
@@ -1040,7 +1040,7 @@ impl LinuxAgent {
             }
         };
         let [first, second] = &mut self.sockets;
-        let input = pulsebeam_runtime::select! {
+        let input = tokio::select! {
             http = work(&mut self.request) => Input::Http(http),
             dial = work(&mut self.dialing) => Input::Dial(dial),
             timer = timer => Input::Timer(timer),
@@ -1101,7 +1101,7 @@ async fn work<Id, T>(work: &mut Option<(Id, Work<T>)>) -> T {
 
 async fn socket_turn(
     slot: &mut Option<Box<UdpAssociation>>,
-    core: &Agent,
+    core: &CoreAgent,
     retry_payload_turn: Option<Generation>,
 ) -> Option<QuicEvent> {
     let Some(socket) = slot.as_mut() else {

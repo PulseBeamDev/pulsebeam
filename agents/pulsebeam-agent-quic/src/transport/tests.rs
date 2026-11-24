@@ -955,9 +955,13 @@ fn control_frame_reports_only_full_write_and_keeps_original_partial_deadline() {
     assert_eq!(server.deadline(), None);
 }
 
+#[cfg(all(
+    target_os = "linux",
+    not(any(feature = "sim", feature = "portable-scalar"))
+))]
 #[test]
 fn moving_reactors_preserves_the_descriptor_and_the_single_pending_transmit() {
-    use super::socket::{Flush, SocketIo};
+    use super::socket::{self, Egress, Flush};
 
     fn assert_send<T: Send>(_: &T) {}
     let first = tokio::runtime::Builder::new_current_thread()
@@ -969,43 +973,50 @@ fn moving_reactors_preserves_the_descriptor_and_the_single_pending_transmit() {
         .enable_time()
         .build()
         .unwrap();
-    let (source, detached) = first.block_on(async {
-        let mut io = SocketIo::bind("127.0.0.1:0".parse().unwrap())
+    let (source, detached, mut egress) = first.block_on(async {
+        let socket = socket::bind("127.0.0.1:0".parse().unwrap())
             .await
-            .unwrap();
-        let source = io.socket().local_addr();
-        assert!(
-            io.stage(|out| {
-                out.extend_from_slice(b"pending");
-                Some(Transmit {
-                    destination: source,
-                    ecn: None,
-                    size: out.len(),
-                    segment_size: None,
-                    src_ip: Some(source.ip()),
-                })
-            })
             .unwrap()
-        );
+            .activate()
+            .unwrap();
+        let source = socket.local_addr();
+        let mut egress = Egress::default();
         assert!(
-            !io.stage(|_| panic!("existing transmit must not be overwritten"))
+            egress
+                .stage(source, |out| {
+                    out.extend_from_slice(b"pending");
+                    Some(Transmit {
+                        destination: source,
+                        ecn: None,
+                        size: out.len(),
+                        segment_size: None,
+                        src_ip: Some(source.ip()),
+                    })
+                })
                 .unwrap()
         );
-        (source, io.detach())
+        assert!(
+            !egress
+                .stage(source, |_| panic!(
+                    "existing transmit must not be overwritten"
+                ))
+                .unwrap()
+        );
+        (source, socket.detach(), egress)
     });
     assert_send(&detached);
     drop(first);
     second.block_on(async {
-        let mut io = detached.activate().map_err(|(_, e)| e).unwrap();
-        assert_eq!(io.socket().local_addr(), source);
-        io.socket().writable().await.unwrap();
-        assert_eq!(io.flush().unwrap(), Flush::Sent);
-        assert_eq!(io.flush().unwrap(), Flush::Empty);
-        tokio::time::timeout(Duration::from_secs(2), io.socket().readable())
+        let mut socket = detached.activate().map_err(|(_, e)| e).unwrap();
+        assert_eq!(socket.local_addr(), source);
+        socket.writable().await.unwrap();
+        assert_eq!(egress.flush(&mut socket).unwrap(), Flush::Sent);
+        assert_eq!(egress.flush(&mut socket).unwrap(), Flush::Empty);
+        tokio::time::timeout(Duration::from_secs(2), socket.readable())
             .await
             .unwrap()
             .unwrap();
-        let batch = io.socket().try_recv_batch().unwrap();
+        let batch = socket.try_recv_batch().unwrap();
         let datagram = batch.iter().next().unwrap();
         assert_eq!(datagram.payload, b"pending");
         assert_eq!(datagram.source, source);

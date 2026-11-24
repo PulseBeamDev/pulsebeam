@@ -67,7 +67,10 @@ impl Client {
         roots: RootCertStore,
         placement: &pulsebeam_agent_core::placement::Placement,
     ) -> Result<Self> {
-        ensure!(placement.port.get() == edge.port(), "placement did not advertise the RTC UDP port");
+        ensure!(
+            placement.port.get() == edge.port(),
+            "placement did not advertise the RTC UDP port"
+        );
         let socket = transport::socket::bind(SocketAddr::new(edge.ip(), 0))
             .await?
             .activate()?;
@@ -328,11 +331,13 @@ async fn issue(
         "admission HTTP status: {}",
         head.lines().next().unwrap_or_default()
     );
-    let result = pulsebeam_agent_core::placement::Placement::decode(&pulsebeam_agent_core::HttpResponse {
-        status: 200,
-        headers: vec![],
-        body: body.as_bytes().to_vec(),
-    }).map_err(|error| anyhow::anyhow!("invalid placement: {error:?}"))?;
+    let result =
+        pulsebeam_agent_core::placement::Placement::decode(&pulsebeam_agent_core::HttpResponse {
+            status: 200,
+            headers: vec![],
+            body: body.as_bytes().to_vec(),
+        })
+        .map_err(|error| anyhow::anyhow!("invalid placement: {error:?}"))?;
     ensure!(result.host == "edge.example");
     Ok(result)
 }
@@ -999,7 +1004,7 @@ fn sim_quic_agent(
     edge: SocketAddr,
     roots: RootCertStore,
     token: &str,
-) -> Result<pulsebeam_agent_quic::executor::linux::LinuxAgent> {
+) -> Result<pulsebeam_agent_quic::executor::host::Agent> {
     sim_quic_agent_with_placement(address, edge, roots, token, sim_placement)
 }
 
@@ -1009,14 +1014,14 @@ fn sim_quic_agent_with_placement<F, Fut>(
     roots: RootCertStore,
     token: &str,
     placement: F,
-) -> Result<pulsebeam_agent_quic::executor::linux::LinuxAgent>
+) -> Result<pulsebeam_agent_quic::executor::host::Agent>
 where
     F: Fn(pulsebeam_agent_core::HttpRequest) -> Fut + 'static,
     Fut: std::future::Future<Output = Option<pulsebeam_agent_core::HttpResponse>> + 'static,
 {
     use pulsebeam_agent_core::AgentConfig;
-    use pulsebeam_agent_quic::executor::linux::LinuxAgent;
-    Ok(LinuxAgent::new(
+    use pulsebeam_agent_quic::executor::host::Agent;
+    Ok(Agent::new(
         AgentConfig {
             endpoint: format!("https://{address}"),
             token: token.into(),
@@ -1373,7 +1378,7 @@ async fn failed_path_exchange(
     mtu.set(1_000);
     let old_payload = [0xf8; 1024];
     loop {
-        use pulsebeam_agent_quic::executor::linux::OpusSendError;
+        use pulsebeam_agent_quic::executor::host::OpusSendError;
         match agent.send_opus("voice", 960, false, &old_payload) {
             Ok(()) => break,
             Err(OpusSendError::Datagram(
@@ -1440,9 +1445,9 @@ async fn prepare_agent_opus_publisher(
     edge: SocketAddr,
     roots: RootCertStore,
     publisher_token: &str,
-) -> Result<(pulsebeam_agent_quic::executor::linux::LinuxAgent, String)> {
+) -> Result<(pulsebeam_agent_quic::executor::host::Agent, String)> {
     use pulsebeam_agent_core::{AgentCommand, DesiredState, MediaKind, PublicationIntent};
-    use pulsebeam_agent_quic::executor::linux::OpusSendError;
+    use pulsebeam_agent_quic::executor::host::OpusSendError;
     let mut publisher = sim_quic_agent(address, edge, roots, publisher_token)?;
     publisher.command(AgentCommand::ReplaceDesired(DesiredState {
         revision: 1,
@@ -1486,7 +1491,7 @@ async fn opus_exchange(
     rebind: bool,
 ) -> Result<()> {
     use pulsebeam_agent_core::{AgentCommand, AudioSubscription, DesiredState};
-    use pulsebeam_agent_quic::executor::linux::OpusSendError;
+    use pulsebeam_agent_quic::executor::host::OpusSendError;
     let (mut publisher, publication_id) =
         prepare_agent_opus_publisher(address, edge, roots.clone(), publisher_token).await?;
     let mut receiver = sim_quic_agent(address, edge, roots, receiver_token)?;
@@ -1594,7 +1599,7 @@ async fn mixed_opus_exchange(
         Agent as RuntimeAgent, AudioInput, Config, Host, InputFrame, MediaStreamUpdate,
         OutputFrame, ReceiveMode, ffi::Agent,
     };
-    use pulsebeam_agent_quic::executor::linux::OpusSendError;
+    use pulsebeam_agent_quic::executor::host::OpusSendError;
     let (mut quic, publication) =
         prepare_agent_opus_publisher(address, edge, roots, quic_token).await?;
     let bulk = TrackSpec::Data {
@@ -2061,7 +2066,7 @@ async fn mixed_h264_exchange(
             .map_err(|error| anyhow::anyhow!("QUIC video send: {error:?}"))?;
         ensure!(
             quic.send_h264("camera", sample.rtp_timestamp, Vec::new())
-                == Err(pulsebeam_agent_quic::executor::linux::H264SendError::Busy)
+                == Err(pulsebeam_agent_quic::executor::host::H264SendError::Busy)
         );
         let receive = async {
             loop {
@@ -2268,7 +2273,7 @@ async fn mixed_h264_exchange(
     ensure!(quic.next_h264().is_none());
     ensure!(
         quic.send_h264("camera", unit.rtp_timestamp, unit.data)
-            == Err(pulsebeam_agent_quic::executor::linux::H264SendError::NotReady)
+            == Err(pulsebeam_agent_quic::executor::host::H264SendError::NotReady)
     );
     rtc.close().await?;
     Ok(())

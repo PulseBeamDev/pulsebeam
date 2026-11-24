@@ -22,6 +22,8 @@ nix = { version = "0.31", default-features = false, features = ["socket", "uio",
 
 [features]
 sim = ["dep:turmoil"]
+# Select the non-Linux backend on Linux for portable client conformance.
+portable-scalar = []
 
 [[bench]]
 name = "io"

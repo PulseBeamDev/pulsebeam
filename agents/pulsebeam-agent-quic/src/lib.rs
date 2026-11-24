@@ -1,4 +1,4 @@
-#![cfg(target_os = "linux")]
+#![cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 
 /// Packet types shared with the negotiated native binding API.
 pub use pulsebeam_core::fabric;

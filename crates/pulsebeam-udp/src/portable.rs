@@ -2,15 +2,18 @@
 //! support and is rejected rather than fabricating receive destinations.
 use super::*;
 
+#[cfg(windows)]
+const WSAEMSGSIZE: i32 = 10040;
+
 pub(crate) struct Bound {
     socket: socket2::Socket,
     local_addr: SocketAddr,
 }
 pub(crate) async fn bind(options: &BindOptions) -> io::Result<Bound> {
-    if options.nonfragmenting_max_datagram_bytes.is_some() {
+    if options.nonfragmenting_max_datagram_bytes.is_some() || options.receive_ecn {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "portable UDP cannot enforce nonfragmenting sends",
+            "portable UDP does not support ECN or nonfragmenting mode",
         ));
     }
     if options.mode == Mode::Batch || options.local_addr.ip().is_unspecified() {
@@ -94,7 +97,16 @@ impl Socket {
         counters: &mut Counters,
     ) -> io::Result<()> {
         let bytes = arena.bytes.get_mut(..arena.slot_size).unwrap_or_default();
-        let (len, source) = self.socket.try_recv_from(bytes)?;
+        let (len, source) = match self.socket.try_recv_from(bytes) {
+            // Winsock consumes the oversized UDP message but returns an error
+            // instead of the truncated byte count returned by Unix.
+            #[cfg(windows)]
+            Err(error) if error.raw_os_error() == Some(WSAEMSGSIZE) => {
+                counters.truncated_drops = counters.truncated_drops.saturating_add(1);
+                return Ok(());
+            }
+            result => result?,
+        };
         if len > max_datagram {
             counters.truncated_drops = counters.truncated_drops.saturating_add(1);
         } else if let Some(entry) = arena.entries.first_mut() {

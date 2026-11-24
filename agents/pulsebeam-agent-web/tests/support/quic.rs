@@ -11,7 +11,7 @@ use agent_core::{
     VideoSubscription,
 };
 use noq_proto::rustls::RootCertStore;
-use pulsebeam_agent_quic::{executor::linux::LinuxAgent, transport::DatagramAdmission};
+use pulsebeam_agent_quic::{executor::host::Agent, transport::DatagramAdmission};
 use pulsebeam_core::identity::{ParticipantId, RoomId};
 use pulsebeam_testdata::{QualityAudioSource, QualityVideoLayer, QualityVideoSource};
 use thirtyfour::bidi::{BiDi, BrowsingContextId};
@@ -114,7 +114,7 @@ pub async fn witness(
     let native_token = mint_development_token(&room, &ParticipantId::new(NATIVE)?, expiry)?;
     let mut roots = RootCertStore::empty();
     roots.add(endpoint.certificate.clone().into())?;
-    let mut agent = LinuxAgent::new(
+    let mut agent = Agent::new(
         AgentConfig {
             endpoint: endpoint.https.clone(),
             token: native_token,
@@ -149,8 +149,8 @@ pub async fn witness(
     Ok(())
 }
 
-async fn drive(agent: &mut LinuxAgent, browser_done: &Cell<bool>) -> TestResult<()> {
-    use pulsebeam_agent_quic::executor::linux::{H264SendError, OpusSendError};
+async fn drive(agent: &mut Agent, browser_done: &Cell<bool>) -> TestResult<()> {
+    use pulsebeam_agent_quic::executor::host::{H264SendError, OpusSendError};
     let spec = TrackSpec::Data {
         track_id: "bytes".into(),
         delivery: TopicMode::Ordered,

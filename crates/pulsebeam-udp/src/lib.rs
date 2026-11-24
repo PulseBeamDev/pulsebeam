@@ -12,15 +12,28 @@ use std::{
 };
 use tokio::time::Instant;
 
-#[cfg(all(target_os = "linux", not(feature = "sim")))]
+#[cfg(all(
+    target_os = "linux",
+    not(any(feature = "sim", feature = "portable-scalar"))
+))]
 mod linux;
-#[cfg(all(not(target_os = "linux"), not(feature = "sim")))]
-#[path = "portable.rs"]
-mod linux;
+#[cfg(all(
+    not(feature = "sim"),
+    any(not(target_os = "linux"), feature = "portable-scalar")
+))]
+mod portable;
 #[cfg(feature = "sim")]
 pub mod simulation;
-#[cfg(not(feature = "sim"))]
+#[cfg(all(
+    target_os = "linux",
+    not(any(feature = "sim", feature = "portable-scalar"))
+))]
 use linux as backend;
+#[cfg(all(
+    not(feature = "sim"),
+    any(not(target_os = "linux"), feature = "portable-scalar")
+))]
+use portable as backend;
 #[cfg(feature = "sim")]
 use simulation as backend;
 
@@ -114,7 +127,10 @@ pub enum Ecn {
 }
 
 impl Ecn {
-    #[cfg(all(target_os = "linux", not(feature = "sim")))]
+    #[cfg(all(
+        target_os = "linux",
+        not(any(feature = "sim", feature = "portable-scalar"))
+    ))]
     fn from_traffic_class(value: u8) -> Self {
         match value & 3 {
             1 => Self::Ect1,
@@ -267,7 +283,10 @@ impl BoundUdpSocket {
     }
 }
 
-#[cfg(all(target_os = "linux", not(feature = "sim")))]
+#[cfg(all(
+    target_os = "linux",
+    not(any(feature = "sim", feature = "portable-scalar"))
+))]
 impl std::os::fd::AsFd for BoundUdpSocket {
     fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
         std::os::fd::AsFd::as_fd(&self.inner)
@@ -275,7 +294,10 @@ impl std::os::fd::AsFd for BoundUdpSocket {
 }
 
 /// An unregistered Linux socket retaining its descriptor, queued packets and state.
-#[cfg(all(target_os = "linux", not(feature = "sim")))]
+#[cfg(all(
+    target_os = "linux",
+    not(any(feature = "sim", feature = "portable-scalar"))
+))]
 pub struct DetachedUdpSocket {
     inner: backend::Detached,
     arena: ReceiveArena,
@@ -284,14 +306,20 @@ pub struct DetachedUdpSocket {
     counters: Counters,
 }
 
-#[cfg(all(target_os = "linux", not(feature = "sim")))]
+#[cfg(all(
+    target_os = "linux",
+    not(any(feature = "sim", feature = "portable-scalar"))
+))]
 impl std::os::fd::AsFd for DetachedUdpSocket {
     fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
         std::os::fd::AsFd::as_fd(&self.inner)
     }
 }
 
-#[cfg(all(target_os = "linux", not(feature = "sim")))]
+#[cfg(all(
+    target_os = "linux",
+    not(any(feature = "sim", feature = "portable-scalar"))
+))]
 impl DetachedUdpSocket {
     /// Register on the current Tokio I/O reactor, returning ownership on failure.
     /// The current runtime must have its I/O driver enabled.
@@ -335,7 +363,10 @@ pub struct UdpSocket {
 
 impl UdpSocket {
     /// Deregister without closing or duplicating the underlying Linux socket.
-    #[cfg(all(target_os = "linux", not(feature = "sim")))]
+    #[cfg(all(
+        target_os = "linux",
+        not(any(feature = "sim", feature = "portable-scalar"))
+    ))]
     pub fn detach(self) -> DetachedUdpSocket {
         DetachedUdpSocket {
             inner: self.inner.detach(),
@@ -404,7 +435,10 @@ impl UdpSocket {
     }
 
     pub const fn supports_ect0(&self) -> bool {
-        cfg!(all(target_os = "linux", not(feature = "sim")))
+        cfg!(all(
+            target_os = "linux",
+            not(any(feature = "sim", feature = "portable-scalar"))
+        ))
     }
 
     /// Submit exactly one ECT(0) datagram using per-packet IP metadata.
