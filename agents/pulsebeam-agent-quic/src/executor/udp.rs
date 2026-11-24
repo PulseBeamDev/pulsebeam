@@ -106,6 +106,11 @@ impl UdpAssociation {
         }
     }
 
+    #[cfg(feature = "sim")]
+    pub(super) fn data_staging(&self) -> super::DataStaging {
+        self.association.data_staging
+    }
+
     pub(super) fn datagram_limit(&mut self) -> Option<usize> {
         self.association.transport.datagram_limit()
     }
@@ -114,14 +119,7 @@ impl UdpAssociation {
         &mut self,
         datagram: crate::records::Datagram<'_>,
     ) -> Result<(), crate::transport::DatagramAdmission> {
-        use crate::transport::DatagramAdmission;
-        if !matches!(self.association.stage, super::Stage::Active { .. }) {
-            return Err(DatagramAdmission::Unsupported);
-        }
-        if !self.association.pending_data.is_empty() {
-            return Err(DatagramAdmission::Full);
-        }
-        self.association.transport.offer_datagram(datagram)
+        self.association.offer_media(datagram)
     }
 
     pub fn submit(&mut self, effect: QuicEffect) -> Result<(), SubmitError> {

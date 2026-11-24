@@ -28,6 +28,7 @@ use crate::{
 };
 
 pub mod linux;
+pub mod recorder;
 pub mod udp;
 
 const RENEW_TIMEOUT: Duration = Duration::from_secs(5);
@@ -47,8 +48,35 @@ pub struct Association {
     generation: Generation,
     transport: ClientTransport,
     stage: Stage,
-    pending_data: VecDeque<QuicDataSend>,
+    pending_data: VecDeque<PendingData>,
+    #[cfg(feature = "sim")]
+    data_staging: DataStaging,
+    bulk_due: bool,
     more_data_work: bool,
+}
+
+struct PendingData {
+    send: QuicDataSend,
+    #[cfg(feature = "sim")]
+    queued_at: Instant,
+}
+
+#[cfg(feature = "sim")]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DataStaging {
+    pub peak_records: usize,
+    pub peak_bytes: usize,
+    pub max_wait: Duration,
+}
+
+impl PendingData {
+    fn new(send: QuicDataSend, _now: Instant) -> Self {
+        Self {
+            send,
+            #[cfg(feature = "sim")]
+            queued_at: _now,
+        }
+    }
 }
 
 enum Stage {
@@ -120,6 +148,9 @@ impl Association {
             transport,
             stage: Stage::Admitting(admission),
             pending_data: VecDeque::new(),
+            #[cfg(feature = "sim")]
+            data_staging: DataStaging::default(),
+            bulk_due: false,
             more_data_work: false,
         })
     }
@@ -161,7 +192,8 @@ impl Association {
                 generation,
                 channel,
             } if generation == self.generation => {
-                self.pending_data.retain(|send| send.channel != channel);
+                self.pending_data
+                    .retain(|data| data.send.channel != channel);
                 Ok(())
             }
             QuicEffect::SendData(send) if send.generation == self.generation => {
@@ -177,7 +209,18 @@ impl Association {
                 if self.pending_data.len() >= MAX_PENDING_DATA {
                     return Err(SubmitError::Data(DatagramAdmission::Full));
                 }
-                self.pending_data.push_back(send);
+                self.pending_data.push_back(PendingData::new(send, now));
+                #[cfg(feature = "sim")]
+                {
+                    self.data_staging.peak_records =
+                        self.data_staging.peak_records.max(self.pending_data.len());
+                    self.data_staging.peak_bytes = self.data_staging.peak_bytes.max(
+                        self.pending_data
+                            .iter()
+                            .map(|data| data.send.payload.len())
+                            .sum(),
+                    );
+                }
                 Ok(())
             }
             QuicEffect::Renew(effect) if effect.generation == self.generation => {
@@ -284,7 +327,7 @@ impl Association {
             } => match poll_active(generation, connection, control, pending, renewal, now) {
                 Ok(Some(event)) => return Some(event),
                 Ok(None) => {
-                    if let Some(event) = self.poll_data_send() {
+                    if let Some(event) = self.poll_data_send(now) {
                         return Some(event);
                     }
                     let connection = self.transport.connection();
@@ -334,8 +377,22 @@ impl Association {
             failure,
         })
     }
-    fn poll_data_send(&mut self) -> Option<QuicEvent> {
-        let pending = self.pending_data.front()?;
+    fn offer_media(&mut self, datagram: Datagram<'_>) -> Result<(), DatagramAdmission> {
+        if !matches!(self.stage, Stage::Active { .. }) {
+            return Err(DatagramAdmission::Unsupported);
+        }
+        // Alternate with pending bulk after successful media admission, not
+        // after a blocked attempt. Stream control retains its own turns.
+        if self.bulk_due && !self.pending_data.is_empty() {
+            return Err(DatagramAdmission::Full);
+        }
+        self.transport.offer_datagram(datagram)?;
+        self.bulk_due = true;
+        Ok(())
+    }
+
+    fn poll_data_send(&mut self, _now: Instant) -> Option<QuicEvent> {
+        let pending = &self.pending_data.front()?.send;
         let result = match self.transport.offer_datagram(Datagram {
             kind: DatagramKind::Data,
             binding: pending.binding,
@@ -349,7 +406,16 @@ impl Association {
             Err(DatagramAdmission::Full) => return None,
             Err(error) => Err(format!("QUIC DATA admission: {error:?}")),
         };
-        let sent = self.pending_data.pop_front()?;
+        let pending = self.pending_data.pop_front()?;
+        #[cfg(feature = "sim")]
+        {
+            self.data_staging.max_wait = self
+                .data_staging
+                .max_wait
+                .max(_now.saturating_duration_since(pending.queued_at));
+        }
+        let sent = pending.send;
+        self.bulk_due = false;
         Some(QuicEvent::DataSent {
             generation: sent.generation,
             channel: sent.channel,

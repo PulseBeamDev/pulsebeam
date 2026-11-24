@@ -32,6 +32,7 @@ const PLACEMENT_BODY_LIMIT: usize = 1_024;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 const EFFECTS_PER_TURN: usize = 32;
 const RTP_HEADER: usize = 12;
+const MAX_VIDEO_SEND_AGE: Duration = Duration::from_millis(120);
 
 type Work<T> = Pin<Box<dyn Future<Output = T>>>;
 type DialResult = Result<Box<UdpAssociation>, QuicEvent>;
@@ -72,6 +73,7 @@ struct PendingVideo {
     generation: Generation,
     binding: NonZeroU16,
     timestamp: u32,
+    accepted_at: Instant,
     packets: Packetization,
     next: PacketizedChunk,
 }
@@ -99,6 +101,8 @@ pub struct ReceivedOpus {
 pub struct ReceivedH264 {
     pub publication_id: String,
     pub timestamp: u32,
+    pub first_sequence: u16,
+    pub last_sequence: u16,
     pub access_unit: Vec<u8>,
 }
 
@@ -106,6 +110,7 @@ pub struct ReceivedH264 {
 struct VideoAssembly {
     depacketizer: Depacketizer,
     last: Option<(u16, u32)>,
+    first_sequence: u16,
     discard: bool,
 }
 
@@ -116,7 +121,7 @@ impl VideoAssembly {
         timestamp: u32,
         marker: bool,
         payload: &[u8],
-    ) -> Option<Vec<u8>> {
+    ) -> Option<(u16, Vec<u8>)> {
         let mut start = true;
         if let Some((previous, time)) = self.last {
             let distance = sequence.wrapping_sub(previous);
@@ -135,10 +140,13 @@ impl VideoAssembly {
         if self.discard {
             return None;
         }
+        if start {
+            self.first_sequence = sequence;
+        }
         match self.depacketizer.push(payload, start, marker) {
             Ok(Some(frame)) => {
                 self.discard = true;
-                Some(frame)
+                Some((self.first_sequence, frame))
             }
             Ok(None) => None,
             Err(_) => {
@@ -428,6 +436,7 @@ impl LinuxAgent {
             generation: live.generation,
             binding: live.binding,
             timestamp,
+            accepted_at: Instant::now(),
             packets,
             next,
         });
@@ -437,6 +446,9 @@ impl LinuxAgent {
     fn offer_pending_video(&mut self) -> Option<Generation> {
         use transport::DatagramAdmission::{ControlTurn, Full};
         let mut video = self.pending_video.take()?;
+        if video.accepted_at.elapsed() >= MAX_VIDEO_SEND_AGE {
+            return None;
+        }
         let kind = pulsebeam_agent_core::MediaKind::Video;
         if !self
             .core
@@ -562,12 +574,13 @@ impl LinuxAgent {
             }
         }
         let timestamp = u32::from_be_bytes([*c, *d, *e, *f]);
-        if let Some(access_unit) = self.video_assemblies.entry(key).or_default().push(
-            u16::from_be_bytes([*a, *b]),
-            timestamp,
-            *pt & 0x80 != 0,
-            payload,
-        ) {
+        let last_sequence = u16::from_be_bytes([*a, *b]);
+        if let Some((first_sequence, access_unit)) = self
+            .video_assemblies
+            .entry(key)
+            .or_default()
+            .push(last_sequence, timestamp, *pt & 0x80 != 0, payload)
+        {
             if self.received_h264.len() >= MAX_QUEUED_H264 {
                 let _ = self.received_h264.pop_front();
             }
@@ -577,6 +590,8 @@ impl LinuxAgent {
                 ReceivedH264 {
                     publication_id: live.publication_id.into(),
                     timestamp,
+                    first_sequence,
+                    last_sequence,
                     access_unit,
                 },
             ));
@@ -653,6 +668,17 @@ impl LinuxAgent {
         socket.rebind(local).await?;
         self.local = local;
         Ok(())
+    }
+
+    /// Per-association DATA executor staging high-water marks and wait.
+    #[cfg(feature = "sim")]
+    pub fn data_staging(&self) -> Option<super::DataStaging> {
+        let generation = self.core.snapshot().generation?;
+        self.sockets
+            .iter()
+            .flatten()
+            .find(|socket| socket.generation() == generation)
+            .map(|socket| socket.data_staging())
     }
 
     pub fn snapshot(&self) -> &Snapshot {
@@ -1015,7 +1041,10 @@ mod tests {
         assert_eq!(rx.push(u16::MAX, 10, false, &nal), None);
         assert_eq!(
             rx.push(0, 10, true, &nal),
-            Some(vec![0, 0, 0, 1, 0x65, 0xa5, 0, 0, 0, 1, 0x65, 0xa5])
+            Some((
+                u16::MAX,
+                vec![0, 0, 0, 1, 0x65, 0xa5, 0, 0, 0, 1, 0x65, 0xa5]
+            ))
         );
         assert_eq!(rx.push(0, 10, true, &nal), None);
         assert_eq!(rx.push(1, 20, false, &nal), None);
@@ -1023,7 +1052,7 @@ mod tests {
         assert_eq!(rx.push(2, 20, false, &nal), None);
         assert_eq!(
             rx.push(4, 30, true, &nal),
-            Some(vec![0, 0, 0, 1, 0x65, 0xa5])
+            Some((4, vec![0, 0, 0, 1, 0x65, 0xa5]))
         );
     }
 }

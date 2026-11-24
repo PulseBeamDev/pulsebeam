@@ -124,6 +124,20 @@ py_binary(
 )
 
 py_binary(
+    name = "quic_profile",
+    testonly = True,
+    srcs = ["scripts/quic_profile.py"],
+    main = "scripts/quic_profile.py",
+    args = [
+        "--runner", "$(rootpath //tools:run-simulations.py)",
+        "--sim-binary", "$(rootpath :sim_binary)",
+        "--kernel", "$(rootpath //crates/pulsebeam:transport_conformance)",
+    ] + CANDIDATE_ARGS,
+    data = [":sim_binary", ":candidate", "//tools:run-simulations.py", "//crates/pulsebeam:transport_conformance"] + INCIDENT_DATA,
+    tags = ["manual"],
+)
+
+py_binary(
     name = "sweep",
     testonly = True,
     srcs = ["//tools:run-simulations.py"],

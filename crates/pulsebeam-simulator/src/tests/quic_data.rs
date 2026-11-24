@@ -369,11 +369,35 @@ fn quic_media_opus_exchanges_with_webrtc_encoded_endpoints() {
     let host = pulsebeam_runtime::testing::test_host_ip("192.168.250.103");
     let mut sim = turmoil::Builder::new().build();
     sim.client(host, async move {
-        witness(Scenario::MixedOpus { host }).await?;
+        witness(Scenario::MixedOpus {
+            host,
+            contention: false,
+        })
+        .await?;
         Ok(())
     });
     super::common::run_sim_or_timeout(&mut sim, Duration::from_secs(10))
         .expect("mixed Opus replay");
+}
+
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "mixed traffic must complete in deterministic replay"
+)]
+fn quic_mixed_keeps_control_media_and_reliable_data_progressing() {
+    let host = pulsebeam_runtime::testing::test_host_ip("192.168.250.103");
+    let mut sim = turmoil::Builder::new().build();
+    sim.client(host, async move {
+        witness(Scenario::MixedOpus {
+            host,
+            contention: true,
+        })
+        .await?;
+        Ok(())
+    });
+    super::common::run_sim_or_timeout(&mut sim, Duration::from_secs(10))
+        .expect("mixed traffic replay");
 }
 
 #[test]
@@ -1276,6 +1300,7 @@ async fn failed_path_exchange(
         error = async { loop { if let Err(error) = agent.turn().await { break error; } } } => anyhow::bail!("old-path drive: {error:?}"),
     }
     mtu.set(0);
+    let recovery_start = Instant::now();
     let replacement = loop {
         ensure!(
             agent.snapshot().terminal_failure.is_none(),
@@ -1300,11 +1325,15 @@ async fn failed_path_exchange(
             .await
             .map_err(|error| anyhow::anyhow!("replacement QUIC path: {error:?}"))?;
     };
+    let recovery_us = recovery_start.elapsed().as_micros();
     let stale = held.take().context("held old-path packet")?;
     proxy.send_to(&stale, edge).await?;
     // Allow the shard to process the old packet while the replacement remains live.
     pulsebeam_runtime::time::sleep(Duration::from_millis(20)).await;
     ensure!(agent.opus_publication_id("voice") == Some(replacement.as_str()));
+    qualification_sample(
+        serde_json::json!({"case": "recovery", "recovery_us": recovery_us, "reconnects": continuations.get(), "old_packet_released": true}),
+    );
     proxy_task.abort();
     let _ = proxy_task.await;
     Ok(())
@@ -1458,11 +1487,13 @@ async fn mixed_opus_exchange(
     rtc_host: std::net::IpAddr,
     quic_token: &str,
     rtc_token: &str,
+    contention: bool,
 ) -> Result<()> {
     use super::common::{client::create_http_client, native::NativeHost};
     use pulsebeam_agent_core::{
-        AgentCommand, AgentConfig, AudioSubscription, DesiredState, MediaKind, PublicationIntent,
-        ffi::PublicationExecution,
+        AgentCommand, AgentConfig, AudioSubscription, DataEvent, DesiredState, MediaKind,
+        PublicationIntent, ResourceCommand, TopicMode, TrackSpec,
+        ffi::{DataDelivery, DataSubscribeOptions, PublicationExecution},
     };
     use pulsebeam_agent_native::{
         Agent as RuntimeAgent, AudioInput, Config, Host, InputFrame, MediaStreamUpdate,
@@ -1471,6 +1502,16 @@ async fn mixed_opus_exchange(
     use pulsebeam_agent_quic::executor::linux::OpusSendError;
     let (mut quic, publication) =
         prepare_agent_opus_publisher(address, edge, roots, quic_token).await?;
+    let bulk = TrackSpec::Data {
+        track_id: "bulk".into(),
+        delivery: TopicMode::Ordered,
+    };
+    if contention {
+        quic.resource(ResourceCommand::DeclareDataPublication {
+            spec: bulk.clone(),
+            capture_clock: None,
+        })?;
+    }
     let host = NativeHost::bind(rtc_host)?;
     let mut config = Config::new(AgentConfig {
         endpoint: format!("http://{address}"),
@@ -1490,6 +1531,18 @@ async fn mixed_opus_exchange(
         .participant("alice".into())?
         .audio("voice".into())?
         .subscribe()?;
+    let bulk_receiver = if contention {
+        Some(
+            rtc.room("stage".into())?
+                .participant("alice".into())?
+                .data("bulk".into())?
+                .subscribe(Some(DataSubscribeOptions {
+                    delivery: Some(DataDelivery::Reliable),
+                }))?,
+        )
+    } else {
+        None
+    };
     let updates = subscriber.updates()?;
     let source = rtc.create_audio_input().await?;
     let reverse = rtc.audio("return".into())?.publish(None)?;
@@ -1519,6 +1572,55 @@ async fn mixed_opus_exchange(
     let opus = super::native_runtime::stock_opus_fixture()
         .first()
         .context("stock Opus packet")?;
+    let mut bulk_payload = None;
+    if let Some(receiver) = &bulk_receiver {
+        let updates = receiver.updates()?;
+        let ready = async {
+            loop {
+                let update = updates
+                    .next()
+                    .await?
+                    .context("reliable DATA subscription")?;
+                ensure!(
+                    update.terminal_error.is_none(),
+                    "mixed DATA receiver: {update:?}"
+                );
+                if update.execution == PublicationExecution::Installed {
+                    return anyhow::Ok(());
+                }
+            }
+        };
+        pulsebeam_runtime::select! {
+            result = pulsebeam_runtime::time::timeout(Duration::from_secs(2), ready) => result.context("mixed reliable DATA subscription did not install")??,
+            error = async { loop { if let Err(error) = quic.turn().await { break error; } } } => anyhow::bail!("mixed reliable DATA readiness: {error:?}"),
+        }
+        let payload = vec![0xa5; pulsebeam_proto::data_record::MAX_UNIT_BYTES];
+        quic.send_data(bulk, payload.clone())?;
+        quic.turn()
+            .await
+            .map_err(|error| anyhow::anyhow!("start reliable DATA transfer: {error:?}"))?;
+        let revision = quic
+            .snapshot()
+            .desired_revision
+            .checked_add(1)
+            .context("mixed desired revision")?;
+        quic.command(AgentCommand::ReplaceDesired(DesiredState {
+            revision,
+            connected: true,
+            publications: ["voice", "control"]
+                .into_iter()
+                .map(|track| PublicationIntent {
+                    slot: track.into(),
+                    track_id: track.into(),
+                    kind: MediaKind::Audio,
+                    active: true,
+                })
+                .collect(),
+            ..Default::default()
+        }))?;
+        bulk_payload = Some(payload);
+    }
+    let media_start = Instant::now();
     loop {
         match quic.send_opus("voice", opus.timestamp, true, &opus.payload) {
             Ok(()) => break,
@@ -1561,6 +1663,42 @@ async fn mixed_opus_exchange(
             anyhow::bail!("mixed Opus Agent drive: {error:?}"),
     }
 
+    let media_us = Instant::now()
+        .saturating_duration_since(media_start)
+        .as_micros();
+    let (mut data_observed_us, mut control_observed_us) = (None, None);
+    if let Some((receiver, payload)) = bulk_receiver.zip(bulk_payload) {
+        let receive_bulk = receiver.next();
+        let received = pulsebeam_runtime::select! {
+            result = pulsebeam_runtime::time::timeout(Duration::from_secs(2), receive_bulk) => result.context("bulk DATA starved by control and media")??,
+            error = async { loop { if let Err(error) = quic.turn().await { break error; } } } => anyhow::bail!("mixed DATA transfer: {error:?}"),
+        };
+        ensure!(
+            matches!(received, Some(DataEvent::Message { participant_id, data, .. }) if participant_id == "alice" && data == payload)
+        );
+        data_observed_us = Some(media_start.elapsed().as_micros());
+        pulsebeam_runtime::time::timeout(Duration::from_secs(2), async {
+            while quic.opus_publication_id("control").is_none() {
+                quic.turn()
+                    .await
+                    .map_err(|error| anyhow::anyhow!("mixed control progress: {error:?}"))?;
+            }
+            anyhow::Ok(())
+        })
+        .await
+        .context("fresh control declaration starved by DATA and media")??;
+        control_observed_us = Some(media_start.elapsed().as_micros());
+    }
+    let staged = quic
+        .data_staging()
+        .context("live QUIC DATA staging profile")?;
+    ensure!(!contention || staged.peak_records > 0);
+    qualification_sample(
+        serde_json::json!({"case": if contention { "mixed" } else { "baseline" },
+            "media_us": media_us, "media_delivered": 1, "data_observed_us": data_observed_us, "control_observed_us": control_observed_us,
+            "staged_records_peak": staged.peak_records, "staged_bytes_peak": staged.peak_bytes, "staged_wait_max_us": staged.max_wait.as_micros(),
+        }),
+    );
     let reverse_id = pulsebeam_runtime::time::timeout(Duration::from_secs(2), async {
         loop {
             let state = demand
@@ -1980,6 +2118,12 @@ async fn mixed_h264_exchange(
     Ok(())
 }
 
+fn qualification_sample(sample: serde_json::Value) {
+    if std::env::var_os("PULSEBEAM_QUIC_PROFILE").is_some() {
+        eprintln!("[simulation-generated] quic-profile {sample}");
+    }
+}
+
 enum Scenario {
     Data {
         delivery: DataV1Delivery,
@@ -1990,6 +2134,7 @@ enum Scenario {
     FailedPath,
     MixedOpus {
         host: std::net::IpAddr,
+        contention: bool,
     },
     MixedH264 {
         host: std::net::IpAddr,
@@ -2113,9 +2258,17 @@ async fn witness(scenario: Scenario) -> Result<()> {
             )
             .await;
         }
-        if let Scenario::MixedOpus { host } = scenario {
-            return mixed_opus_exchange(address, edge, roots, host, &credential, &subscriber_token)
-                .await;
+        if let Scenario::MixedOpus { host, contention } = scenario {
+            return mixed_opus_exchange(
+                address,
+                edge,
+                roots,
+                host,
+                &credential,
+                &subscriber_token,
+                contention,
+            )
+            .await;
         }
         if let Scenario::MixedH264 { host } = scenario {
             return mixed_h264_exchange(address, edge, roots, host, &credential, &subscriber_token)
