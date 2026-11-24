@@ -114,6 +114,23 @@ impl Peer {
     }
 }
 
+fn credentials(trusted: bool) -> (RootCertStore, ServerConfig) {
+    let cert = rcgen::generate_simple_self_signed(vec!["edge.example".into()]).unwrap();
+    let mut roots = RootCertStore::empty();
+    if trusted {
+        roots.add(cert.cert.der().clone()).unwrap();
+    }
+    let server = server_config(
+        vec![cert.cert.der().clone()],
+        PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()).into(),
+        Arc::new(Clock),
+        Arc::new(Clock),
+        NonZeroUsize::MIN,
+    )
+    .unwrap();
+    (roots, server)
+}
+
 struct Pair {
     now: Instant,
     client: Peer,
@@ -126,19 +143,7 @@ impl Pair {
     }
 
     fn profile(name: &str, trusted: bool, alpn: &[u8], datagrams: bool) -> Self {
-        let cert = rcgen::generate_simple_self_signed(vec!["edge.example".into()]).unwrap();
-        let mut roots = RootCertStore::empty();
-        if trusted {
-            roots.add(cert.cert.der().clone()).unwrap();
-        }
-        let server_config = server_config(
-            vec![cert.cert.der().clone()],
-            PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()).into(),
-            Arc::new(Clock),
-            Arc::new(Clock),
-            NonZeroUsize::MIN,
-        )
-        .unwrap();
+        let (roots, server_config) = credentials(trusted);
         let mut client_config = client_config_for_alpn(roots, Arc::new(Clock), alpn).unwrap();
         if !datagrams {
             let mut limits = limits();
@@ -310,6 +315,320 @@ fn control_progresses_between_full_payloads_without_displacing_admitted_data() {
     let _ = chunks.finalize();
     pair.client.control_runnable = false;
     pair.client.offer(&payload).unwrap();
+}
+
+#[test]
+fn listener_emits_exact_admit_once_and_fences_stalled_controller() {
+    use super::{control::ControlStream, listener::Listener};
+    use crate::{
+        frame::{Kind, Phase},
+        records::Admit,
+    };
+    use std::num::NonZeroU64;
+
+    let (roots, server_config) = credentials(true);
+    let mut listener = Listener::new(server_config).unwrap();
+    let edge: SocketAddr = "127.0.0.1:4443".parse().unwrap();
+    let agent: SocketAddr = "127.0.0.1:7000".parse().unwrap();
+    let mut ep = endpoint(None).unwrap();
+    let start = Instant::now();
+    let (id, mut conn) = ep
+        .connect(
+            start,
+            client_config(roots, Arc::new(Clock)).unwrap(),
+            edge,
+            "edge.example",
+        )
+        .unwrap();
+    let body = Admit {
+        attempt: NonZeroU64::MIN,
+        room: Some("stage"),
+        owner: "proof",
+        token: "a.b.c",
+        successor: None,
+    }
+    .encode()
+    .unwrap();
+    let mut sent = false;
+    let mut admitted = None;
+    let mut client_out = Vec::new();
+    let mut server_out = Vec::new();
+    for ms in 0..5_100 {
+        let now = start + Duration::from_millis(ms);
+        service_timeout(&mut conn, now);
+        for _ in 0..16 {
+            if !forward_endpoint_event(&mut ep, id, &mut conn) {
+                break;
+            }
+        }
+        if !sent && data_readiness(&mut conn) == Readiness::Ready {
+            let mut control = ControlStream::open(&mut conn).unwrap().unwrap();
+            control.offer(Kind::Admit, &body, Phase::Bootstrap).unwrap();
+            assert!(matches!(
+                control.write(&mut conn, now).unwrap(),
+                super::control::Write::Admitted { .. }
+            ));
+            sent = true;
+        }
+        if let Some(tx) = poll_packet(&mut conn, now, &mut client_out) {
+            assert_eq!(tx.destination, edge);
+            assert!(
+                listener
+                    .receive(
+                        now,
+                        FourTuple::new(agent, Some(edge.ip())),
+                        tx.ecn,
+                        &client_out[..tx.size],
+                        &mut server_out
+                    )
+                    .is_none()
+            );
+        }
+        listener.begin_turn();
+        if let Some((_, Some(tx))) = listener.poll_one(now, &mut server_out, |handle, peer| {
+            if !peer.connection.is_closed()
+                && let Some(attempt) = peer.take_admit(now).unwrap()
+            {
+                assert_eq!(attempt, body);
+                assert!(admitted.replace(handle).is_none());
+            }
+        }) {
+            client_out.clear();
+            if let Some(DatagramEvent::ConnectionEvent(handle, event)) = ep.handle(
+                now,
+                FourTuple::new(edge, Some(agent.ip())),
+                tx.ecn,
+                BytesMut::from(&server_out[..tx.size]),
+                &mut client_out,
+            ) {
+                assert_eq!(handle, id);
+                conn.handle_event(event);
+            }
+        }
+    }
+    assert!(sent);
+    let handle = admitted.unwrap();
+    assert!(conn.is_closed());
+    assert!(!listener.admitted(handle));
+}
+
+#[cfg(feature = "executor")]
+#[test]
+fn executor_admits_and_renews_a_core_session() {
+    use crate::{
+        executor::Association,
+        frame::{Kind, Phase},
+        records::{Accepted, Admit, Lease, Renew, RenewResult, encode_admit_result},
+    };
+    use pulsebeam_agent_core::{
+        Agent, AgentCommand, AgentConfig, ConnectionState, Effect, HostEvent, HttpEffect,
+        HttpEvent, HttpResponse, QuicEffect,
+    };
+
+    let mut core = Agent::new_quic(AgentConfig {
+        endpoint: "https://api.example".into(),
+        token: "token".into(),
+        retry: Default::default(),
+        log_level: Default::default(),
+    })
+    .unwrap();
+    core.command(AgentCommand::Connect).unwrap();
+    let Some(Effect::Http(HttpEffect::Request { operation, .. })) = core.next_effect() else {
+        panic!("placement request")
+    };
+    core.handle(HostEvent::Http(HttpEvent::Response { operation, response: HttpResponse {
+        status: 200, headers: vec![], body: br#"{"profile":"pulsebeam-rt-v1","authority":{"host":"edge.example","port":4443},"owner":"owner","valid_for_ms":5000}"#.to_vec(),
+    } })).unwrap();
+    let Some(Effect::Quic(QuicEffect::Admit(admit))) = core.next_effect() else {
+        panic!("admission effect")
+    };
+    let (roots, server) = credentials(true);
+    let mut listener = listener::Listener::new(server).unwrap();
+    let edge: SocketAddr = "127.0.0.1:4443".parse().unwrap();
+    let local: SocketAddr = "127.0.0.1:7000".parse().unwrap();
+    let start = Instant::now();
+    let mut carrier = Association::connect(
+        start,
+        start,
+        client_config(roots, Arc::new(Clock)).unwrap(),
+        edge,
+        admit,
+    )
+    .unwrap();
+    let mut client_out = Vec::new();
+    let mut server_out = Vec::new();
+    use pulsebeam_proto::state;
+    use std::num::NonZeroU64;
+
+    let mut redemption_count = 0;
+    let mut renewals = 0;
+    let mut grant_to_send = None;
+    let mut renewal_started = false;
+    for step in 0..1_000 {
+        let now = start + Duration::from_millis(step);
+        if let Some(event) = carrier.poll_event(now) {
+            if matches!(event, pulsebeam_agent_core::QuicEvent::Accepted { .. }) {
+                assert_eq!(core.snapshot().connection, ConnectionState::Joining);
+            }
+            core.handle_at(HostEvent::Quic(event), now.duration_since(start))
+                .unwrap();
+        }
+        if !renewal_started && core.snapshot().authorization_expires_at == Some(10_000) {
+            core.command_at(
+                AgentCommand::RenewAuthorization("next-token".into()),
+                now.duration_since(start),
+            )
+            .unwrap();
+            renewal_started = true;
+        }
+        while let Some(effect) = core.next_effect() {
+            match effect {
+                Effect::Quic(effect) => carrier.submit(effect, now).unwrap(),
+                Effect::Timer(pulsebeam_agent_core::TimerEffect::Schedule { timer, after })
+                    if after.is_zero() =>
+                {
+                    core.handle_at(
+                        HostEvent::Timer(pulsebeam_agent_core::TimerEvent::Fired { timer }),
+                        now.duration_since(start),
+                    )
+                    .unwrap();
+                }
+                Effect::Timer(pulsebeam_agent_core::TimerEffect::Cancel { .. }) => {}
+                _ => panic!("unexpected effect in QUIC fixture: {effect:?}"),
+            }
+        }
+        if core.snapshot().accepted_credential_revision == Some(1) {
+            break;
+        }
+        if let (Some(tx), _) = carrier.poll_packet(now, &mut client_out) {
+            assert_eq!(tx.destination, edge);
+            assert!(
+                listener
+                    .receive(
+                        now,
+                        FourTuple::new(local, Some(edge.ip())),
+                        tx.ecn,
+                        &client_out[..tx.size],
+                        &mut server_out
+                    )
+                    .is_none()
+            );
+        }
+        listener.begin_turn();
+        if let Some((_, Some(tx))) = listener.poll_one(now, &mut server_out, |_, peer| {
+            if let Some(body) = peer.take_admit(now).unwrap() {
+                redemption_count += 1;
+                let admit = Admit::decode(&body).unwrap();
+                assert_eq!(admit.attempt.get(), carrier.generation().get());
+                assert_eq!((admit.owner, admit.token), ("owner", "token"));
+                let accepted = encode_admit_result(Ok(Accepted {
+                    connection: [0, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 1],
+                    participant: "alice",
+                    room: None,
+                    capabilities: &[],
+                }))
+                .unwrap();
+                let control = peer.control.as_mut().unwrap();
+                control
+                    .offer(Kind::AdmitResult, &accepted, Phase::Bootstrap)
+                    .unwrap();
+                assert!(matches!(
+                    control.write(&mut peer.connection, now).unwrap(),
+                    control::Write::Admitted { .. }
+                ));
+                assert!(peer.finish_admission());
+                grant_to_send = Some(1);
+                return;
+            }
+            if redemption_count == 0 {
+                return;
+            }
+            let Some(control) = peer.control.as_mut() else {
+                return;
+            };
+            let frame = if let Some(revision) = grant_to_send.take() {
+                let expires_at_unix_seconds = if revision == 1 { 10_000 } else { 20_000 };
+                let batch = state::ServerStateBatch {
+                    records: vec![state::ServerStateRecord {
+                        key: Some(state::ResourceKey {
+                            key: Some(state::resource_key::Key::Session(true)),
+                        }),
+                        confirmed: Some(state::ConfirmedState {
+                            value: Some(state::confirmed_state::Value::Session(
+                                state::SessionState {
+                                    authorization: Some(state::Authorization {
+                                        revision,
+                                        expires_at_unix_seconds,
+                                    }),
+                                    ..Default::default()
+                                },
+                            )),
+                            ..Default::default()
+                        }),
+                    }],
+                    ..Default::default()
+                };
+                Some((
+                    Kind::ServerState,
+                    state::codec::encode_quic_server(&batch).unwrap(),
+                ))
+            } else if let control::Read::Frame(frame) = control
+                .read(&mut peer.connection, Phase::Admitted, now)
+                .unwrap()
+            {
+                assert_eq!(frame.kind, Kind::Renew);
+                let request = Renew::decode(&frame.body).unwrap();
+                assert_eq!(request.token, "next-token");
+                renewals += 1;
+                grant_to_send = Some(2);
+                Some((
+                    Kind::RenewResult,
+                    RenewResult {
+                        request: request.revision,
+                        accepted: Some(Lease {
+                            revision: NonZeroU64::new(2).unwrap(),
+                            expires_unix_seconds: NonZeroU64::new(20_000).unwrap(),
+                        }),
+                    }
+                    .encode(),
+                ))
+            } else {
+                None
+            };
+            if let Some((kind, body)) = frame {
+                control.offer(kind, &body, Phase::Admitted).unwrap();
+                assert!(matches!(
+                    control.write(&mut peer.connection, now).unwrap(),
+                    control::Write::Admitted { .. }
+                ));
+            }
+        }) {
+            assert_eq!(tx.destination, local);
+            carrier.receive(
+                now,
+                pulsebeam_udp::ReceivedDatagram {
+                    source: edge,
+                    destination: local,
+                    payload: &server_out[..tx.size],
+                    received_at: pulsebeam_udp::ReceiveTime {
+                        monotonic: now.into(),
+                        wall: noq_proto::TimeSource::now(&Clock),
+                    },
+                    ecn: None,
+                },
+            );
+        }
+    }
+    assert_eq!(redemption_count, 1);
+    assert_eq!(renewals, 1);
+    assert_eq!(core.snapshot().accepted_credential_revision, Some(1));
+    assert_eq!(core.snapshot().authorization_expires_at, Some(20_000));
+    assert_eq!(core.snapshot().connection, ConnectionState::Connected);
+    assert_eq!(core.snapshot().participant_id.as_deref(), Some("alice"));
+    assert_eq!(
+        core.snapshot().connection_id.as_ref().unwrap().as_str(),
+        "conn_00000000001R010000000000004"
+    );
 }
 
 #[test]

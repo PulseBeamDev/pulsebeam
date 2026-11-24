@@ -216,6 +216,7 @@ impl DataBranchIds {
 
 #[derive(Default)]
 pub(crate) struct NativeSession {
+    binding_profile: validation::BindingProfile,
     pub(crate) cid: Option<ChannelId>,
     incident_context: Option<(ProjectId, ConnectionId)>,
     pub(crate) catalog: catalog::CatalogSession,
@@ -258,6 +259,20 @@ pub(crate) struct NativeSession {
 }
 
 impl NativeSession {
+    pub(super) fn with_binding_profile(binding_profile: validation::BindingProfile) -> Self {
+        Self {
+            binding_profile,
+            ..Self::default()
+        }
+    }
+
+    fn encode_batch(&self, batch: &wire::ServerStateBatch) -> Result<Vec<u8>, codec::EncodeError> {
+        match self.binding_profile {
+            validation::BindingProfile::Rtc => codec::encode_server(batch),
+            validation::BindingProfile::Quic => codec::encode_quic_server(batch),
+        }
+    }
+
     fn charge(&mut self, previous: usize, next: usize) -> Result<(), OutputError> {
         let bytes = self
             .retained_bytes
@@ -281,7 +296,7 @@ impl NativeSession {
             key: Some(key.wire()),
             confirmed: Some(value.clone()),
         };
-        codec::encode_server(&wire::ServerStateBatch {
+        self.encode_batch(&wire::ServerStateBatch {
             records: vec![record],
             initial_complete: false,
             ..Default::default()
@@ -741,8 +756,11 @@ impl NativeSession {
         else {
             return Ok(());
         };
-        let batch =
-            codec::decode_server(&output.bytes).map_err(|_| OutputError::InvalidObservation)?;
+        let batch = match self.binding_profile {
+            validation::BindingProfile::Rtc => codec::decode_server(&output.bytes),
+            validation::BindingProfile::Quic => codec::decode_quic_server(&output.bytes),
+        }
+        .map_err(|_| OutputError::InvalidObservation)?;
         if !batch.catalog_records.is_empty() {
             // Selected resource revisions remain dirty until ACK. Only unsent output is canceled.
             self.pending = None;
@@ -772,7 +790,11 @@ impl NativeSession {
 
     pub(crate) fn apply_input(&mut self, bytes: &[u8]) -> Result<NativeInput, InputError> {
         self.source_wait_changed();
-        let batch = codec::decode_client(bytes).map_err(InputError::Decode)?;
+        let batch = match self.binding_profile {
+            validation::BindingProfile::Rtc => codec::decode_client(bytes),
+            validation::BindingProfile::Quic => codec::decode_quic_client(bytes),
+        }
+        .map_err(InputError::Decode)?;
         let mut effects = NativeInput::default();
         if !self.closed {
             if !batch.catalog_records.is_empty() {
@@ -873,7 +895,7 @@ impl NativeSession {
                 .map_err(|_| InputError::Capacity)?;
                 continue;
             }
-            let invalid = validation::validate_spec(spec).is_err()
+            let invalid = validation::validate_spec_for(spec, self.binding_profile).is_err()
                 || matches!(
                     spec.declaration.as_ref(),
                     Some(wire::resource_spec::Declaration::Subscription(subscription))
@@ -2382,7 +2404,7 @@ impl NativeSession {
             self.initial_cursor = selected_cursor;
             return Ok(None);
         }
-        let bytes = codec::encode_server(&batch).map_err(OutputError::Encode)?;
+        let bytes = self.encode_batch(&batch).map_err(OutputError::Encode)?;
         self.catalog_first = !self.catalog_first;
         let sequence = self
             .output_sequence

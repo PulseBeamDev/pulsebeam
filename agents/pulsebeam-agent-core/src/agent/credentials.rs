@@ -216,12 +216,21 @@ impl Agent {
         pending.operation = Some(operation);
         pending.issued = true;
         pending.attempts = pending.attempts.saturating_add(1);
+        let Some(rtc) = active.rtc.as_ref() else {
+            self.effects
+                .push_back(Effect::Quic(crate::QuicEffect::Renew(crate::QuicRenew {
+                    generation: active.generation,
+                    operation,
+                    token: pending.credential.token.clone(),
+                })));
+            return;
+        };
         self.effects.push_back(Effect::Http(HttpEffect::Request {
             operation,
             generation: Some(active.generation),
             request: HttpRequest {
                 method: HttpMethod::Patch,
-                uri: active.resource_uri.clone(),
+                uri: rtc.resource_uri.clone(),
                 headers: vec![
                     HttpHeader {
                         name: "Authorization".into(),
@@ -235,6 +244,64 @@ impl Agent {
                 body: Vec::new(),
             },
         }));
+    }
+
+    pub(super) fn quic_renewal_result(
+        &mut self,
+        generation: crate::Generation,
+        operation: OperationId,
+        revision: Option<u64>,
+    ) {
+        let Some(active) = self
+            .active
+            .as_mut()
+            .filter(|active| active.generation == generation && !active.signaling_terminal)
+        else {
+            return;
+        };
+        let Some(pending) = active
+            .pending_renewal
+            .as_mut()
+            .filter(|pending| pending.operation == Some(operation))
+        else {
+            return;
+        };
+        pending.operation = None;
+        match revision {
+            Some(revision) if revision == pending.expected_revision => {
+                pending.accepted = true;
+                self.commit_renewal();
+            }
+            Some(_) => {
+                self.close_transport(generation);
+                self.fail_terminal(Failure::protocol("QUIC renewal revision mismatch"));
+            }
+            None => self.reject_credential(),
+        }
+    }
+
+    fn reject_credential(&mut self) {
+        let Some(pending) = self
+            .active
+            .as_mut()
+            .and_then(|active| active.pending_renewal.take())
+        else {
+            return;
+        };
+        let status = if pending.uncertain {
+            CredentialStatus::Uncertain
+        } else {
+            CredentialStatus::Rejected
+        };
+        self.credential_outcome(
+            pending.credential.revision,
+            status,
+            Some(Failure {
+                class: FailureClass::Authorization,
+                message: "authorization replacement rejected".into(),
+            }),
+        );
+        self.request_reconciliation();
     }
 
     pub(super) fn credential_http_failed(&mut self, operation: OperationId) -> bool {
@@ -311,22 +378,7 @@ impl Agent {
             }
             self.retry_credential();
         } else if (400..500).contains(&response.status) && !matches!(response.status, 408 | 429) {
-            let revision = pending.credential.revision;
-            let status = if pending.uncertain {
-                CredentialStatus::Uncertain
-            } else {
-                CredentialStatus::Rejected
-            };
-            active.pending_renewal = None;
-            self.credential_outcome(
-                revision,
-                status,
-                Some(Failure {
-                    class: FailureClass::Authorization,
-                    message: "authorization replacement rejected".into(),
-                }),
-            );
-            self.request_reconciliation();
+            self.reject_credential();
         } else {
             pending.uncertain = true;
             self.retry_credential();
@@ -397,7 +449,9 @@ impl Agent {
     }
 
     pub(super) fn cancel_credential_work(&mut self, pending: native::Renewal) {
-        if let Some(operation) = pending.operation {
+        if !self.quic
+            && let Some(operation) = pending.operation
+        {
             self.effects
                 .push_back(Effect::Http(HttpEffect::Cancel { operation }));
         }

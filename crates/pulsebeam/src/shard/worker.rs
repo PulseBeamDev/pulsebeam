@@ -159,6 +159,14 @@ pub(crate) enum ShardError {
 /// Topology and lifecycle changes are published through `ShardUpdate`.
 #[derive(Debug)]
 pub(crate) enum ShardCommand {
+    MaterializeQuic {
+        association: std::num::NonZeroU64,
+        connection: crate::entity::ConnectionId,
+        participant: crate::entity::ParticipantId,
+        transport: crate::route::NodeTransportAddress,
+        handoff: Box<crate::control::native::handoff::EndpointHandoff>,
+        ack: pulsebeam_runtime::sync::oneshot::Sender<bool>,
+    },
     MaterializeParticipant {
         transport: crate::route::NodeTransportAddress,
         config: Box<ConnectionConfig>,
@@ -438,6 +446,7 @@ impl IngressTransport for LinkTransport {
 
 pub(crate) struct ShardWorker {
     core: ShardCore,
+    quic: Option<super::quic::QuicShard>,
     recv_batch: Vec<RecvPacketBatch>,
     tcp_inbox: Option<crate::ice_tcp::Inbox>,
     loop_start: Instant,
@@ -520,6 +529,14 @@ impl Service for ShardWorker {
         let result = metrics::with_local_recorder(&*recorder, || {
             self.observe_health(previous_busy);
             self.tick(at, io.socket());
+            if let (Some(quic), Some(socket)) = (&mut self.quic, io.secondary_socket()) {
+                quic.turn(
+                    self.router.shard_id,
+                    socket,
+                    at.monotonic,
+                    &mut self.shard_event_backlog,
+                )?;
+            }
             self.flush_shard_events()
         });
         if let Err(error) = result {
@@ -576,6 +593,7 @@ impl ShardWorker {
 
         Self {
             core,
+            quic: None,
             recv_batch: Vec::with_capacity(net::BATCH_SIZE),
             tcp_inbox,
             loop_start: Instant::now(),
@@ -595,6 +613,14 @@ impl ShardWorker {
                 .unwrap_or_else(Instant::now),
             last_busy: Duration::ZERO,
         }
+    }
+
+    pub(crate) fn enable_quic(
+        &mut self,
+        ingress: pulsebeam_agent_quic::transport::ingress::Ingress,
+        controller: mailbox::Sender<crate::control::controller::ControllerCommand>,
+    ) {
+        self.quic = Some(super::quic::QuicShard::new(ingress, controller));
     }
 
     /// What every shard reports whether or not it is carrying traffic.
@@ -654,14 +680,21 @@ impl ShardWorker {
         if !self.shard_event_backlog.is_empty() {
             return Ok(());
         }
-        let deadline = self.next_wait_deadline();
+        let mut deadline = self.next_wait_deadline();
+        let secondary_write = self.quic.as_ref().map(|quic| {
+            deadline = deadline.into_iter().chain(quic.deadline()).min();
+            quic.wants_write()
+        });
 
         // Block until at least one source is ready.
         pulsebeam_runtime::select! {
             biased;
             true = self.core.update_readable() => {}
             true = self.clock_rx.readable() => {}
-            ready = io.readable(deadline) => { ready?; }
+            () = async {
+                if let Some(quic) = &mut self.quic { quic.ready().await; }
+            }, if secondary_write.is_some() => {}
+            ready = io.readable_with_secondary(deadline, secondary_write) => { ready?; }
             true = self.frame_rx.readable() => {}
             true = async {
                 match self.tcp_inbox.as_mut() {
@@ -692,12 +725,53 @@ impl ShardWorker {
                 break;
             };
             commands = commands.saturating_add(1);
-            let _ = self.core.on_command(cmd, &self.router);
+            match cmd {
+                ShardCommand::MaterializeQuic {
+                    association,
+                    connection,
+                    participant,
+                    transport,
+                    handoff,
+                    ack,
+                } => {
+                    let installed =
+                        super::quic::Installed::new(connection, participant, transport, handoff);
+                    let accepted = self
+                        .quic
+                        .as_mut()
+                        .is_some_and(|quic| quic.install(association, installed));
+                    let _ = ack.send(accepted);
+                }
+                ShardCommand::AuthorizationResult {
+                    connection_id,
+                    revision,
+                    expiry,
+                } if self.quic.as_mut().is_some_and(|quic| {
+                    quic.authorization_result(connection_id, revision, expiry)
+                }) => {}
+                cmd => {
+                    if matches!(cmd, ShardCommand::NativeReady { .. })
+                        && let Some(quic) = &mut self.quic
+                    {
+                        quic.wake();
+                    }
+                    let _ = self.core.on_command(cmd, &self.router);
+                }
+            }
         }
         if commands == SHARD_COMMAND_BUDGET {
             self.tick_budget_hit("commands");
         }
-        if self.core.apply_updates(SHARD_UPDATE_OP_BUDGET) >= SHARD_UPDATE_OP_BUDGET {
+        let quic = &mut self.quic;
+        if self.core.apply_updates_with_retirement(
+            SHARD_UPDATE_OP_BUDGET,
+            |connection, transport| {
+                if let Some(quic) = quic {
+                    quic.retire(connection, transport, now);
+                }
+            },
+        ) >= SHARD_UPDATE_OP_BUDGET
+        {
             self.tick_budget_hit("shard_update");
         }
         self.frame_batch.clear();

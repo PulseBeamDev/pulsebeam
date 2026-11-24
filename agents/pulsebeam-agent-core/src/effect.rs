@@ -9,11 +9,62 @@ use crate::{
 #[derive(Clone, Debug, PartialEq)]
 pub enum Effect {
     Rtc(RtcEffect),
+    Quic(QuicEffect),
     Http(HttpEffect),
     Timer(TimerEffect),
     DataChannel(DataChannelEffect),
     PublicationInput(crate::PublicationInputControl),
     MediaObservation(crate::MediaObservationControl),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum QuicEffect {
+    Admit(QuicAdmit),
+    Renew(QuicRenew),
+    Close {
+        generation: Generation,
+    },
+    SendControl {
+        generation: Generation,
+        operation: OperationId,
+        payload: Vec<u8>,
+    },
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct QuicAdmit {
+    pub generation: Generation,
+    pub room: Option<String>,
+    pub placement: crate::placement::Placement,
+    pub deadline: Duration,
+    pub token: String,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct QuicRenew {
+    pub generation: Generation,
+    pub operation: OperationId,
+    pub token: String,
+}
+
+impl core::fmt::Debug for QuicRenew {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("QuicRenew")
+            .field("generation", &self.generation)
+            .field("operation", &self.operation)
+            .finish_non_exhaustive()
+    }
+}
+
+impl core::fmt::Debug for QuicAdmit {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("QuicAdmit")
+            .field("generation", &self.generation)
+            .field("placement", &self.placement)
+            .field("deadline", &self.deadline)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

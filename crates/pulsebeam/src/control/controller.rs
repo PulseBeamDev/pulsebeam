@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     future::{Future, poll_fn},
     io,
     pin::Pin,
@@ -11,6 +11,8 @@ mod catalog;
 mod native_service;
 pub(crate) mod ownership;
 pub mod peer_ownership;
+mod quic_placement;
+pub(crate) mod quic_redeem;
 
 use super::api::creation;
 use super::native::handler::StateProtocolHandler;
@@ -266,6 +268,8 @@ pub struct AdmissionCommand(AdmissionAction);
 
 enum AdmissionAction {
     Issue(Box<IssueOwnershipCommand>),
+    IssueQuic(Box<IssueQuicCommand>),
+    RedeemQuic(Box<quic_redeem::Command>),
     Create(Box<OwnedCreateCommand>),
 }
 
@@ -273,6 +277,25 @@ struct IssueOwnershipCommand {
     principal: VerifiedPrincipal,
     room: Option<RoomId>,
     reply: oneshot::Sender<Result<ownership::Proof, ControllerError>>,
+}
+
+struct IssueQuicCommand {
+    principal: VerifiedPrincipal,
+    room: Option<RoomId>,
+    continuation: Option<QuicContinuation>,
+    reply: oneshot::Sender<Result<QuicAdmission, ControllerError>>,
+}
+
+pub(crate) struct QuicContinuation {
+    pub proof: ownership::Proof,
+    pub successor: Vec<u8>,
+}
+
+pub(crate) struct QuicAdmission {
+    pub proof: ownership::Proof,
+    pub host: String,
+    pub port: u16,
+    pub valid_for_ms: u32,
 }
 
 struct OwnedCreateCommand {
@@ -288,6 +311,10 @@ impl std::fmt::Debug for AdmissionCommand {
 }
 
 impl AdmissionCommand {
+    pub(crate) fn redeem_quic(command: quic_redeem::Command) -> Self {
+        Self(AdmissionAction::RedeemQuic(Box::new(command)))
+    }
+
     pub(crate) fn issue(
         principal: VerifiedPrincipal,
         room: Option<RoomId>,
@@ -296,6 +323,20 @@ impl AdmissionCommand {
         Self(AdmissionAction::Issue(Box::new(IssueOwnershipCommand {
             principal,
             room,
+            reply,
+        })))
+    }
+
+    pub(crate) fn issue_quic(
+        principal: VerifiedPrincipal,
+        room: Option<RoomId>,
+        continuation: Option<QuicContinuation>,
+        reply: oneshot::Sender<Result<QuicAdmission, ControllerError>>,
+    ) -> Self {
+        Self(AdmissionAction::IssueQuic(Box::new(IssueQuicCommand {
+            principal,
+            room,
+            continuation,
             reply,
         })))
     }
@@ -518,6 +559,77 @@ struct OwnershipAttempt {
     successor_receipt: Option<Vec<u8>>,
 }
 
+struct RtcAdmissionProjection<'a> {
+    location: &'a axum::http::HeaderValue,
+    capabilities: Option<&'a pulsebeam_proto::state::RtpCapabilities>,
+}
+
+impl RtcAdmissionProjection<'_> {
+    fn validate<'a>(
+        &'a self,
+        pending: &'a PendingMaterialization,
+    ) -> Result<creation::PreparedCreation<'a>, OwnedAdmissionError> {
+        let response = if pending.profile == SignalingProtocol::State {
+            let Some(capabilities) = self.capabilities else {
+                pulsebeam_runtime::fatal!("prepared native creation lost protocol capabilities");
+            };
+            let Some(lease) = pending.authorization.as_ref() else {
+                pulsebeam_runtime::fatal!("owned creation lost verified authorization");
+            };
+            creation::CreationResponse::native(
+                self.location,
+                &lease.authority,
+                pending.connection_id(),
+                capabilities,
+                &pending.answer,
+            )
+        } else {
+            creation::CreationResponse::sdp(self.location, &pending.answer)
+        };
+        response.validate().map_err(OwnedAdmissionError::Image)
+    }
+}
+
+enum AdmissionProjection<'a> {
+    Rtc(RtcAdmissionProjection<'a>),
+    Quic,
+}
+
+enum PreparedAdmission<'a> {
+    Rtc(creation::PreparedCreation<'a>),
+    Quic(Vec<u8>),
+}
+
+impl AdmissionProjection<'_> {
+    fn validate<'a>(
+        &'a self,
+        pending: &'a PendingMaterialization,
+    ) -> Result<PreparedAdmission<'a>, OwnedAdmissionError> {
+        match self {
+            Self::Rtc(projection) => projection.validate(pending).map(PreparedAdmission::Rtc),
+            Self::Quic => {
+                use pulsebeam_agent_quic::records::{Accepted, encode_admit_result};
+                let result = Accepted {
+                    connection: *pending.connection_id().as_bytes(),
+                    participant: pending.participant.as_str(),
+                    room: pending.scope.room.as_ref().map(RoomId::as_str),
+                    capabilities: &[],
+                };
+                encode_admit_result(Ok(result))
+                    .map(PreparedAdmission::Quic)
+                    .map_err(|_| ControllerError::ServiceUnavailable.into())
+            }
+        }
+    }
+}
+
+struct AttemptKey {
+    proof: ownership::Proof,
+    sequence: std::num::NonZeroU64,
+    binding: ownership::RequestBinding,
+    successor_receipt: Option<Vec<u8>>,
+}
+
 enum OwnedPreparation {
     Start(ownership::Ticket, Box<PendingMaterialization>),
     Pending(ownership::Ticket),
@@ -610,6 +722,10 @@ enum MaterializationReply {
     Create(oneshot::Sender<Result<CreateParticipantReply, ControllerError>>),
     Patch(oneshot::Sender<Result<PatchParticipantReply, ControllerError>>),
     Owned(Box<OwnedReplies>),
+    Quic(
+        quic_redeem::Reply,
+        pulsebeam_runtime::sync::OwnedSemaphorePermit,
+    ),
 }
 
 impl MaterializationReply {
@@ -652,6 +768,8 @@ pub struct ControllerActor {
     deletion_rx: pulsebeam_runtime::sync::mpsc::Receiver<NativeDeletionCompletion>,
     deletion_bytes: usize,
     ownership: ownership::Authority,
+    quic_placements: quic_placement::Placements,
+    quic_addresses: BTreeMap<ShardId, (String, u16)>,
     peer_ownership: ownership::observations::Observations,
     provisioned_peers: Vec<peer_ownership::provisioned::Peer>,
     ownership_entropy: pulsebeam_runtime::rand::Rng,
@@ -737,6 +855,8 @@ impl ControllerActor {
             deletion_rx,
             deletion_bytes: 0,
             ownership: ownership::Authority::default(),
+            quic_placements: quic_placement::Placements::default(),
+            quic_addresses: BTreeMap::new(),
             peer_ownership: peer_ownership::new_observations(),
             provisioned_peers: Vec::new(),
             ownership_entropy,
@@ -758,6 +878,10 @@ impl ControllerActor {
     #[cfg(feature = "sim")]
     pub(crate) fn set_sim_ownership_peer(&mut self, peer: ownership::sim::SimOwnershipPeer) {
         self.receipt_trust = Some(ownership::receipt::Authority::Local(peer.trust()));
+    }
+
+    pub(crate) fn set_quic_addresses(&mut self, addresses: BTreeMap<ShardId, (String, u16)>) {
+        self.quic_addresses = addresses;
     }
 
     pub(crate) fn set_ownership_mode(&mut self, mode: OwnershipMode) {
@@ -849,6 +973,7 @@ impl ControllerActor {
                 .into_iter()
                 .chain(self.native_deadlines.first().map(|(deadline, _)| *deadline))
                 .chain(self.peer_ownership.deadline())
+                .chain(self.quic_placements.deadline())
                 .chain(
                     self.provisioned_peers
                         .iter()
@@ -901,6 +1026,8 @@ impl ControllerActor {
             };
             self.release_deletion(bytes);
         }
+        self.quic_placements
+            .expire(&mut self.core.registry, started, API_COMMAND_BUDGET);
         self.expire_authorizations(started, SystemTime::now());
         self.expire_peer_sources(started);
         self.drive_provisioned_peers(started);
@@ -1206,6 +1333,22 @@ impl ControllerActor {
                     let _ = reply.send(result);
                 }
             }
+            AdmissionAction::IssueQuic(command) => {
+                let IssueQuicCommand {
+                    principal,
+                    room,
+                    continuation,
+                    reply,
+                } = *command;
+                if !reply.is_closed() {
+                    let result = self.issue_quic_placement(principal, room, continuation, wall_now);
+                    if let Err(Ok(issuance)) = reply.send(result) {
+                        self.quic_placements
+                            .remove(issuance.proof, &mut self.core.registry);
+                    }
+                }
+            }
+            AdmissionAction::RedeemQuic(command) => self.submit_quic_redeem(*command, wall_now),
             AdmissionAction::Create(command) => {
                 let OwnedCreateCommand {
                     message,
@@ -1228,6 +1371,16 @@ impl ControllerActor {
         room: Option<RoomId>,
         wall_now: SystemTime,
     ) -> Result<ownership::Proof, ControllerError> {
+        self.issue_ownership_for(principal, room, wall_now, ownership::Carrier::Rtc)
+    }
+
+    fn issue_ownership_for(
+        &mut self,
+        principal: &VerifiedPrincipal,
+        room: Option<RoomId>,
+        wall_now: SystemTime,
+        carrier: ownership::Carrier,
+    ) -> Result<ownership::Proof, ControllerError> {
         if !self
             .receipt_trust
             .as_ref()
@@ -1243,13 +1396,101 @@ impl ControllerActor {
         }
         let key = ownership::PrincipalKey::from_principal(principal, room);
         let now = pulsebeam_runtime::time::Instant::now();
-        if room.is_none() {
-            self.ownership
-                .issue_roomless(key, now, &mut self.ownership_entropy)
-        } else {
-            self.ownership.issue(key, now, &mut self.ownership_entropy)
+        match (room, carrier) {
+            (None, _) => {
+                self.ownership
+                    .issue_roomless(key, carrier, now, &mut self.ownership_entropy)
+            }
+            (Some(_), ownership::Carrier::Rtc) => {
+                self.ownership.issue(key, now, &mut self.ownership_entropy)
+            }
+            (Some(_), ownership::Carrier::Quic) => {
+                self.ownership
+                    .issue_for(key, carrier, now, &mut self.ownership_entropy)
+            }
         }
         .map_err(|_| ControllerError::ServiceUnavailable)
+    }
+
+    fn issue_quic_placement(
+        &mut self,
+        principal: VerifiedPrincipal,
+        room: Option<RoomId>,
+        continuation: Option<QuicContinuation>,
+        wall_now: SystemTime,
+    ) -> Result<QuicAdmission, ControllerError> {
+        if self.quic_addresses.is_empty() {
+            return Err(ControllerError::ServiceUnavailable);
+        }
+        let verified = principal
+            .clone()
+            .authorize_presence(room)
+            .map_err(|_| ControllerError::AuthorizationRejected)?;
+        let scope = crate::entity::ConnectionScope {
+            project: verified.project_id,
+            room,
+        };
+        let (partition, shard) = self.select_placement(scope, verified.participant_id)?;
+        let (host, port) = self
+            .quic_addresses
+            .get(&shard)
+            .cloned()
+            .ok_or(ControllerError::ServiceUnavailable)?;
+        let now = pulsebeam_runtime::time::Instant::now();
+        let connection = ConnectionId::new();
+        let (proof, successor) = if let Some(QuicContinuation { proof, successor }) = continuation {
+            let key = ownership::PrincipalKey::from_verified(&verified);
+            if !self
+                .ownership
+                .can_continue(&key, proof, ownership::Carrier::Quic, now)
+                || self
+                    .successor_rank(
+                        &successor,
+                        scope.endpoint(verified.participant_id),
+                        connection,
+                        wall_now,
+                    )
+                    .is_err()
+                || verified.expiry.is_expired_at(
+                    wall_now
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                )
+            {
+                return Err(ControllerError::AuthorizationRejected);
+            }
+            (proof, Some(successor))
+        } else {
+            if !self.quic_placements.has_capacity(shard) {
+                return Err(ControllerError::ServiceUnavailable);
+            }
+            (
+                self.issue_ownership_for(&principal, room, wall_now, ownership::Carrier::Quic)?,
+                None,
+            )
+        };
+        self.quic_placements.insert(
+            proof,
+            quic_placement::Lease {
+                target: quic_placement::Target {
+                    scope,
+                    participant: verified.participant_id,
+                    shard,
+                },
+                connection,
+                partition,
+                successor,
+            },
+            &mut self.core.registry,
+            now,
+        )?;
+        Ok(QuicAdmission {
+            proof,
+            host,
+            port,
+            valid_for_ms: quic_placement::VALID_FOR_MS,
+        })
     }
 
     fn submit_owned_create(
@@ -1303,6 +1544,45 @@ impl ControllerActor {
         attempt: OwnershipAttempt,
         wall_now: SystemTime,
     ) -> Result<OwnedPreparation, OwnedAdmissionError> {
+        let OwnershipAttempt {
+            proof,
+            sequence,
+            binding,
+            successor_receipt,
+            location,
+        } = attempt;
+        let capabilities = message.state.rtp_capabilities.clone();
+        let project = AdmissionProjection::Rtc(RtcAdmissionProjection {
+            location: &location,
+            capabilities: capabilities.as_ref(),
+        });
+        let attempt = AttemptKey {
+            proof,
+            sequence,
+            binding,
+            successor_receipt,
+        };
+        let CreateParticipant { state, offer } = message;
+        self.prepare_owned_attempt(
+            state,
+            attempt,
+            wall_now,
+            |actor, state| actor.begin_create_participant(state, offer),
+            &project,
+        )
+    }
+
+    fn prepare_owned_attempt(
+        &mut self,
+        state: ParticipantState,
+        attempt: AttemptKey,
+        wall_now: SystemTime,
+        materialize: impl FnOnce(
+            &mut Self,
+            ParticipantState,
+        ) -> Result<PendingMaterialization, ControllerError>,
+        project: &AdmissionProjection<'_>,
+    ) -> Result<OwnedPreparation, OwnedAdmissionError> {
         if !self
             .receipt_trust
             .as_ref()
@@ -1310,7 +1590,6 @@ impl ControllerActor {
         {
             return Err(ControllerError::ServiceUnavailable.into());
         }
-        let state = &message.state;
         let lease = state
             .authorization
             .as_ref()
@@ -1330,11 +1609,10 @@ impl ControllerActor {
             principal
         };
         let now = pulsebeam_runtime::time::Instant::now();
-        let OwnershipAttempt {
+        let AttemptKey {
             proof,
             sequence,
             binding,
-            location,
             successor_receipt,
         } = attempt;
         let preview = self
@@ -1380,31 +1658,13 @@ impl ControllerActor {
             return Err(ControllerError::ServiceUnavailable.into());
         }
         self.ownership.reserve_binding()?;
-        let capabilities = message.state.rtp_capabilities.clone();
-        let mut pending = self.begin_create_participant(message.state, message.offer)?;
+        let mut pending = materialize(self, state)?;
         pending.claim = claim;
-        let response = if pending.profile == SignalingProtocol::State {
-            let Some(capabilities) = capabilities.as_ref() else {
-                pulsebeam_runtime::fatal!("prepared native creation lost protocol capabilities");
-            };
-            let Some(lease) = pending.authorization.as_ref() else {
-                pulsebeam_runtime::fatal!("owned creation lost verified authorization");
-            };
-            creation::CreationResponse::native(
-                &location,
-                &lease.authority,
-                pending.connection_id(),
-                capabilities,
-                &pending.answer,
-            )
-        } else {
-            creation::CreationResponse::sdp(&location, &pending.answer)
-        };
-        let prepared = match response.validate() {
+        let prepared = match project.validate(&pending) {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.discard_materialization(pending, MaterializationCutoffs::new());
-                return Err(OwnedAdmissionError::Image(error));
+                return Err(error);
             }
         };
         let claim_now = pulsebeam_runtime::time::Instant::now();
@@ -1431,7 +1691,10 @@ impl ControllerActor {
                 pulsebeam_runtime::fatal!("prepared ownership claim changed without a transition")
             }
         };
-        let image = prepared.encode();
+        let image = match prepared {
+            PreparedAdmission::Rtc(image) => image.encode(),
+            PreparedAdmission::Quic(image) => image,
+        };
         let live = self.ownership.live_predecessor(&ticket);
         self.fence_predecessors(&ticket, claim, live);
         self.advance_materializations();
@@ -1460,17 +1723,16 @@ impl ControllerActor {
             let Some(owned) = work.pending.owned.as_ref() else {
                 continue;
             };
-            let MaterializationReply::Owned(replies) = &mut work.reply else {
-                pulsebeam_runtime::fatal!("owned materialization must retain charged reply sinks");
-            };
-            replies.retain(|waiter| {
-                if waiter.reply.is_closed() {
-                    self.ownership.detach_waiter(&owned.ticket);
-                    false
-                } else {
-                    true
-                }
-            });
+            if let MaterializationReply::Owned(replies) = &mut work.reply {
+                replies.retain(|waiter| {
+                    if waiter.reply.is_closed() {
+                        self.ownership.detach_waiter(&owned.ticket);
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
         }
     }
 
@@ -1490,7 +1752,8 @@ impl ControllerActor {
             return Err((reply, ownership::Error::ReplayUnavailable));
         };
         let MaterializationReply::Owned(replies) = &mut work.reply else {
-            pulsebeam_runtime::fatal!("owned materialization must retain charged reply sinks");
+            self.ownership.detach_waiter(ticket);
+            return Err((reply, ownership::Error::ReplayUnavailable));
         };
         if replies.is_full() {
             self.ownership.detach_waiter(ticket);
@@ -1818,6 +2081,7 @@ impl ControllerActor {
         let owned = pending.owned.take();
         let wall_now = SystemTime::now();
         let validation = if superseded
+            || matches!(&reply, MaterializationReply::Quic(waiter, _) if waiter.is_closed())
             || !cutoffs.is_empty()
             || pending
                 .endpoint()
@@ -1954,6 +2218,19 @@ impl ControllerActor {
                     };
                     PatchParticipantReply { answer }
                 }));
+            }
+            MaterializationReply::Quic(reply, permit) => {
+                let result = result
+                    .and_then(|success| match success {
+                        MaterializationSuccess::Owned(bytes) => {
+                            Ok(creation::Delivery::new(bytes, permit))
+                        }
+                        MaterializationSuccess::Answer(_) => {
+                            Err(ControllerError::ServiceUnavailable)
+                        }
+                    })
+                    .map_err(|error| quic_redeem::denial(&OwnedAdmissionError::Request(error)));
+                let _ = reply.send(result);
             }
             MaterializationReply::Owned(replies) => {
                 let result = result
@@ -3525,6 +3802,32 @@ impl ControllerActor {
         Ok(())
     }
 
+    fn select_placement(
+        &self,
+        scope: crate::entity::ConnectionScope,
+        participant: ParticipantId,
+    ) -> Result<(Option<usize>, ShardId), ControllerError> {
+        let choose = |snapshot: Option<&pulsebeam_runtime::rt::ExecutionSnapshot>| {
+            let now = pulsebeam_runtime::time::Instant::now();
+            let shards = self.router.shard_count();
+            if let Some(room) = scope.joined_room() {
+                self.placement
+                    .admit(&self.core, &room, &participant, shards, snapshot, now)
+                    .map(|(slot, shard)| (Some(slot), shard))
+            } else {
+                self.placement
+                    .admit_without_partition(&self.core, shards, snapshot, now)
+                    .map(|shard| (None, shard))
+            }
+        };
+        let selected = if let Some(execution) = self.execution.as_ref() {
+            execution.with_snapshot(choose)
+        } else {
+            choose(None)
+        };
+        selected.ok_or(ControllerError::ServiceUnavailable)
+    }
+
     fn begin_create_participant(
         &mut self,
         mut state: ParticipantState,
@@ -3585,25 +3888,7 @@ impl ControllerActor {
             }
             _ => return Err(NegotiatorError::InvalidResources.into()),
         };
-        let choose = |snapshot: Option<&pulsebeam_runtime::rt::ExecutionSnapshot>| {
-            let now = pulsebeam_runtime::time::Instant::now();
-            let shards = self.router.shard_count();
-            if let Some(room) = scope.joined_room() {
-                self.placement
-                    .admit(&self.core, &room, &participant_id, shards, snapshot, now)
-                    .map(|(slot, shard)| (Some(slot), shard))
-            } else {
-                self.placement
-                    .admit_without_partition(&self.core, shards, snapshot, now)
-                    .map(|shard| (None, shard))
-            }
-        };
-        let selected = if let Some(execution) = self.execution.as_ref() {
-            execution.with_snapshot(choose)
-        } else {
-            choose(None)
-        };
-        let (slot, shard) = selected.ok_or(ControllerError::ServiceUnavailable)?;
+        let (slot, shard) = self.select_placement(scope, participant_id)?;
         let at = self
             .clock
             .observe_execution(pulsebeam_runtime::net::ReceiveTime::now());
@@ -4316,6 +4601,257 @@ mod replacement_tests {
         actor_with_shards(1)
     }
 
+    #[test]
+    fn quic_issuance_pins_placement_without_committing_presence() {
+        let (mut actor, mut shards) = actor_with_receivers(1);
+        let shard_rx = shards.first_mut().unwrap();
+        let now = pulsebeam_runtime::time::Instant::now();
+        let wall = SystemTime::now();
+        let issued_at = wall.duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let room = RoomId::new("stage").unwrap();
+        let scope = ProjectRoomKey::fixture(room);
+        let registry = KeyRegistry::new(
+            scope.project,
+            vec![pulsebeam_core::auth::KeyRegistryEntry {
+                key_id: *pulsebeam_core::auth::DEVELOPMENT_API_KEY_ID,
+                public_key: *pulsebeam_core::auth::DEVELOPMENT_API_PUBLIC_KEY,
+            }],
+        )
+        .unwrap();
+        let signed = pulsebeam_server::sign_participant_token(
+            &pulsebeam_server::insecure_dev_api_key().unwrap(),
+            &full_grants("stage"),
+            "alice",
+            issued_at.saturating_add(3_600),
+        )
+        .unwrap();
+        let principal =
+            authenticate_participant_token(&registry, &signed.token, issued_at).unwrap();
+        assert!(matches!(
+            actor.issue_quic_placement(principal.clone(), Some(room), None, wall),
+            Err(ControllerError::ServiceUnavailable)
+        ));
+        actor.set_ownership_mode(OwnershipMode::Standalone);
+        let shard = ShardId::new(0);
+        actor
+            .quic_addresses
+            .insert(shard, ("edge.example".to_owned(), 9443));
+        let participant = *principal.participant_id();
+        let result = actor
+            .issue_quic_placement(principal.clone(), Some(room), None, wall)
+            .unwrap();
+        assert_eq!((result.host.as_str(), result.port), ("edge.example", 9443));
+        assert_eq!(
+            actor
+                .core
+                .registry
+                .get_room_shard(&scope)
+                .unwrap()
+                .partition_owner(0),
+            Some(shard)
+        );
+        assert_eq!(actor.core.registry.connections().count(), 0);
+        let expiry = actor.quic_placements.deadline().unwrap();
+        assert!(expiry > now);
+        let check = |shard, at| {
+            actor
+                .quic_placements
+                .get(
+                    result.proof,
+                    quic_placement::Target {
+                        scope: scope.into(),
+                        participant,
+                        shard,
+                    },
+                    &actor.core.registry,
+                    at,
+                )
+                .is_some()
+        };
+        assert!(check(shard, now));
+        assert!(!check(ShardId::new(1), now));
+        assert!(!check(shard, expiry));
+        actor.set_key_registry(Some(registry));
+        let proof_text = result.proof.encode();
+        let request = pulsebeam_agent_quic::records::Admit {
+            attempt: std::num::NonZeroU64::MIN,
+            room: Some("stage"),
+            owner: &proof_text,
+            token: &signed.token,
+            successor: None,
+        };
+        use pulsebeam_agent_quic::records::Denial;
+        let body = request.encode().unwrap();
+        let admitted = actor
+            .preflight_quic_redeem(shard, &body, wall, now)
+            .unwrap();
+        assert_eq!(admitted.target.scope, scope.into());
+        assert_eq!(admitted.target.participant, participant);
+        assert_eq!(admitted.proof, result.proof);
+        assert_eq!(admitted.sequence, request.attempt);
+        assert_eq!(admitted.partition, Some(0));
+        assert!(actor.core.registry.partition_reserved(
+            scope,
+            participant,
+            admitted.connection,
+            shard,
+            0
+        ));
+        assert!(admitted.lease.matches_participant(Some(room), participant));
+        assert_eq!(
+            admitted.binding,
+            ownership::RequestBinding::for_quic(&body).unwrap()
+        );
+        assert!(admitted.successor_receipt.is_none());
+        assert_eq!(
+            actor
+                .preflight_quic_redeem(ShardId::new(1), &body, wall, now)
+                .err(),
+            Some(Denial::Placement)
+        );
+        assert_eq!(
+            actor
+                .preflight_quic_redeem(shard, &body, wall, expiry)
+                .err(),
+            Some(Denial::Placement)
+        );
+        let wrong_room = pulsebeam_agent_quic::records::Admit {
+            room: Some("other"),
+            ..request
+        }
+        .encode()
+        .unwrap();
+        assert_eq!(
+            actor
+                .preflight_quic_redeem(shard, &wrong_room, wall, now)
+                .err(),
+            Some(Denial::Denied)
+        );
+        assert_eq!(actor.core.registry.connections().count(), 0);
+        let (reply, mut result_rx) = oneshot::channel();
+        let command = AdmissionCommand::redeem_quic(quic_redeem::Command {
+            shard,
+            association: std::num::NonZeroU64::MIN,
+            body: body.clone(),
+            reply,
+        });
+        actor.process_admission(command, wall);
+        assert!(matches!(
+            result_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert_eq!(actor.materializations.len(), 1);
+        assert_eq!(actor.core.registry.connections().count(), 0);
+        let (reply, mut retry) = oneshot::channel();
+        actor.process_admission(
+            AdmissionCommand::redeem_quic(quic_redeem::Command {
+                shard,
+                association: std::num::NonZeroU64::new(2).unwrap(),
+                body,
+                reply,
+            }),
+            wall,
+        );
+        assert!(matches!(retry.try_recv().unwrap(), Err(Denial::Placement)));
+        let work = actor.materializations.pop_front().unwrap();
+        actor.finish_materialization(work, false);
+        assert!(matches!(
+            result_rx.try_recv().unwrap(),
+            Err(Denial::Capacity)
+        ));
+        actor
+            .quic_placements
+            .expire(&mut actor.core.registry, expiry, 1);
+        assert!(actor.core.registry.get_room_shard(&scope).is_none());
+
+        let (failed_ticket, failed_incarnation) = actor.ownership.next_retirement().unwrap();
+        actor.ownership.start_retirement(&failed_ticket);
+        actor
+            .ownership
+            .finish_retirement(&failed_ticket, failed_incarnation, true, now);
+        let next = actor
+            .issue_quic_placement(principal, Some(room), None, wall)
+            .unwrap();
+        let owner = next.proof.encode();
+        let attempt = pulsebeam_agent_quic::records::Admit {
+            owner: &owner,
+            ..request
+        }
+        .encode()
+        .unwrap();
+        let (reply, mut accepted) = oneshot::channel();
+        let association = std::num::NonZeroU64::new(3).unwrap();
+        actor.process_admission(
+            AdmissionCommand::redeem_quic(quic_redeem::Command {
+                shard,
+                association,
+                body: attempt.clone(),
+                reply,
+            }),
+            wall,
+        );
+        actor.flush_command_backlog();
+        // The failed attempt also queued materialization, before its cleanup.
+        let materialized =
+            std::iter::from_fn(|| shard_rx.try_recv().ok()).find_map(|command| match command {
+                ShardCommand::MaterializeQuic {
+                    association: serial,
+                    connection,
+                    ack,
+                    ..
+                } if serial == association => Some((connection, ack)),
+                _ => None,
+            });
+        let (connection, ack) = materialized.unwrap();
+        assert!(
+            actor
+                .core
+                .registry
+                .get_incarnation(participant, connection)
+                .is_none()
+        );
+        let _ = ack.send(true);
+        actor.advance_materializations();
+        let result = accepted.try_recv().unwrap().unwrap();
+        let result = pulsebeam_agent_quic::records::decode_admit_result(result.as_ref())
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.connection, *connection.as_bytes());
+        assert_eq!(result.room, Some("stage"));
+        assert!(
+            actor
+                .core
+                .registry
+                .get_incarnation(participant, connection)
+                .is_some()
+        );
+        let (reply, mut replay) = oneshot::channel();
+        actor.process_admission(
+            AdmissionCommand::redeem_quic(quic_redeem::Command {
+                shard,
+                association: std::num::NonZeroU64::new(4).unwrap(),
+                body: attempt,
+                reply,
+            }),
+            wall,
+        );
+        assert!(matches!(replay.try_recv().unwrap(), Err(Denial::Placement)));
+        actor.handle_shard_event((
+            shard,
+            ShardEvent::ParticipantClosed {
+                participant,
+                connection_id: connection,
+            },
+        ));
+        assert!(
+            actor
+                .core
+                .registry
+                .get_incarnation(participant, connection)
+                .is_none()
+        );
+    }
+
     fn actor_with_shards(shard_count: usize) -> ControllerActor {
         actor_with_receivers(shard_count).0
     }
@@ -4373,6 +4909,8 @@ mod replacement_tests {
                 deletion_rx,
                 deletion_bytes: 0,
                 ownership: ownership::Authority::default(),
+                quic_placements: quic_placement::Placements::default(),
+                quic_addresses: BTreeMap::new(),
                 peer_ownership: peer_ownership::new_observations(),
                 provisioned_peers: Vec::new(),
                 ownership_entropy: pulsebeam_runtime::rand::seeded_rng(19),

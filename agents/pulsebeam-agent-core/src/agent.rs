@@ -44,6 +44,8 @@ macro_rules! agent_log {
 
 mod admission;
 mod credentials;
+mod quic;
+pub use admission::placement;
 mod native;
 mod publication;
 mod subscription;
@@ -130,12 +132,16 @@ struct Credential {
     revision: u64,
 }
 
+struct RtcAdmission {
+    receipts: admission::AcceptedReceipts,
+    resource_uri: String,
+}
+
 struct Session {
     credential: Credential,
-    admission: admission::AcceptedReceipts,
+    rtc: Option<RtcAdmission>,
     generation: Generation,
     connection_id: crate::ConnectionId,
-    resource_uri: String,
     participant_id: String,
     room_id: Option<String>,
     coordinates: BTreeMap<MediaSlot, Option<SlotBinding>>,
@@ -160,6 +166,52 @@ struct Session {
     capabilities: crate::BootstrapCapabilities,
     media_preparation:
         Option<Result<crate::rtc_preparation::PreparedMedia, crate::client_sdp::Error>>,
+}
+
+struct SessionIdentity {
+    connection_id: crate::ConnectionId,
+    participant_id: String,
+    room_id: Option<String>,
+}
+
+impl Session {
+    fn new(
+        generation: Generation,
+        credential: Credential,
+        identity: SessionIdentity,
+        state: NativeState,
+        signaling_channel: ChannelId,
+        capabilities: crate::BootstrapCapabilities,
+    ) -> Self {
+        Self {
+            generation,
+            credential,
+            connection_id: identity.connection_id,
+            participant_id: identity.participant_id,
+            room_id: identity.room_id,
+            state,
+            signaling_channel,
+            capabilities,
+            rtc: None,
+            coordinates: BTreeMap::new(),
+            payloads: BTreeMap::new(),
+            payload_resources: BTreeMap::new(),
+            next_stream: 1,
+            reusable_streams: BTreeSet::new(),
+            media_leases: BTreeMap::new(),
+            media_retirement: None,
+            media_allocation: None,
+            media_wanted: BTreeMap::new(),
+            media_blocked: BTreeMap::new(),
+            authorization_expires_at: None,
+            pending_renewal: None,
+            authorization_revision: 0,
+            signaling_terminal: false,
+            reliable_data_enabled: false,
+            data_preparations: BTreeMap::new(),
+            media_preparation: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -215,6 +267,7 @@ struct CapabilityRequest {
 }
 
 struct Attempt {
+    quic: Option<quic::Attempt>,
     generation: Generation,
     join_revision: u64,
     room: Option<String>,
@@ -263,6 +316,7 @@ struct Closing {
 }
 
 pub struct Agent {
+    quic: bool,
     config: AgentConfig,
     config_credential_revision: u64,
     admission_denial: Option<credentials::AdmissionDenial>,
@@ -299,6 +353,7 @@ impl Agent {
     pub fn new(mut config: AgentConfig) -> Result<Self, AgentError> {
         config.validate()?;
         Ok(Self {
+            quic: false,
             config,
             config_credential_revision: 0,
             admission_denial: None,
@@ -348,6 +403,11 @@ impl Agent {
     }
 
     pub fn command(&mut self, command: AgentCommand) -> Result<(), AgentError> {
+        self.command_at(command, self.data_now)
+    }
+
+    pub fn command_at(&mut self, command: AgentCommand, now: Duration) -> Result<(), AgentError> {
+        self.data_now = self.data_now.max(now);
         let result = match command {
             AgentCommand::ReplaceDesired(desired) => self.replace_desired(desired),
             AgentCommand::RenewAuthorization(token) => self.renew_authorization(token),
@@ -384,7 +444,9 @@ impl Agent {
     pub fn handle_at(&mut self, event: HostEvent, now: Duration) -> Result<(), AgentError> {
         self.data_now = self.data_now.max(now);
         let result = match event {
-            HostEvent::Rtc(event) => self.handle_rtc(event),
+            HostEvent::Rtc(event) if !self.quic => self.handle_rtc(event),
+            HostEvent::Quic(event) if self.quic => self.handle_quic(event),
+            HostEvent::Rtc(_) | HostEvent::Quic(_) => Ok(()),
             HostEvent::Http(event) => self.handle_http(event),
             HostEvent::Timer(event) => self.handle_timer(event),
             HostEvent::DataChannel(event) => self.handle_data_channel(event),
@@ -1436,6 +1498,7 @@ impl Agent {
             generation.get()
         );
         self.attempt = Some(Attempt {
+            quic: None,
             generation,
             join_revision: self.snapshot.join_revision,
             room: self.snapshot.desired_room.clone(),
@@ -1454,6 +1517,10 @@ impl Agent {
             media_preparation: None,
             data_preparations: BTreeMap::new(),
         });
+        if self.quic {
+            self.start_quic_placement(generation);
+            return;
+        }
         let data_channels = vec![DataChannelSpec {
             label: signaling::SIGNALING_LABEL.to_string(),
             ordered: true,
@@ -1900,6 +1967,9 @@ impl Agent {
                 response,
             } => self.http_response(operation, response),
             HttpEvent::Failed { operation, .. } => {
+                if self.quic_placement_failed(operation) {
+                    return Ok(());
+                }
                 if self.credential_http_failed(operation) {
                     return Ok(());
                 }
@@ -1964,8 +2034,9 @@ impl Agent {
         }
         self.active.as_ref().is_some_and(|active| {
             active
-                .admission
-                .is_latest_receipt(operation, &self.ownership)
+                .rtc
+                .as_ref()
+                .is_some_and(|rtc| rtc.receipts.is_latest_receipt(operation, &self.ownership))
         })
     }
 
@@ -1974,6 +2045,9 @@ impl Agent {
         operation: OperationId,
         response: HttpResponse,
     ) -> Result<(), AgentError> {
+        if self.quic_placement_response(operation, &response) {
+            return Ok(());
+        }
         if self.credential_http_response(operation, &response) {
             return Ok(());
         }
@@ -1993,9 +2067,9 @@ impl Agent {
                 .and_then(|attempt| attempt.request.as_ref())
                 .is_some_and(|request| request.is_latest_receipt(operation, &self.ownership))
                 || self.active.as_ref().is_some_and(|active| {
-                    active
-                        .admission
-                        .is_latest_receipt(operation, &self.ownership)
+                    active.rtc.as_ref().is_some_and(|rtc| {
+                        rtc.receipts.is_latest_receipt(operation, &self.ownership)
+                    })
                 }))
         {
             if let Some(failure) = classify_http_failure(response.status) {
@@ -2639,46 +2713,54 @@ impl Agent {
                     room_id: room_id.clone(),
                 }),
         )?;
-        self.retry_attempts = 0;
-        self.snapshot.evaluated_join_revision = attempt.join_revision;
-        self.snapshot.accepted_join_revision = Some(attempt.join_revision);
-        let previous_generation = self.active.as_ref().map(|session| session.generation);
-        self.joined_successor = None;
         let reliable_data_enabled = candidate.capabilities.data_v1
             && candidate
                 .capabilities
                 .data_delivery
                 .contains(&pulsebeam_proto::state::DataDelivery::Ordered);
-        if let Some(mut previous) = self.active.replace(Session {
-            credential: candidate.credential,
-            admission: admission.into_accepted_receipts(),
-            generation: attempt.generation,
-            connection_id: candidate.connection_id,
-            resource_uri: candidate.resource_uri,
-            participant_id: candidate.participant_id,
-            room_id: candidate.room_id,
-            coordinates,
+        let mut session = Session::new(
+            attempt.generation,
+            candidate.credential,
+            SessionIdentity {
+                connection_id: candidate.connection_id,
+                participant_id: candidate.participant_id,
+                room_id: candidate.room_id,
+            },
             state,
-            payloads: BTreeMap::new(),
-            payload_resources: BTreeMap::new(),
-            next_stream: 1,
-            reusable_streams: BTreeSet::new(),
-            media_leases: BTreeMap::new(),
-            media_retirement: None,
-            media_allocation: None,
-            media_wanted: BTreeMap::new(),
-            media_blocked: BTreeMap::new(),
+            resources.signaling_channel,
+            candidate.capabilities,
+        );
+        session.rtc = Some(RtcAdmission {
+            receipts: admission.into_accepted_receipts(),
+            resource_uri: candidate.resource_uri,
+        });
+        session.coordinates = coordinates;
+        session.reliable_data_enabled = reliable_data_enabled;
+        session.data_preparations = attempt.data_preparations;
+        session.media_preparation = attempt.media_preparation;
+        self.activate_session(session, attempt.join_revision);
+        for payload in attempt.early_signaling {
+            self.handle_data_channel(DataChannelEvent::Message {
+                generation: attempt.generation,
+                channel: resources.signaling_channel,
+                binary: true,
+                payload,
+            })?;
+        }
+        self.refresh_resources()?;
+        self.request_reconciliation();
+        Ok(())
+    }
 
-            authorization_expires_at: None,
-            pending_renewal: None,
-            authorization_revision: 0,
-            signaling_terminal: false,
-            reliable_data_enabled,
-            signaling_channel: resources.signaling_channel,
-            data_preparations: attempt.data_preparations,
-            capabilities: candidate.capabilities,
-            media_preparation: attempt.media_preparation,
-        }) && previous.generation != attempt.generation
+    fn activate_session(&mut self, session: Session, join_revision: u64) {
+        let generation = session.generation;
+        self.retry_attempts = 0;
+        self.snapshot.evaluated_join_revision = join_revision;
+        self.snapshot.accepted_join_revision = Some(join_revision);
+        let previous_generation = self.active.as_ref().map(|session| session.generation);
+        self.joined_successor = None;
+        if let Some(mut previous) = self.active.replace(session)
+            && previous.generation != generation
         {
             for physical in previous.payloads.values_mut() {
                 physical.settle_data_sender(
@@ -2691,15 +2773,13 @@ impl Agent {
             if let Some(renewal) = previous.pending_renewal {
                 self.cancel_credential_work(renewal);
             }
-            self.effects.push_back(Effect::Rtc(RtcEffect::Close {
-                generation: previous.generation,
-            }));
+            self.close_transport(previous.generation);
         }
         agent_log!(
             self,
             Info,
             "activated connection generation={} replaced_generation={:?}",
-            attempt.generation.get(),
+            generation.get(),
             previous_generation.map(Generation::get),
         );
         self.pending_signal = None;
@@ -2718,17 +2798,6 @@ impl Agent {
             self.credential_accepted(revision);
         }
         self.set_connection_state(ConnectionState::Connected);
-        for payload in attempt.early_signaling {
-            self.handle_data_channel(DataChannelEvent::Message {
-                generation: attempt.generation,
-                channel: resources.signaling_channel,
-                binary: true,
-                payload,
-            })?;
-        }
-        self.refresh_resources()?;
-        self.request_reconciliation();
-        Ok(())
     }
 
     fn update_attempt_state(&mut self) {
@@ -2770,9 +2839,7 @@ impl Agent {
             attempt.generation.get(),
             failure.class,
         );
-        self.effects.push_back(Effect::Rtc(RtcEffect::Close {
-            generation: attempt.generation,
-        }));
+        self.retire_attempt_transport(&mut attempt);
         if let Some(capability) = attempt.capability.take()
             && let Some(operation) = capability.operation
         {
@@ -2835,9 +2902,7 @@ impl Agent {
             FailureClass::ParticipantSuperseded | FailureClass::ResourceExpired
         ) {
             if let Some(active) = self.active.as_ref() {
-                self.effects.push_back(Effect::Rtc(RtcEffect::Close {
-                    generation: active.generation,
-                }));
+                self.close_transport(active.generation);
             }
             self.snapshot.connection_id = None;
             self.snapshot.room_id = None;
@@ -3029,14 +3094,13 @@ impl Agent {
             }
             pending.operation = self.ids.operation();
             pending.retrying = false;
-            self.effects
-                .push_back(Effect::DataChannel(DataChannelEffect::Send {
-                    operation: pending.operation,
-                    generation: pending.generation,
-                    channel: pending.channel,
-                    binary: true,
-                    payload: pending.payload.clone(),
-                }));
+            self.effects.push_back(signal_effect(
+                self.quic,
+                pending.operation,
+                pending.generation,
+                pending.channel,
+                pending.payload.clone(),
+            ));
             return;
         }
         let (payload, retryable) = match active.state.next_frame() {
@@ -3082,14 +3146,9 @@ impl Agent {
         } else {
             Vec::new()
         };
-        self.effects
-            .push_back(Effect::DataChannel(DataChannelEffect::Send {
-                operation,
-                generation,
-                channel,
-                binary: true,
-                payload,
-            }));
+        self.effects.push_back(signal_effect(
+            self.quic, operation, generation, channel, payload,
+        ));
         self.pending_signal = Some(PendingSignal {
             operation,
             generation,
@@ -3158,10 +3217,9 @@ impl Agent {
         self.pending_signal = None;
         let mut closing = Closing::default();
         if let Some(mut attempt) = self.attempt.take() {
-            let _ = closing.generations.insert(attempt.generation);
-            self.effects.push_back(Effect::Rtc(RtcEffect::Close {
-                generation: attempt.generation,
-            }));
+            if self.retire_attempt_transport(&mut attempt) {
+                let _ = closing.generations.insert(attempt.generation);
+            }
             if let Some(capability) = attempt.capability.take()
                 && let Some(operation) = capability.operation
             {
@@ -3192,11 +3250,11 @@ impl Agent {
                 self.cancel_credential_work(renewal);
             }
             if closing.generations.insert(active.generation) {
-                self.effects.push_back(Effect::Rtc(RtcEffect::Close {
-                    generation: active.generation,
-                }));
+                self.close_transport(active.generation);
             }
-            self.track_delete(active.resource_uri, active.credential.token, &mut closing);
+            if let Some(rtc) = active.rtc {
+                self.track_delete(rtc.resource_uri, active.credential.token, &mut closing);
+            }
         }
         self.retry_attempts = 0;
         if closing.generations.is_empty() && closing.deletes.is_empty() {
@@ -3370,6 +3428,30 @@ impl Failure {
             class: FailureClass::Protocol,
             message: message.into(),
         }
+    }
+}
+
+fn signal_effect(
+    quic: bool,
+    operation: OperationId,
+    generation: Generation,
+    channel: ChannelId,
+    payload: Vec<u8>,
+) -> Effect {
+    if quic {
+        Effect::Quic(crate::QuicEffect::SendControl {
+            generation,
+            operation,
+            payload,
+        })
+    } else {
+        Effect::DataChannel(DataChannelEffect::Send {
+            generation,
+            operation,
+            channel,
+            binary: true,
+            payload,
+        })
     }
 }
 

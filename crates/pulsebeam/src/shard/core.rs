@@ -135,6 +135,16 @@ impl ShardCore {
         self.execution.wall.observe_execution(at)
     }
 
+    pub(super) fn apply_updates_with_retirement(
+        &mut self,
+        budget: usize,
+        retire: impl FnMut(crate::entity::ConnectionId, crate::route::NodeTransportAddress),
+    ) -> usize {
+        self.updates
+            .apply_with_retirement(&mut self.execution, budget, retire)
+    }
+
+    #[cfg(test)]
     pub(crate) fn apply_updates(&mut self, budget: usize) -> usize {
         self.updates.apply(&mut self.execution, budget)
     }
@@ -2884,6 +2894,10 @@ impl ShardExecution {
         router: &impl IngressTransport,
     ) -> Option<()> {
         match cmd {
+            ShardCommand::MaterializeQuic { ack, .. } => {
+                // QUIC materialization belongs to the shard worker's ingress owner.
+                let _ = ack.send(false);
+            }
             ShardCommand::MaterializeParticipant {
                 transport,
                 config,

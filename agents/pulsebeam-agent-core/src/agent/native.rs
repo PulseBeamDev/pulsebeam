@@ -2210,9 +2210,14 @@ impl Agent {
     }
 
     pub(super) fn apply_native(&mut self, payload: &[u8]) -> Result<(), AgentError> {
-        let batch = match state::codec::decode_server_frame(payload)
-            .map_err(|_| SignalingError::Malformed)?
-        {
+        let decoded = self
+            .active
+            .as_ref()
+            .ok_or(SignalingError::Invalid("inactive Session"))?
+            .state
+            .decode_frame(payload)
+            .map_err(|_| SignalingError::Malformed)?;
+        let batch = match decoded {
             state::codec::NativeFrame::State(batch) => batch,
             state::codec::NativeFrame::Data(control) => {
                 return self.apply_reliable_data_control(control);

@@ -256,6 +256,7 @@ impl ParticipantKey {
 }
 
 pub(crate) struct NativeState {
+    profile: validation::BindingProfile,
     revision: u64,
     targets: BTreeMap<Resource, Target>,
     owned: BTreeMap<u64, Owned>,
@@ -285,12 +286,25 @@ impl NativeState {
         memory_limit: usize,
         self_participant: impl Into<Option<wire::Participant>>,
     ) -> Result<Self, SignalingError> {
+        Self::with_profile(
+            memory_limit,
+            self_participant,
+            validation::BindingProfile::Rtc,
+        )
+    }
+
+    pub(crate) fn with_profile(
+        memory_limit: usize,
+        self_participant: impl Into<Option<wire::Participant>>,
+        profile: validation::BindingProfile,
+    ) -> Result<Self, SignalingError> {
         let self_participant = self_participant.into();
         if let Some(participant) = &self_participant {
             validation::validate_participant(participant)
                 .map_err(|_| SignalingError::Invalid("bootstrap participant"))?;
         }
         Ok(Self {
+            profile,
             revision: 0,
             targets: BTreeMap::new(),
             owned: BTreeMap::new(),
@@ -316,6 +330,29 @@ impl NativeState {
         })
     }
 
+    pub(crate) fn decode_frame(
+        &self,
+        frame: &[u8],
+    ) -> Result<codec::NativeFrame<wire::ServerStateBatch>, codec::DecodeError> {
+        match self.profile {
+            validation::BindingProfile::Rtc => codec::decode_server_frame(frame),
+            validation::BindingProfile::Quic => {
+                if let Some(control) = codec::decode_data_control_frame(frame) {
+                    control.map(codec::NativeFrame::Data)
+                } else {
+                    codec::decode_quic_server(frame).map(codec::NativeFrame::State)
+                }
+            }
+        }
+    }
+
+    fn encode_batch(&self, batch: &wire::ClientStateBatch) -> Result<Vec<u8>, codec::EncodeError> {
+        match self.profile {
+            validation::BindingProfile::Rtc => codec::encode_client(batch),
+            validation::BindingProfile::Quic => codec::encode_quic_client(batch),
+        }
+    }
+
     pub(crate) fn stage(
         &mut self,
         resource: Resource,
@@ -325,13 +362,13 @@ impl NativeState {
             return Err(SignalingError::Invalid("terminal Session"));
         }
         if let Some(spec) = &spec {
-            validation::validate_spec(spec)
+            validation::validate_spec_for(spec, self.profile)
                 .map_err(|_| SignalingError::Invalid("resource spec"))?;
             if !resource.matches_spec(spec) {
                 return Err(SignalingError::Invalid("resource correlation"));
             }
             // Reserve representability with the largest revision/ref encodings.
-            codec::encode_client(&wire::ClientStateBatch {
+            self.encode_batch(&wire::ClientStateBatch {
                 records: alloc::vec![desired_record(u64::MAX, u64::MAX, Some(spec.clone()))],
                 ..Default::default()
             })
@@ -503,9 +540,9 @@ impl NativeState {
             revision: u64::MAX,
             outcome: Some(outcome),
         });
-        validation::validate_execution_report(&report)
+        validation::validate_execution_report_for(&report, self.profile)
             .map_err(|_| SignalingError::Invalid("execution report"))?;
-        codec::encode_client(&wire::ClientStateBatch {
+        self.encode_batch(&wire::ClientStateBatch {
             records: alloc::vec![wire::ClientStateRecord {
                 owned: reference,
                 desired: None,
@@ -530,7 +567,7 @@ impl NativeState {
         &mut self,
         record: wire::CatalogClientRecord,
     ) -> Result<(), SignalingError> {
-        codec::encode_client(&wire::ClientStateBatch {
+        self.encode_batch(&wire::ClientStateBatch {
             catalog_records: vec![record.clone()],
             ..Default::default()
         })
@@ -762,7 +799,7 @@ impl NativeState {
             return Ok(None);
         }
         self.catalog_first = !self.catalog_first;
-        codec::encode_client(&batch)
+        self.encode_batch(&batch)
             .map(Some)
             .map_err(|_| SignalingError::Encode)
     }
@@ -772,7 +809,12 @@ impl NativeState {
         if self.terminal {
             return Ok(Vec::new());
         }
-        let batch = codec::decode_server(frame).map_err(|_| SignalingError::Malformed)?;
+        let codec::NativeFrame::State(batch) = self
+            .decode_frame(frame)
+            .map_err(|_| SignalingError::Malformed)?
+        else {
+            return Err(SignalingError::Malformed);
+        };
         self.apply_batch(batch)
     }
 

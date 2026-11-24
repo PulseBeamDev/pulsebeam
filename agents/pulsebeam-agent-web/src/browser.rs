@@ -1437,6 +1437,7 @@ impl RuntimeInner {
                 BrowserHost::new(self).publication_input_state(&control.state());
             }
             Effect::MediaObservation(control) => self.observation_control(control),
+            Effect::Quic(_) => unreachable!("browser Core is configured for RTC"),
         }
     }
 

@@ -5,9 +5,44 @@ use crate::{ChannelId, Generation, HttpResponse, OfferResources, OperationId, Ti
 #[derive(Clone, Debug, PartialEq)]
 pub enum HostEvent {
     Rtc(RtcEvent),
+    Quic(QuicEvent),
     Http(HttpEvent),
     Timer(TimerEvent),
     DataChannel(DataChannelEvent),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum QuicEvent {
+    Accepted {
+        generation: Generation,
+        connection_id: String,
+        participant_id: String,
+        room: Option<String>,
+    },
+    Control {
+        generation: Generation,
+        payload: Vec<u8>,
+    },
+    ControlSent {
+        generation: Generation,
+        operation: OperationId,
+    },
+    Renewed {
+        generation: Generation,
+        operation: OperationId,
+        revision: Option<u64>,
+    },
+    TransportLost {
+        generation: Generation,
+        failure: crate::Failure,
+    },
+    AdmissionFailed {
+        generation: Generation,
+        failure: crate::Failure,
+    },
+    Closed {
+        generation: Generation,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]

@@ -227,6 +227,12 @@ impl Socket {
             .poll_read_ready(cx)
             .map(|result| result.map(|_| ()))
     }
+    pub(crate) fn poll_writable(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.socket
+            .poll_write_ready(cx)
+            .map(|result| result.map(|_| ()))
+    }
+
     pub(crate) async fn writable(&self) -> io::Result<()> {
         self.socket.writable().await.map(|_| ())
     }

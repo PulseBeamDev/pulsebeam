@@ -5,6 +5,23 @@ mod discovery;
 mod permissions;
 
 #[test]
+fn quic_native_session_rejects_wrong_carrier_as_a_scoped_proposal() {
+    let mut model = NativeSession::with_binding_profile(validation::BindingProfile::Quic);
+    model
+        .authorization(900, 1, ResourcePermissions::RoomBound)
+        .unwrap();
+    input(&mut model, vec![present(1, 1, subscription("source"))]).unwrap();
+    let row = &model.rows[&Key::Owned(1)].value;
+    assert_eq!(row.evaluated_revision, 1);
+    assert_eq!(
+        row.rejection.as_ref().unwrap().code,
+        wire::FailureCode::InvalidConfiguration as i32
+    );
+    assert!(model.take_preparation().unwrap().is_none());
+    assert!(!model.closed);
+}
+
+#[test]
 fn successor_receipt_updates_independently_of_grant_and_is_cleared_on_close() {
     let mut session = NativeSession::default();
     let receipt = |value, expires| wire::SuccessorReceipt {

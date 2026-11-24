@@ -8,13 +8,22 @@ publish = false
 [dependencies]
 bytes.workspace = true
 noq-proto = { version = "=1.4.0", default-features = false, features = ["rustls", "aws-lc-rs"] }
+pulsebeam-agent-core = { path = "../pulsebeam-agent-core", optional = true }
+pulsebeam-core = { path = "../../crates/pulsebeam-core", optional = true }
 pulsebeam-proto = { path = "../../crates/pulsebeam-proto" }
+pulsebeam-runtime = { path = "../../crates/pulsebeam-runtime", optional = true }
 pulsebeam-udp = { path = "../../crates/pulsebeam-udp" }
+reqwest = { version = "0.13.4", optional = true }
+tokio = { workspace = true, optional = true }
 rustls = { version = "0.23.46", default-features = false, features = ["std", "aws_lc_rs"] }
 
 [dev-dependencies]
 rcgen = { version = "0.14.7", default-features = false, features = ["crypto", "aws_lc_rs"] }
 tokio.workspace = true
+
+[features]
+executor = ["dep:pulsebeam-agent-core", "dep:pulsebeam-core", "dep:pulsebeam-runtime", "dep:reqwest", "dep:tokio"]
+sim = ["pulsebeam-udp/sim", "pulsebeam-runtime?/sim"]
 
 [lints]
 workspace = true

@@ -155,13 +155,28 @@ impl fmt::Debug for Proof {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) struct RequestBinding([u8; 32]);
+pub(crate) struct RequestBinding([u8; 32], Carrier);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Carrier {
+    Rtc,
+    Quic,
+}
 
 impl RequestBinding {
     pub(crate) fn for_native(body: &[u8], credential: &str) -> Result<Self, Error> {
         Self::hash(
+            Carrier::Rtc,
             b"pulsebeam.admission.native-request.v1",
             [body, credential.as_bytes()],
+        )
+    }
+
+    pub(super) fn for_quic(body: &[u8]) -> Result<Self, Error> {
+        Self::hash(
+            Carrier::Quic,
+            b"pulsebeam.admission.quic-request.v1",
+            [body],
         )
     }
 
@@ -178,6 +193,7 @@ impl RequestBinding {
             SignalingProtocol::Whep => 3,
         }];
         Self::hash(
+            Carrier::Rtc,
             b"pulsebeam.admission.fixture-request.v1",
             [
                 protocol.as_slice(),
@@ -188,7 +204,11 @@ impl RequestBinding {
         )
     }
 
-    fn hash<'a>(domain: &[u8], parts: impl IntoIterator<Item = &'a [u8]>) -> Result<Self, Error> {
+    fn hash<'a>(
+        carrier: Carrier,
+        domain: &[u8],
+        parts: impl IntoIterator<Item = &'a [u8]>,
+    ) -> Result<Self, Error> {
         let mut digest = Sha3_256::new();
         digest.update(domain);
         for part in parts {
@@ -196,7 +216,7 @@ impl RequestBinding {
             digest.update(length.to_be_bytes());
             digest.update(part);
         }
-        Ok(Self(digest.finalize().into()))
+        Ok(Self(digest.finalize().into(), carrier))
     }
 }
 
@@ -260,6 +280,7 @@ impl Default for Limits {
 
 struct Fresh {
     proof: Proof,
+    carrier: Carrier,
     base: Option<Proof>,
     deadline: Instant,
 }
@@ -364,6 +385,16 @@ impl Authority {
         now: Instant,
         entropy: &mut (impl RngCore + rand::CryptoRng),
     ) -> Result<Proof, Error> {
+        self.issue_for(principal, Carrier::Rtc, now, entropy)
+    }
+
+    pub(super) fn issue_for(
+        &mut self,
+        principal: PrincipalKey,
+        carrier: Carrier,
+        now: Instant,
+        entropy: &mut (impl RngCore + rand::CryptoRng),
+    ) -> Result<Proof, Error> {
         self.expire_principal(&principal, now);
         let record = self.records.get(&principal);
         if self.fresh >= self.limits.fresh
@@ -389,6 +420,7 @@ impl Authority {
         let mut record = self.take_record(&principal).unwrap_or_default();
         record.fresh.push(Fresh {
             proof,
+            carrier,
             base: record.generation,
             deadline,
         });
@@ -400,6 +432,7 @@ impl Authority {
     pub(super) fn issue_roomless(
         &mut self,
         principal: PrincipalKey,
+        carrier: Carrier,
         now: Instant,
         entropy: &mut (impl RngCore + rand::CryptoRng),
     ) -> Result<Proof, Error> {
@@ -418,6 +451,7 @@ impl Authority {
             let mut record = Record::default();
             record.fresh.push(Fresh {
                 proof,
+                carrier,
                 base: None,
                 deadline,
             });
@@ -426,6 +460,22 @@ impl Authority {
             return Ok(proof);
         }
         Err(Error::Capacity)
+    }
+
+    pub(super) fn can_continue(
+        &mut self,
+        principal: &PrincipalKey,
+        proof: Proof,
+        carrier: Carrier,
+        now: Instant,
+    ) -> bool {
+        self.expire_principal(principal, now);
+        self.records.get(principal).is_some_and(|record| {
+            record.generation == Some(proof)
+                && record.family.as_ref().is_some_and(|family| {
+                    family.proof == proof && family.binding.1 == carrier && !family.expired
+                })
+        })
     }
 
     pub(crate) fn preview(
@@ -462,6 +512,9 @@ impl Authority {
             .is_some_and(|family| family.proof == proof && !family.expired);
         if continuation {
             let family = record.family.as_ref().ok_or(Error::InvalidTransition)?;
+            if family.binding.1 != binding.1 {
+                return Err(Error::InvalidProof);
+            }
             match sequence.cmp(&family.sequence) {
                 Ordering::Less => return Err(Error::StaleAttempt),
                 Ordering::Equal => {
@@ -486,11 +539,9 @@ impl Authority {
                 }
                 Ordering::Greater => {}
             }
-        } else if !record
-            .fresh
-            .iter()
-            .any(|fresh| fresh.proof == proof && fresh.base == record.generation)
-        {
+        } else if !record.fresh.iter().any(|fresh| {
+            fresh.proof == proof && fresh.carrier == binding.1 && fresh.base == record.generation
+        }) {
             return Err(if record.generation.is_some() {
                 Error::Replaced
             } else {
@@ -1079,6 +1130,10 @@ mod tests {
     use super::*;
     use rand::{SeedableRng, rngs::StdRng};
 
+    fn rtc_binding(value: u8) -> RequestBinding {
+        RequestBinding([value; 32], Carrier::Rtc)
+    }
+
     fn principal(name: &str) -> PrincipalKey {
         PrincipalKey {
             project: ProjectId::new(),
@@ -1086,6 +1141,32 @@ mod tests {
             room: Some(RoomId::new("main").unwrap()),
             roomless_attempt: None,
         }
+    }
+
+    #[test]
+    fn a_quic_proof_is_not_redeemable_with_the_rtc_request_binding() {
+        let now = Instant::now();
+        let principal = principal("alice");
+        let mut authority = Authority::default();
+        let mut entropy = pulsebeam_runtime::rand::seeded_rng(2);
+        let proof = authority
+            .issue_for(principal.clone(), Carrier::Quic, now, &mut entropy)
+            .unwrap();
+        let rtc = RequestBinding::for_native(b"admit", "token").unwrap();
+        let quic = RequestBinding::for_quic(b"admit").unwrap();
+        assert_ne!(rtc, quic);
+        assert!(matches!(
+            authority.preview(&principal, proof, sequence(1), rtc, now),
+            Err(Error::UnknownProof)
+        ));
+        assert!(matches!(
+            authority.begin(&principal, proof, sequence(1), quic, now),
+            Ok(Admission::Start(_))
+        ));
+        assert!(matches!(
+            authority.preview(&principal, proof, sequence(2), rtc, now),
+            Err(Error::InvalidProof)
+        ));
     }
 
     #[test]
@@ -1099,7 +1180,7 @@ mod tests {
         };
         let now = Instant::now();
         let proof = authority.issue(stage.clone(), now, &mut entropy).unwrap();
-        let binding = RequestBinding([1; 32]);
+        let binding = rtc_binding(1);
         assert_eq!(
             authority.begin(&workshop, proof, sequence(1), binding, now),
             Err(Error::UnknownProof)
@@ -1156,7 +1237,7 @@ mod tests {
                 principal,
                 proof,
                 sequence(value),
-                RequestBinding([u8::try_from(value).unwrap(); 32]),
+                rtc_binding(u8::try_from(value).unwrap()),
                 now,
             )
             .unwrap()
@@ -1247,26 +1328,26 @@ mod tests {
         assert_ne!(a, rival);
         let old = start(&mut authority, &principal, a, 1, now);
         assert_eq!(
-            authority.begin(&principal, rival, sequence(1), RequestBinding([1; 32]), now),
+            authority.begin(&principal, rival, sequence(1), rtc_binding(1), now),
             Err(Error::Replaced)
         );
         for _ in 1..MAX_WAITERS {
             assert_eq!(
-                authority.begin(&principal, a, sequence(1), RequestBinding([1; 32]), now),
+                authority.begin(&principal, a, sequence(1), rtc_binding(1), now),
                 Ok(Admission::Pending(old.clone()))
             );
         }
         assert_eq!(
-            authority.begin(&principal, a, sequence(1), RequestBinding([1; 32]), now),
+            authority.begin(&principal, a, sequence(1), rtc_binding(1), now),
             Err(Error::Capacity)
         );
         authority.detach_waiter(&old);
         assert_eq!(
-            authority.begin(&principal, a, sequence(1), RequestBinding([1; 32]), now),
+            authority.begin(&principal, a, sequence(1), rtc_binding(1), now),
             Ok(Admission::Pending(old.clone()))
         );
         assert_eq!(
-            authority.begin(&principal, a, sequence(1), RequestBinding([9; 32]), now),
+            authority.begin(&principal, a, sequence(1), rtc_binding(9), now),
             Err(Error::ChangedAttempt)
         );
         authority
@@ -1277,7 +1358,7 @@ mod tests {
             b"first answer"
         );
         assert_eq!(
-            authority.begin(&principal, a, sequence(1), RequestBinding([1; 32]), now),
+            authority.begin(&principal, a, sequence(1), rtc_binding(1), now),
             Ok(Admission::Replay(old.clone()))
         );
         let b = authority
@@ -1290,7 +1371,7 @@ mod tests {
         let new = start(&mut authority, &principal, b, 1, now);
         assert!(authority.is_current(&old));
         assert_eq!(
-            authority.begin(&principal, a, sequence(1), RequestBinding([1; 32]), now),
+            authority.begin(&principal, a, sequence(1), rtc_binding(1), now),
             Ok(Admission::Replay(old.clone()))
         );
         authority.retry_failed_materialization(&new);
@@ -1309,7 +1390,7 @@ mod tests {
         authority.commit(&new, b"new answer".to_vec(), now).unwrap();
         assert!(authority.is_current(&new));
         assert_eq!(
-            authority.begin(&principal, a, sequence(2), RequestBinding([2; 32]), now),
+            authority.begin(&principal, a, sequence(2), rtc_binding(2), now),
             Err(Error::Replaced)
         );
         authority.retire(&old, now);
@@ -1358,13 +1439,13 @@ mod tests {
         authority.queue_retirement(old);
         authority.retire(&ticket, now);
         assert_eq!(
-            authority.preview(&principal, proof, sequence(1), RequestBinding([1; 32]), now),
+            authority.preview(&principal, proof, sequence(1), rtc_binding(1), now),
             Err(Error::QuiescencePending)
         );
         authority.start_retirement(&ticket);
         authority.finish_retirement(&ticket, old, true, now);
         assert_eq!(
-            authority.begin(&principal, proof, sequence(1), RequestBinding([2; 32]), now),
+            authority.begin(&principal, proof, sequence(1), rtc_binding(2), now),
             Err(Error::ChangedAttempt)
         );
         assert_eq!(start(&mut authority, &principal, proof, 1, now), ticket);
@@ -1376,7 +1457,7 @@ mod tests {
         check(&authority);
         authority.commit(&ticket, b"answer".to_vec(), now).unwrap();
         assert_eq!(
-            authority.begin(&principal, proof, sequence(1), RequestBinding([1; 32]), now),
+            authority.begin(&principal, proof, sequence(1), rtc_binding(1), now),
             Ok(Admission::Replay(ticket.clone()))
         );
         authority.retry_failed_materialization(&ticket);
@@ -1389,7 +1470,7 @@ mod tests {
         );
         authority.finish_retirement(&ticket, current, true, now);
         assert_eq!(
-            authority.begin(&principal, proof, sequence(1), RequestBinding([1; 32]), now),
+            authority.begin(&principal, proof, sequence(1), rtc_binding(1), now),
             Err(Error::ReplayUnavailable)
         );
         check(&authority);
@@ -1422,23 +1503,11 @@ mod tests {
         assert_eq!(authority.expire(later, 1), 1);
         assert!(authority.is_current(&current));
         assert_eq!(
-            authority.begin(
-                &principal,
-                proof,
-                sequence(2),
-                RequestBinding([2; 32]),
-                later
-            ),
+            authority.begin(&principal, proof, sequence(2), rtc_binding(2), later),
             Err(Error::ReplayUnavailable)
         );
         assert_eq!(
-            authority.begin(
-                &principal,
-                proof,
-                sequence(1),
-                RequestBinding([1; 32]),
-                later
-            ),
+            authority.begin(&principal, proof, sequence(1), rtc_binding(1), later),
             Err(Error::StaleAttempt)
         );
         authority.retire(&current, later);
@@ -1446,13 +1515,7 @@ mod tests {
         assert_eq!(authority.expire(gone, 1), 1);
         assert!(authority.records.is_empty());
         assert_eq!(
-            authority.begin(
-                &principal,
-                proof,
-                sequence(3),
-                RequestBinding([3; 32]),
-                gone
-            ),
+            authority.begin(&principal, proof, sequence(3), rtc_binding(3), gone),
             Err(Error::UnknownProof)
         );
         let replacement = authority
@@ -1460,24 +1523,12 @@ mod tests {
             .unwrap();
         assert_ne!(proof, replacement);
         assert_eq!(
-            authority.begin(
-                &principal,
-                proof,
-                sequence(3),
-                RequestBinding([3; 32]),
-                gone
-            ),
+            authority.begin(&principal, proof, sequence(3), rtc_binding(3), gone),
             Err(Error::UnknownProof)
         );
         let mut restarted = Authority::default();
         assert_eq!(
-            restarted.begin(
-                &principal,
-                replacement,
-                sequence(1),
-                RequestBinding([1; 32]),
-                gone
-            ),
+            restarted.begin(&principal, replacement, sequence(1), rtc_binding(1), gone),
             Err(Error::UnknownProof)
         );
         check(&authority);
@@ -1504,14 +1555,14 @@ mod tests {
         let now = Instant::now();
         let a = authority.issue(alice.clone(), now, &mut entropy).unwrap();
         assert_eq!(
-            authority.begin(&bob, a, sequence(1), RequestBinding([1; 32]), now),
+            authority.begin(&bob, a, sequence(1), rtc_binding(1), now),
             Err(Error::UnknownProof)
         );
         assert_eq!(authority.records.len(), 1);
         let old = start(&mut authority, &alice, a, 1, now);
         let b = authority.issue(bob.clone(), now, &mut entropy).unwrap();
         assert_eq!(
-            authority.begin(&bob, b, sequence(1), RequestBinding([1; 32]), now),
+            authority.begin(&bob, b, sequence(1), rtc_binding(1), now),
             Err(Error::Capacity)
         );
         assert_eq!(authority.records[&bob].generation, None);
@@ -1526,7 +1577,7 @@ mod tests {
         drop(delivery);
         assert_eq!(authority.result_bytes, b"answer".len());
         assert_eq!(
-            authority.begin(&bob, b, sequence(1), RequestBinding([1; 32]), now),
+            authority.begin(&bob, b, sequence(1), rtc_binding(1), now),
             Err(Error::Capacity),
             "cached bytes also count"
         );
@@ -1536,7 +1587,7 @@ mod tests {
             Err(Error::Capacity)
         );
         assert_eq!(
-            authority.begin(&alice, next, sequence(1), RequestBinding([1; 32]), now),
+            authority.begin(&alice, next, sequence(1), rtc_binding(1), now),
             Err(Error::Capacity)
         );
         assert!(
@@ -1545,12 +1596,12 @@ mod tests {
         );
         drop(frame);
         assert_eq!(
-            authority.begin(&alice, next, sequence(1), RequestBinding([1; 32]), now),
+            authority.begin(&alice, next, sequence(1), rtc_binding(1), now),
             Err(Error::Capacity)
         );
         drop(last_frame);
         assert_eq!(
-            authority.begin(&alice, next, sequence(1), RequestBinding([1; 32]), now),
+            authority.begin(&alice, next, sequence(1), rtc_binding(1), now),
             Err(Error::Capacity),
             "an admitted replay image is not evicted to fund its contender"
         );
@@ -1574,14 +1625,14 @@ mod tests {
         assert_eq!(authority.expire(later, 0), 0);
         assert_eq!(authority.expire(later, 2), 2);
         assert_eq!(
-            authority.begin(&bob, b, sequence(1), RequestBinding([1; 32]), later),
+            authority.begin(&bob, b, sequence(1), rtc_binding(1), later),
             Err(Error::UnknownProof)
         );
         assert_eq!(authority.deadlines.len(), 0);
         assert!(authority.is_current(&new));
         let fresh_b = authority.issue(bob.clone(), later, &mut entropy).unwrap();
         assert_eq!(
-            authority.begin(&bob, fresh_b, sequence(1), RequestBinding([1; 32]), later),
+            authority.begin(&bob, fresh_b, sequence(1), rtc_binding(1), later),
             Err(Error::Capacity),
             "cache expiry cannot reclaim a delivered frame's allocation"
         );
@@ -1625,7 +1676,7 @@ mod tests {
         ] {
             assert_eq!(Proof::parse(&invalid), Err(Error::InvalidProof));
         }
-        let diagnostic = format!("{principal:?} {proof:?} {:?}", RequestBinding([42; 32]));
+        let diagnostic = format!("{principal:?} {proof:?} {:?}", rtc_binding(42));
         assert!(!diagnostic.contains(&encoded));
         assert!(!diagnostic.contains("private-external-name"));
         assert!(!diagnostic.contains("42"));

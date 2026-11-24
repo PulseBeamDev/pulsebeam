@@ -1,5 +1,7 @@
 use std::collections::VecDeque;
 
+use pulsebeam_proto::state::validation::BindingProfile;
+
 use super::handoff::{ControllerHandoff, Fact};
 use super::{ExecutionCommand, InputError, NativeSession, OutputError, ResolvedSource};
 use crate::entity::{ParticipantId, PublicationKey, RoomId};
@@ -25,7 +27,23 @@ impl StateProtocolHandler {
         capabilities: Option<pulsebeam_proto::state::RtpCapabilities>,
         handoff: ControllerHandoff,
     ) -> Result<Self, OutputError> {
-        let mut model = NativeSession::default();
+        Self::with_binding_profile(
+            participant,
+            room,
+            capabilities,
+            handoff,
+            BindingProfile::Rtc,
+        )
+    }
+
+    pub(in crate::control) fn with_binding_profile(
+        participant: ParticipantId,
+        room: Option<RoomId>,
+        capabilities: Option<pulsebeam_proto::state::RtpCapabilities>,
+        handoff: ControllerHandoff,
+        profile: BindingProfile,
+    ) -> Result<Self, OutputError> {
+        let mut model = NativeSession::with_binding_profile(profile);
         if let Some(room) = room {
             model.observe_self(pulsebeam_proto::state::Participant {
                 participant_id: participant.as_str().to_owned(),

@@ -6,10 +6,11 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Instant;
 
+pub use noq_proto::ServerConfig;
 use noq_proto::crypto::rustls::{HandshakeData, QuicClientConfig, QuicServerConfig};
 use noq_proto::{
     ClientConfig, Connection, ConnectionHandle, Endpoint, EndpointConfig, SendDatagramError,
-    ServerConfig, Transmit, TransportConfig,
+    Transmit, TransportConfig,
 };
 use pulsebeam_proto::data_record::MAX_ENDPOINT_RECORD_BYTES;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -62,6 +63,15 @@ pub fn endpoint(server: Option<ServerConfig>) -> Result<Endpoint, noq_proto::Con
         }))
         .max_udp_payload_size(UDP_PAYLOAD_BYTES)?;
     Ok(Endpoint::new(Arc::new(config), server.map(Arc::new), true))
+}
+
+#[cfg(feature = "executor")]
+#[allow(
+    clippy::disallowed_types,
+    reason = "rustls requires an immutable shared clock provider"
+)]
+pub(crate) fn system_client_config(roots: RootCertStore) -> Result<ClientConfig, ConfigError> {
+    client_config(roots, Arc::new(rustls::time_provider::DefaultTimeProvider))
 }
 
 #[allow(
@@ -295,7 +305,21 @@ impl PacketScheduler {
     }
 }
 
+/// Stop the application association without embedding credentials in the close.
+#[allow(
+    clippy::disallowed_types,
+    reason = "Noq's close API accepts an owned byte buffer"
+)]
+pub fn close(connection: &mut Connection, now: Instant) {
+    if !connection.is_closed() {
+        connection.close(now, 0u32.into(), bytes::Bytes::new());
+    }
+}
+
+pub mod client;
 pub mod control;
+pub mod ingress;
+pub mod listener;
 pub mod socket;
 
 #[cfg(test)]

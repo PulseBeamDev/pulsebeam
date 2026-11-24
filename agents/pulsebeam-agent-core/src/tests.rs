@@ -82,6 +82,122 @@ fn config() -> AgentConfig {
 }
 
 #[test]
+fn quic_placement_fences_late_http_and_transport_outcomes() {
+    use pulsebeam_proto::state;
+
+    let mut agent = Agent::new_quic(config()).unwrap();
+    let start = |agent: &mut Agent| {
+        agent.command(AgentCommand::Connect).unwrap();
+        let Effect::Http(HttpEffect::Request {
+            generation: Some(generation),
+            operation,
+            request,
+        }) = next_effect(agent)
+        else {
+            panic!("placement request")
+        };
+        assert_eq!(request.uri, "https://sfu.test/api/v1/native/admissions");
+        (generation, operation)
+    };
+    let (old_generation, old_operation) = start(&mut agent);
+    agent.command(AgentCommand::Disconnect).unwrap();
+    assert_eq!(
+        next_effect(&mut agent),
+        Effect::Http(HttpEffect::Cancel {
+            operation: old_operation
+        })
+    );
+    let (generation, operation) = start(&mut agent);
+    let response = HttpResponse { status: 200, headers: vec![], body: br#"{"profile":"pulsebeam-rt-v1","owner":"owner","authority":{"host":"edge.example","port":443},"valid_for_ms":5000}"#.to_vec() };
+    agent
+        .handle(HostEvent::Http(HttpEvent::Response {
+            operation: old_operation,
+            response: response.clone(),
+        }))
+        .unwrap();
+    agent
+        .handle(HostEvent::Http(HttpEvent::Response {
+            operation,
+            response,
+        }))
+        .unwrap();
+    let Effect::Quic(crate::QuicEffect::Admit(admit)) = next_effect(&mut agent) else {
+        panic!("QUIC admission")
+    };
+    assert_eq!(admit.generation, generation);
+    assert_eq!(admit.placement.host, "edge.example");
+    assert_eq!(admit.token, config().token);
+    let accepted = |generation| {
+        HostEvent::Quic(crate::QuicEvent::Accepted {
+            generation,
+            connection_id: "conn_00000000001R010000000000004".into(),
+            participant_id: "alice".into(),
+            room: None,
+        })
+    };
+    agent.handle(accepted(old_generation)).unwrap();
+    assert_eq!(agent.snapshot().connection, ConnectionState::Joining);
+    agent.handle(accepted(generation)).unwrap();
+    assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
+    assert_eq!(agent.snapshot().participant_id.as_deref(), Some("alice"));
+    let grant = |revision| {
+        HostEvent::Quic(crate::QuicEvent::Control {
+            generation,
+            payload: state::codec::encode_quic_server(&state::ServerStateBatch {
+                records: vec![native_connection::confirmed(
+                    state::resource_key::Key::Session(true),
+                    0,
+                    state::confirmed_state::Value::Session(state::SessionState {
+                        authorization: Some(state::Authorization {
+                            expires_at_unix_seconds: 10_000,
+                            revision,
+                        }),
+                        ..Default::default()
+                    }),
+                )],
+                ..Default::default()
+            })
+            .unwrap(),
+        })
+    };
+    agent.handle(grant(1)).unwrap();
+    agent
+        .command(AgentCommand::RenewAuthorization("next-token".into()))
+        .unwrap();
+    let Effect::Quic(crate::QuicEffect::Renew(renew)) = next_effect(&mut agent) else {
+        panic!("QUIC renewal")
+    };
+    assert_eq!(renew.token, "next-token");
+    let result = |generation| {
+        HostEvent::Quic(crate::QuicEvent::Renewed {
+            generation,
+            operation: renew.operation,
+            revision: Some(2),
+        })
+    };
+    agent.handle(result(old_generation)).unwrap();
+    agent.handle(grant(2)).unwrap();
+    assert_eq!(agent.snapshot().accepted_credential_revision, Some(0));
+    agent.handle(result(generation)).unwrap();
+    assert_eq!(agent.snapshot().accepted_credential_revision, Some(1));
+    agent.command(AgentCommand::Disconnect).unwrap();
+    assert_eq!(
+        next_effect(&mut agent),
+        Effect::Quic(crate::QuicEffect::Close { generation })
+    );
+    agent
+        .handle(HostEvent::Quic(crate::QuicEvent::Closed {
+            generation: old_generation,
+        }))
+        .unwrap();
+    assert_eq!(agent.snapshot().connection, ConnectionState::Closing);
+    agent
+        .handle(HostEvent::Quic(crate::QuicEvent::Closed { generation }))
+        .unwrap();
+    assert_eq!(agent.snapshot().connection, ConnectionState::Disconnected);
+}
+
+#[test]
 fn log_level_applies_per_agent_verbosity() {
     assert!(LogLevel::Error.allows(log::Level::Error));
     assert!(!LogLevel::Error.allows(log::Level::Warn));

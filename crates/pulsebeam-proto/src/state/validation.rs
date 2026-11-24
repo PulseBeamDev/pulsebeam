@@ -26,8 +26,9 @@ pub fn validate_client_batch(batch: &ClientStateBatch) -> Result {
     validate_client_batch_for(batch, BindingProfile::Rtc)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BindingProfile {
+    #[default]
     Rtc,
     Quic,
 }
@@ -629,7 +630,7 @@ pub fn validate_execution_report(report: &ExecutionReport) -> Result {
     validate_execution_report_for(report, BindingProfile::Rtc)
 }
 
-fn validate_execution_report_for(report: &ExecutionReport, profile: BindingProfile) -> Result {
+pub fn validate_execution_report_for(report: &ExecutionReport, profile: BindingProfile) -> Result {
     match report.outcome.as_ref() {
         Some(execution_report::Outcome::Failure(failure)) => validate_failure(failure),
         Some(execution_report::Outcome::LogicalReceiver(report)) if report.source_revision != 0 => {

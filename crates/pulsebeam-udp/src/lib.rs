@@ -361,6 +361,10 @@ impl UdpSocket {
     pub fn poll_readable(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.inner.poll_readable(cx)
     }
+    pub fn poll_writable(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.inner.poll_writable(cx)
+    }
+
     pub async fn writable(&self) -> io::Result<()> {
         self.inner.writable().await
     }

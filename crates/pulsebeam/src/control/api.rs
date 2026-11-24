@@ -548,6 +548,12 @@ async fn create_native(state: State<AppState>, request: Request) -> Result<Respo
 #[serde(deny_unknown_fields)]
 struct NativeAdmissionRequest {
     room: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_requested_room")]
+    profile: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_requested_room")]
+    owner: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_requested_room")]
+    successor_receipt: Option<String>,
 }
 
 #[derive(Serialize, ToSchema)]

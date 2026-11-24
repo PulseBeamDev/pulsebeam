@@ -7,6 +7,7 @@ use axum::{
     http::{HeaderMap, HeaderValue},
     response::{IntoResponse, Response},
 };
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use hyper::header::{CACHE_CONTROL, CONTENT_ENCODING};
 use pulsebeam_core::{auth::VerifiedPrincipal, identity::RoomId};
 use pulsebeam_queue::TrySendError;
@@ -19,6 +20,22 @@ use super::{
 use crate::control::controller;
 
 const MAX_CAPABILITY_BODY_BYTES: usize = 1_024;
+const MAX_QUIC_CAPABILITY_BODY_BYTES: usize = 2_048;
+const QUIC_PROFILE: &str = "pulsebeam-rt-v1";
+
+#[derive(serde::Serialize)]
+struct QuicAdmissionResponse {
+    owner: String,
+    profile: &'static str,
+    authority: QuicAuthority,
+    valid_for_ms: u32,
+}
+
+#[derive(serde::Serialize)]
+struct QuicAuthority {
+    host: String,
+    port: u16,
+}
 
 fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<VerifiedPrincipal, ApiError> {
     let now = SystemTime::now()
@@ -45,10 +62,17 @@ pub(super) async fn issue(
     let principal = authenticate(&state, request.headers())?;
     ensure_json_content_type(request.headers())?;
     creation::require_identity(request.headers())?;
-    let body = to_bytes(request.into_body(), MAX_CAPABILITY_BODY_BYTES)
+    let body = to_bytes(request.into_body(), MAX_QUIC_CAPABILITY_BODY_BYTES)
         .await
         .map_err(|_| ApiError::PayloadTooLarge)?;
-    let invalid = || ApiError::BadRequest("invalid native admission JSON request".to_owned());
+    let ordinary_limit_exceeded = body.len() > MAX_CAPABILITY_BODY_BYTES;
+    let invalid = || {
+        if ordinary_limit_exceeded {
+            ApiError::PayloadTooLarge
+        } else {
+            ApiError::BadRequest("invalid native admission JSON request".to_owned())
+        }
+    };
     if body.iter().find(|byte| !byte.is_ascii_whitespace()) != Some(&b'{') {
         return Err(invalid());
     }
@@ -59,6 +83,53 @@ pub(super) async fn issue(
         .map(RoomId::new)
         .transpose()
         .map_err(|_| invalid())?;
+    let headers = [(CACHE_CONTROL, "no-store"), (CONTENT_ENCODING, "identity")];
+    if let Some(profile) = request.profile {
+        if profile != QUIC_PROFILE {
+            return Err(invalid());
+        }
+        let continuation = match (request.owner, request.successor_receipt) {
+            (None, None) if body.len() <= MAX_CAPABILITY_BODY_BYTES => None,
+            (Some(owner), Some(receipt))
+                if room.is_some() && owner.len() <= 256 && receipt.len() <= 1_024 =>
+            {
+                let proof = controller::ownership::Proof::parse(&owner).map_err(|_| invalid())?;
+                let successor = URL_SAFE_NO_PAD.decode(receipt).map_err(|_| invalid())?;
+                if successor.is_empty()
+                    || successor.len() > pulsebeam_proto::state::MAX_SUCCESSOR_RECEIPT_BYTES
+                {
+                    return Err(invalid());
+                }
+                Some(controller::QuicContinuation { proof, successor })
+            }
+            _ => return Err(invalid()),
+        };
+        let (reply, received) = pulsebeam_runtime::sync::oneshot::channel();
+        enqueue(
+            &state,
+            controller::AdmissionCommand::issue_quic(principal, room, continuation, reply),
+        )?;
+        let issuance = received.await.map_err(|_| ApiError::ServiceUnavailable)??;
+        return Ok((
+            headers,
+            Json(QuicAdmissionResponse {
+                owner: issuance.proof.encode(),
+                profile: QUIC_PROFILE,
+                authority: QuicAuthority {
+                    host: issuance.host,
+                    port: issuance.port,
+                },
+                valid_for_ms: issuance.valid_for_ms,
+            }),
+        )
+            .into_response());
+    }
+    if ordinary_limit_exceeded {
+        return Err(ApiError::PayloadTooLarge);
+    }
+    if request.owner.is_some() || request.successor_receipt.is_some() {
+        return Err(invalid());
+    }
     let (reply, received) = pulsebeam_runtime::sync::oneshot::channel();
     enqueue(
         &state,
@@ -66,7 +137,7 @@ pub(super) async fn issue(
     )?;
     let proof = received.await.map_err(|_| ApiError::ServiceUnavailable)??;
     Ok((
-        [(CACHE_CONTROL, "no-store"), (CONTENT_ENCODING, "identity")],
+        headers,
         Json(NativeAdmissionResponse {
             owner: proof.encode(),
         }),

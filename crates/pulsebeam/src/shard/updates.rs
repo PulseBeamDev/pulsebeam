@@ -35,7 +35,17 @@ impl ShardUpdateApplication {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn apply(&mut self, execution: &mut ShardExecution, budget: usize) -> usize {
+        self.apply_with_retirement(execution, budget, |_, _| {})
+    }
+
+    pub(super) fn apply_with_retirement(
+        &mut self,
+        execution: &mut ShardExecution,
+        budget: usize,
+        mut retire: impl FnMut(ConnectionId, crate::route::NodeTransportAddress),
+    ) -> usize {
         debug_assert!(budget > 0);
         let mut applied = 0;
         while applied < budget {
@@ -106,6 +116,13 @@ impl ShardUpdateApplication {
                 self.apply_lifecycle_op(execution, op);
             }
             for op in delta.lifecycle.iter().filter(|op| is_retire(op)) {
+                if let ShardUpdateOp::RemoveParticipant {
+                    connection,
+                    address,
+                } = op
+                {
+                    retire(*connection, *address);
+                }
                 self.apply_lifecycle_op(execution, op);
             }
             self.generation = delta.generation;

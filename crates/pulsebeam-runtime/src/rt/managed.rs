@@ -14,9 +14,8 @@ pub trait Service: Unpin + 'static {
 
 /// Resources belonging to one logical service across worker placements.
 pub struct ManagedIo {
-    socket: Option<pulsebeam_udp::UdpSocket>,
-    #[cfg(all(target_os = "linux", not(feature = "sim")))]
-    detached: Option<pulsebeam_udp::DetachedUdpSocket>,
+    primary: SocketSlot,
+    secondary: SocketSlot,
     timer: Option<Pin<Box<Sleep>>>,
     deadline: Option<Instant>,
     runnable_since: Option<Instant>,
@@ -27,12 +26,46 @@ pub struct ManagedIo {
     fail_activations: usize,
 }
 
+#[derive(Default)]
+struct SocketSlot {
+    attached: Option<pulsebeam_udp::UdpSocket>,
+    #[cfg(all(target_os = "linux", not(feature = "sim")))]
+    detached: Option<pulsebeam_udp::DetachedUdpSocket>,
+}
+
+#[cfg(all(target_os = "linux", not(feature = "sim")))]
+impl SocketSlot {
+    fn detach(&mut self) {
+        if let Some(socket) = self.attached.take() {
+            self.detached = Some(socket.detach());
+        }
+    }
+
+    fn attach(&mut self) -> io::Result<()> {
+        let Some(socket) = self.detached.take() else {
+            return Ok(());
+        };
+        match socket.activate() {
+            Ok(socket) => {
+                self.attached = Some(socket);
+                Ok(())
+            }
+            Err((socket, error)) => {
+                self.detached = Some(*socket);
+                Err(error)
+            }
+        }
+    }
+}
+
 impl ManagedIo {
     pub fn new(socket: pulsebeam_udp::UdpSocket) -> Self {
         Self {
-            socket: Some(socket),
-            #[cfg(all(target_os = "linux", not(feature = "sim")))]
-            detached: None,
+            primary: SocketSlot {
+                attached: Some(socket),
+                ..SocketSlot::default()
+            },
+            secondary: SocketSlot::default(),
             timer: None,
             deadline: None,
             runnable_since: None,
@@ -50,7 +83,14 @@ impl ManagedIo {
             clippy::expect_used,
             reason = "only attached envelopes may poll application logic"
         )]
-        self.socket.as_mut().expect("polling detached service")
+        self.primary
+            .attached
+            .as_mut()
+            .expect("polling detached service")
+    }
+
+    pub fn secondary_socket(&mut self) -> Option<&mut pulsebeam_udp::UdpSocket> {
+        self.secondary.attached.as_mut()
     }
 
     /// End a budgeted tick and record only runnable-to-poll delay, excluding idle waits.
@@ -60,6 +100,14 @@ impl ManagedIo {
     }
 
     pub async fn readable(&mut self, deadline: Option<Instant>) -> io::Result<()> {
+        self.readable_with_secondary(deadline, None).await
+    }
+
+    pub async fn readable_with_secondary(
+        &mut self,
+        deadline: Option<Instant>,
+        secondary_write: Option<bool>,
+    ) -> io::Result<()> {
         if self.deadline != deadline {
             self.timer = None;
             self.deadline = deadline;
@@ -72,11 +120,22 @@ impl ManagedIo {
                 .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(deadline)));
         }
         std::future::poll_fn(|cx| {
-            let Some(socket) = self.socket.as_ref() else {
+            let Some(socket) = self.primary.attached.as_ref() else {
                 return Poll::Ready(Err(io::Error::other("waiting on detached service")));
             };
             if let Poll::Ready(result) = socket.poll_readable(cx) {
                 return Poll::Ready(result);
+            }
+            if let (Some(write), Some(socket)) = (secondary_write, self.secondary.attached.as_ref())
+            {
+                let ready = if write {
+                    socket.poll_writable(cx)
+                } else {
+                    socket.poll_readable(cx)
+                };
+                if ready.is_ready() {
+                    return ready;
+                }
             }
             match self.timer.as_mut() {
                 Some(timer) => timer.as_mut().poll(cx).map(|()| Ok(())),
@@ -112,9 +171,8 @@ impl ManagedIo {
         #[cfg(all(target_os = "linux", not(feature = "sim")))]
         {
             self.timer = None;
-            if let Some(socket) = self.socket.take() {
-                self.detached = Some(socket.detach());
-            }
+            self.primary.detach();
+            self.secondary.detach();
             Ok(())
         }
         #[cfg(not(all(target_os = "linux", not(feature = "sim"))))]
@@ -133,19 +191,12 @@ impl ManagedIo {
         }
         #[cfg(all(target_os = "linux", not(feature = "sim")))]
         {
-            let Some(socket) = self.detached.take() else {
-                return Ok(());
-            };
-            match socket.activate() {
-                Ok(socket) => {
-                    self.socket = Some(socket);
-                    Ok(())
-                }
-                Err((socket, error)) => {
-                    self.detached = Some(*socket);
-                    Err(error)
-                }
+            self.primary.attach()?;
+            if let Err(error) = self.secondary.attach() {
+                self.primary.detach();
+                return Err(error);
             }
+            Ok(())
         }
         #[cfg(not(all(target_os = "linux", not(feature = "sim"))))]
         Ok(())
@@ -171,6 +222,11 @@ impl<S: Service> ManagedService<S> {
             service,
             io: ManagedIo::new(socket),
         }
+    }
+
+    pub fn with_secondary_socket(mut self, socket: pulsebeam_udp::UdpSocket) -> Self {
+        self.io.secondary.attached = Some(socket);
+        self
     }
 }
 
@@ -227,14 +283,39 @@ mod tests {
         .unwrap();
         let destination = socket.local_addr();
         let mut io = ManagedIo::new(socket.activate().unwrap());
+        let secondary = pulsebeam_udp::bind(pulsebeam_udp::BindOptions::new(
+            "127.0.0.1:0".parse().unwrap(),
+        ))
+        .await
+        .unwrap();
+        let secondary_addr = secondary.local_addr();
+        io.secondary.attached = Some(secondary.activate().unwrap());
         let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let signal = Arc::new(Signal(tokio::sync::Notify::new()));
         let waker = std::task::Waker::from(signal.clone());
         let mut cx = Context::from_waker(&waker);
         for reattach in [false, true] {
             if reattach {
+                sender.send_to(b"secondary", secondary_addr).await.unwrap();
                 io.detach().unwrap();
+                assert!(io.secondary_socket().is_none());
                 io.attach().unwrap();
+                let secondary = io.secondary_socket().unwrap();
+                assert_eq!(secondary.local_addr(), secondary_addr);
+                tokio::time::timeout(Duration::from_secs(1), secondary.readable())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    secondary
+                        .try_recv_batch()
+                        .unwrap()
+                        .iter()
+                        .next()
+                        .unwrap()
+                        .payload,
+                    b"secondary"
+                );
             }
             match io.socket().try_recv_batch() {
                 Err(error) => assert_eq!(error.kind(), io::ErrorKind::WouldBlock),

@@ -9,6 +9,9 @@ filegroup(name = "cargo_metadata_inputs", srcs = ["Cargo.toml"] + glob(["src/**/
 
 extract_cargo_lints(name = "lints", manifest = "Cargo.toml", workspace = "//:Cargo.toml")
 
+# Optional Cargo executor dependencies are declared explicitly on its Bazel target.
+_TRANSPORT_DEPS = all_crate_deps(normal = True)
+
 rust_library(
     name = "pulsebeam-agent-quic",
     crate_root = "src/lib.rs",
@@ -16,8 +19,45 @@ rust_library(
     edition = crate_edition(),
     lint_config = ":lints",
     aliases = aliases(),
-    deps = all_crate_deps(normal = True) + [
+    deps = _TRANSPORT_DEPS + [
         "//crates/pulsebeam-proto:pulsebeam-proto",
+        "//crates/pulsebeam-udp:pulsebeam-udp",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],
+)
+
+rust_library(
+    name = "pulsebeam-agent-quic-sim",
+    crate_name = "pulsebeam_agent_quic",
+    crate_root = "src/lib.rs",
+    srcs = glob(["src/**/*.rs"]),
+    edition = crate_edition(),
+    crate_features = ["sim"],
+    lint_config = ":lints",
+    aliases = aliases(),
+    deps = _TRANSPORT_DEPS + [
+        "//crates/pulsebeam-proto:pulsebeam-proto-json",
+        "//crates/pulsebeam-udp:pulsebeam-udp-sim",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],
+)
+
+rust_library(
+    name = "executor",
+    crate_name = "pulsebeam_agent_quic",
+    crate_root = "src/lib.rs",
+    srcs = glob(["src/**/*.rs"]),
+    edition = crate_edition(),
+    crate_features = ["executor"],
+    lint_config = ":lints",
+    aliases = aliases(),
+    deps = _TRANSPORT_DEPS + [
+        "@crates//:reqwest",
+        "@crates//:tokio",
+        "//agents/pulsebeam-agent-core:pulsebeam-agent-core",
+        "//crates/pulsebeam-core:pulsebeam-core-http",
+        "//crates/pulsebeam-proto:pulsebeam-proto",
+        "//crates/pulsebeam-runtime:pulsebeam-runtime",
         "//crates/pulsebeam-udp:pulsebeam-udp",
     ],
     target_compatible_with = ["@platforms//os:linux"],
@@ -25,11 +65,12 @@ rust_library(
 
 rust_test(
     name = "unit_tests",
-    crate = ":pulsebeam-agent-quic",
+    crate = ":executor",
+    crate_features = ["executor"],
     aliases = aliases(normal = True, normal_dev = True),
     deps = all_crate_deps(normal_dev = True),
     target_compatible_with = ["@platforms//os:linux"],
 )
 
-rust_clippy_test(name = "clippy", targets = [":pulsebeam-agent-quic", ":unit_tests"])
-rustfmt_test(name = "format", targets = [":pulsebeam-agent-quic", ":unit_tests"])
+rust_clippy_test(name = "clippy", targets = [":pulsebeam-agent-quic", ":executor", ":unit_tests"])
+rustfmt_test(name = "format", targets = [":pulsebeam-agent-quic", ":executor", ":unit_tests"])

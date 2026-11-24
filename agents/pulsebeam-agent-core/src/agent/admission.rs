@@ -17,6 +17,14 @@ pub(super) const MAX_CREATE_BODY_BYTES: usize = 262_144;
 const OWNER_HEADER: &str = "PulseBeam-Owner";
 const ATTEMPT_HEADER: &str = "PulseBeam-Attempt";
 
+pub mod placement;
+
+fn valid_proof(proof: &str) -> bool {
+    !proof.is_empty()
+        && proof.len() <= MAX_PROOF_BYTES
+        && proof.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+}
+
 pub(super) fn attempt_unavailable(response: &HttpResponse) -> bool {
     #[derive(Deserialize)]
     struct Problem<'a> {
@@ -75,13 +83,7 @@ impl Ownership {
         }
         let capability: Capability =
             serde_json::from_slice(body).map_err(|_| Error::InvalidCapability)?;
-        if capability.owner.is_empty()
-            || capability.owner.len() > MAX_PROOF_BYTES
-            || !capability
-                .owner
-                .bytes()
-                .all(|byte| (0x21..=0x7e).contains(&byte))
-        {
+        if !valid_proof(&capability.owner) {
             return Err(Error::InvalidCapability);
         }
         self.proof = Some(capability.owner);

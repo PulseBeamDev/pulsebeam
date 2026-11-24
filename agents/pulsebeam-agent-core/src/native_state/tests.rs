@@ -97,6 +97,37 @@ fn spec(enabled: bool, stream: u32) -> wire::ResourceSpec {
     }
 }
 
+#[test]
+fn negotiated_native_profile_reuses_resource_revision_and_state_codec() {
+    let mut state =
+        NativeState::with_profile(64 * 1024, None, validation::BindingProfile::Quic).unwrap();
+    let mut proposal = spec(true, 1);
+    assert!(state.stage(resource(), Some(proposal.clone())).is_err());
+    let Some(wire::resource_spec::Declaration::Publication(publication)) =
+        &mut proposal.declaration
+    else {
+        panic!("publication fixture")
+    };
+    let Some(wire::publication_spec::Kind::Data(data)) = &mut publication.kind else {
+        panic!("DATA fixture")
+    };
+    data.binding = Some(wire::TrackBinding {
+        transport: Some(wire::track_binding::Transport::QuicDataV1(
+            wire::QuicDataV1Parameters {
+                binding_id: 1,
+                version: 1,
+                incarnation: 1,
+                delivery: wire::DataV1Delivery::Reliable as i32,
+            },
+        )),
+    });
+    state.stage(resource(), Some(proposal)).unwrap();
+    let bytes = state.next_frame().unwrap().unwrap();
+    let batch = codec::decode_quic_client(&bytes).unwrap();
+    assert_eq!(batch.records.first().unwrap().owned, 1);
+    assert_eq!(state.reference(&resource()), Some(1));
+}
+
 fn frame(records: Vec<wire::ServerStateRecord>, initial_complete: bool) -> Vec<u8> {
     codec::encode_server(&wire::ServerStateBatch {
         records,

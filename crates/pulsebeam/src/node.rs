@@ -8,7 +8,7 @@ use pulsebeam_runtime::net::UdpMode;
 use pulsebeam_runtime::net::tcp::TcpListener;
 use pulsebeam_runtime::rand;
 use pulsebeam_runtime::rand::SeedableRng;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
 use std::net::{Ipv6Addr, SocketAddr};
 #[allow(
@@ -62,6 +62,16 @@ pub enum IceTcpConfig {
     },
 }
 
+/// One dedicated QUIC socket for a logical shard. The advertised DNS name and
+/// port are supplied by the operator and need not equal the local bind mapping.
+#[derive(Clone)]
+pub struct QuicListener {
+    pub bind: SocketAddr,
+    pub host: String,
+    pub port: u16,
+    pub tls: pulsebeam_agent_quic::transport::ServerConfig,
+}
+
 pub struct NodeBuilder {
     #[cfg(test)]
     runtime_control:
@@ -81,6 +91,7 @@ pub struct NodeBuilder {
     local_addr: Option<SocketAddr>,
     external_addrs: Vec<SocketAddr>,
     advertise_bound_udp: bool,
+    quic_listeners: Vec<QuicListener>,
 
     // Dependencies (Transport / Logic)
     rng: Option<rand::Rng>,
@@ -135,6 +146,7 @@ impl NodeBuilder {
             local_addr: None,
             external_addrs: Vec::new(),
             advertise_bound_udp: false,
+            quic_listeners: Vec::new(),
             rng: None,
             udp_mode: UdpMode::Batch,
             #[cfg(not(test))]
@@ -287,6 +299,12 @@ impl NodeBuilder {
 
     /// Set the local bind address for UDP/TCP transports.
     /// Ignored if transports are injected manually.
+    /// Opt into one dedicated QUIC socket per logical shard, in shard order.
+    pub fn quic_listeners(mut self, listeners: Vec<QuicListener>) -> Self {
+        self.quic_listeners = listeners;
+        self
+    }
+
     pub fn local_addr(mut self, addr: SocketAddr) -> Self {
         self.local_addr = Some(addr);
         self
@@ -593,6 +611,51 @@ impl NodeBuilder {
             );
         }
 
+        if !self.quic_listeners.is_empty() {
+            anyhow::ensure!(
+                self.quic_listeners.len() == shard_count,
+                "QUIC requires a listener for each logical shard"
+            );
+            anyhow::ensure!(
+                self.key_registry.is_some() && self.http_api.is_some(),
+                "QUIC requires native admission and a key registry"
+            );
+        }
+        let mut quic_listeners = self.quic_listeners.into_iter();
+        let mut quic_addresses = BTreeMap::new();
+        let mut quic_bound = Vec::with_capacity(quic_listeners.len());
+        let mut authorities = HashSet::new();
+        for (index, listener) in quic_listeners.by_ref().enumerate() {
+            let label = |name: &str| {
+                !name.is_empty()
+                    && name.len() <= 63
+                    && !name.starts_with('-')
+                    && !name.ends_with('-')
+                    && name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            };
+            anyhow::ensure!(
+                listener.port != 0
+                    && listener.host.len() <= 253
+                    && listener.host.split('.').all(label)
+                    && listener.host.parse::<std::net::IpAddr>().is_err(),
+                "invalid QUIC advertised DNS authority"
+            );
+            anyhow::ensure!(
+                authorities.insert((listener.host.to_ascii_lowercase(), listener.port)),
+                "QUIC advertised authorities must distinguish logical shards"
+            );
+            let socket = pulsebeam_agent_quic::transport::socket::bind(listener.bind)
+                .await
+                .context("binding dedicated shard QUIC socket")?;
+            let ingress = pulsebeam_agent_quic::transport::ingress::Ingress::new(listener.tls)
+                .context("configuring shard QUIC listener")?;
+            quic_addresses.insert(ShardId::new(index), (listener.host, listener.port));
+            quic_bound.push((socket, ingress));
+        }
+        let mut quic_bound = quic_bound.into_iter();
+
         let steering = match self.steering {
             Some(attach) => Some(attach(&udp_sockets).context("attaching UDP steering")?),
             None => None,
@@ -727,6 +790,9 @@ impl NodeBuilder {
         };
 
         let mut view_writers = Vec::with_capacity(shard_count);
+        // Bounded control lane shared with HTTPS admission and other low-rate work.
+        let (controller_command_tx, controller_command_rx) =
+            mailbox::bounded(const { core::num::NonZeroUsize::new(16).unwrap() });
 
         for (shard_idx, ((udp_sock, tcp_rx), frame_rx)) in udp_sockets
             .into_iter()
@@ -755,11 +821,13 @@ impl NodeBuilder {
             let (clock_tx, clock_rx) = mailbox::bounded(core::num::NonZeroUsize::MIN);
             clock_senders.push(clock_tx);
             let initial_global_clock = initial_global_clock.clone();
+            let quic = quic_bound.next();
+            let controller = controller_command_tx.clone();
 
             let launch =
                 move || -> std::io::Result<pulsebeam_runtime::rt::ManagedService<ShardWorker>> {
                     let udp_sock = udp_sock.activate()?;
-                    let shard = ShardWorker::new(
+                    let mut shard = ShardWorker::new(
                         shard_id,
                         udp_sock.capabilities().max_gso_segments,
                         tcp_rx,
@@ -775,7 +843,12 @@ impl NodeBuilder {
                         initial_global_clock,
                         clock_rx,
                     );
-                    Ok(pulsebeam_runtime::rt::ManagedService::new(shard, udp_sock))
+                    if let Some((socket, ingress)) = quic {
+                        shard.enable_quic(ingress, controller);
+                        Ok(pulsebeam_runtime::rt::ManagedService::new(shard, udp_sock).with_secondary_socket(socket.activate()?))
+                    } else {
+                        Ok(pulsebeam_runtime::rt::ManagedService::new(shard, udp_sock))
+                    }
                 };
 
             let worker = crate::control::placement::initial_worker(shard_id, shard_executor.worker_count())
@@ -813,6 +886,7 @@ impl NodeBuilder {
             view_writers,
         );
         controller.set_ownership_mode(ownership_mode);
+        controller.set_quic_addresses(quic_addresses);
         #[cfg(feature = "sim")]
         if let Some(peer) = self.sim_ownership_peer.as_ref() {
             controller.set_sim_ownership_peer(peer.clone());
@@ -862,10 +936,6 @@ impl NodeBuilder {
         controller.set_execution(shard_executor.migration_handle());
         controller.set_steering(steering);
         controller.set_key_registry(self.key_registry.clone());
-        // intentionally small so backpressure is applied early
-        // with 62.5 ms pacing rate, at most we get 1s latency here.
-        let (controller_command_tx, controller_command_rx) =
-            mailbox::bounded(const { core::num::NonZeroUsize::new(16).unwrap() });
         if let Some(ready) = self.link_control {
             let _ = ready.send(crate::link::Control::new(controller_command_tx.clone()));
         }
@@ -1356,6 +1426,10 @@ mod transport_conformance;
 #[cfg(all(test, feature = "sim"))]
 #[path = "node/link_conformance.rs"]
 mod link_conformance;
+
+#[cfg(all(test, feature = "sim"))]
+#[path = "node/quic_admission.rs"]
+mod quic_admission;
 
 #[cfg(test)]
 mod tests {
