@@ -661,12 +661,28 @@ message VideoReceiveOptions {
 // packet indices, replay state and RTCP attribution. Terminal replacements use
 // fresh RTP identities or reset-gated SCTP channels, never source relabeling.
 message TrackBinding {
-  // Exactly one transport: RTP for audio/video, SCTP for data.
+  // Exactly one negotiated transport. QUIC arms are never sent to RTC peers.
   oneof transport {
     RtpParameters rtp = 1;
     SctpParameters sctp = 2;
     SctpDataV1Parameters sctp_data_v1 = 3;
+    QuicDataV1Parameters quic_data_v1 = 4;
+    QuicRtpParameters quic_rtp = 5;
   }
+}
+
+message QuicDataV1Parameters {
+  uint32 binding_id = 1;
+  uint32 version = 2;
+  fixed64 incarnation = 3;
+  DataV1Delivery delivery = 4;
+}
+
+message QuicRtpParameters {
+  uint32 binding_id = 1;
+  fixed64 incarnation = 2;
+  RtpCodecParameters codec = 3;
+  fixed32 primary_ssrc = 4;
 }
 
 // Explicit DATA_V1 payload negotiation, never an opt-in flag on a legacy

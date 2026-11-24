@@ -15,8 +15,8 @@ mod preflight;
 
 pub const MAX_FRAME_SIZE: usize = 4096;
 pub const MAX_RECORDS: usize = 16;
+pub const MAX_DATA_CONTROL_FRAME: usize = MAX_DATA_CONTROL + 17;
 const MAX_DATA_CONTROL: usize = crate::data_control::MAX_CONTROL_FRAME_BYTES;
-const MAX_DATA_CONTROL_FRAME: usize = MAX_DATA_CONTROL + 17;
 pub(super) const DATA_PUBLISHER_FIELD: u32 = 4;
 pub(super) const DATA_SUBSCRIBER_FIELD: u32 = 5;
 pub(super) const CLOCK_FIELD: u32 = 6;
@@ -125,6 +125,32 @@ pub fn decode_client(frame: &[u8]) -> Result<ClientStateBatch, DecodeError> {
 pub fn decode_server(frame: &[u8]) -> Result<ServerStateBatch, DecodeError> {
     let batch = decode(frame, preflight::check_server)?;
     validation::validate_server_batch(&batch).map_err(DecodeError::Validation)?;
+    Ok(batch)
+}
+
+pub fn encode_quic_client(batch: &ClientStateBatch) -> Result<Vec<u8>, EncodeError> {
+    validation::validate_client_batch_for(batch, validation::BindingProfile::Quic)
+        .map_err(EncodeError::Validation)?;
+    encode(batch)
+}
+
+pub fn encode_quic_server(batch: &ServerStateBatch) -> Result<Vec<u8>, EncodeError> {
+    validation::validate_server_batch_for(batch, validation::BindingProfile::Quic)
+        .map_err(EncodeError::Validation)?;
+    encode(batch)
+}
+
+pub fn decode_quic_client(frame: &[u8]) -> Result<ClientStateBatch, DecodeError> {
+    let batch = decode(frame, preflight::check_client)?;
+    validation::validate_client_batch_for(&batch, validation::BindingProfile::Quic)
+        .map_err(DecodeError::Validation)?;
+    Ok(batch)
+}
+
+pub fn decode_quic_server(frame: &[u8]) -> Result<ServerStateBatch, DecodeError> {
+    let batch = decode(frame, preflight::check_server)?;
+    validation::validate_server_batch_for(&batch, validation::BindingProfile::Quic)
+        .map_err(DecodeError::Validation)?;
     Ok(batch)
 }
 

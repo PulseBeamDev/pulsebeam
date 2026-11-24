@@ -14,7 +14,7 @@ RUST_OWNERS = [
     "crates/pulsebeam", "crates/pulsebeam-cli", "crates/pulsebeam-auth", "crates/pulsebeam-core", "crates/pulsebeam-membership", "crates/pulsebeam-feedback", "crates/pulsebeam-clock", "crates/pulsebeam-dtls",
     "crates/pulsebeam-proto", "crates/pulsebeam-steer", "crates/pulsebeam-rtc", "crates/pulsebeam-cc", "crates/pulsebeam-libwebrtc-sys",
     "crates/pulsebeam-runtime", "crates/pulsebeam-queue", "crates/pulsebeam-link", "crates/pulsebeam-transport", "crates/pulsebeam-tcp", "crates/pulsebeam-udp", "crates/pulsebeam-testdata",
-    "agents/pulsebeam-agent-core", "agents/pulsebeam-agent-native", "agents/pulsebeam-agent-web",
+    "agents/pulsebeam-agent-core", "agents/pulsebeam-agent-native", "agents/pulsebeam-agent-quic", "agents/pulsebeam-agent-web",
 ]
 
 build_test(

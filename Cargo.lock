@@ -3827,6 +3827,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "pulsebeam-agent-quic"
+version = "0.3.2"
+dependencies = [
+ "bytes",
+ "noq-proto",
+ "pulsebeam-proto",
+ "pulsebeam-udp",
+ "rcgen",
+ "rustls",
+ "tokio",
+]
+
+[[package]]
 name = "pulsebeam-agent-web"
 version = "0.1.0"
 dependencies = [

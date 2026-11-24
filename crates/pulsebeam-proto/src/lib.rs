@@ -15,18 +15,31 @@ pub mod state {
 
     impl SctpDataV1Parameters {
         pub fn format(&self) -> Option<crate::data_endpoint::Format> {
-            use crate::data_endpoint::{Delivery, Format};
             if !matches!(self.stream_id, Some(1..=65534)) || self.channel_incarnation == 0 {
                 return None;
             }
-            let delivery = match DataV1Delivery::try_from(self.delivery).ok()? {
-                DataV1Delivery::Unreliable => Delivery::Unreliable,
-                DataV1Delivery::Latest => Delivery::Latest,
-                DataV1Delivery::Reliable => Delivery::Reliable,
-                DataV1Delivery::Unspecified => return None,
-            };
-            Format::negotiate(u8::try_from(self.version).ok(), delivery)
+            data_format(self.version, self.delivery)
         }
+    }
+
+    impl QuicDataV1Parameters {
+        pub fn format(&self) -> Option<crate::data_endpoint::Format> {
+            if !(1..=u32::from(u16::MAX)).contains(&self.binding_id) || self.incarnation == 0 {
+                return None;
+            }
+            data_format(self.version, self.delivery)
+        }
+    }
+
+    fn data_format(version: u32, delivery: i32) -> Option<crate::data_endpoint::Format> {
+        use crate::data_endpoint::{Delivery, Format};
+        let delivery = match DataV1Delivery::try_from(delivery).ok()? {
+            DataV1Delivery::Unreliable => Delivery::Unreliable,
+            DataV1Delivery::Latest => Delivery::Latest,
+            DataV1Delivery::Reliable => Delivery::Reliable,
+            DataV1Delivery::Unspecified => return None,
+        };
+        Format::negotiate(u8::try_from(version).ok(), delivery)
     }
 
     impl DataV1ReceiverOffer {

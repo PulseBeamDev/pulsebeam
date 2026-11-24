@@ -236,6 +236,77 @@ fn data_v1_requires_its_exact_negotiated_transport_variant() {
 }
 
 #[test]
+fn quic_binding_uses_new_wire_arm_and_is_scoped_to_the_negotiated_profile() {
+    use track_binding::Transport;
+    let mut batch = publication(1);
+    let Some(desired_state::Value::Present(spec)) = desired(&mut batch).value.as_mut() else {
+        panic!("publication fixture")
+    };
+    let Some(resource_spec::Declaration::Publication(publication)) = spec.declaration.as_mut()
+    else {
+        panic!("publication fixture")
+    };
+    let Some(publication_spec::Kind::Data(data)) = publication.kind.as_mut() else {
+        panic!("DATA fixture")
+    };
+    let rtc = data.binding.clone().unwrap();
+    let rtc_bytes = rtc.encode_to_vec();
+    let binding = TrackBinding {
+        transport: Some(Transport::QuicDataV1(QuicDataV1Parameters {
+            binding_id: 7,
+            version: 1,
+            incarnation: 9,
+            delivery: DataV1Delivery::Unreliable as i32,
+        })),
+    };
+    let quic_bytes = binding.encode_to_vec();
+    assert_eq!(
+        quic_bytes,
+        [0x22, 15, 8, 7, 16, 1, 25, 9, 0, 0, 0, 0, 0, 0, 0, 32, 1]
+    );
+    #[derive(prost::Message)]
+    struct LegacyTrackBinding {
+        #[prost(message, optional, tag = "2")]
+        sctp: Option<SctpParameters>,
+    }
+    assert!(
+        LegacyTrackBinding::decode(rtc_bytes.as_slice())
+            .unwrap()
+            .sctp
+            .is_some()
+    );
+    assert!(
+        LegacyTrackBinding::decode(quic_bytes.as_slice())
+            .unwrap()
+            .sctp
+            .is_none()
+    );
+    assert_eq!(validation::validate_spec(spec), Ok(()));
+    assert_eq!(
+        validation::validate_spec_for(spec, validation::BindingProfile::Quic),
+        Err(ValidationError::Binding)
+    );
+    let Some(resource_spec::Declaration::Publication(publication)) = spec.declaration.as_mut()
+    else {
+        panic!("publication fixture")
+    };
+    let Some(publication_spec::Kind::Data(data)) = publication.kind.as_mut() else {
+        panic!("DATA fixture")
+    };
+    data.binding = Some(binding);
+    assert_eq!(
+        validation::validate_spec_for(spec, validation::BindingProfile::Quic),
+        Ok(())
+    );
+    assert_eq!(
+        validation::validate_spec(spec),
+        Err(ValidationError::Binding)
+    );
+    let encoded = encode_quic_client(&batch).unwrap();
+    assert_eq!(decode_quic_client(&encoded), Ok(batch));
+}
+
+#[test]
 fn installed_data_v1_publication_requires_the_authenticated_source_incarnation() {
     let mut desired_batch = publication(1);
     let Some(desired_state::Value::Present(spec)) = desired(&mut desired_batch).value.as_mut()

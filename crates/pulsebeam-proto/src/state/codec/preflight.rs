@@ -73,7 +73,9 @@ shapes! {
     LiveResource { 1 => ResourceSpec, 2 => Participant, 3 => Track, 5 => Failure },
     AudioReceiveOptions {},
     VideoReceiveOptions {},
-    TrackBinding { 1 => RtpParameters, 2 => SctpParameters, 3 => SctpDataV1Parameters },
+    TrackBinding { 1 => RtpParameters, 2 => SctpParameters, 3 => SctpDataV1Parameters, 4 => QuicDataV1Parameters, 5 => QuicRtpParameters },
+    QuicDataV1Parameters {},
+    QuicRtpParameters { 3 => RtpCodecParameters },
     SctpParameters {},
     SctpDataV1Parameters {},
     RtpParameters { 2 => RtpCodecParameters, 3 => RtpHeaderExtensionParameters, 4 => RtpEncodingParameters, 5 => RtcpParameters },
@@ -118,11 +120,32 @@ fn message(
             return Err(DecodeError::Structure);
         }
         let member = match (shape, field, wire) {
-            (Some(Shape::TrackBinding), 1..=3, 2) | (Some(Shape::SctpDataV1Parameters), 1, 0) => 1,
-            (Some(Shape::SctpDataV1Parameters), 2, 0) => 2,
-            (Some(Shape::SctpDataV1Parameters), 3, 1) => 4,
-            (Some(Shape::SctpDataV1Parameters), 4, 0) => 8,
-            (Some(Shape::TrackBinding), 1..=3, _) | (Some(Shape::SctpDataV1Parameters), _, _) => {
+            (Some(Shape::TrackBinding), 1..=5, 2)
+            | (
+                Some(
+                    Shape::SctpDataV1Parameters
+                    | Shape::QuicDataV1Parameters
+                    | Shape::QuicRtpParameters,
+                ),
+                1,
+                0,
+            ) => 1,
+            (Some(Shape::SctpDataV1Parameters | Shape::QuicDataV1Parameters), 2, 0)
+            | (Some(Shape::QuicRtpParameters), 2, 1) => 2,
+            (Some(Shape::SctpDataV1Parameters | Shape::QuicDataV1Parameters), 3, 1)
+            | (Some(Shape::QuicRtpParameters), 3, 2) => 4,
+            (Some(Shape::SctpDataV1Parameters | Shape::QuicDataV1Parameters), 4, 0)
+            | (Some(Shape::QuicRtpParameters), 4, 5) => 8,
+            (Some(Shape::TrackBinding), 1..=5, _)
+            | (
+                Some(
+                    Shape::SctpDataV1Parameters
+                    | Shape::QuicDataV1Parameters
+                    | Shape::QuicRtpParameters,
+                ),
+                _,
+                _,
+            ) => {
                 return Err(DecodeError::Structure);
             }
             _ => 0,

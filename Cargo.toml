@@ -26,6 +26,7 @@ members = [
   "agents/pulsebeam-agent-core",
   "agents/pulsebeam-agent-web",
   "agents/pulsebeam-agent-native",
+  "agents/pulsebeam-agent-quic",
   "tools/rust/wasm_proof",
   "server/rust",
   "server/auth",

@@ -1,0 +1,20 @@
+[package]
+name = "pulsebeam-agent-quic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+bytes.workspace = true
+noq-proto = { version = "=1.4.0", default-features = false, features = ["rustls", "aws-lc-rs"] }
+pulsebeam-proto = { path = "../../crates/pulsebeam-proto" }
+pulsebeam-udp = { path = "../../crates/pulsebeam-udp" }
+rustls = { version = "0.23.46", default-features = false, features = ["std", "aws_lc_rs"] }
+
+[dev-dependencies]
+rcgen = { version = "0.14.7", default-features = false, features = ["crypto", "aws_lc_rs"] }
+tokio.workspace = true
+
+[lints]
+workspace = true

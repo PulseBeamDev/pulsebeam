@@ -23,6 +23,19 @@ pub enum ValidationError {
 type Result<T = ()> = core::result::Result<T, ValidationError>;
 
 pub fn validate_client_batch(batch: &ClientStateBatch) -> Result {
+    validate_client_batch_for(batch, BindingProfile::Rtc)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BindingProfile {
+    Rtc,
+    Quic,
+}
+
+pub(super) fn validate_client_batch_for(
+    batch: &ClientStateBatch,
+    profile: BindingProfile,
+) -> Result {
     if batch
         .records
         .len()
@@ -48,7 +61,7 @@ pub fn validate_client_batch(batch: &ClientStateBatch) -> Result {
                 desired.revision
             }
             (None, Some(report)) if record.owned < report.revision => {
-                validate_execution_report(report)?;
+                validate_execution_report_for(report, profile)?;
                 report.revision
             }
             _ => return Err(ValidationError::Desired),
@@ -79,6 +92,13 @@ pub fn validate_client_batch(batch: &ClientStateBatch) -> Result {
 }
 
 pub fn validate_server_batch(batch: &ServerStateBatch) -> Result {
+    validate_server_batch_for(batch, BindingProfile::Rtc)
+}
+
+pub(super) fn validate_server_batch_for(
+    batch: &ServerStateBatch,
+    profile: BindingProfile,
+) -> Result {
     if batch
         .records
         .len()
@@ -99,7 +119,7 @@ pub fn validate_server_batch(batch: &ServerStateBatch) -> Result {
             .confirmed
             .as_ref()
             .ok_or(ValidationError::Confirmed)?;
-        validate_confirmed(key, confirmed)?;
+        validate_confirmed(key, confirmed, profile)?;
     }
     for record in &batch.catalog_records {
         match record.response.as_ref() {
@@ -129,7 +149,11 @@ fn validate_key(key: &resource_key::Key) -> Result {
     }
 }
 
-fn validate_confirmed(key: &resource_key::Key, confirmed: &ConfirmedState) -> Result {
+fn validate_confirmed(
+    key: &resource_key::Key,
+    confirmed: &ConfirmedState,
+    profile: BindingProfile,
+) -> Result {
     use confirmed_state::Value;
     use resource_key::Key;
     let owned = matches!(key, Key::Owned(_));
@@ -144,7 +168,7 @@ fn validate_confirmed(key: &resource_key::Key, confirmed: &ConfirmedState) -> Re
             if confirmed.evaluated_revision < *reference {
                 return Err(ValidationError::Confirmed);
             }
-            validate_live(live)
+            validate_live_for(live, profile)
         }
         (Key::Owned(reference), Some(Value::SourceLookup(lookup))) => {
             if confirmed.evaluated_revision < *reference {
@@ -156,7 +180,7 @@ fn validate_confirmed(key: &resource_key::Key, confirmed: &ConfirmedState) -> Re
             if confirmed.evaluated_revision < *reference {
                 return Err(ValidationError::Confirmed);
             }
-            validate_logical_subscription(subscription)
+            validate_logical_subscription_for(subscription, profile)
         }
         (Key::Owned(_), Some(Value::Absent(absent))) => {
             if !known::<AbsenceReason>(absent.reason)
@@ -206,6 +230,10 @@ fn validate_confirmed(key: &resource_key::Key, confirmed: &ConfirmedState) -> Re
 }
 
 pub fn validate_spec(spec: &ResourceSpec) -> Result {
+    validate_spec_for(spec, BindingProfile::Rtc)
+}
+
+pub fn validate_spec_for(spec: &ResourceSpec, profile: BindingProfile) -> Result {
     let settings = spec.settings.as_ref().ok_or(ValidationError::Settings)?;
     if settings.enabled.is_none() {
         return Err(ValidationError::Settings);
@@ -217,10 +245,10 @@ pub fn validate_spec(spec: &ResourceSpec) -> Result {
             }
             match publication.kind.as_ref().ok_or(ValidationError::Binding)? {
                 publication_spec::Kind::Audio(audio) => {
-                    validate_binding(audio.binding.as_ref(), TrackKind::Audio, true)
+                    validate_binding(audio.binding.as_ref(), TrackKind::Audio, true, profile)
                 }
                 publication_spec::Kind::Video(video) => {
-                    validate_binding(video.binding.as_ref(), TrackKind::Video, true)
+                    validate_binding(video.binding.as_ref(), TrackKind::Video, true, profile)
                 }
                 publication_spec::Kind::Data(data) => {
                     if let Some(clock) = &data.capture_clock
@@ -229,12 +257,15 @@ pub fn validate_spec(spec: &ResourceSpec) -> Result {
                                 data.binding
                                     .as_ref()
                                     .and_then(|binding| binding.transport.as_ref()),
-                                Some(track_binding::Transport::SctpDataV1(_))
+                                Some(
+                                    track_binding::Transport::SctpDataV1(_)
+                                        | track_binding::Transport::QuicDataV1(_)
+                                )
                             ))
                     {
                         return Err(ValidationError::Binding);
                     }
-                    validate_data_binding(data.binding.as_ref(), data.delivery)
+                    validate_data_binding(data.binding.as_ref(), data.delivery, profile)
                 }
             }
         }
@@ -268,7 +299,7 @@ pub fn validate_spec(spec: &ResourceSpec) -> Result {
             let kind =
                 TrackKind::try_from(subscription.kind).map_err(|_| ValidationError::Binding)?;
             validate_receive_settings(settings, kind)?;
-            validate_binding(subscription.binding.as_ref(), kind, false)
+            validate_binding(subscription.binding.as_ref(), kind, false, profile)
         }
     }
 }
@@ -333,8 +364,12 @@ fn validate_discovery_format(format: Option<&CodecFormat>, audio: bool) -> Resul
 }
 
 pub fn validate_live(live: &LiveResource) -> Result {
+    validate_live_for(live, BindingProfile::Rtc)
+}
+
+fn validate_live_for(live: &LiveResource, profile: BindingProfile) -> Result {
     let spec = live.spec.as_ref().ok_or(ValidationError::Confirmed)?;
-    validate_spec(spec)?;
+    validate_spec_for(spec, profile)?;
     if matches!(
         spec.declaration,
         Some(
@@ -417,7 +452,7 @@ pub fn validate_live(live: &LiveResource) -> Result {
                 &publication.kind,
                 Some(publication_spec::Kind::Data(data))
                     if matches!(data.binding.as_ref().and_then(|binding| binding.transport.as_ref()),
-                        Some(track_binding::Transport::SctpDataV1(_)))
+                        Some(track_binding::Transport::SctpDataV1(_) | track_binding::Transport::QuicDataV1(_)))
             )
     );
     if live.data_v1_source == Some(0)
@@ -480,6 +515,13 @@ pub fn validate_source_lookup(lookup: &SourceLookupState) -> Result {
 }
 
 pub fn validate_logical_subscription(subscription: &LogicalSubscriptionState) -> Result {
+    validate_logical_subscription_for(subscription, BindingProfile::Rtc)
+}
+
+fn validate_logical_subscription_for(
+    subscription: &LogicalSubscriptionState,
+    profile: BindingProfile,
+) -> Result {
     let spec = subscription
         .spec
         .as_ref()
@@ -515,18 +557,21 @@ pub fn validate_logical_subscription(subscription: &LogicalSubscriptionState) ->
             Some(logical_subscription_state::Execution::Installed(binding)) => {
                 if matches!(
                     binding.transport,
-                    Some(track_binding::Transport::SctpDataV1(_))
+                    Some(
+                        track_binding::Transport::SctpDataV1(_)
+                            | track_binding::Transport::QuicDataV1(_)
+                    )
                 ) != data_v1_requested
                     || data_v1_requested != subscription.data_v1.is_some()
                 {
                     return Err(ValidationError::Binding);
                 }
                 if let Some(track::Kind::Data(data)) = &track.kind {
-                    validate_data_binding(Some(binding), data.delivery)?;
+                    validate_data_binding(Some(binding), data.delivery, profile)?;
                 } else {
                     let kind =
                         TrackKind::try_from(address.kind).map_err(|_| ValidationError::Binding)?;
-                    validate_binding(Some(binding), kind, false)?;
+                    validate_binding(Some(binding), kind, false, profile)?;
                 }
             }
             Some(logical_subscription_state::Execution::Failure(failure)) => {
@@ -556,11 +601,12 @@ fn track_kind(kind: &track::Kind) -> i32 {
 }
 
 fn validate_source_format(binding: Option<&TrackBinding>, format: Option<&CodecFormat>) -> Result {
-    let Some(track_binding::Transport::Rtp(rtp)) = binding.and_then(|b| b.transport.as_ref())
-    else {
-        return Err(ValidationError::Binding);
+    let codec = match binding.and_then(|b| b.transport.as_ref()) {
+        Some(track_binding::Transport::Rtp(rtp)) => rtp.codec.as_ref(),
+        Some(track_binding::Transport::QuicRtp(rtp)) => rtp.codec.as_ref(),
+        _ => return Err(ValidationError::Binding),
     };
-    match (rtp.codec.as_ref().and_then(|c| c.format.as_ref()), format) {
+    match (codec.and_then(|c| c.format.as_ref()), format) {
         (Some(binding), Some(source)) if formats_equivalent(binding, source) => (),
         _ => return Err(ValidationError::Format),
     }
@@ -580,12 +626,19 @@ fn validate_video(options: &VideoReceiveOptions) -> Result {
 }
 
 pub fn validate_execution_report(report: &ExecutionReport) -> Result {
+    validate_execution_report_for(report, BindingProfile::Rtc)
+}
+
+fn validate_execution_report_for(report: &ExecutionReport, profile: BindingProfile) -> Result {
     match report.outcome.as_ref() {
         Some(execution_report::Outcome::Failure(failure)) => validate_failure(failure),
         Some(execution_report::Outcome::LogicalReceiver(report)) if report.source_revision != 0 => {
             match report.outcome.as_ref() {
                 Some(logical_receiver_report::Outcome::Prepared(binding))
-                    if binding.transport.is_some() =>
+                    if binding
+                        .transport
+                        .as_ref()
+                        .is_some_and(|transport| binding_profile(transport) == profile) =>
                 {
                     Ok(())
                 }
@@ -599,17 +652,28 @@ pub fn validate_execution_report(report: &ExecutionReport) -> Result {
     }
 }
 
-fn validate_data_binding(binding: Option<&TrackBinding>, delivery: i32) -> Result {
+fn validate_data_binding(
+    binding: Option<&TrackBinding>,
+    delivery: i32,
+    profile: BindingProfile,
+) -> Result {
     use crate::data_endpoint::{Delivery, Format};
 
     if !known::<DataDelivery>(delivery) {
         return Err(ValidationError::Binding);
     }
-    if let Some(track_binding::Transport::SctpDataV1(parameters)) =
-        binding.and_then(|binding| binding.transport.as_ref())
-    {
+    use track_binding::Transport;
+    let format = match (
+        profile,
+        binding.and_then(|binding| binding.transport.as_ref()),
+    ) {
+        (BindingProfile::Rtc, Some(Transport::SctpDataV1(params))) => Some(params.format()),
+        (BindingProfile::Quic, Some(Transport::QuicDataV1(params))) => Some(params.format()),
+        _ => None,
+    };
+    if let Some(format) = format {
         return match (
-            parameters.format().map(Format::delivery),
+            format.map(Format::delivery),
             DataDelivery::try_from(delivery),
         ) {
             (Some(Delivery::Unreliable), Ok(DataDelivery::Lossy))
@@ -618,11 +682,33 @@ fn validate_data_binding(binding: Option<&TrackBinding>, delivery: i32) -> Resul
             _ => Err(ValidationError::Binding),
         };
     }
-    validate_binding(binding, TrackKind::Data, false)
+    validate_binding(binding, TrackKind::Data, false, profile)
 }
 
-fn validate_binding(binding: Option<&TrackBinding>, kind: TrackKind, publication: bool) -> Result {
-    match binding.and_then(|b| b.transport.as_ref()) {
+fn binding_profile(transport: &track_binding::Transport) -> BindingProfile {
+    use track_binding::Transport::*;
+    match transport {
+        Rtp(_) | Sctp(_) | SctpDataV1(_) => BindingProfile::Rtc,
+        QuicDataV1(_) | QuicRtp(_) => BindingProfile::Quic,
+    }
+}
+
+fn validate_binding(
+    binding: Option<&TrackBinding>,
+    kind: TrackKind,
+    publication: bool,
+    profile: BindingProfile,
+) -> Result {
+    match binding
+        .and_then(|b| b.transport.as_ref())
+        .filter(|transport| binding_profile(transport) == profile)
+    {
+        Some(track_binding::Transport::QuicDataV1(parameters))
+            if kind == TrackKind::Data && parameters.format().is_some() =>
+        {
+            Ok(())
+        }
+        Some(track_binding::Transport::QuicRtp(parameters)) => validate_quic_rtp(parameters, kind),
         Some(track_binding::Transport::Sctp(sctp))
             if kind == TrackKind::Data && matches!(sctp.stream_id, Some(1..=65534)) =>
         {
@@ -639,6 +725,33 @@ fn validate_binding(binding: Option<&TrackBinding>, kind: TrackKind, publication
             validate_rtp(rtp, kind, publication)
         }
         _ => Err(ValidationError::Binding),
+    }
+}
+
+fn validate_quic_rtp(rtp: &QuicRtpParameters, kind: TrackKind) -> Result {
+    if !(1..=u32::from(u16::MAX)).contains(&rtp.binding_id)
+        || rtp.incarnation == 0
+        || rtp.primary_ssrc == 0
+    {
+        return Err(ValidationError::Binding);
+    }
+    let codec = rtp.codec.as_ref().ok_or(ValidationError::Binding)?;
+    if !payload_type(codec.payload_type)
+        || codec.rtx_payload_type.is_some()
+        || !unique_text(&codec.feedback, 32, 128)
+    {
+        return Err(ValidationError::Binding);
+    }
+    let format = codec.format.as_ref().ok_or(ValidationError::Format)?;
+    validate_format(format)?;
+    match (kind, format.known_codec()) {
+        (TrackKind::Audio, Some(codec_format::Codec::Opus(_)))
+            if !video_feedback(&codec.feedback) =>
+        {
+            Ok(())
+        }
+        (TrackKind::Video, Some(codec_format::Codec::H264(_))) => Ok(()),
+        _ => Err(ValidationError::Format),
     }
 }
 
@@ -793,6 +906,8 @@ pub fn bindings_equivalent(left: Option<&TrackBinding>, right: Option<&TrackBind
         left.and_then(|v| v.transport.as_ref()),
         right.and_then(|v| v.transport.as_ref()),
     ) {
+        (Some(Transport::QuicDataV1(left)), Some(Transport::QuicDataV1(right))) => left == right,
+        (Some(Transport::QuicRtp(left)), Some(Transport::QuicRtp(right))) => left == right,
         (Some(Transport::Sctp(left)), Some(Transport::Sctp(right))) => left == right,
         (Some(Transport::SctpDataV1(left)), Some(Transport::SctpDataV1(right))) => left == right,
         (Some(Transport::Rtp(left)), Some(Transport::Rtp(right))) => {
