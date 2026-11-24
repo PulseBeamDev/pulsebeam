@@ -23,6 +23,14 @@ native_build(
     adapters = glob(["native/**"]),
 )
 
+native_build(
+    name = "vp9_capture",
+    bridge = "src/bridge.rs",
+    capture = "gn/capture/vp9_capture.cc",
+    testonly = True,
+    visibility = ["//crates/pulsebeam-testdata:__pkg__"],
+)
+
 py_test(
     name = "native_build_test",
     srcs = ["native_build.py", "native_build_test.py", "source_manifest.py"],

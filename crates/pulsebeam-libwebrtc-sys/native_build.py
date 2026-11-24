@@ -51,7 +51,7 @@ def reapi_address(value):
     return endpoint.netloc
 
 
-def siso_command(siso, build, executor, endpoint):
+def siso_command(siso, build, executor, endpoint, root_target="pulsebeam:native"):
     local_jobs = 2 if executor == "reapi" else 8
     command = [siso, "ninja", "-C", build, f"-local_jobs={local_jobs}", "-remote_jobs=32", "-k=8", "-load=@config//pulsebeam.star"]
     if executor == "local":
@@ -62,7 +62,7 @@ def siso_command(siso, build, executor, endpoint):
             command += ["-re_exec_enable=false", "-re_cache_enable_write"]
         else:
             command += ["-strict_remote", "-config=remote-link"]
-    return command + ["pulsebeam:native"]
+    return command + [root_target]
 
 
 def stage_file(root, relative, content=None):
@@ -234,12 +234,19 @@ def main():
     sources = parser.add_mutually_exclusive_group(required=True)
     sources.add_argument("--source-root")
     sources.add_argument("--source-manifest", dest="source_root", type=repository_sources)
-    for name in ("bridge", "overlay", "host-bin", "build", "flavor", "pulsebeam", "webrtc", "runtime", "notices", "license-manifest", "owned-cargo-manifest"):
+    for name in ("bridge", "overlay", "host-bin", "build", "flavor", "owned-cargo-manifest"):
         parser.add_argument("--" + name, required=True)
+    for name in ("pulsebeam", "webrtc", "runtime", "notices", "license-manifest", "capture-source", "capture-output"):
+        parser.add_argument("--" + name)
     parser.add_argument("--asan", action="store_true")
     parser.add_argument("--executor", choices=("local", "cache", "reapi"), default="local")
     parser.add_argument("--reapi", type=reapi_address, default="grpc://127.0.0.1:50051")
     args = parser.parse_args()
+    if args.capture_source or args.capture_output:
+        if not (args.capture_source and args.capture_output):
+            parser.error("capture requires both --capture-source and --capture-output")
+    elif not (args.pulsebeam and args.webrtc and args.runtime and args.notices and args.license_manifest):
+        parser.error("native build requires --pulsebeam, --webrtc, --runtime, --notices and --license-manifest")
     if args.executor == "reapi":
         build(args)
     else:
@@ -276,6 +283,13 @@ def build(args, lock_fd=None):
         package.mkdir()
         for relative in ("BUILD.gn", "bridge.py", "rust", "toolchain", "runtime.cc"):
             (package / relative).symlink_to(overlay / relative, target_is_directory=relative in ("rust", "toolchain"))
+        target = "//pulsebeam:native"
+        if args.capture_source:
+            capture = package / "capture"
+            capture.mkdir()
+            (capture / "BUILD.gn").symlink_to(overlay / "capture/BUILD.gn")
+            (capture / "vp9_capture.cc").symlink_to(Path(args.capture_source).absolute())
+            target = "//pulsebeam/capture:vp9_capture"
         owned = package / "pulsebeam-webrtc-sys"
         (owned / "src").mkdir(parents=True)
         (owned / "src/bridge.rs").symlink_to(bridge)
@@ -288,7 +302,8 @@ def build(args, lock_fd=None):
         (package / "remote.sh").chmod(0o755)
         native = args.flavor == "native"
         config = (overlay / "args.gn").read_text()
-        config += f"\npulsebeam_native = {str(native).lower()}\n"
+        if not args.capture_source:
+            config += f"\npulsebeam_native = {str(native).lower()}\n"
         config += f"rtc_include_internal_audio_device = {str(native).lower()}\n"
         config += f"rtc_use_x11 = {str(native).lower()}\n"
         config += f"rtc_use_pipewire = {str(native).lower()}\n"
@@ -301,7 +316,12 @@ def build(args, lock_fd=None):
         config += f"use_remoteexec = {str(args.executor != 'local').lower()}\n"
         gn = root / "buildtools/linux64/gn"
         siso = root / "third_party/siso/cipd/siso"
-        run([gn, "gen", build, f"--root={root}", "--root-target=//pulsebeam:native", "--ide=json", "--args=" + config], cwd=root, env=env, lock_fd=lock_fd)
+        run([gn, "gen", build, f"--root={root}", f"--root-target={target}", "--ide=json", "--args=" + config], cwd=root, env=env, lock_fd=lock_fd)
+        if args.capture_output:
+            run(siso_command(siso, build, args.executor, args.reapi, "vp9_capture"), cwd=root, env=env, lock_fd=lock_fd)
+            shutil.copyfile(build / "vp9_capture", args.capture_output)
+            Path(args.capture_output).chmod(0o755)
+            return
         graph = json.loads((build / "project.json").read_text())
         objects = runtime_objects(graph["targets"])
         write_notices(gn, root, build, source, env, args.notices, args.license_manifest)

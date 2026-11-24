@@ -1,0 +1,692 @@
+{
+  "encoder_dependencies": [
+    [],
+    [],
+    [
+      0
+    ],
+    [
+      1
+    ],
+    [
+      2
+    ],
+    [
+      3
+    ],
+    [
+      4
+    ],
+    [
+      5
+    ],
+    [
+      6
+    ],
+    [
+      7
+    ],
+    [
+      8
+    ],
+    [
+      9
+    ],
+    [
+      10
+    ],
+    [
+      11
+    ],
+    [
+      12
+    ],
+    [
+      13
+    ],
+    [],
+    [],
+    [
+      16
+    ],
+    [
+      17
+    ],
+    [
+      18
+    ],
+    [
+      19
+    ],
+    [
+      20
+    ],
+    [
+      21
+    ]
+  ],
+  "wire_units": [
+    {
+      "unit": 0,
+      "dd": 101,
+      "picture": 51,
+      "rtp_timestamp": 4294946816,
+      "packets": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ]
+    },
+    {
+      "unit": 1,
+      "dd": 102,
+      "picture": 51,
+      "rtp_timestamp": 4294946816,
+      "packets": [
+        6,
+        7,
+        8,
+        9
+      ]
+    },
+    {
+      "unit": 2,
+      "dd": 103,
+      "picture": 52,
+      "rtp_timestamp": 4294949816,
+      "packets": [
+        10
+      ]
+    },
+    {
+      "unit": 3,
+      "dd": 104,
+      "picture": 52,
+      "rtp_timestamp": 4294949816,
+      "packets": [
+        11,
+        12,
+        13
+      ]
+    },
+    {
+      "unit": 4,
+      "dd": 105,
+      "picture": 53,
+      "rtp_timestamp": 4294952816,
+      "packets": [
+        14
+      ]
+    },
+    {
+      "unit": 5,
+      "dd": 106,
+      "picture": 53,
+      "rtp_timestamp": 4294952816,
+      "packets": [
+        15,
+        16
+      ]
+    },
+    {
+      "unit": 6,
+      "dd": 107,
+      "picture": 54,
+      "rtp_timestamp": 4294955816,
+      "packets": [
+        17
+      ]
+    },
+    {
+      "unit": 7,
+      "dd": 108,
+      "picture": 54,
+      "rtp_timestamp": 4294955816,
+      "packets": [
+        18,
+        19,
+        20
+      ]
+    },
+    {
+      "unit": 8,
+      "dd": 109,
+      "picture": 55,
+      "rtp_timestamp": 4294958816,
+      "packets": [
+        21
+      ]
+    },
+    {
+      "unit": 9,
+      "dd": 110,
+      "picture": 55,
+      "rtp_timestamp": 4294958816,
+      "packets": [
+        22,
+        23
+      ]
+    },
+    {
+      "unit": 10,
+      "dd": 111,
+      "picture": 56,
+      "rtp_timestamp": 4294961816,
+      "packets": [
+        24
+      ]
+    },
+    {
+      "unit": 11,
+      "dd": 112,
+      "picture": 56,
+      "rtp_timestamp": 4294961816,
+      "packets": [
+        25,
+        26,
+        27
+      ]
+    },
+    {
+      "unit": 12,
+      "dd": 113,
+      "picture": 57,
+      "rtp_timestamp": 4294964816,
+      "packets": [
+        28
+      ]
+    },
+    {
+      "unit": 13,
+      "dd": 114,
+      "picture": 57,
+      "rtp_timestamp": 4294964816,
+      "packets": [
+        29,
+        30,
+        31
+      ]
+    },
+    {
+      "unit": 14,
+      "dd": 115,
+      "picture": 58,
+      "rtp_timestamp": 520,
+      "packets": [
+        32
+      ]
+    },
+    {
+      "unit": 15,
+      "dd": 116,
+      "picture": 58,
+      "rtp_timestamp": 520,
+      "packets": [
+        33,
+        34,
+        35
+      ]
+    },
+    {
+      "unit": 16,
+      "dd": 117,
+      "picture": 59,
+      "rtp_timestamp": 3520,
+      "packets": [
+        37,
+        38,
+        39,
+        40
+      ]
+    },
+    {
+      "unit": 17,
+      "dd": 118,
+      "picture": 59,
+      "rtp_timestamp": 3520,
+      "packets": [
+        41,
+        42,
+        43,
+        44,
+        45
+      ]
+    },
+    {
+      "unit": 18,
+      "dd": 119,
+      "picture": 60,
+      "rtp_timestamp": 6520,
+      "packets": [
+        46,
+        47
+      ]
+    },
+    {
+      "unit": 19,
+      "dd": 120,
+      "picture": 60,
+      "rtp_timestamp": 6520,
+      "packets": [
+        48,
+        49,
+        50,
+        51,
+        52,
+        53,
+        54,
+        55
+      ]
+    },
+    {
+      "unit": 20,
+      "dd": 121,
+      "picture": 61,
+      "rtp_timestamp": 9520,
+      "packets": [
+        56
+      ]
+    },
+    {
+      "unit": 21,
+      "dd": 122,
+      "picture": 61,
+      "rtp_timestamp": 9520,
+      "packets": [
+        57,
+        58
+      ]
+    },
+    {
+      "unit": 22,
+      "dd": 123,
+      "picture": 62,
+      "rtp_timestamp": 12520,
+      "packets": [
+        59
+      ]
+    },
+    {
+      "unit": 23,
+      "dd": 124,
+      "picture": 62,
+      "rtp_timestamp": 12520,
+      "packets": [
+        60,
+        61,
+        62
+      ]
+    }
+  ],
+  "decoder_build": {
+    "pyav": "17.0.1",
+    "ffmpeg_libraries": {
+      "libavutil": [
+        60,
+        26,
+        102
+      ],
+      "libavcodec": [
+        62,
+        28,
+        102
+      ],
+      "libavformat": [
+        62,
+        12,
+        102
+      ],
+      "libavdevice": [
+        62,
+        3,
+        102
+      ],
+      "libavfilter": [
+        11,
+        14,
+        102
+      ],
+      "libswscale": [
+        9,
+        5,
+        102
+      ],
+      "libswresample": [
+        6,
+        3,
+        102
+      ]
+    }
+  },
+  "lost_unit": 0,
+  "lost_packets": [
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "corrupt_unit": 1,
+  "intact": {
+    "ivf_sha256": "e0dad22ba649572cae2396f7b7cce0673267379fe1306b2415b548f3943ef57e",
+    "error": null,
+    "decoder_errors": [],
+    "frames": [
+      {
+        "pts": 0,
+        "time_base": "1/90000",
+        "width": 640,
+        "height": 360,
+        "planes_sha256": [
+          "537c0c995046bff4b3b15721b0b05c88c555aa6cf41285aa879bfc81d83e84d8",
+          "a787926b1c7b55a0716c978a3887f3abc60605d6e6e380aed4859377c1990a8b",
+          "56d2449cb3bf6e5d5d0348262ecba2161da0ed5657e21004f8b18b7ef8842ef2"
+        ]
+      },
+      {
+        "pts": 3000,
+        "time_base": "1/90000",
+        "width": 640,
+        "height": 360,
+        "planes_sha256": [
+          "2b758e8b0ee98027567d5594056a1f8d96545be630eeb67bb4ca09bf142aaf36",
+          "ef72f754c908885c7bf292cf2efc2bc4548813c892f7ed37083b567d4d98995b",
+          "70b7ef0e1253100b3e9cecc64a5d0716a2a14818d827590cdd2b2cd9cfd10ad7"
+        ]
+      },
+      {
+        "pts": 6000,
+        "time_base": "1/90000",
+        "width": 640,
+        "height": 360,
+        "planes_sha256": [
+          "eb07c8ecd7394394a27c97baf96e8872e1998d428b38d59ce9c12e33c697bc2d",
+          "af37fe14f43078c42ca71fcf9e99668604a28b7b0a772b2807437abf03fa8f49",
+          "3021f8ec9e9b3bd94e62ea615de67e6bb867e262c850b7d57d0c8ec24e745584"
+        ]
+      },
+      {
+        "pts": 9000,
+        "time_base": "1/90000",
+        "width": 640,
+        "height": 360,
+        "planes_sha256": [
+          "a4611d0805270d400678505df2a479bc00d05d91a616df99448994241d184922",
+          "b6ae831e2afe0a08a4210130a9505619d27a82e9a15d09ff3d41c5abc8cff8bf",
+          "4295e2c5b3de278046d6dc558d6dafd7d351336b8ea3a3e8c6f7bd3e0c8d1943"
+        ]
+      },
+      {
+        "pts": 12000,
+        "time_base": "1/90000",
+        "width": 640,
+        "height": 360,
+        "planes_sha256": [
+          "c90531ddca0daaadd1067dec9d8b58ca1bb21e6d699237208ce4dda76289eec4",
+          "e267097151326e50019efa6f5513d4b85020835a8323bc968f86c6b770958555",
+          "a175a6fd4f1b7701c774348bf82c7b9439c698a6b22d515ff0d5f0994cc00ab0"
+        ]
+      },
+      {
+        "pts": 15000,
+        "time_base": "1/90000",
+        "width": 640,
+        "height": 360,
+        "planes_sha256": [
+          "e9d3ef249d81fbc7e6fbee4ee7f13b5774c39571e1a5e34f54a19c1042c1efd3",
+          "4d344cd0b1d6bd1bd02ee53bff5a6482a2c44fed1633649a5bdb0dc1e80a5e47",
+          "f0a05ec7f45942d82613d2708d926432dd8cca704480a96987485e211318a410"
+        ]
+      },
+      {
+        "pts": 18000,
+        "time_base": "1/90000",
+        "width": 640,
+        "height": 360,
+        "planes_sha256": [
+          "ea960e5e91f6d6a780886645e34331032ed31d40d4c5fe48fe508be80d85c4ce",
+          "9755fc4f75fc6060a403a9787c8b8ab5a7ae584b196042fa5e93a4bbf8e52ee1",
+          "4e0be623971491acc306feed7b79f6f78c578d58cd9ccc9bc3eb6cd81ff93f5f"
+        ]
+      },
+      {
+        "pts": 21000,
+        "time_base": "1/90000",
+        "width": 640,
+        "height": 360,
+        "planes_sha256": [
+          "dc7d4941b83580eda24d647e2946cfbb712b348f7f23d563b0f05faf7767e12c",
+          "df1d11dda55957d75f962b8a65b0e4cb3244248b1ebc25e0b196cd2d2c7fe9e6",
+          "d9a70eb73e381c5ff6de61929a5ab0b3ae523a34e7f5c7c7038b93a5c1cd8606"
+        ]
+      },
+      {
+        "pts": 24000,
+        "time_base": "1/90000",
+        "width": 640,
+        "height": 360,
+        "planes_sha256": [
+          "d87a59f8982c3527670079523a1cdd81681a2241778fbf5f24145a7b1840cb73",
+          "f188fd2ce78732c5121541ca59c87285045f975c099d34094ce225878fd4468a",
+          "8e1f0ec5e528648dcc0f7931f42fa28099fcd007ebd0601e28649afa508013c3"
+        ]
+      },
+      {
+        "pts": 27000,
+        "time_base": "1/90000",
+        "width": 640,
+        "height": 360,
+        "planes_sha256": [
+          "24bbe390b5085c2b3f6142401f90a04e405e37edb240c4b9f2653f0ff58c588c",
+          "e5d8463148aab0066b95d7784fc64710c5ba1d6db96ccc545e0f7d65ff438c29",
+          "99b1dbf7744a125691924b40dd80b490bd53760800e1cba2a6eb3eb5b08cf2c2"
+        ]
+      },
+      {
+        "pts": 30000,
+        "time_base": "1/90000",
+        "width": 640,
+        "height": 360,
+        "planes_sha256": [
+          "831cba0fa825d703d41eb48e81615188db71317249a8932f86a2516b266e3442",
+          "8ed95c1856e48f81ee339bb08e89bcb8276e16220be3360233e94776d3cea602",
+          "d7f2760bfd43f4d0b30677cc2a7ed8368d1f0feabcba4a3c0dbdd8cb7fd6d1b4"
+        ]
+      },
+      {
+        "pts": 33000,
+        "time_base": "1/90000",
+        "width": 640,
+        "height": 360,
+        "planes_sha256": [
+          "22bd9cc4e1787b2c8e1ad0dafbc9e7ffc8da58720f183dd9529965d5945acc19",
+          "c2ecc02b01193208b34bef820123e2de5373e5144f03e388f7c3444830cbadf8",
+          "4a2e64a253d5ae6402acac2c5999a2d812b23dd38aa907b53966694e3579235c"
+        ]
+      }
+    ],
+    "options": {
+      "threads": "1",
+      "err_detect": "explode"
+    }
+  },
+  "lost_lower": {
+    "ivf_sha256": "e0dad22ba649572cae2396f7b7cce0673267379fe1306b2415b548f3943ef57e",
+    "error": null,
+    "decoder_errors": [],
+    "frames": [
+      {
+        "pts": 0,
+        "time_base": "1/90000",
+        "width": 640,
+        "height": 360,
+        "planes_sha256": [
+          "537c0c995046bff4b3b15721b0b05c88c555aa6cf41285aa879bfc81d83e84d8",
+          "a787926b1c7b55a0716c978a3887f3abc60605d6e6e380aed4859377c1990a8b",
+          "56d2449cb3bf6e5d5d0348262ecba2161da0ed5657e21004f8b18b7ef8842ef2"
+        ]
+      },
+      {
+        "pts": 3000,
+        "time_base": "1/90000",
+        "width": 640,
+        "height": 360,
+        "planes_sha256": [
+          "2b758e8b0ee98027567d5594056a1f8d96545be630eeb67bb4ca09bf142aaf36",
+          "ef72f754c908885c7bf292cf2efc2bc4548813c892f7ed37083b567d4d98995b",
+          "70b7ef0e1253100b3e9cecc64a5d0716a2a14818d827590cdd2b2cd9cfd10ad7"
+        ]
+      },
+      {
+        "pts": 6000,
+        "time_base": "1/90000",
+        "width": 640,
+        "height": 360,
+        "planes_sha256": [
+          "eb07c8ecd7394394a27c97baf96e8872e1998d428b38d59ce9c12e33c697bc2d",
+          "af37fe14f43078c42ca71fcf9e99668604a28b7b0a772b2807437abf03fa8f49",
+          "3021f8ec9e9b3bd94e62ea615de67e6bb867e262c850b7d57d0c8ec24e745584"
+        ]
+      },
+      {
+        "pts": 9000,
+        "time_base": "1/90000",
+        "width": 640,
+        "height": 360,
+        "planes_sha256": [
+          "a4611d0805270d400678505df2a479bc00d05d91a616df99448994241d184922",
+          "b6ae831e2afe0a08a4210130a9505619d27a82e9a15d09ff3d41c5abc8cff8bf",
+          "4295e2c5b3de278046d6dc558d6dafd7d351336b8ea3a3e8c6f7bd3e0c8d1943"
+        ]
+      },
+      {
+        "pts": 12000,
+        "time_base": "1/90000",
+        "width": 640,
+        "height": 360,
+        "planes_sha256": [
+          "c90531ddca0daaadd1067dec9d8b58ca1bb21e6d699237208ce4dda76289eec4",
+          "e267097151326e50019efa6f5513d4b85020835a8323bc968f86c6b770958555",
+          "a175a6fd4f1b7701c774348bf82c7b9439c698a6b22d515ff0d5f0994cc00ab0"
+        ]
+      },
+      {
+        "pts": 15000,
+        "time_base": "1/90000",
+        "width": 640,
+        "height": 360,
+        "planes_sha256": [
+          "e9d3ef249d81fbc7e6fbee4ee7f13b5774c39571e1a5e34f54a19c1042c1efd3",
+          "4d344cd0b1d6bd1bd02ee53bff5a6482a2c44fed1633649a5bdb0dc1e80a5e47",
+          "f0a05ec7f45942d82613d2708d926432dd8cca704480a96987485e211318a410"
+        ]
+      },
+      {
+        "pts": 18000,
+        "time_base": "1/90000",
+        "width": 640,
+        "height": 360,
+        "planes_sha256": [
+          "ea960e5e91f6d6a780886645e34331032ed31d40d4c5fe48fe508be80d85c4ce",
+          "9755fc4f75fc6060a403a9787c8b8ab5a7ae584b196042fa5e93a4bbf8e52ee1",
+          "4e0be623971491acc306feed7b79f6f78c578d58cd9ccc9bc3eb6cd81ff93f5f"
+        ]
+      },
+      {
+        "pts": 21000,
+        "time_base": "1/90000",
+        "width": 640,
+        "height": 360,
+        "planes_sha256": [
+          "dc7d4941b83580eda24d647e2946cfbb712b348f7f23d563b0f05faf7767e12c",
+          "df1d11dda55957d75f962b8a65b0e4cb3244248b1ebc25e0b196cd2d2c7fe9e6",
+          "d9a70eb73e381c5ff6de61929a5ab0b3ae523a34e7f5c7c7038b93a5c1cd8606"
+        ]
+      },
+      {
+        "pts": 24000,
+        "time_base": "1/90000",
+        "width": 640,
+        "height": 360,
+        "planes_sha256": [
+          "d87a59f8982c3527670079523a1cdd81681a2241778fbf5f24145a7b1840cb73",
+          "f188fd2ce78732c5121541ca59c87285045f975c099d34094ce225878fd4468a",
+          "8e1f0ec5e528648dcc0f7931f42fa28099fcd007ebd0601e28649afa508013c3"
+        ]
+      },
+      {
+        "pts": 27000,
+        "time_base": "1/90000",
+        "width": 640,
+        "height": 360,
+        "planes_sha256": [
+          "24bbe390b5085c2b3f6142401f90a04e405e37edb240c4b9f2653f0ff58c588c",
+          "e5d8463148aab0066b95d7784fc64710c5ba1d6db96ccc545e0f7d65ff438c29",
+          "99b1dbf7744a125691924b40dd80b490bd53760800e1cba2a6eb3eb5b08cf2c2"
+        ]
+      },
+      {
+        "pts": 30000,
+        "time_base": "1/90000",
+        "width": 640,
+        "height": 360,
+        "planes_sha256": [
+          "831cba0fa825d703d41eb48e81615188db71317249a8932f86a2516b266e3442",
+          "8ed95c1856e48f81ee339bb08e89bcb8276e16220be3360233e94776d3cea602",
+          "d7f2760bfd43f4d0b30677cc2a7ed8368d1f0feabcba4a3c0dbdd8cb7fd6d1b4"
+        ]
+      },
+      {
+        "pts": 33000,
+        "time_base": "1/90000",
+        "width": 640,
+        "height": 360,
+        "planes_sha256": [
+          "22bd9cc4e1787b2c8e1ad0dafbc9e7ffc8da58720f183dd9529965d5945acc19",
+          "c2ecc02b01193208b34bef820123e2de5373e5144f03e388f7c3444830cbadf8",
+          "4a2e64a253d5ae6402acac2c5999a2d812b23dd38aa907b53966694e3579235c"
+        ]
+      }
+    ],
+    "options": {
+      "threads": "1",
+      "err_detect": "explode"
+    }
+  },
+  "corrupt_retained": {
+    "ivf_sha256": "4ae6bb3ac8e073c7a47464b5d72c5627ed80c1fd172204147a04ec344525542f",
+    "error": 1094995529,
+    "decoder_errors": [
+      "frame_sync_byte_0 out of range: 0, but must be in [73,73].",
+      "Failed to read unit 0 (type 0): Invalid data found when processing input.",
+      "Failed to read frame header.",
+      "Not all references are available",
+      "zero_bit out of range: 1, but must be in [0,0].",
+      "Failed to read unit 0 (type 0): Invalid data found when processing input.",
+      "Failed to read frame header.",
+      "zero_bit out of range: 1, but must be in [0,0].",
+      "Failed to read unit 0 (type 0): Invalid data found when processing input.",
+      "Failed to read frame header.",
+      "Not all references are available",
+      "zero_bit out of range: 1, but must be in [0,0].",
+      "Failed to read unit 0 (type 0): Invalid data found when processing input.",
+      "Failed to read frame header.",
+      "zero_bit out of range: 1, but must be in [0,0].",
+      "Failed to read unit 0 (type 0): Invalid data found when processing input.",
+      "Failed to read frame header.",
+      "zero_bit out of range: 1, but must be in [0,0].",
+      "Failed to read unit 0 (type 0): Invalid data found when processing input.",
+      "Failed to read frame header.",
+      "frame_sync_byte_0 out of range: 0, but must be in [73,73].",
+      "Failed to read unit 0 (type 0): Invalid data found when processing input.",
+      "Failed to read frame header."
+    ],
+    "frames": [],
+    "options": {
+      "threads": "1",
+      "err_detect": "explode"
+    }
+  }
+}

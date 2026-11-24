@@ -1,10 +1,47 @@
 load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
+load("@rules_python//python:defs.bzl", "py_test")
 load("@rules_rust//cargo:defs.bzl", "cargo_toml_env_vars", "extract_cargo_lints")
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test", "rust_clippy_test", "rustfmt_test")
 
 package(default_visibility = ["//visibility:public"])
 filegroup(name = "workflow_inputs", srcs = glob(["*.md", "docs/**/*.md", "Justfile", "scripts/*.sh"], allow_empty = True))
-exports_files(["Cargo.toml"])
+exports_files(["Cargo.toml", "scripts/codec-tools.nix"])
+
+py_test(
+    name = "layered_pilot",
+    srcs = ["scripts/layered_pilot_test.py", "scripts/observe_vp9_pilot.py"],
+    main = "scripts/layered_pilot_test.py",
+    imports = ["scripts"],
+    data = glob(["fixtures/vp9-pilot/**"]),
+)
+
+genrule(
+    name = "author_layered_pilot",
+    srcs = [
+        "scripts/capture-vp9-pilot.py",
+        "scripts/observe_vp9_pilot.py",
+        "src/quality_s0_720p.yuv420p.zst",
+    ],
+    outs = ["layered-pilot-candidate.tar"],
+    cmd = """
+        work=$$(mktemp -d)
+        trap 'rm -rf "$$work"' EXIT
+        $(location @webrtc_host//:bin/python3) $(location scripts/capture-vp9-pilot.py) \\
+          --capture $(location //crates/pulsebeam-libwebrtc-sys:vp9_capture) \\
+          --source $(location src/quality_s0_720p.yuv420p.zst) \\
+          --zstd $(location @codec_authoring_tools//:bin/zstd) --out "$$work"
+        $(location @codec_authoring_tools//:bin/python3) $(location scripts/observe_vp9_pilot.py) \\
+          --capture "$$work" --archive "$@"
+    """,
+    tags = ["manual", "no-remote-exec"],
+    testonly = True,
+    tools = [
+        "//crates/pulsebeam-libwebrtc-sys:vp9_capture",
+        "@codec_authoring_tools//:bin/python3",
+        "@codec_authoring_tools//:bin/zstd",
+        "@webrtc_host//:bin/python3",
+    ],
+)
 filegroup(
     name = "quality_zero_video_inputs",
     srcs = ["src/quality_s0_180p.h264", "src/quality_s0_360p.h264", "src/quality_s0_720p.h264"],

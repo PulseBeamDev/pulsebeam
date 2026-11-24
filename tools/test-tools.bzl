@@ -10,6 +10,12 @@ def _test_tools_impl(ctx):
         repository = "@nixpkgs",
         build_file_content = 'package(default_visibility = ["//visibility:public"])\nexports_files(["bin/git", "bin/bash", "bin/readlink", "bin/stat", "bin/sha256sum", "bin/uname", "bin/mkdir", "bin/dirname", "bin/flock"])\n',
     )
+    nixpkgs_package(
+        name = "codec_authoring_tools",
+        nix_file = Label("//crates/pulsebeam-testdata:scripts/codec-tools.nix"),
+        repository = "@nixpkgs",
+        build_file_content = 'package(default_visibility = ["//visibility:public"])\nexports_files(["bin/python3", "bin/zstd"])\n',
+    )
     return ctx.extension_metadata(reproducible = True)
 
 
