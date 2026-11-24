@@ -636,22 +636,26 @@ impl NodeBuilder {
                         .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
             };
             anyhow::ensure!(
-                listener.port != 0
-                    && listener.host.len() <= 253
+                listener.host.len() <= 253
                     && listener.host.split('.').all(label)
                     && listener.host.parse::<std::net::IpAddr>().is_err(),
                 "invalid QUIC advertised DNS authority"
             );
-            anyhow::ensure!(
-                authorities.insert((listener.host.to_ascii_lowercase(), listener.port)),
-                "QUIC advertised authorities must distinguish logical shards"
-            );
             let socket = pulsebeam_agent_quic::transport::socket::bind(listener.bind)
                 .await
                 .context("binding dedicated shard QUIC socket")?;
+            let port = if listener.port == 0 {
+                socket.local_addr().port()
+            } else {
+                listener.port
+            };
+            anyhow::ensure!(
+                port != 0 && authorities.insert((listener.host.to_ascii_lowercase(), port)),
+                "QUIC advertised authorities must distinguish logical shards"
+            );
             let ingress = pulsebeam_agent_quic::transport::ingress::Ingress::new(listener.tls)
                 .context("configuring shard QUIC listener")?;
-            quic_addresses.insert(ShardId::new(index), (listener.host, listener.port));
+            quic_addresses.insert(ShardId::new(index), (listener.host, port));
             quic_bound.push((socket, ingress));
         }
         let mut quic_bound = quic_bound.into_iter();

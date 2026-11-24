@@ -88,7 +88,7 @@ fn create_media(
             &peer.connection,
             if video { "video" } else { "audio" },
             sending,
-            video && sending,
+            video && sending && !peer.single_video_encoding,
         )
         .map_err(|_| Error::Observation)?;
         peer.transceivers

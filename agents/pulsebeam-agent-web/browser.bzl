@@ -13,12 +13,18 @@ def browser_test(name, source, assets, env, contracts = [], live = False, featur
         edition = crate_edition(),
         rustc_env_files = [":cargo_env"],
         lint_config = ":lints",
-        aliases = aliases(normal = True, normal_dev = True, proc_macro = True, proc_macro_dev = True),
-        deps = crate_deps(["serde", "serde_json", "thirtyfour", "tokio"] + (["tokio-util"] if live else [])) + [
+        aliases = aliases(normal = True, normal_dev = True, proc_macro = True, proc_macro_dev = True) | ({"//agents/pulsebeam-agent-core:pulsebeam-agent-core": "agent_core"} if live else {}),
+        deps = crate_deps(["serde", "serde_json", "thirtyfour", "tokio"] + (["noq-proto", "rcgen", "tokio-rustls", "tokio-util"] if live else [])) + [
             "//crates/pulsebeam-core:pulsebeam-core",
             "//crates/pulsebeam-proto:pulsebeam-proto",
             "//server/rust:pulsebeam-server",
-        ] + (["//crates/pulsebeam:pulsebeam", "//crates/pulsebeam-runtime:pulsebeam-runtime"] if live else []),
+        ] + ([
+            "//agents/pulsebeam-agent-core:pulsebeam-agent-core",
+            "//agents/pulsebeam-agent-quic:executor",
+            "//crates/pulsebeam:pulsebeam",
+            "//crates/pulsebeam-runtime:pulsebeam-runtime",
+            "//crates/pulsebeam-testdata",
+        ] if live else []),
         data = assets + [
             ":logged_chromedriver",
             "@browser_chrome//:files",

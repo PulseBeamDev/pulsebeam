@@ -1010,8 +1010,9 @@ impl ShardExecution {
             .resolve_mut(key)
             .and_then(|participant| participant.staged_handoff(key))
         {
+            let unix_now = self.fabric_unix_time();
             let authorized =
-                Self::authorize_media_handoff(&self.runtime, &mut self.registry, handoff);
+                Self::authorize_media_handoff(&self.runtime, &mut self.registry, handoff, unix_now);
             if let Some(participant) = self.registry.resolve_mut(key) {
                 participant.dispatch_handoff(handoff, authorized);
             }
@@ -1019,10 +1020,11 @@ impl ShardExecution {
     }
 
     fn flush_udp(&mut self, socket: &mut pulsebeam_udp::UdpSocket) -> bool {
+        let unix_now = self.fabric_unix_time();
         let runtime = &self.runtime;
         let registry = &mut self.registry;
         let submission = self.udp_send_batch.flush_checked(socket, |handoff| {
-            Self::authorize_media_handoff(runtime, registry, handoff)
+            Self::authorize_media_handoff(runtime, registry, handoff, unix_now)
         });
         self.resolve_media_submissions(submission.handoffs);
         submission.accepted != 0
@@ -1042,9 +1044,16 @@ impl ShardExecution {
         runtime: &ShardRuntime,
         registry: &mut ParticipantRegistry,
         handoff: Handoff,
+        unix_now: Option<u64>,
     ) -> bool {
         use crate::shard::router::FabricOwner;
         let allowed = match runtime.fabric_handoff_owner(handoff.branch, handoff.participant) {
+            Some(FabricOwner::Local(publisher)) if registry.is_quic_owner(publisher) => runtime
+                .quic_media_association(handoff.branch.source(), publisher)
+                .zip(unix_now)
+                .is_some_and(|(association, now)| {
+                    registry.quic_owner_authorized(publisher, association, now)
+                }),
             Some(FabricOwner::Local(publisher)) => registry
                 .resolve_mut(publisher)
                 .is_some_and(|owner| owner.fabric_source_authorized(handoff.branch.source())),

@@ -409,7 +409,11 @@ fn quic_media_h264_exchanges_with_webrtc_encoded_endpoints() {
     let host = pulsebeam_runtime::testing::test_host_ip("192.168.250.103");
     let mut sim = turmoil::Builder::new().build();
     sim.client(host, async move {
-        witness(Scenario::MixedH264 { host }).await?;
+        witness(Scenario::MixedH264 {
+            host,
+            cross_shard: true,
+        })
+        .await?;
         Ok(())
     });
     super::common::run_sim_or_timeout(&mut sim, Duration::from_secs(10))
@@ -424,6 +428,23 @@ fn replay_scenario(host: std::net::IpAddr, scenario: Scenario) {
             .unwrap()
             .unwrap();
     });
+}
+
+#[test]
+#[allow(clippy::expect_used, reason = "same-shard H.264 witness must complete")]
+fn quic_media_h264_same_shard() {
+    let host = pulsebeam_runtime::testing::test_host_ip("192.168.250.103");
+    let mut sim = turmoil::Builder::new().build();
+    sim.client(host, async move {
+        witness(Scenario::MixedH264 {
+            host,
+            cross_shard: false,
+        })
+        .await?;
+        Ok(())
+    });
+    super::common::run_sim_or_timeout(&mut sim, Duration::from_secs(10))
+        .expect("same-shard H.264 replay");
 }
 
 fn quic_data_proposal(delivery: DataV1Delivery) -> Result<Vec<u8>> {
@@ -1810,6 +1831,7 @@ async fn mixed_h264_exchange(
     rtc_host: std::net::IpAddr,
     quic_token: &str,
     rtc_token: &str,
+    cross_shard: bool,
 ) -> Result<()> {
     use super::common::{client::create_http_client, native::NativeHost};
     use pulsebeam_agent_core::{
@@ -1972,8 +1994,12 @@ async fn mixed_h264_exchange(
         );
     }
     ensure!(
-        pulsebeam::sim_metrics::routing_counter("fabric_rtp_h264_shard_enqueued") > 0,
-        "mixed H.264 must cross shard owners"
+        pulsebeam::sim_metrics::routing_counter(if cross_shard {
+            "fabric_rtp_h264_shard_enqueued"
+        } else {
+            "fabric_rtp_h264_local_enqueued"
+        }) > 0,
+        "mixed H.264 must use the configured ownership path"
     );
     reverse.ready().await?;
     let reverse_id = reverse
@@ -2138,6 +2164,7 @@ enum Scenario {
     },
     MixedH264 {
         host: std::net::IpAddr,
+        cross_shard: bool,
     },
 }
 
@@ -2198,6 +2225,7 @@ async fn witness(scenario: Scenario) -> Result<()> {
     let (notify, mut ready) = pulsebeam_runtime::sync::mpsc::channel(1);
     let shutdown = CancellationToken::new();
     let builder = NodeBuilder::new()
+        .sim_utc_clock(crate::sim_clock::unix_nanos)
         .with_current_runtime()
         .local_addr(SocketAddr::new(host, 0))
         .advertise_bound_udp()
@@ -2212,7 +2240,10 @@ async fn witness(scenario: Scenario) -> Result<()> {
             sctp_host: Some(_),
             ..
         } | Scenario::MixedOpus { .. }
-            | Scenario::MixedH264 { .. }
+            | Scenario::MixedH264 {
+                cross_shard: true,
+                ..
+            }
     ) {
         2
     } else {
@@ -2270,9 +2301,17 @@ async fn witness(scenario: Scenario) -> Result<()> {
             )
             .await;
         }
-        if let Scenario::MixedH264 { host } = scenario {
-            return mixed_h264_exchange(address, edge, roots, host, &credential, &subscriber_token)
-                .await;
+        if let Scenario::MixedH264 { host, cross_shard } = scenario {
+            return mixed_h264_exchange(
+                address,
+                edge,
+                roots,
+                host,
+                &credential,
+                &subscriber_token,
+                cross_shard,
+            )
+            .await;
         }
         if let Scenario::FailedPath = scenario {
             return failed_path_exchange(address, edge, roots, &credential).await;

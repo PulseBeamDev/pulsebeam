@@ -62,6 +62,9 @@ pub struct WebAgentConfig {
     pub token: String,
     #[uniffi(default = None)]
     pub log_level: Option<agent_core::ffi::LogLevel>,
+    /// Offer one video encoding instead of the default simulcast set.
+    #[uniffi(default = None)]
+    pub single_video_encoding: Option<bool>,
 }
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
@@ -97,6 +100,7 @@ impl Agent {
                 config.endpoint,
                 config.token,
                 config.log_level.unwrap_or_default().into(),
+                config.single_video_encoding.unwrap_or(false),
             )?;
             Ok(Arc::new(Self { runtime }))
         }

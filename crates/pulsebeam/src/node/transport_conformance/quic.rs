@@ -136,7 +136,7 @@ fn witness(ip: IpAddr) -> Result<()> {
                         Ok(()) => echoed = true,
                         Err(DatagramAdmission::ControlTurn | DatagramAdmission::Full) => {}
                         Err(error) => {
-                            offered = Err(anyhow!("server DATAGRAM admission: {error:?}"))
+                            offered = Err(anyhow!("server DATAGRAM admission: {error:?}"));
                         }
                     }
                 }

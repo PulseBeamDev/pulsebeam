@@ -1073,12 +1073,14 @@ impl FabricRtpFixture {
     ) {
         self.queue_receiver_datagrams();
         let execution = &mut self.execution;
+        let unix_now = execution.fabric_unix_time();
         let submission = execution.udp_send_batch.submit(
             |handoff| {
                 ShardExecution::authorize_media_handoff(
                     &execution.runtime,
                     &mut execution.registry,
                     handoff,
+                    unix_now,
                 )
             },
             send,
@@ -1370,16 +1372,28 @@ fn quic_data_ingress_fences_owner_association_and_binding_before_admission() {
         (publisher, wrong_incarnation),
     ] {
         assert!(matches!(
-            execution
-                .runtime
-                .admit_quic_data(source, owner, candidate, &[], now, 0),
+            execution.runtime.admit_quic_data(
+                source,
+                owner,
+                candidate,
+                &[],
+                now,
+                Default::default()
+            ),
             Err(Error::Fenced)
         ));
     }
     let packet = r3_record();
     let admitted = execution
         .runtime
-        .admit_quic_data(source, publisher, installation, &packet, now, 0)
+        .admit_quic_data(
+            source,
+            publisher,
+            installation,
+            &packet,
+            now,
+            Default::default(),
+        )
         .unwrap();
     assert_eq!(admitted.installation, installation);
     let reliable = admitted.reliable.unwrap();
@@ -1490,9 +1504,14 @@ fn quic_data_ingress_fences_owner_association_and_binding_before_admission() {
         Err(crate::route::fabric::local::Rejection::Binding)
     ));
     assert!(matches!(
-        execution
-            .runtime
-            .admit_quic_data(source, publisher, installation, &packet, now, 0),
+        execution.runtime.admit_quic_data(
+            source,
+            publisher,
+            installation,
+            &packet,
+            now,
+            Default::default()
+        ),
         Err(Error::Fenced)
     ));
 }

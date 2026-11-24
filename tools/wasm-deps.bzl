@@ -16,6 +16,7 @@ WASM_DEPS = {
         "@wasm_crates//:web-sys"
     ],
     "agents/pulsebeam-agent-core": [
+        "@wasm_crates//:base64",
         "@wasm_crates//:log",
         "@wasm_crates//:serde",
         "@wasm_crates//:serde_json",

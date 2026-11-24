@@ -1626,7 +1626,7 @@ where
             match effect {
                 Effect::PublicationInput(control) => self.input_control(control),
                 Effect::MediaObservation(control) => self.observation_control(control),
-                Effect::Quic(_) => unreachable!("native RTC host is configured for RTC"),
+                Effect::Quic(_) => tracing::error!("native RTC host received a QUIC effect"),
                 Effect::Rtc(effect) => match effect {
                     RtcEffect::CreateOffer {
                         generation,

@@ -90,7 +90,7 @@ impl RtpOutput {
         ) else {
             return Ok(());
         };
-        let mut bytes = Vec::with_capacity(12 + packet.payload().len());
+        let mut bytes = Vec::with_capacity(packet.payload().len().saturating_add(12));
         bytes.extend_from_slice(&[0x80, self.payload_type | (u8::from(header.marker) << 7)]);
         let [.., high, low] = projected.sequence.to_be_bytes();
         bytes.extend_from_slice(&[high, low]);
@@ -379,7 +379,11 @@ impl Installed {
                         ),
                     _ => None,
                 };
-                if subscriber.branch.is_some() {
+                if let Some(branch) = subscriber.branch {
+                    if matches!(&subscriber.payload, SubscriberPayload::Rtp(output) if output.profile == pulsebeam_core::fabric::Profile::H264)
+                    {
+                        core.request_quic_receiver_refresh(receiver, branch);
+                    }
                     subscriber.execution.ready = true;
                     if !self
                         .handoff

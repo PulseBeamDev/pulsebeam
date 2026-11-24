@@ -60,6 +60,11 @@ web-sys = { version = "0.3.104", features = [
 ] }
 
 [dev-dependencies]
+noq-proto = { version = "=1.4.0", default-features = false, features = ["rustls", "aws-lc-rs"] }
+rcgen = { version = "0.14.7", default-features = false, features = ["crypto", "aws_lc_rs"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["aws_lc_rs"] }
+pulsebeam-agent-quic = { path = "../pulsebeam-agent-quic", features = ["executor"] }
+pulsebeam-testdata = { path = "../../crates/pulsebeam-testdata" }
 pulsebeam = { path = "../../crates/pulsebeam" }
 pulsebeam-runtime = { path = "../../crates/pulsebeam-runtime" }
 tokio-util.workspace = true

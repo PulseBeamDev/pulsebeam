@@ -191,12 +191,7 @@ impl LinuxAgent {
         quic_roots: RootCertStore,
     ) -> Result<Self, Error> {
         let core = Agent::new_quic(config).map_err(Error::Core)?;
-        let http = reqwest::Client::builder()
-            .https_only(true)
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(HTTP_TIMEOUT)
-            .build()
-            .map_err(Error::Http)?;
+        let http = Self::placement_client().build().map_err(Error::Http)?;
         let tls = transport::system_client_config(quic_roots).map_err(Error::Tls)?;
         Ok(Self {
             core,
@@ -217,6 +212,24 @@ impl LinuxAgent {
             #[cfg(feature = "sim")]
             sim: None,
         })
+    }
+
+    fn placement_client() -> reqwest::ClientBuilder {
+        reqwest::Client::builder()
+            .https_only(true)
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(HTTP_TIMEOUT)
+    }
+
+    /// Add a trust anchor for the configured HTTPS placement origin. Normal
+    /// certificate and hostname verification still applies.
+    pub fn with_placement_root(mut self, root_der: &[u8]) -> Result<Self, Error> {
+        let root = reqwest::Certificate::from_der(root_der).map_err(Error::Http)?;
+        self.http = Self::placement_client()
+            .add_root_certificate(root)
+            .build()
+            .map_err(Error::Http)?;
+        Ok(self)
     }
 
     pub fn command(&mut self, command: AgentCommand) -> Result<(), AgentError> {
@@ -679,6 +692,28 @@ impl LinuxAgent {
             .flatten()
             .find(|socket| socket.generation() == generation)
             .map(|socket| socket.data_staging())
+    }
+
+    pub fn catalog_watch(
+        &mut self,
+        room: String,
+        config: pulsebeam_agent_core::ffi::WatchConfig,
+    ) -> Result<pulsebeam_agent_core::TrackOwner, pulsebeam_agent_core::ffi::ErrorInfo> {
+        self.core.catalog_watch(room, config)
+    }
+
+    pub fn catalog_watch_state(
+        &self,
+        owner: pulsebeam_agent_core::TrackOwner,
+    ) -> Option<pulsebeam_agent_core::ffi::WatchState> {
+        self.core.catalog_watch_state(owner)
+    }
+
+    pub fn close_catalog_watch(
+        &mut self,
+        owner: pulsebeam_agent_core::TrackOwner,
+    ) -> Option<pulsebeam_agent_core::ffi::WatchState> {
+        self.core.close_catalog_watch(owner)
     }
 
     pub fn snapshot(&self) -> &Snapshot {

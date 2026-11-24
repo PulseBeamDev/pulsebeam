@@ -110,9 +110,9 @@ fn extension_free_quic_opus_uses_negotiated_packet_coordinates() {
     let adapter = QuicRtpIngress::new(binding).unwrap();
     let arrival = Instant::now();
     let packet = [0x80, 0xef, 0, 90, 0, 0, 0, 100, 0, 0, 0, 11, 0xf8];
-    let ingress = adapter.prepare(arrival, 42, &packet).unwrap();
+    let ingress = adapter.prepare(arrival, &packet).unwrap();
     assert!(matches!(ingress.position, Position::LowSequence(90)));
-    assert_eq!((ingress.arrival, ingress.ingress_ntp32), (arrival, 42));
+    assert_eq!(ingress.arrival, arrival);
     ingress.with_input(|input| {
         let Input::Media(media) = input else {
             panic!("expected media");
@@ -127,12 +127,12 @@ fn extension_free_quic_opus_uses_negotiated_packet_coordinates() {
         0x90, 0xef, 0, 90, 0, 0, 0, 100, 0, 0, 0, 11, 0xbe, 0xde, 0, 0, 0xf8,
     ];
     assert!(matches!(
-        adapter.prepare(arrival, 42, &extended),
+        adapter.prepare(arrival, &extended),
         Err(DropReason::ExtensionForm)
     ));
     let wrong_source = [0x80, 0xef, 0, 90, 0, 0, 0, 100, 0, 0, 0, 12, 0xf8];
     assert!(matches!(
-        adapter.prepare(arrival, 42, &wrong_source),
+        adapter.prepare(arrival, &wrong_source),
         Err(DropReason::Binding)
     ));
 }

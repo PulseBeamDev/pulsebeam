@@ -1,5 +1,7 @@
 #[path = "support/destination.rs"]
 mod destination;
+#[path = "support/quic.rs"]
+mod quic;
 mod support;
 
 use destination::DestinationServer;
@@ -32,7 +34,7 @@ fn authorization_expiry() -> TestResult<u64> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn native_platform_smoke() -> TestResult<()> {
-    let destination = DestinationServer::start_observed().await?;
+    let (destination, quic_endpoint) = quic::start_destination().await?;
     let server = StaticServer::start(root()).await?;
     let room = RoomId::new("public-web-contract")?;
     let expires_at = authorization_expiry()?;
@@ -79,6 +81,17 @@ async fn native_platform_smoke() -> TestResult<()> {
         .await?;
         assert_eq!(rejections, 0, "connected-media: unhandled completion");
         destination.wait_for_fabric_rtp_admissions().await?;
+        navigate(&bidi, &context, fixture.url("tests/uniffi-fixture.html")).await?;
+        let _: () = evaluate_json(&bidi, &context, LOAD).await?;
+        quic::witness(
+            &bidi,
+            &context,
+            &destination,
+            &quic_endpoint,
+            expires_at,
+            include_str!("contracts/quic-agent-smoke.js"),
+        )
+        .await?;
         let source_room = RoomId::new("react-native-source")?;
         let publisher_token = mint_development_token(
             &source_room,

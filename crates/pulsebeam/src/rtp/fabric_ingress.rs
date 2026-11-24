@@ -672,12 +672,10 @@ fn normalize<'a>(
     wire: Wire<'a>,
     elements: impl Iterator<Item = (u8, &'a [u8])>,
 ) -> Result<Option<(u16, Normalized<'a>)>, DropReason> {
-    if !binding
-        .extension_form
-        .map_or(wire.extension_profile.is_none(), |form| {
-            form.accepts(wire.extension_profile)
-        })
-    {
+    if !binding.extension_form.map_or_else(
+        || wire.extension_profile.is_none(),
+        |form| form.accepts(wire.extension_profile),
+    ) {
         return Err(DropReason::ExtensionForm);
     }
     let expected = if wire.is_repair {

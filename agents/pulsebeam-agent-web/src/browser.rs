@@ -216,6 +216,7 @@ impl DataChannel {
 
 struct Peer {
     generation: Generation,
+    single_video_encoding: bool,
     connection: RtcPeerConnection,
     sdp: Option<agent_core::client_sdp::Executor>,
     transceivers: Vec<(MediaSlot, RtcRtpTransceiver)>,
@@ -400,6 +401,7 @@ impl Host for BrowserHost {
 
 struct RuntimeInner {
     actor: RefCell<Option<ActorHandle>>,
+    single_video_encoding: bool,
     agent_state: Rc<agent_core::observer::AgentStateObserver>,
     publication_observers:
         RefCell<BTreeMap<u64, Rc<agent_core::observer::PublicationStateObserver>>>,
@@ -437,6 +439,7 @@ impl BrowserRuntime {
         endpoint: String,
         token: String,
         log_level: LogLevel,
+        single_video_encoding: bool,
     ) -> Result<Self, agent_core::ffi::ErrorInfo> {
         let core_config = AgentConfig {
             endpoint,
@@ -446,6 +449,7 @@ impl BrowserRuntime {
         };
         let inner = Rc::new(RuntimeInner {
             actor: RefCell::new(None),
+            single_video_encoding,
             agent_state: Rc::new(agent_core::observer::AgentStateObserver::new(
                 (&agent_core::Snapshot::default()).into(),
             )),
@@ -1437,7 +1441,9 @@ impl RuntimeInner {
                 BrowserHost::new(self).publication_input_state(&control.state());
             }
             Effect::MediaObservation(control) => self.observation_control(control),
-            Effect::Quic(_) => unreachable!("browser Core is configured for RTC"),
+            Effect::Quic(_) => self
+                .logger
+                .warn(LOG_TARGET, "browser host received a QUIC effect"),
         }
     }
 
@@ -1684,6 +1690,7 @@ impl RuntimeInner {
 
         Ok(Peer {
             generation,
+            single_video_encoding: self.single_video_encoding,
             connection,
             sdp: None,
             // Keep the initial SCTP m-line as the non-retiring BUNDLE anchor.

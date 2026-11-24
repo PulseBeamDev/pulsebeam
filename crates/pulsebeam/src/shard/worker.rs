@@ -535,7 +535,7 @@ impl Service for ShardWorker {
                 quic.turn(
                     self.router.shard_id,
                     socket,
-                    at.monotonic,
+                    Instant::now(),
                     &mut self.shard_event_backlog,
                     &mut self.core,
                 )?;

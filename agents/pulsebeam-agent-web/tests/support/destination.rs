@@ -17,19 +17,32 @@ impl DestinationServer {
         Self::bind("127.0.0.1:0".parse()?).await
     }
 
-    pub async fn start_observed() -> TestResult<Self> {
+    pub async fn start_observed(
+        configure: impl FnOnce(
+            pulsebeam::node::NodeBuilder,
+            SocketAddr,
+        ) -> TestResult<pulsebeam::node::NodeBuilder>
+        + Send
+        + 'static,
+    ) -> TestResult<Self> {
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         listener.set_nonblocking(true)?;
-        Self::bind_with_metrics("127.0.0.1:0".parse()?, Some(listener)).await
+        Self::bind_with_metrics("127.0.0.1:0".parse()?, Some(listener), configure).await
     }
 
     pub async fn bind(address: SocketAddr) -> TestResult<Self> {
-        Self::bind_with_metrics(address, None).await
+        Self::bind_with_metrics(address, None, |node, _| Ok(node)).await
     }
 
     async fn bind_with_metrics(
         address: SocketAddr,
         metrics: Option<std::net::TcpListener>,
+        configure: impl FnOnce(
+            pulsebeam::node::NodeBuilder,
+            SocketAddr,
+        ) -> TestResult<pulsebeam::node::NodeBuilder>
+        + Send
+        + 'static,
     ) -> TestResult<Self> {
         use pulsebeam_core::auth::{
             DEVELOPMENT_API_KEY_ID, DEVELOPMENT_API_PUBLIC_KEY, DEVELOPMENT_PROJECT_ID,
@@ -77,7 +90,7 @@ impl DestinationServer {
                 if let Some(metrics) = metrics {
                     node = node.with_internal_metrics_listener(TcpListener::from_std(metrics)?);
                 }
-                node.run(cancellation).await?;
+                configure(node, address)?.run(cancellation).await?;
                 Ok(())
             })
         });
