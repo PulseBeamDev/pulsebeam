@@ -1495,6 +1495,7 @@ async fn opus_exchange(
         executor::rtp::{Receive, SendPacket, SendPacketError},
         fabric::{Extension, ExtensionKind, WireError},
         media::{Opus, PacketBudget},
+        records::RtcpSenderReport,
     };
     let (mut publisher, publication_id) =
         prepare_agent_opus_publisher(address, edge, roots.clone(), publisher_token).await?;
@@ -1611,7 +1612,99 @@ async fn opus_exchange(
         ensure!(publisher.snapshot().generation == Some(generation));
         ensure!(publisher.opus_publication_id("voice") == Some(publication_id.as_str()));
     }
+    let (_, _, binding) = first.context("first raw RTP packet")?;
+    ensure!(
+        receiver.rtp_sender_report(binding).is_none(),
+        "arrival time is not a report"
+    );
+    let utc = SystemTime::now().duration_since(UNIX_EPOCH)?;
+    let ntp = (utc.as_secs().saturating_add(2_208_988_800) << 32)
+        | ((u64::from(utc.subsec_nanos()) << 32) / 1_000_000_000);
+    let report = RtcpSenderReport {
+        ssrc: source.ssrc().try_into()?,
+        ntp,
+        rtp_timestamp: 2880,
+        packets: 3,
+        octets: 0,
+    };
+    let timed = || SendPacket {
+        sequence: 3,
+        timestamp: 3840,
+        marker: true,
+        extensions: &[],
+        payload: &[0xf8],
+    };
+    let send = async {
+        let mut anchored = false;
+        let mut sent = false;
+        loop {
+            if !anchored {
+                match publisher.send_rtp_sender_report(&source, report) {
+                    Ok(()) => anchored = true,
+                    Err(SendPacketError::Datagram(
+                        DatagramAdmission::Full | DatagramAdmission::ControlTurn,
+                    )) => {}
+                    Err(error) => anyhow::bail!("send RTP anchor: {error:?}"),
+                }
+            } else if !sent {
+                match publisher.send_rtp(&source, timed()) {
+                    Ok(()) => sent = true,
+                    Err(SendPacketError::Datagram(
+                        DatagramAdmission::Full | DatagramAdmission::ControlTurn,
+                    )) => {}
+                    Err(error) => anyhow::bail!("send timed RTP: {error:?}"),
+                }
+            }
+            publisher
+                .turn()
+                .await
+                .map_err(|error| anyhow::anyhow!("drive RTP anchor: {error:?}"))?;
+        }
+    };
+    let receive = async {
+        let mut timestamp = None;
+        loop {
+            if let Some(Receive::Packet(packet)) = receiver.next_rtp() {
+                ensure!(packet.binding == binding && packet.payload() == timed().payload);
+                timestamp = Some(packet.timestamp());
+            }
+            if let (Some(timestamp), Some(anchor)) =
+                (timestamp, receiver.rtp_sender_report(binding))
+            {
+                ensure!(
+                    anchor.rtp_timestamp == timestamp,
+                    "SR must use receiver RTP coordinates"
+                );
+                let expected = ntp.saturating_add((1u64 << 32) / 50);
+                // The exported sender fit is independent of the receiver RTP
+                // continuity bridge. Allow fixed-point/ns conversion rounding.
+                let tolerance = 8;
+                ensure!(
+                    anchor.ntp.abs_diff(expected) < tolerance,
+                    "SR sender coordinate: {anchor:?}, expected near {expected}"
+                );
+                return anyhow::Ok(());
+            }
+            receiver
+                .turn()
+                .await
+                .map_err(|error| anyhow::anyhow!("receive RTP anchor: {error:?}"))?;
+        }
+    };
+    pulsebeam_runtime::select! {
+        result = pulsebeam_runtime::time::timeout(Duration::from_secs(2), receive) =>
+            result.context("no sender report for timed RTP")??,
+        result = send => return result,
+    }
+    if !rebind {
+        timed_opus_readers(&mut publisher, &mut receiver, &source).await?;
+    }
     publisher.command(AgentCommand::Disconnect)?;
+    receiver.command(AgentCommand::Disconnect)?;
+    ensure!(
+        receiver.rtp_sender_report(binding).is_none(),
+        "retired binding clock must not survive disconnect"
+    );
     ensure!(matches!(
         publisher.send_rtp(
             &source,
@@ -1626,6 +1719,239 @@ async fn opus_exchange(
         Err(SendPacketError::NotReady)
     ));
     Ok(())
+}
+
+async fn timed_opus_readers(
+    publisher: &mut pulsebeam_agent_quic::executor::host::Agent,
+    receiver: &mut pulsebeam_agent_quic::executor::host::Agent,
+    voice: &pulsebeam_agent_quic::executor::rtp::Publication,
+) -> Result<()> {
+    use pulsebeam_agent_core::{
+        AgentCommand, AudioSubscription, DesiredState, MediaKind, PublicationIntent,
+    };
+    use pulsebeam_agent_quic::{
+        executor::timed::{Policy, Receive},
+        media::{
+            jitter::GapReason,
+            units::{Cause, Event},
+        },
+    };
+
+    publisher.command(AgentCommand::ReplaceDesired(DesiredState {
+        revision: publisher.snapshot().desired_revision.saturating_add(1),
+        connected: true,
+        publications: ["voice", "control"]
+            .into_iter()
+            .map(|track| PublicationIntent {
+                slot: track.into(),
+                track_id: track.into(),
+                kind: MediaKind::Audio,
+                active: true,
+            })
+            .collect(),
+        ..Default::default()
+    }))?;
+    let control = loop {
+        if let Some(control) = publisher.rtp_publication(MediaKind::Audio, "control") {
+            break control;
+        }
+        publisher
+            .turn()
+            .await
+            .map_err(|error| anyhow::anyhow!("second Opus publication: {error:?}"))?;
+    };
+    receiver.command(AgentCommand::ReplaceDesired(DesiredState {
+        revision: receiver.snapshot().desired_revision.saturating_add(1),
+        connected: true,
+        audio: AudioSubscription {
+            pinned: vec![
+                voice.publication_id().into(),
+                control.publication_id().into(),
+            ],
+            ..Default::default()
+        },
+        ..Default::default()
+    }))?;
+    let recording = receiver
+        .rtp_subscription(MediaKind::Audio, voice.publication_id())
+        .context("recording binding")?;
+    let fresh = loop {
+        if let Some(fresh) = receiver.rtp_subscription(MediaKind::Audio, control.publication_id()) {
+            break fresh;
+        }
+        receiver
+            .turn()
+            .await
+            .map_err(|error| anyhow::anyhow!("second Opus receiver: {error:?}"))?;
+    };
+    receiver
+        .attach_encoded(
+            recording,
+            Policy::Recording {
+                reorder: Duration::from_millis(8),
+            },
+        )
+        .map_err(|error| anyhow::anyhow!("recording policy: {error:?}"))?;
+    receiver
+        .attach_encoded(
+            fresh,
+            Policy::Freshness {
+                reorder: Duration::from_millis(4),
+                max_age: Duration::from_millis(40),
+            },
+        )
+        .map_err(|error| anyhow::anyhow!("freshness policy: {error:?}"))?;
+    paced_timed_rtp(
+        publisher,
+        receiver,
+        [(&control, fresh, Some(0)), (voice, recording, None)],
+    )
+    .await?;
+    pulsebeam_runtime::time::timeout(Duration::from_secs(1), async {
+        while receiver
+            .encoded_stats(fresh)
+            .context("freshness stats")?
+            .expired_events
+            == 0
+        {
+            receiver
+                .turn()
+                .await
+                .map_err(|error| anyhow::anyhow!("media expiry timer: {error:?}"))?;
+        }
+        anyhow::Ok(())
+    })
+    .await
+    .context("freshness expiry must wake an idle host")??;
+    ensure!(matches!(receiver.next_encoded(fresh), Some(Receive::Loss(loss)) if loss.expired == 1));
+
+    for ordinal in 1_u32..=36 {
+        let sequence = if ordinal == 1 {
+            4
+        } else {
+            ordinal.saturating_add(4)
+        };
+        paced_timed_rtp(
+            publisher,
+            receiver,
+            [
+                (voice, recording, Some(sequence)),
+                (&control, fresh, Some(ordinal)),
+            ],
+        )
+        .await?;
+        ensure!(
+            matches!(receiver.next_encoded(fresh), Some(Receive::Media(Event::Unit(unit))) if unit.source == fresh && unit.data == [0xf8, 0xfe])
+        );
+    }
+    let mut retained = 0;
+    let mut deadline_gap = None;
+    let mut overflow = None;
+    while let Some(event) = receiver.next_encoded(recording) {
+        match event {
+            Receive::Media(Event::Unit(unit)) => {
+                ensure!(unit.source == recording && unit.data == [0xf8, 0xfe]);
+                retained += 1;
+            }
+            Receive::Media(Event::Discontinuity(gap)) => {
+                ensure!(gap.source == recording && gap.cause == Cause::Gap(GapReason::Deadline));
+                ensure!(deadline_gap.replace(gap.sequence).is_none());
+            }
+            Receive::Loss(loss) => ensure!(overflow.replace(loss).is_none()),
+        }
+    }
+    let stats = receiver
+        .encoded_stats(recording)
+        .context("recording stats")?;
+    let gap = deadline_gap.context("bounded recording must report a hole")?;
+    let loss = overflow.context("full queue must retain overflow evidence")?;
+    ensure!(gap.end.saturating_sub(gap.start) == 1);
+    ensure!(retained == 31 && stats.received == 36 && stats.gaps == 1);
+    ensure!(
+        loss.overflow == 5 && loss.overflow == stats.handoff_overflow && stats.expired_events == 0
+    );
+    ensure!(stats.residence_max > Duration::ZERO);
+    ensure!(
+        receiver
+            .encoded_stats(fresh)
+            .context("fast reader")?
+            .handoff_overflow
+            == 0
+    );
+    Ok(())
+}
+
+async fn paced_timed_rtp(
+    publisher: &mut pulsebeam_agent_quic::executor::host::Agent,
+    receiver: &mut pulsebeam_agent_quic::executor::host::Agent,
+    lanes: [(
+        &pulsebeam_agent_quic::executor::rtp::Publication,
+        pulsebeam_agent_quic::executor::rtp::Binding,
+        Option<u32>,
+    ); 2],
+) -> Result<()> {
+    use pulsebeam_agent_quic::executor::rtp::{SendPacket, SendPacketError};
+    let expected = lanes.map(|(_, binding, sequence)| {
+        receiver
+            .encoded_stats(binding)
+            .map(|stats| stats.received.saturating_add(u64::from(sequence.is_some())))
+    });
+    let sending = async {
+        for (publication, _, sequence) in lanes {
+            let Some(sequence) = sequence else {
+                continue;
+            };
+            loop {
+                let packet = SendPacket {
+                    sequence,
+                    timestamp: sequence.saturating_add(1).saturating_mul(960),
+                    marker: true,
+                    extensions: &[],
+                    payload: &[0xf8, 0xfe],
+                };
+                match publisher.send_rtp(publication, packet) {
+                    Ok(()) => break,
+                    Err(SendPacketError::Datagram(
+                        DatagramAdmission::Full | DatagramAdmission::ControlTurn,
+                    )) => {}
+                    Err(error) => anyhow::bail!("send timed Opus: {error:?}"),
+                }
+                publisher
+                    .turn()
+                    .await
+                    .map_err(|error| anyhow::anyhow!("pace publisher: {error:?}"))?;
+            }
+        }
+        loop {
+            publisher
+                .turn()
+                .await
+                .map_err(|error| anyhow::anyhow!("drive timed publisher: {error:?}"))?;
+        }
+    };
+    let receiving = async {
+        while !lanes
+            .iter()
+            .zip(expected)
+            .all(|((_, binding, _), expected)| {
+                expected.is_some_and(|expected| {
+                    receiver
+                        .encoded_stats(*binding)
+                        .is_some_and(|stats| stats.received == expected)
+                })
+            })
+        {
+            receiver
+                .turn()
+                .await
+                .map_err(|error| anyhow::anyhow!("drive timed receiver: {error:?}"))?;
+        }
+        anyhow::Ok(())
+    };
+    pulsebeam_runtime::select! {
+        result = sending => result,
+        result = pulsebeam_runtime::time::timeout(Duration::from_secs(1), receiving) => result.context("timed packet not received")?,
+    }
 }
 
 async fn mixed_opus_exchange(

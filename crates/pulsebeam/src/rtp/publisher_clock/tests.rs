@@ -53,8 +53,9 @@ fn deferred_report_stays_inside_the_admitted_lifetime_and_unfolds_across_era() {
     let mut replacement = clock(start, 2, 2);
     assert_eq!(replacement.report(early, start), Err(Error::Stale));
     assert_eq!(replacement.encodings[0].pending_report, None);
-    let projected = unrelated.media(0, 180_000, start, start).unwrap();
+    let (projected, sender_time) = unrelated.media(0, 180_000, start, start).unwrap();
     assert_eq!(projected.provenance, Provenance::ArrivalEstimate);
+    assert_eq!(sender_time, None);
 }
 
 #[test]
@@ -62,10 +63,12 @@ fn unqualified_arrival_cadence_crosses_rtp_wrap_without_source_evidence() {
     let at = Instant::now();
     let mut clock = clock(at, 2, 1);
     clock.host_reference(at, 0, false).unwrap();
-    let first = clock.media(0, u32::MAX - 44_999, at, at).unwrap();
+    let (first, sender_time) = clock.media(0, u32::MAX - 44_999, at, at).unwrap();
+    assert_eq!(sender_time, None);
     let now = at + Duration::from_secs(1);
     clock.host_reference(now, 1, false).unwrap();
-    let next = clock.media(0, 45_000, now, now).unwrap();
+    let (next, sender_time) = clock.media(0, 45_000, now, now).unwrap();
+    assert_eq!(sender_time, None);
     assert_eq!(next.provenance, Provenance::ArrivalEstimate);
     assert_eq!(next.rtp.0.wrapping_sub(first.rtp.0), 90_000);
     assert_eq!(
@@ -113,8 +116,9 @@ fn verified_members_share_a_domain_but_keep_independent_rtp_coordinates() {
     .unwrap();
     let early = report(at, u32::MAX - 1, 90_000);
     shared.report(early, at).unwrap();
-    let audio = shared.media(1, 1_000, at, at).unwrap();
-    let video = shared.media(0, 90_000, at, at).unwrap();
+    let (audio, audio_sender_time) = shared.media(1, 1_000, at, at).unwrap();
+    let (video, _) = shared.media(0, 90_000, at, at).unwrap();
+    assert_eq!(audio_sender_time, None);
     assert_eq!(audio.binding, binding);
     assert_eq!(video.binding, binding);
     assert_ne!(audio.rtp, video.rtp);

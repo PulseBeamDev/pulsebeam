@@ -5,7 +5,7 @@ use pulsebeam_agent_quic::{
     data_bindings::{
         BindingId, Bindings, DataBinding, FabricBinding, FabricOffer, InstallError, PayloadBinding,
     },
-    records::{Datagram, DatagramKind, PictureLossIndication},
+    records::{Datagram, DatagramKind, PictureLossIndication, RtcpSenderReport},
     transport::{DatagramAdmission, NativeDatagram, framing::Receiver, listener::Association},
 };
 use pulsebeam_core::fabric::{ExtensionKind, MAJOR, Profile};
@@ -489,8 +489,22 @@ impl Installed {
                         .current_quic_grant(self.connection, self.transport, association)
                         .is_some()
                 {
-                    let receiver = core.quic_owner_handle(self.transport)?;
-                    self.ingest_receiver_pli(receiver, packet, core);
+                    let owner = core.quic_owner_handle(self.transport)?;
+                    if let Ok(report) = RtcpSenderReport::decode(packet.payload) {
+                        let (binding, &(source, reference)) =
+                            self.publishers.bindings.resolve(packet.binding)?;
+                        let installed = self.publishers.owned.get(&reference)?;
+                        let (parameters, _) = installed.rtp.as_ref()?;
+                        if installed.execution.enabled
+                            && !installed.retiring
+                            && installed.binding == binding
+                            && parameters.primary_ssrc == report.ssrc.get()
+                        {
+                            core.ingest_quic_sender_report(source, owner, report, now);
+                        }
+                    } else {
+                        self.ingest_receiver_pli(owner, packet, core);
+                    }
                 }
                 None
             }

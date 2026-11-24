@@ -37,7 +37,7 @@ DATA, Opus and H.264 all carry a canonical Fabric packet. Admission exchanges th
 
 | Kind | Fields after the one-byte kind and two-byte big-endian binding ID |
 | --- | --- |
-| 3 (feedback) | RTCP PLI for the media binding in the opposite direction |
+| 3 (RTCP) | One RTCP PLI or Sender Report for a media binding |
 | 4 (Whole) | One Fabric packet of at most 1,147 bytes |
 | 5 (Slice) | Nonzero transfer ID (`u32be`), total packet size (`u16be`), slice offset (`u16be`), and up to 1,139 bytes |
 
@@ -47,7 +47,7 @@ Add explicit QUIC alternatives to `TrackBinding.transport`: field `4`, `QuicData
 
 Native QUIC disables path MTU discovery and caps UDP payloads at 1,200 bytes in both directions (1,248 bytes with base IPv6 and UDP headers). Reserve 50 bytes for the short header (1 byte of flags, up to 20 bytes of CID and 4 bytes of packet number), the 16-byte AEAD tag and Noq's 9-byte DATAGRAM frame allowance. The remaining 1,150 bytes include the application envelope. Noq must support that cap at admission and send; a smaller limit is incompatible, while a larger limit does not raise the cap. Rebinding and CID rotation do not change the budget. A path that cannot carry the floor without IP fragmentation is unsupported. Do not truncate packets or change logical DATA fragmentation to fit the path. The Rust client uses the same caller-driven `executor::host::Agent` on Linux, macOS and Windows. Bind a concrete local address in the peer's IP family. The macOS and Windows scalar backend does not request ECN, UDP offloads, or a kernel no-fragment mode. Use a path that carries 1,200-byte UDP datagrams without fragmentation; the client never probes for or sends larger ones. Runtime conformance is Linux-only. Reliable, Unreliable and Latest all carry canonical records. Reliable application receipts and repair stay on native control; Noq ACKs are not replacements. Use existing addressed Reliable frontiers, bounded Unreliable gaps, complete Latest units and independent subscribers.
 
-Native H.264 and Opus carry media payload, timestamp, sequence and marker in Fabric, not RTP. The H.264 packetizer targets Whole frames; larger valid packets can use Slice frames. Media timing and keyframe demand stay scoped to the installed binding; feedback uses RTCP PLI separately from packet delivery. WebRTC adapters retain their RTP/SRTP contracts. QUIC owns congestion and recovery; application staging favors control, sparse data and freshness without retaining stale encoded input across lifetimes.
+Native H.264 and Opus carry media payload, timestamp, sequence and marker in Fabric, not RTP. The H.264 packetizer targets Whole frames; larger valid packets can use Slice frames. RTCP uses a separate best-effort datagram. PLI travels from receiver to publisher. A publisher can supply a 28-byte Sender Report with no reception-report blocks and a nonzero NTP value. The edge validates the report against the active publication binding and SSRC. Where the edge has qualified sender timing, it emits a report in the active subscriber's SSRC and RTP timestamp space. Missing reports mean sender time is unknown; RTP cadence alone does not establish synchronized capture time. WebRTC adapters retain their RTP/SRTP contracts. QUIC owns congestion and recovery; application staging favors control, sparse data and freshness without retaining stale encoded input across lifetimes.
 
 ## Initial bounds
 

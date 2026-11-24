@@ -56,6 +56,7 @@ pub(crate) struct PublisherClock {
 pub(crate) struct AssignedSample {
     pub timestamp: u32,
     pub projection: Option<(Instant, Projection)>,
+    pub sender_ntp: Option<u64>,
 }
 
 struct EncodingClock {
@@ -209,6 +210,7 @@ impl PublisherClock {
         let fallback = AssignedSample {
             timestamp: 0,
             projection: None,
+            sender_ntp: None,
         };
         let Some(track) = self.encodings.get_mut(slot) else {
             return fallback;
@@ -224,7 +226,12 @@ impl PublisherClock {
         if let Some(sample) = track.assigned.get(&raw) {
             return *sample;
         }
-        let projection = self.media(slot, raw, arrival, now).ok();
+        let (projection, sender_ntp) = match self.media(slot, raw, arrival, now) {
+            Ok((projection, sender_time)) => {
+                (Some(projection), sender_time.and_then(sender_report_ntp))
+            }
+            Err(_) => (None, None),
+        };
         let Some(track) = self.encodings.get_mut(slot) else {
             return fallback;
         };
@@ -275,6 +282,7 @@ impl PublisherClock {
         let sample = AssignedSample {
             timestamp,
             projection: projection.map(|projection| (now, projection)),
+            sender_ntp,
         };
         track.assigned_order.push_back((now, raw));
         track.assigned.insert(raw, sample);
@@ -293,7 +301,7 @@ impl PublisherClock {
         residue: u32,
         received_at: Instant,
         now: Instant,
-    ) -> Result<Projection, Error> {
+    ) -> Result<(Projection, Option<SourceTime>), Error> {
         let at = self.at(received_at)?;
         let measured = self.at(now)?;
         if measured.elapsed_since(at)? > EVIDENCE_AGE_NS {
@@ -312,13 +320,14 @@ impl PublisherClock {
             self.domain.bootstrap_track(sample, at, measured)?;
         }
         let projection = self.domain.project_rtp(sample, measured)?;
+        let sender_time = self.domain.sender_report_time(sample, measured).ok();
         if track.frontier.is_none_or(|prior| tick > prior.tick) {
             track.frontier = Some(TimedTick { tick, at });
         }
         if let Some(report) = track.pending_report.take() {
             let _ = self.report(report, now);
         }
-        Ok(projection)
+        Ok((projection, sender_time))
     }
 
     pub(crate) fn report(
@@ -417,6 +426,20 @@ impl PublisherClock {
             i64::try_from(ns).map_err(|_| Error::Overflow)?,
         ))
     }
+}
+
+fn sender_report_ntp(time: SourceTime) -> Option<u64> {
+    let ntp = i128::from(time.as_nanos())
+        .checked_add(NTP_TO_UNIX_SECONDS.saturating_mul(NS_PER_SECOND))?;
+    let seconds = u32::try_from(ntp.div_euclid(NS_PER_SECOND).rem_euclid(NTP_ERA_SECONDS)).ok()?;
+    let fraction = u32::try_from(
+        ntp.rem_euclid(NS_PER_SECOND)
+            .saturating_mul(NTP_ERA_SECONDS)
+            .div_euclid(NS_PER_SECOND),
+    )
+    .ok()?;
+    let ntp = (u64::from(seconds) << 32) | u64::from(fraction);
+    (ntp != 0).then_some(ntp)
 }
 
 fn nearest_residue(residue: i128, pivot: i128, modulus: i128) -> Result<i128, Error> {

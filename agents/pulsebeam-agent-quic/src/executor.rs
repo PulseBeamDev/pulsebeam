@@ -24,7 +24,10 @@ use pulsebeam_udp::ReceivedDatagram;
 use crate::{
     data_bindings::FabricOffer,
     frame::{Kind, Phase},
-    records::{Admit, Datagram, DatagramKind, Denial, PictureLossIndication, Renew, RenewResult},
+    records::{
+        Admit, Datagram, DatagramKind, Denial, PictureLossIndication, Renew, RenewResult,
+        RtcpSenderReport,
+    },
     transport::{
         DatagramAdmission, NativeDatagram,
         client::{
@@ -40,10 +43,17 @@ use crate::{
 pub mod host;
 pub mod recorder;
 pub mod rtp;
+pub mod timed;
 pub mod udp;
 
 pub(crate) enum Event {
     Core(QuicEvent),
+    SenderReport {
+        generation: Generation,
+        binding: NonZeroU16,
+        report: crate::media::units::SenderReport,
+        received_at: Instant,
+    },
     Rtp {
         generation: Generation,
         binding: NonZeroU16,
@@ -456,15 +466,32 @@ impl Association {
                                 NativeDatagram::Endpoint(datagram)
                                     if datagram.kind == DatagramKind::Rtcp =>
                                 {
-                                    PictureLossIndication::decode(datagram.payload).ok().map(
-                                        |pli| {
-                                            Event::Core(QuicEvent::PictureLoss {
-                                                generation,
-                                                binding: datagram.binding,
-                                                media_ssrc: pli.media_ssrc,
-                                            })
-                                        },
-                                    )
+                                    if let Ok(report) = RtcpSenderReport::decode(datagram.payload) {
+                                        let (ReceiveBinding::Media { ssrc, .. }, true) =
+                                            authorize(datagram.binding)?
+                                        else {
+                                            return None;
+                                        };
+                                        (ssrc == report.ssrc.get()).then_some(Event::SenderReport {
+                                            generation,
+                                            binding: datagram.binding,
+                                            report: crate::media::units::SenderReport {
+                                                rtp_timestamp: report.rtp_timestamp,
+                                                ntp: report.ntp,
+                                            },
+                                            received_at: now,
+                                        })
+                                    } else {
+                                        PictureLossIndication::decode(datagram.payload).ok().map(
+                                            |pli| {
+                                                Event::Core(QuicEvent::PictureLoss {
+                                                    generation,
+                                                    binding: datagram.binding,
+                                                    media_ssrc: pli.media_ssrc,
+                                                })
+                                            },
+                                        )
+                                    }
                                 }
                                 NativeDatagram::Endpoint(_) => None,
                             })?;

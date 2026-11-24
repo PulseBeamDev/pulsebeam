@@ -26,7 +26,8 @@ use tokio::time::{self, Instant};
 
 use crate::{
     data_bindings::FabricOffer,
-    records::{Datagram, DatagramKind, PictureLossIndication},
+    media::units::{Codec, SenderReport},
+    records::{Datagram, DatagramKind, PictureLossIndication, RtcpSenderReport},
     transport::{
         self, DatagramAdmission,
         framing::{SendError, SendProgress, Sender, WHOLE_CAPACITY},
@@ -36,6 +37,7 @@ use crate::{
 use super::{
     Event, ReceiveBinding,
     rtp::{Binding, Publication, Receive, ReceivedPacket, SendPacket, SendPacketError},
+    timed,
     udp::{OpenError, UdpAssociation},
 };
 
@@ -200,6 +202,8 @@ pub struct Agent {
     received_h264: VecDeque<(Generation, NonZeroU16, ReceivedH264)>,
     received_opus: VecDeque<(Generation, NonZeroU16, ReceivedOpus)>,
     raw_rtp: Option<RawRtp>,
+    timed: BTreeMap<Binding, timed::Track>,
+    sender_reports: BTreeMap<Binding, (std::time::Instant, SenderReport)>,
     timers: BTreeMap<TimerId, Instant>,
     #[cfg(feature = "sim")]
     sim: Option<SimServices>,
@@ -236,6 +240,8 @@ impl Agent {
             received_h264: VecDeque::new(),
             received_opus: VecDeque::new(),
             raw_rtp: None,
+            timed: BTreeMap::new(),
+            sender_reports: BTreeMap::new(),
             timers: BTreeMap::new(),
             #[cfg(feature = "sim")]
             sim: None,
@@ -272,6 +278,88 @@ impl Agent {
             }
         }
         None
+    }
+
+    /// Latest sender-report anchor for a still-installed raw RTP binding.
+    /// The NTP coordinate is scoped to that sender, not arrival time.
+    pub fn rtp_sender_report(&self, binding: Binding) -> Option<SenderReport> {
+        if !live_rtp_receiver(&self.core, binding) {
+            return None;
+        }
+        self.report_at(binding, Instant::now().into_std())
+    }
+
+    fn report_at(&self, binding: Binding, now: std::time::Instant) -> Option<SenderReport> {
+        let (at, report) = self.sender_reports.get(&binding)?;
+        (now.checked_duration_since(*at)? <= Duration::from_secs(3)).then_some(*report)
+    }
+
+    /// Get the current installed receiver identity for a pinned publication.
+    pub fn rtp_subscription(&self, kind: MediaKind, publication_id: &str) -> Option<Binding> {
+        let live = self
+            .core
+            .quic_rtp_receivers(kind)
+            .find(|live| live.publication_id == publication_id)?;
+        Some(Binding {
+            generation: live.generation,
+            id: live.binding,
+        })
+    }
+
+    /// Route future packets for this exact binding through a timed policy.
+    /// Other bindings keep their selected raw or compatibility path. Up to
+    /// 16 tracks are active, each with 128 reorder packets (256 KiB), one
+    /// 512 KiB assembly, and 32 queued events (1 MiB of encoded payload).
+    pub fn attach_encoded(
+        &mut self,
+        binding: Binding,
+        policy: timed::Policy,
+    ) -> Result<(), timed::AttachError> {
+        let codec = receiver_codec(&self.core, binding).ok_or(timed::AttachError::NotLive)?;
+        self.timed
+            .retain(|&binding, _| live_rtp_receiver(&self.core, binding));
+        if self.timed.contains_key(&binding) {
+            return Err(timed::AttachError::AlreadyAttached);
+        }
+        if self.timed.len() >= timed::TRACKS {
+            return Err(timed::AttachError::Capacity);
+        }
+        self.timed
+            .insert(binding, timed::Track::new(binding, codec, policy)?);
+        if let Some(raw) = &mut self.raw_rtp {
+            raw.packets.retain(|packet| packet.binding != binding);
+        }
+        self.video_assemblies
+            .remove(&(binding.generation, binding.id));
+        self.received_h264
+            .retain(|&(generation, id, _)| (generation, id) != (binding.generation, binding.id));
+        self.received_opus
+            .retain(|&(generation, id, _)| (generation, id) != (binding.generation, binding.id));
+        Ok(())
+    }
+
+    /// Retire this local reader. Queued events are dropped; future packets
+    /// return to the raw or compatibility receive path.
+    pub fn detach_encoded(&mut self, binding: Binding) -> bool {
+        self.timed.remove(&binding).is_some()
+    }
+
+    /// Pull from one reader without advancing or consuming any other track.
+    /// A retired binding cannot expose queued events.
+    pub fn next_encoded(&mut self, binding: Binding) -> Option<timed::Receive> {
+        if !live_rtp_receiver(&self.core, binding) {
+            self.timed.remove(&binding);
+            return None;
+        }
+        self.timed
+            .get_mut(&binding)?
+            .next(Instant::now().into_std())
+    }
+
+    pub fn encoded_stats(&self, binding: Binding) -> Option<timed::Stats> {
+        live_rtp_receiver(&self.core, binding)
+            .then(|| self.timed.get(&binding).map(timed::Track::stats))
+            .flatten()
     }
 
     fn placement_client() -> reqwest::ClientBuilder {
@@ -421,6 +509,37 @@ impl Agent {
             packet,
             Some(publication),
         )
+    }
+
+    /// Submit an optional sender clock anchor for a live raw RTP publication.
+    /// Retry transport backpressure only while this exact publication is current.
+    pub fn send_rtp_sender_report(
+        &mut self,
+        publication: &Publication,
+        report: RtcpSenderReport,
+    ) -> Result<(), SendPacketError> {
+        if self
+            .rtp_publication(publication.kind, &publication.track_id)
+            .as_ref()
+            != Some(publication)
+            || report.ssrc.get() != publication.ssrc
+            || report.ntp == 0
+        {
+            return Err(SendPacketError::NotReady);
+        }
+        let socket = self
+            .sockets
+            .iter_mut()
+            .flatten()
+            .find(|socket| socket.generation() == publication.binding.generation)
+            .ok_or(SendPacketError::NotReady)?;
+        socket
+            .offer_media(Datagram {
+                kind: DatagramKind::Rtcp,
+                binding: publication.binding.id,
+                payload: &report.encode(),
+            })
+            .map_err(SendPacketError::Datagram)
     }
 
     fn send_rtp_inner(
@@ -717,11 +836,25 @@ impl Agent {
         &mut self,
         publication_id: &str,
     ) -> Result<(), transport::DatagramAdmission> {
-        use transport::DatagramAdmission::Unsupported;
         let live = self
             .core
             .quic_rtp_receivers(MediaKind::Video)
             .find(|live| live.publication_id == publication_id)
+            .ok_or(DatagramAdmission::Unsupported)?;
+        self.request_rtp_keyframe(Binding {
+            generation: live.generation,
+            id: live.binding,
+        })
+    }
+
+    /// Send a PLI for the exact binding returned by a video recovery stage.
+    /// A request retained during backpressure cannot target a replacement.
+    pub fn request_rtp_keyframe(&mut self, binding: Binding) -> Result<(), DatagramAdmission> {
+        use transport::DatagramAdmission::Unsupported;
+        let live = self
+            .core
+            .quic_rtp_receivers(MediaKind::Video)
+            .find(|live| live.generation == binding.generation && live.binding == binding.id)
             .ok_or(Unsupported)?;
         let media_ssrc = NonZeroU32::new(live.ssrc).ok_or(Unsupported)?;
         let socket = self
@@ -933,6 +1066,8 @@ impl Agent {
     /// Execute bounded ready effects, then wait for one input. It is safe to
     /// cancel this wait, invoke a command, and drive the same Agent again.
     pub async fn turn(&mut self) -> Result<(), Error> {
+        self.timed
+            .retain(|&binding, _| live_rtp_receiver(&self.core, binding));
         for _ in 0..EFFECTS_PER_TURN {
             let Some(effect) = self.core.next_effect() else {
                 return self.wait().await;
@@ -945,6 +1080,34 @@ impl Agent {
     fn accept_socket(&mut self, event: Event) -> Result<(), Error> {
         let (generation, binding, arrived_at, ssrc, payload_type, packet) = match event {
             Event::Core(event) => return self.accept(HostEvent::Quic(event)),
+            Event::SenderReport {
+                generation,
+                binding,
+                report,
+                received_at,
+            } => {
+                let binding = Binding {
+                    generation,
+                    id: binding,
+                };
+                if (self.raw_rtp.is_some() || self.timed.contains_key(&binding))
+                    && live_rtp_receiver(&self.core, binding)
+                {
+                    self.sender_reports
+                        .retain(|&id, _| live_rtp_receiver(&self.core, id));
+                    if self.sender_reports.len() < 64 || self.sender_reports.contains_key(&binding)
+                    {
+                        let current = self
+                            .sender_reports
+                            .entry(binding)
+                            .or_insert((received_at, report));
+                        if report.is_after(current.1) {
+                            *current = (received_at, report);
+                        }
+                    }
+                }
+                return Ok(());
+            }
             Event::Rtp {
                 generation,
                 binding,
@@ -960,7 +1123,11 @@ impl Agent {
             Profile::H264 => MediaKind::Video,
             _ => return Ok(()),
         };
-        if let Some(raw) = &mut self.raw_rtp {
+        let id = Binding {
+            generation,
+            id: binding,
+        };
+        if self.timed.contains_key(&id) || self.raw_rtp.is_some() {
             let Some(live) = self
                 .core
                 .quic_rtp_receivers(kind)
@@ -968,21 +1135,25 @@ impl Agent {
             else {
                 return Ok(());
             };
-            if raw.packets.len() >= MAX_QUEUED_RTP {
-                raw.dropped = raw.dropped.saturating_add(1);
-            } else {
-                raw.packets.push_back(ReceivedPacket {
-                    binding: Binding {
-                        generation,
-                        id: binding,
-                    },
-                    publication_id: live.publication_id.to_owned(),
-                    kind,
-                    arrived_at,
-                    ssrc,
-                    payload_type,
-                    packet,
-                });
+            let input = ReceivedPacket {
+                binding: id,
+                publication_id: live.publication_id.to_owned(),
+                kind,
+                arrived_at,
+                ssrc,
+                payload_type,
+                packet,
+            };
+            let now = Instant::now().into_std();
+            let report = self.report_at(id, now);
+            if let Some(track) = self.timed.get_mut(&id) {
+                track.push(now, input, report);
+            } else if let Some(raw) = &mut self.raw_rtp {
+                if raw.packets.len() >= MAX_QUEUED_RTP {
+                    raw.dropped = raw.dropped.saturating_add(1);
+                } else {
+                    raw.packets.push_back(input);
+                }
             }
         } else {
             // The compatibility frame adapters consume minimal RTP. Only the
@@ -1202,6 +1373,21 @@ impl Agent {
         Ok(())
     }
 
+    fn advance_timed(&mut self) {
+        let now = Instant::now().into_std();
+        let mut tracks = std::mem::take(&mut self.timed);
+        tracks.retain(|&binding, _| live_rtp_receiver(&self.core, binding));
+        for (&binding, track) in &mut tracks {
+            if track.deadline().is_some_and(|deadline| deadline <= now) {
+                track.advance(now, self.report_at(binding, now));
+                if track.refresh_due(now) {
+                    track.refresh_result(now, self.request_rtp_keyframe(binding));
+                }
+            }
+        }
+        self.timed = tracks;
+    }
+
     async fn wait(&mut self) -> Result<(), Error> {
         let retry_payload_turn = self
             .offer_pending_media()
@@ -1219,11 +1405,20 @@ impl Agent {
                 pending().await
             }
         };
+        let next_media = self.timed.values().filter_map(timed::Track::deadline).min();
+        let media = async {
+            if let Some(deadline) = next_media {
+                time::sleep_until(Instant::from_std(deadline)).await;
+            } else {
+                pending::<()>().await;
+            }
+        };
         let [first, second] = &mut self.sockets;
         let input = tokio::select! {
             http = work(&mut self.request) => Input::Http(http),
             dial = work(&mut self.dialing) => Input::Dial(dial),
             timer = timer => Input::Timer(timer),
+            () = media => Input::TimedMedia,
             event = socket_turn(first, &self.core, retry_payload_turn) => Input::Socket(event),
             event = socket_turn(second, &self.core, retry_payload_turn) => Input::Socket(event),
         };
@@ -1250,6 +1445,7 @@ impl Agent {
                 self.timers.remove(&timer);
                 self.accept(HostEvent::Timer(TimerEvent::Fired { timer }))?;
             }
+            Input::TimedMedia => self.advance_timed(),
             Input::Socket(Some(event)) => self.accept_socket(event)?,
             Input::Socket(None) => {}
         }
@@ -1269,7 +1465,25 @@ enum Input {
     Http(HttpEvent),
     Dial(DialResult),
     Timer(TimerId),
+    TimedMedia,
     Socket(Option<Event>),
+}
+
+fn live_rtp_receiver(core: &CoreAgent, binding: Binding) -> bool {
+    receiver_codec(core, binding).is_some()
+}
+
+fn receiver_codec(core: &CoreAgent, binding: Binding) -> Option<Codec> {
+    [
+        (MediaKind::Audio, Codec::Opus),
+        (MediaKind::Video, Codec::H264),
+    ]
+    .into_iter()
+    .find_map(|(kind, codec)| {
+        core.quic_rtp_receivers(kind)
+            .any(|live| live.generation == binding.generation && live.binding == binding.id)
+            .then_some(codec)
+    })
 }
 
 async fn work<Id, T>(work: &mut Option<(Id, Work<T>)>) -> T {

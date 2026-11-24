@@ -88,6 +88,7 @@ pub struct OutputEvidence {
     pub(crate) output_position: u64,
     pub(crate) ingress: Option<NonZeroU64>,
     pub(crate) capture: Option<pulsebeam_clock::deadline::Timing>,
+    pub(crate) sender_ntp: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -321,6 +322,7 @@ fn dd_structure(
 struct Frozen {
     packet: OwnedPacket,
     capture: Option<pulsebeam_clock::deadline::Timing>,
+    sender_ntp: Option<u64>,
     live_arrival: Option<Instant>,
     ready_at: Option<std::time::Instant>,
     live_ingress: Option<NonZeroU64>,
@@ -383,6 +385,7 @@ impl LiveWork {
 }
 
 pub(crate) struct Transit<'a> {
+    pub(crate) sender_ntp: Option<u64>,
     pub work: LiveWork,
     pub packet: PacketView<'a>,
     pub ready_at: Option<std::time::Instant>,
@@ -1074,6 +1077,7 @@ impl SourceFanout {
                 Frozen {
                     packet,
                     capture: None,
+                    sender_ntp: None,
                     live_arrival: None,
                     ready_at: None,
                     live_ingress: None,
@@ -1395,14 +1399,18 @@ impl SourceFanout {
         now: Instant,
         offer: ShardOffer,
     ) -> Result<Offers, Rejection> {
-        self.offer_from(
+        let outcome = self.offer_from(
             now,
             offer.arrival,
             offer.sequence,
             Some(offer.packet),
             None,
             offer.ready_at,
-        )
+        )?;
+        if let Some(ntp) = offer.sender_ntp {
+            self.attach_sender_ntp(offer.sequence, offer.arrival, ntp);
+        }
+        Ok(outcome)
     }
 
     pub(crate) fn bind_media_identity(&mut self, identity: MediaIdentity) -> bool {
@@ -1506,6 +1514,7 @@ impl SourceFanout {
             Frozen {
                 packet,
                 capture: None,
+                sender_ntp: None,
                 live_arrival: None,
                 ready_at: None,
                 live_ingress: None,
@@ -1651,6 +1660,7 @@ impl SourceFanout {
                     Frozen {
                         packet: packet.ok_or(Rejection::Stale)?,
                         capture: None,
+                        sender_ntp: None,
                         live_arrival: Some(arrival),
                         ready_at,
                         live_ingress: ingress,
@@ -1763,6 +1773,16 @@ impl SourceFanout {
             .map(|offers| (sequence, offers))
     }
 
+    pub(crate) fn attach_sender_ntp(&mut self, sequence: u64, arrival: Instant, ntp: u64) {
+        if let Some(frozen) = self.fates.get_mut(&sequence)
+            && frozen.live_arrival == Some(arrival)
+            && frozen.live_ingress.is_none()
+            && frozen.sender_ntp.is_none()
+        {
+            frozen.sender_ntp = Some(ntp);
+        }
+    }
+
     pub(crate) fn attach_network_capture(
         &mut self,
         sequence: u64,
@@ -1818,6 +1838,7 @@ impl SourceFanout {
     pub(crate) fn transit(&self, sequence: u64, hops: u8) -> Option<Transit<'_>> {
         let frozen = self.fates.get(&sequence)?;
         Some(Transit {
+            sender_ntp: frozen.sender_ntp,
             work: LiveWork::new(self.high?, sequence, frozen.live_arrival?, hops)?,
             packet: frozen.packet.arrival_view(hops)?,
             ready_at: frozen.ready_at,
@@ -1904,6 +1925,7 @@ impl SourceFanout {
             output_position: queued.output_position,
             ingress: queued.ingress,
             capture,
+            sender_ntp: frozen.sender_ntp,
         };
         let result = write(queued.sequence, packet, projected)?;
         if capture.is_some()

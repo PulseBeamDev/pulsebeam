@@ -230,6 +230,7 @@ pub(crate) struct ShardOffer {
     pub arrival: Instant,
     pub ready_at: Option<std::time::Instant>,
     pub sequence: u64,
+    pub sender_ntp: Option<u64>,
     pub packet: local::OwnedPacket,
 }
 

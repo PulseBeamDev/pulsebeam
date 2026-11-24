@@ -401,6 +401,48 @@ impl PictureLossIndication {
     }
 }
 
+/// RTCP Sender Report without reception report blocks (RFC 3550).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RtcpSenderReport {
+    pub ssrc: NonZeroU32,
+    pub ntp: u64,
+    pub rtp_timestamp: u32,
+    pub packets: u32,
+    pub octets: u32,
+}
+
+impl RtcpSenderReport {
+    pub fn decode(mut bytes: &[u8]) -> Result<Self, Error> {
+        if bytes.len() != 28 || take::<4>(&mut bytes)? != [0x80, 200, 0, 6] {
+            return Err(Error::Body);
+        }
+        let ssrc = NonZeroU32::new(u32::from_be_bytes(take(&mut bytes)?)).ok_or(Error::Body)?;
+        let ntp = u64::from_be_bytes(take(&mut bytes)?);
+        if ntp == 0 {
+            return Err(Error::Body);
+        }
+        Ok(Self {
+            ssrc,
+            ntp,
+            rtp_timestamp: u32::from_be_bytes(take(&mut bytes)?),
+            packets: u32::from_be_bytes(take(&mut bytes)?),
+            octets: u32::from_be_bytes(take(&mut bytes)?),
+        })
+    }
+
+    pub fn encode(self) -> [u8; 28] {
+        let [s0, s1, s2, s3] = self.ssrc.get().to_be_bytes();
+        let [n0, n1, n2, n3, n4, n5, n6, n7] = self.ntp.to_be_bytes();
+        let [t0, t1, t2, t3] = self.rtp_timestamp.to_be_bytes();
+        let [p0, p1, p2, p3] = self.packets.to_be_bytes();
+        let [b0, b1, b2, b3] = self.octets.to_be_bytes();
+        [
+            0x80, 200, 0, 6, s0, s1, s2, s3, n0, n1, n2, n3, n4, n5, n6, n7, t0, t1, t2, t3, p0,
+            p1, p2, p3, b0, b1, b2, b3,
+        ]
+    }
+}
+
 fn take<const N: usize>(bytes: &mut &[u8]) -> Result<[u8; N], Error> {
     let (value, rest) = bytes.split_first_chunk().ok_or(Error::Body)?;
     *bytes = rest;

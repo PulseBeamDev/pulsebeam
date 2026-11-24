@@ -9,6 +9,7 @@ use pulsebeam_core::{
 
 pub mod descriptor;
 pub mod jitter;
+pub mod units;
 
 /// Source packet coordinates. The installed publication supplies the SSRC,
 /// payload type and codec profile.

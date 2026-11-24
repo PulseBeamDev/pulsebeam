@@ -271,6 +271,33 @@ impl ShardCore {
             .set_quic_media_binding(source, association, enabled)
     }
 
+    pub(super) fn ingest_quic_sender_report(
+        &mut self,
+        source: FabricSourceHandle,
+        publisher: ParticipantHandle,
+        report: pulsebeam_agent_quic::records::RtcpSenderReport,
+        now: Instant,
+    ) {
+        if self
+            .execution
+            .fabric_publisher_authorized(publisher, source)
+        {
+            let [a, b, c, d, e, f, g, h] = report.ntp.to_be_bytes();
+            self.execution.runtime.observe_fabric_sender_report(
+                source,
+                publisher,
+                now,
+                pulsebeam_rtc::SenderReport {
+                    arrival: now.into_std(),
+                    ssrc: report.ssrc.get(),
+                    ntp_seconds: u32::from_be_bytes([a, b, c, d]),
+                    ntp_fraction: u32::from_be_bytes([e, f, g, h]),
+                    rtp_timestamp: report.rtp_timestamp,
+                },
+            );
+        }
+    }
+
     pub(super) fn ingest_quic_media_packet(
         &mut self,
         source: FabricSourceHandle,
@@ -494,13 +521,11 @@ impl ShardCore {
             .request_fabric_refresh(receiver, branch);
     }
 
-    pub(super) fn admit_quic_rtp(
+    pub(super) fn quic_rtp_branch_live(
         &mut self,
         branch: FabricLocalBranch,
         receiver: ParticipantHandle,
-        now: Instant,
-        write: impl FnOnce(crate::route::fabric::local::PacketView<'_>, u64) -> Result<(), ()>,
-    ) -> Result<Option<()>, ()> {
+    ) -> bool {
         use crate::shard::router::FabricOwner;
         let execution = &mut self.execution;
         let publication = match execution.runtime.fabric_handoff_owner(branch, receiver) {
@@ -514,17 +539,30 @@ impl ShardCore {
             Some(FabricOwner::Shard(binding)) => Some(binding.publication),
             _ => None,
         };
-        let member = publication
+        publication
             .and_then(|id| execution.runtime.track_handle(id))
             .and_then(|track| execution.plans.get(track))
-            .is_some_and(|plan| plan.local.contains(&receiver));
-        if !member {
+            .is_some_and(|plan| plan.local.contains(&receiver))
+    }
+
+    pub(super) fn admit_quic_rtp(
+        &mut self,
+        branch: FabricLocalBranch,
+        receiver: ParticipantHandle,
+        now: Instant,
+        write: impl FnOnce(
+            crate::route::fabric::local::PacketView<'_>,
+            u64,
+            Option<u64>,
+        ) -> Result<(), ()>,
+    ) -> Result<Option<()>, ()> {
+        if !self.quic_rtp_branch_live(branch, receiver) {
             return Ok(None);
         }
-        execution
+        self.execution
             .runtime
             .admit_fabric(branch, receiver, now, |_, packet, evidence| {
-                write(packet, evidence.output_position)
+                write(packet, evidence.output_position, evidence.sender_ntp)
             })
     }
 

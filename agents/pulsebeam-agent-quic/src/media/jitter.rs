@@ -93,6 +93,8 @@ pub enum Push<S, P> {
 pub enum GapReason {
     Deadline,
     ReorderLimit,
+    /// A caller chose not to deliver already ordered work past its age limit.
+    Expired,
 }
 
 #[derive(Debug)]

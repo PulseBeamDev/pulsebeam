@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, VecDeque};
-use std::num::{NonZeroU16, NonZeroU64};
+use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
+use std::time::Duration;
 
 use pulsebeam_agent_quic::{
     data_bindings::{BindingId, Bindings, DataBinding, FabricOffer, InstallError, PayloadBinding},
-    records::{Datagram, PictureLossIndication},
+    records::{Datagram, DatagramKind, PictureLossIndication, RtcpSenderReport},
     transport::{
         DatagramAdmission,
         framing::{SendProgress, Sender},
@@ -64,11 +65,19 @@ enum SubscriberPayload {
 
 struct RtpOutput {
     profile: Profile,
-    ssrc: u32,
-    wire: FramedOutput<(timeline::Projected, timeline::Timeline<FabricLocalBranch>)>,
+    ssrc: NonZeroU32,
+    wire: FramedOutput<(
+        timeline::Projected,
+        timeline::Timeline<FabricLocalBranch>,
+        Option<u64>,
+    )>,
     timeline: timeline::Timeline<FabricLocalBranch>,
     admitted: Option<u64>,
     last_branch: Option<FabricLocalBranch>,
+    packets: u32,
+    octets: u32,
+    pending_report: Option<(Instant, RtcpSenderReport)>,
+    last_report: Option<Instant>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -175,6 +184,7 @@ impl RtpOutput {
         now: Instant,
         packet: PacketView<'_>,
         position: u64,
+        sender_ntp: Option<u64>,
         peer: &mut Association,
     ) -> Result<(), OutputError> {
         let key = OutputKey {
@@ -182,7 +192,8 @@ impl RtpOutput {
             position,
             repair: None,
         };
-        let (projected, next) = self.wire.offer(key, now, peer, || {
+        let payload_bytes = u32::try_from(packet.payload().len()).unwrap_or(0);
+        let (projected, next, sender_ntp) = self.wire.offer(key, now, peer, || {
             let header = packet.header();
             if header.profile != self.profile {
                 return None;
@@ -207,16 +218,63 @@ impl RtpOutput {
             let wire_sequence = u32::from_be_bytes([a, b, c, d]);
             Some((
                 packet.with_receiver_media_position(wire_sequence, projected.timestamp),
-                (projected, next),
+                (projected, next, sender_ntp),
             ))
         })?;
         self.timeline = next;
+        if self.last_branch != Some(branch) {
+            self.pending_report = None;
+            self.last_report = None;
+        }
         self.last_branch = Some(branch);
+        self.packets = self.packets.wrapping_add(1);
+        self.octets = self.octets.wrapping_add(payload_bytes);
+        if let Some(ntp) = sender_ntp
+            && self
+                .last_report
+                .is_none_or(|last| now.saturating_duration_since(last) >= Duration::from_secs(1))
+        {
+            self.pending_report = Some((
+                now,
+                RtcpSenderReport {
+                    ssrc: self.ssrc,
+                    ntp,
+                    rtp_timestamp: projected.timestamp,
+                    packets: self.packets,
+                    octets: self.octets,
+                },
+            ));
+        }
         self.admitted = Some(
             self.admitted
                 .map_or(projected.sequence, |high| high.max(projected.sequence)),
         );
         Ok(())
+    }
+
+    fn poll_report(&mut self, binding: NonZeroU16, now: Instant, peer: &mut Association) -> bool {
+        let Some((sampled, report)) = self.pending_report else {
+            return false;
+        };
+        if now.saturating_duration_since(sampled) > Duration::from_secs(1) {
+            self.pending_report = None;
+            return false;
+        }
+        match peer.scheduler.offer_bound(
+            &mut peer.connection,
+            Datagram {
+                kind: DatagramKind::Rtcp,
+                binding,
+                payload: &report.encode(),
+            },
+        ) {
+            Err(DatagramAdmission::ControlTurn) => return true,
+            Err(DatagramAdmission::Full) => return false,
+            Ok(()) => self.last_report = Some(now),
+            Err(DatagramAdmission::Size | DatagramAdmission::Unsupported) => {}
+        }
+        self.pending_report = None;
+        false
     }
 }
 
@@ -293,11 +351,15 @@ impl Installed {
                             PayloadBinding::from(binding),
                             SubscriberPayload::Rtp(Box::new(RtpOutput {
                                 profile,
-                                ssrc: binding.ssrc().get(),
+                                ssrc: binding.ssrc(),
                                 wire,
                                 timeline,
                                 admitted: None,
                                 last_branch: None,
+                                packets: 0,
+                                octets: 0,
+                                pending_report: None,
+                                last_report: None,
                             })),
                             emission,
                         )
@@ -444,9 +506,9 @@ impl Installed {
             (subscriber.binding == binding
                 && subscriber.execution.enabled
                 && output.profile == pulsebeam_core::fabric::Profile::H264
-                && output.ssrc == pli.media_ssrc.get())
-            .then_some(subscriber.branch)
-            .flatten()
+                && output.ssrc == pli.media_ssrc)
+                .then_some(subscriber.branch)
+                .flatten()
         }) else {
             return;
         };
@@ -525,16 +587,31 @@ impl Installed {
                     ..
                 } => (capture_clock, wire),
                 SubscriberPayload::Rtp(output) => {
+                    if output.pending_report.is_some() {
+                        if !core.quic_rtp_branch_live(branch, receiver)
+                            || output.last_branch != Some(branch)
+                        {
+                            output.pending_report = None;
+                        } else {
+                            retry |= output.poll_report(subscriber.binding.binding_id(), now, peer);
+                        }
+                    }
                     if matches!(
-                        core.admit_quic_rtp(branch, receiver, now, |packet, position| {
-                            match output.offer(branch, now, packet, position, peer) {
-                                Ok(()) | Err(OutputError::Rejected) => Ok(()),
-                                Err(OutputError::Deferred { runnable }) => {
-                                    retry |= runnable;
-                                    Err(())
+                        core.admit_quic_rtp(
+                            branch,
+                            receiver,
+                            now,
+                            |packet, position, sender_ntp| {
+                                match output.offer(branch, now, packet, position, sender_ntp, peer)
+                                {
+                                    Ok(()) | Err(OutputError::Rejected) => Ok(()),
+                                    Err(OutputError::Deferred { runnable }) => {
+                                        retry |= runnable;
+                                        Err(())
+                                    }
                                 }
                             }
-                        }),
+                        ),
                         Ok(Some(()))
                     ) {
                         retry = true;

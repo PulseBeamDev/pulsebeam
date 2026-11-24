@@ -521,6 +521,24 @@ impl ClockDomain {
         }
     }
 
+    /// Sender-clock correlation from an accepted report fit, without the
+    /// continuity bridge used by `project_rtp`. Not a receiver wall clock.
+    pub fn sender_report_time(
+        &self,
+        sample: RtpSample,
+        now: MonotonicTime,
+    ) -> Result<SourceTime, Error> {
+        let track = self.track(sample.binding)?;
+        if !track.source.includes(sample.tick)
+            || track.bridge.is_some_and(|bridge| sample.tick < bridge.tick)
+        {
+            return Err(Error::Unresolved);
+        }
+        let report = track.report.ok_or(Error::Unresolved)?;
+        self.check_observation_age(report.received_at, now)?;
+        report.line.at(sample.tick).map(SourceTime::from_nanos)
+    }
+
     pub fn project_data(
         &self,
         capture: Option<DataCapture>,

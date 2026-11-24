@@ -2188,7 +2188,7 @@ impl ShardRuntime {
                     if let Some(clock) = clock {
                         clock.sync_host_reference(now, reference);
                         let sample = clock.assign_sample(0, timestamp, arrival, now);
-                        assigned = Some(sample.projection);
+                        assigned = Some(sample);
                         sample.timestamp
                     } else {
                         // Standalone shard fixtures may omit the node clock.
@@ -2199,10 +2199,17 @@ impl ShardRuntime {
         else {
             return Ok(Offers::default());
         };
-        if let Some(projection) = assigned
-            && bound.fanout.live_sequence_anchor(now) == Some(sequence)
-        {
-            bound.publisher_timing = projection.map(|(at, projection)| (sequence, at, projection));
+        if let Some(sample) = assigned {
+            if let Some(ntp) = sample.sender_ntp {
+                bound
+                    .fanout
+                    .attach_sender_ntp(sequence, input.arrival.into(), ntp);
+            }
+            if bound.fanout.live_sequence_anchor(now) == Some(sequence) {
+                bound.publisher_timing = sample
+                    .projection
+                    .map(|(at, projection)| (sequence, at, projection));
+            }
         }
         Self::forward_publisher_branches(bound, now, sequence, hops, None, &mut report);
         Ok(report)
@@ -2293,6 +2300,7 @@ impl ShardRuntime {
                         arrival: frozen.work.arrival(),
                         ready_at: frozen.ready_at,
                         sequence: frozen.work.sequence(),
+                        sender_ntp: frozen.sender_ntp,
                         packet: frozen.packet.clone().into_owned(),
                     })
                 });

@@ -91,6 +91,29 @@ impl ReceivedPacket {
         self.packet.extensions()
     }
 
+    /// Adapt a packet after sequence ordering. Pass the extended sequence and
+    /// presentation timestamp supplied by the ordering stage.
+    pub fn ordered(
+        &self,
+        sequence: u64,
+        rtp_time: Option<u64>,
+    ) -> crate::media::units::OrderedPacket<'_> {
+        crate::media::units::OrderedPacket {
+            sequence,
+            timestamp: self.timestamp(),
+            rtp_time,
+            arrived_at: self.arrived_at,
+            marker: self.marker(),
+            payload: self.payload(),
+            descriptor: self
+                .extensions()
+                .find(|extension| {
+                    extension.kind == pulsebeam_core::fabric::ExtensionKind::DependencyDescriptor
+                })
+                .map(|extension| extension.value),
+        }
+    }
+
     pub fn payload(&self) -> &[u8] {
         self.packet.payload()
     }

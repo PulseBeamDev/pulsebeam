@@ -1992,6 +1992,7 @@ fn shard_mailbox_preserves_fabric_image_and_fences_rebound_sources() {
         arrival: now,
         ready_at: None,
         sequence: 1,
+        sender_ntp: None,
         packet: value.clone().into_owned(),
     };
     let mut full = false;
