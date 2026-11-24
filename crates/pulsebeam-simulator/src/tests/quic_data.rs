@@ -2308,11 +2308,25 @@ async fn mixed_h264_exchange(
         kind: MediaKind::Video,
         active: true,
     };
+    let mut publications = vec![camera.clone()];
+    if native_receiver_token.is_some() {
+        quic.enable_h264_dependency_descriptors("descriptor-camera")?;
+        publications.push(PublicationIntent {
+            slot: "descriptor-camera".into(),
+            track_id: "descriptor-camera".into(),
+            ..camera.clone()
+        });
+    }
     quic.command(AgentCommand::ReplaceDesired(DesiredState {
         revision: 1,
-        publications: vec![camera.clone()],
+        publications,
         ..Default::default()
     }))?;
+    let mut diverted = cross_shard.then(|| {
+        pulsebeam_runtime::net::set_wrong_owner_injection_with(edge.ip(), |packet, shards| {
+            transport::routing::destination(packet, usize::from(shards))
+        })
+    });
     quic.command(AgentCommand::Join("stage".into()))?;
     let publication = loop {
         ensure!(
@@ -2327,6 +2341,15 @@ async fn mixed_h264_exchange(
             .await
             .map_err(|error| anyhow::anyhow!("QUIC video publication: {error:?}"))?;
     };
+    if let Some(receipt) = &mut diverted {
+        receipt
+            .try_recv()
+            .context("QUIC wrong-ingress injection did not run")?;
+        ensure!(
+            pulsebeam::sim_metrics::routing_counter("quic_wrong_ingress_received") > 0,
+            "the QUIC owner did not receive forwarded ingress"
+        );
+    }
     let mut native_receiver = if let Some(token) = native_receiver_token {
         let mut receiver = sim_quic_agent(address, edge, roots, token)?;
         receiver.command(AgentCommand::ReplaceDesired(DesiredState {
@@ -2510,6 +2533,15 @@ async fn mixed_h264_exchange(
         }) > 0,
         "mixed H.264 must use the configured ownership path"
     );
+    if let Some(receiver) = native_receiver.take() {
+        descriptor_h264_exchange(
+            &mut quic,
+            receiver.with_raw_rtp(),
+            edge.ip(),
+            [&unit.data, &delta.data],
+        )
+        .await?;
+    }
     reverse.ready().await?;
     let reverse_id = reverse
         .state()
@@ -2651,6 +2683,239 @@ async fn mixed_h264_exchange(
     );
     rtc.close().await?;
     Ok(())
+}
+
+async fn descriptor_h264_exchange(
+    publisher: &mut pulsebeam_agent_quic::executor::host::Agent,
+    mut receiver: pulsebeam_agent_quic::executor::host::Agent,
+    local: std::net::IpAddr,
+    [keyframe, delta]: [&[u8]; 2],
+) -> Result<()> {
+    use pulsebeam_agent_core::{AgentCommand, DesiredState, MediaKind};
+    use pulsebeam_agent_quic::{
+        data_bindings::FabricOffer,
+        executor::{
+            host::H264SendError,
+            rtp::{Receive, SendPacketError},
+        },
+        fabric::{ExtensionKind, FabricPacket, Header, Profile, WireError},
+        media::{
+            H264, PacketBudget,
+            descriptor::{
+                DecodeTargetIndication, DependencyDescriptor, FrameDependencyTemplate,
+                TemplateDependencyStructure, Writer,
+            },
+            jitter,
+            units::{Codec, Depacketizer, Dependency, Event},
+        },
+    };
+    const TRACK: &str = "descriptor-camera";
+    let source = publisher
+        .rtp_publication(MediaKind::Video, TRACK)
+        .context("DD publication")?;
+    ensure!(source.publishes_h264_dd());
+    ensure!(
+        publisher.send_h264(TRACK, 9000, keyframe.to_vec())
+            == Err(H264SendError::DescriptorRequired)
+    );
+    let id = source.publication_id();
+    receiver.command(AgentCommand::ReplaceDesired(DesiredState {
+        revision: receiver.snapshot().desired_revision.saturating_add(1),
+        connected: true,
+        video: vec![pinned_video(id.to_owned())],
+        ..Default::default()
+    }))?;
+    let binding = pulsebeam_runtime::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(binding) = receiver.rtp_subscription(MediaKind::Video, id) {
+                return anyhow::Ok(binding);
+            }
+            receiver
+                .turn()
+                .await
+                .map_err(|error| anyhow::anyhow!("DD receiver install: {error:?}"))?;
+        }
+    })
+    .await
+    .context("DD receiver install deadline")??;
+    let mut reorder = jitter::Buffer::new(
+        binding,
+        jitter::Limits::new(Duration::from_millis(25), 16, 16, 32 * 1024)
+            .context("DD reorder budget")?,
+    );
+    let mut depacketize = Depacketizer::new(binding, Codec::H264);
+    let packetizer =
+        H264::new(PacketBudget::new(1200, 24).context("DD RTP budget")?).context("H.264 budget")?;
+    let wire = FabricOffer::CURRENT.bind_publisher(FabricOffer::CURRENT, Profile::H264, true)?;
+    let template = FrameDependencyTemplate {
+        dtis: [DecodeTargetIndication::Switch].into_iter().collect(),
+        ..Default::default()
+    };
+    let key = DependencyDescriptor {
+        frame_dependencies: template.clone(),
+        attached_structure: Some(Box::new(TemplateDependencyStructure {
+            decode_target_count: 1,
+            templates: [template].into_iter().collect(),
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    let mut dependent = DependencyDescriptor {
+        frame_number: 2,
+        attached_structure: None,
+        ..key.clone()
+    };
+    dependent.frame_dependencies.frame_diffs.push(1);
+    dependent.fields.set_custom_fdiffs(true);
+    let mut second_key = key.clone();
+    second_key.frame_number = 1;
+    let mut describe = Writer::default();
+    let mut sequence = 0_u32;
+    let (mut sequence_offset, mut timestamp_offset) = (None, None);
+    let mut first_carriage = Vec::new();
+    for (frame, (data, facts)) in [(keyframe, key), (keyframe, second_key), (delta, dependent)]
+        .into_iter()
+        .enumerate()
+    {
+        if frame == 1 {
+            publisher.rebind(local).await?;
+        }
+        let timestamp = 9000 + u32::from(facts.frame_number) * 3000;
+        let packets = packetizer
+            .packetize(sequence, timestamp, data.to_vec())
+            .map_err(|error| anyhow::anyhow!("DD packetize: {error:?}"))?;
+        let mut carriage = Vec::new();
+        let mut observed = None;
+        for packet in packets {
+            if sequence == 0 {
+                ensure!(
+                    publisher.send_rtp(&source, packet.as_send_packet(&[]))
+                        == Err(SendPacketError::Invalid(WireError::RequiredFeature))
+                );
+            }
+            let dd = describe
+                .write(&packet, packet.first.then_some(&facts))
+                .map_err(|error| anyhow::anyhow!("DD write: {error:?}"))?;
+            let extensions = [dd.extension()];
+            let header = Header {
+                profile: Profile::H264,
+                marker: packet.marker,
+                sequence,
+                timestamp,
+            };
+            let image = FabricPacket::new(header, &extensions, packet.payload.as_slice())?;
+            let mut bytes = [0; MAX_PACKET_BYTES];
+            let size = wire.agreement.write(&image, &mut bytes)?;
+            carriage.push(size > transport::framing::WHOLE_CAPACITY);
+            let send = async {
+                loop {
+                    match publisher.send_rtp(&source, packet.as_send_packet(&extensions)) {
+                        Ok(()) => break,
+                        Err(SendPacketError::Datagram(
+                            DatagramAdmission::ControlTurn | DatagramAdmission::Full,
+                        )) => {}
+                        Err(error) => anyhow::bail!("DD raw send: {error:?}"),
+                    }
+                    publisher
+                        .turn()
+                        .await
+                        .map_err(|error| anyhow::anyhow!("DD send progress: {error:?}"))?;
+                }
+                loop {
+                    publisher
+                        .turn()
+                        .await
+                        .map_err(|error| anyhow::anyhow!("DD publisher: {error:?}"))?;
+                }
+            };
+            let receive = async {
+                loop {
+                    if let Some(event) = receiver.next_rtp() {
+                        let Receive::Packet(packet) = event else {
+                            anyhow::bail!("DD raw receiver: {event:?}");
+                        };
+                        return Ok(packet);
+                    }
+                    receiver
+                        .turn()
+                        .await
+                        .map_err(|error| anyhow::anyhow!("DD receiver: {error:?}"))?;
+                }
+            };
+            let received = pulsebeam_runtime::select! {
+                error = send => return error,
+                result = pulsebeam_runtime::time::timeout(Duration::from_secs(2), receive) => result.context("DD logical RTP delivery deadline")??,
+            };
+            let offset = received.extended_sequence().wrapping_sub(sequence);
+            ensure!(*sequence_offset.get_or_insert(offset) == offset);
+            let offset = received.timestamp().wrapping_sub(timestamp);
+            ensure!(*timestamp_offset.get_or_insert(offset) == offset);
+            ensure!(received.binding == binding && received.publication_id == id);
+            ensure!(received.marker() == packet.last && received.payload() == packet.payload);
+            ensure!(received.extensions().any(|extension| extension.kind
+                == ExtensionKind::DependencyDescriptor
+                && extension.value == dd.extension().value));
+            let now = pulsebeam_runtime::time::Instant::now().into_std();
+            ensure!(matches!(
+                reorder.push(now, received.into()),
+                jitter::Push::Queued
+            ));
+            let Some(jitter::Output::Packet {
+                input,
+                sequence: ordered,
+                timestamp,
+            }) = reorder
+                .poll(now)
+                .map_err(|error| anyhow::anyhow!("DD reorder: {error:?}"))?
+            else {
+                anyhow::bail!("DD orderer did not emit a complete RTP packet");
+            };
+            let event = depacketize
+                .push(binding, input.packet.ordered(ordered, timestamp))
+                .map_err(|error| anyhow::anyhow!("DD depacketizer: {error:?}"))?;
+            ensure!(event.is_some() == packet.last);
+            if let Some(event) = event {
+                ensure!(observed.replace(event).is_none());
+            }
+            sequence = sequence.wrapping_add(1);
+        }
+        let Some(Event::Unit(unit)) = observed else {
+            anyhow::bail!("no complete DD access unit");
+        };
+        ensure!(unit.data == data && unit.rtp_time.is_some());
+        let Dependency::Parsed(parsed) = unit.dependency else {
+            anyhow::bail!("DD facts did not survive depacketization");
+        };
+        ensure!(parsed.start_of_frame && parsed.frame_number == facts.frame_number);
+        ensure!(
+            parsed.frame_dependencies == facts.frame_dependencies
+                && parsed.attached_structure == facts.attached_structure
+        );
+        match frame {
+            0 => {
+                ensure!(carriage.contains(&false) && carriage.contains(&true));
+                first_carriage = carriage;
+            }
+            1 => ensure!(
+                carriage == first_carriage
+                    && publisher.rtp_publication(MediaKind::Video, TRACK).as_ref() == Some(&source)
+            ),
+            _ => {}
+        }
+    }
+    receiver.command(AgentCommand::Disconnect)?;
+    pulsebeam_runtime::time::timeout(Duration::from_secs(2), async {
+        while receiver.snapshot().connection != pulsebeam_agent_core::ConnectionState::Disconnected
+        {
+            receiver
+                .turn()
+                .await
+                .map_err(|error| anyhow::anyhow!("DD receiver cleanup: {error:?}"))?;
+        }
+        anyhow::Ok(())
+    })
+    .await
+    .context("DD receiver cleanup deadline")?
 }
 
 fn qualification_sample(sample: serde_json::Value) {

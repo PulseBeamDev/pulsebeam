@@ -6,6 +6,7 @@ Use the Rust `encoded_worker` example to record a pinned Opus or H.264 publicati
 
 - On the Linux edge, set `--quic-host edge.example.com --quic-cert chain.pem --quic-key key.pem`. The name must match the TLS certificate and resolve to the edge. Allow native QUIC and WebRTC on the **same advertised UDP port**. Do not assign QUIC a second UDP port. The HTTPS API still uses its normal endpoint and certificate.
 - Obtain a short-lived participant token from your application backend. It needs access to join the room and discover and subscribe to the publication. Keep signing keys on the backend. Pass the token in `PULSEBEAM_TOKEN`, not as a command argument.
+- Set `PULSEBEAM_LOCAL_IP` to this host's local interface address in the edge's IP family, not a wildcard address.
 - Obtain the publication ID while the upstream publisher is live. Use `opus` for its audio publication or `h264` for its H.264 publication. The QUIC CA file contains trusted PEM roots for the advertised authority. The HTTPS placement client uses its normal trust roots; set `PULSEBEAM_PLACEMENT_CA_DER` to add a private HTTPS CA if needed. Neither connection disables hostname verification.
 
 ## Start recording
@@ -16,7 +17,7 @@ Use the Rust `encoded_worker` example to record a pinned Opus or H.264 publicati
   record ./capture
 ```
 
-Use a directory that does not yet exist. Set `PULSEBEAM_LOCAL_IP` to choose a local address or an IPv6 bind address; the default is `0.0.0.0`. The worker needs a publisher sending media. If the directory contains only `index.tsv`, check access, the publication ID, the selected IP family, and UDP reachability.
+Use a directory that does not yet exist. The worker needs a publisher sending media. If the directory contains only `index.tsv`, check access, the publication ID, the selected IP family, and UDP reachability.
 
 `index.tsv` lists units, gaps, handoff loss, and binding resets. Payload files contain one Opus packet or Annex B H.264 access unit each. Sequence bounds are inclusive; a loss summary can enclose several intervals. `rtp_time` is extended presentation time, not the sequence-order key. Use `clock_hz` to interpret its units. `-` means unknown or not applicable. A sender-report anchor includes its RTP coordinate and a hex NTP value. It is not proof of synchronized capture across tracks. A new `epoch` resets both sequence and timing context. Recording preserves complete dependent video and reports holes instead of synthesizing audio or video.
 
@@ -46,6 +47,6 @@ let packet = packetizer
 let result = agent.send_rtp(&publication, packet.as_send_packet(&[]));
 ```
 
-For H.264 Annex B, use `media::H264::packetize` and send the resulting packets in order. Where negotiated, `media::descriptor::Writer` attaches dependency facts supplied by the encoder, not inferred references. On temporary transport backpressure, retain the same packet and its descriptor, drive `turn`, and retry while the binding is live. The framer decides Whole or Slice carriage; the size in the snippet is not a UDP payload size or a path discovery setting. The [native QUIC wire contract](native-quic-v1.md) defines the fixed transport budget.
+For H.264 Annex B, use `media::H264::packetize` and send the resulting packets in order. To publish Dependency Descriptors (DD), call `agent.enable_h264_dependency_descriptors(track_id)` before connecting. Use `media::descriptor::Writer` with the encoder's dependency facts and pass its extension to `send_rtp` on each packet. Reset the writer on binding replacement. The default H.264 publication is DD-free. On temporary transport backpressure, retain the same packet and its descriptor, drive `turn`, and retry while the binding is live. The framer decides Whole or Slice carriage; the size in the snippet is not a UDP payload size or a path discovery setting. The [native QUIC wire contract](native-quic-v1.md) defines the fixed transport budget.
 
 To build a receive pipeline without the host policy, feed raw packets into `media::jitter::Buffer`, pass gap events to `media::units::Depacketizer::gap`, and use `ReceivedPacket::ordered` to adapt ordered output for `Depacketizer::push`. Attach sender timing only from `agent.rtp_sender_report(binding)` for the same binding. Apply `VideoRecovery` optionally; retry its PLI with `request_rtp_keyframe(binding)` only while that binding is current. See [`examples/encoded_worker.rs`](../../../agents/pulsebeam-agent-quic/examples/encoded_worker.rs) for the complete client loop and bounded sink.

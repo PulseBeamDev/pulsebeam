@@ -76,6 +76,7 @@ pub enum OpusSendError {
 #[derive(Debug, PartialEq, Eq)]
 pub enum H264SendError {
     NotReady,
+    DescriptorRequired,
     Busy,
     InvalidAccessUnit,
     Size,
@@ -476,6 +477,12 @@ impl Agent {
         })
     }
 
+    /// Opt a local H.264 track into Dependency Descriptor emission before connecting.
+    /// Publish using `send_rtp` with encoder-supplied DD on every media packet.
+    pub fn enable_h264_dependency_descriptors(&mut self, track_id: &str) -> Result<(), AgentError> {
+        self.core.enable_quic_h264_dd(track_id)
+    }
+
     pub fn rtp_publication(&self, kind: MediaKind, track_id: &str) -> Option<Publication> {
         let live = self
             .core
@@ -491,6 +498,7 @@ impl Agent {
             publication_id: live.publication_id.to_owned(),
             ssrc: live.ssrc,
             payload_type: live.payload_type,
+            publishes_h264_dd: live.publishes_h264_dd,
         })
     }
 
@@ -569,6 +577,15 @@ impl Agent {
         }) {
             return Err(SendPacketError::NotReady);
         }
+        let publishes_h264_dd = live.publishes_h264_dd;
+        if publishes_h264_dd
+            && !input.payload.is_empty()
+            && !input.extensions.iter().any(|extension| {
+                extension.kind == crate::fabric::ExtensionKind::DependencyDescriptor
+            })
+        {
+            return Err(SendPacketError::Invalid(WireError::RequiredFeature));
+        }
         let generate_sequence = expected.is_none();
         let key = (kind, track_id.to_owned());
         if !self.media_senders.contains_key(&key) && self.media_senders.len() >= 64 {
@@ -594,7 +611,7 @@ impl Agent {
         {
             let offer = socket.peer_fabric().ok_or(SendPacketError::NotReady)?;
             let selected = FabricOffer::CURRENT
-                .bind(offer, profile, 0)
+                .bind_publisher(offer, profile, publishes_h264_dd)
                 .map_err(SendPacketError::Invalid)?;
             self.media_senders.insert(
                 key.clone(),
@@ -758,6 +775,9 @@ impl Agent {
             .quic_rtp_publication(pulsebeam_agent_core::MediaKind::Video, track_id)
             .filter(|live| live.ready)
             .ok_or(H264SendError::NotReady)?;
+        if live.publishes_h264_dd {
+            return Err(H264SendError::DescriptorRequired);
+        }
         if !self
             .sockets
             .iter()

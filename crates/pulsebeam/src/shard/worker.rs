@@ -883,6 +883,8 @@ impl ShardWorker {
             match received.packet {
                 ShardFrame::QuicIngress { datagram, .. } => {
                     if let Some(quic) = &mut self.quic {
+                        #[cfg(feature = "sim")]
+                        crate::sim_metrics::record_routing_counter("quic_wrong_ingress_received");
                         quic.receive(local, datagram.as_received(), now, &mut self.core)?;
                     }
                 }

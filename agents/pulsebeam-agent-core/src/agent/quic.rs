@@ -29,6 +29,7 @@ pub(super) enum Attempt {
 
 #[doc(hidden)]
 pub struct QuicRtpPublication<'a> {
+    pub publishes_h264_dd: bool,
     pub generation: Generation,
     pub binding: core::num::NonZeroU16,
     pub ssrc: u32,
@@ -169,6 +170,7 @@ impl Agent {
                 .and_then(|settings| settings.enabled)
                 == Some(true);
         Some(QuicRtpPublication {
+            publishes_h264_dd: parameters.publishes_h264_dd,
             generation: session.generation,
             binding,
             ssrc: parameters.primary_ssrc,
@@ -183,6 +185,22 @@ impl Agent {
         let mut agent = Self::new(config)?;
         agent.quic = true;
         Ok(agent)
+    }
+
+    #[doc(hidden)]
+    pub fn enable_quic_h264_dd(&mut self, track_id: &str) -> Result<(), AgentError> {
+        const MAX_TRACKS: usize = 64;
+        if !self.quic || self.desired.connected || self.closing.is_some() {
+            return Err(crate::ValidationError::QuicPublicationProfile.into());
+        }
+        crate::model::validate_track_id(track_id)?;
+        if self.quic_h264_dd_tracks.len() >= MAX_TRACKS
+            && !self.quic_h264_dd_tracks.contains(track_id)
+        {
+            return Err(crate::ValidationError::QuicPublicationProfileLimit.into());
+        }
+        self.quic_h264_dd_tracks.insert(track_id.into());
+        Ok(())
     }
 
     pub(super) fn start_quic_placement(&mut self, generation: Generation) {

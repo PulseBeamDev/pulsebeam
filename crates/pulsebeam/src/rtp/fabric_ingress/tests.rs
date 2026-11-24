@@ -99,6 +99,7 @@ fn quic_opus_uses_canonical_packet_coordinates() {
         binding_id: 7,
         incarnation: 9,
         primary_ssrc: 11,
+        publishes_h264_dd: false,
         codec: Some(wire::RtpCodecParameters {
             payload_type: Some(111),
             format: Some(wire::CodecFormat::from(codec_format::Codec::Opus(

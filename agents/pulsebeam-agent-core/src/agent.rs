@@ -321,6 +321,7 @@ struct Closing {
 
 pub struct Agent {
     quic: bool,
+    quic_h264_dd_tracks: BTreeSet<String>,
     config: AgentConfig,
     config_credential_revision: u64,
     admission_denial: Option<credentials::AdmissionDenial>,
@@ -358,6 +359,7 @@ impl Agent {
         config.validate()?;
         Ok(Self {
             quic: false,
+            quic_h264_dd_tracks: BTreeSet::new(),
             config,
             config_credential_revision: 0,
             admission_denial: None,
@@ -3102,6 +3104,7 @@ impl Agent {
                 &mut self.logs,
                 &self.desired,
                 &self.resources,
+                &self.quic_h264_dd_tracks,
                 &mut self.ids,
                 &mut self.effects,
             ) {

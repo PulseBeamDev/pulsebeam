@@ -314,6 +314,7 @@ fn quic_rtp_binding_compiles_opus_coordinates_without_rtc_fields() {
         binding_id: 7,
         incarnation: 9,
         primary_ssrc: 11,
+        publishes_h264_dd: false,
         codec: Some(RtpCodecParameters {
             payload_type: Some(111),
             format: Some(CodecFormat::from(codec_format::Codec::Opus(
@@ -334,6 +335,12 @@ fn quic_rtp_binding_compiles_opus_coordinates_without_rtc_fields() {
         Err(ValidationError::Format)
     );
 
+    parameters.publishes_h264_dd = true;
+    assert_eq!(
+        QuicRtpBinding::compile(&parameters, TrackKind::Audio),
+        Err(ValidationError::Format)
+    );
+    parameters.publishes_h264_dd = false;
     parameters.codec.as_mut().unwrap().payload_type = Some(72);
     assert_eq!(
         QuicRtpBinding::compile(&parameters, TrackKind::Audio),

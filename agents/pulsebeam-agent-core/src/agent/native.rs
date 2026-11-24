@@ -871,6 +871,7 @@ fn quic_rtp_binding(
     session: &mut Session,
     resource: &Resource,
     source: Option<&str>,
+    publishes_h264_dd: bool,
     ids: &mut IdGenerator,
 ) -> Option<state::TrackBinding> {
     use state::{publication_spec::Kind, resource_spec::Declaration, track_binding::Transport};
@@ -926,6 +927,7 @@ fn quic_rtp_binding(
             binding_id: u32::from(id),
             incarnation: ids.channel().get(),
             primary_ssrc: u32::from(id),
+            publishes_h264_dd,
             codec: Some(state::RtpCodecParameters {
                 payload_type: Some(if video { 102 } else { 111 }),
                 format: Some(format),
@@ -940,6 +942,7 @@ pub(super) fn reconcile(
     logs: &mut crate::logging::LogBuffer,
     desired: &DesiredState,
     resources: &crate::track::TrackResources,
+    quic_h264_dd_tracks: &alloc::collections::BTreeSet<String>,
     ids: &mut IdGenerator,
     effects: &mut VecDeque<Effect>,
 ) -> Result<(), SignalingError> {
@@ -961,7 +964,9 @@ pub(super) fn reconcile(
         };
         let binding = if session.state.binding_profile() == state::validation::BindingProfile::Quic
         {
-            quic_rtp_binding(session, &resource, None, ids)
+            let publishes_h264_dd =
+                kind == crate::MediaKind::Video && quic_h264_dd_tracks.contains(&value.track_id);
+            quic_rtp_binding(session, &resource, None, publishes_h264_dd, ids)
         } else {
             if let Some(want) = media_want(session, resource.clone(), &slot, None) {
                 media.insert(slot.clone(), want);
@@ -1002,7 +1007,7 @@ pub(super) fn reconcile(
         let track = &video.publication_id;
         if session.state.binding_profile() == state::validation::BindingProfile::Quic {
             if let Some(source_room) = session.room_id.clone()
-                && let Some(binding) = quic_rtp_binding(session, &resource, Some(track), ids)
+                && let Some(binding) = quic_rtp_binding(session, &resource, Some(track), false, ids)
             {
                 wanted.insert(
                     resource,
@@ -1114,7 +1119,7 @@ pub(super) fn reconcile(
             let Some(room) = session.room_id.clone() else {
                 continue;
             };
-            if let Some(binding) = quic_rtp_binding(session, &resource, Some(&id), ids) {
+            if let Some(binding) = quic_rtp_binding(session, &resource, Some(&id), false, ids) {
                 wanted.insert(
                     resource,
                     subscription(id, room, state::TrackKind::Audio, binding, audio_options()),

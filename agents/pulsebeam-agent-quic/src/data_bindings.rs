@@ -4,7 +4,7 @@ use std::{
 };
 
 use pulsebeam_core::fabric::{
-    Profile, WireError,
+    ExtensionKind, Profile, WireError,
     packet::{Agreement, Offer},
 };
 use pulsebeam_proto::{
@@ -66,6 +66,29 @@ impl FabricOffer {
             supported: self.supported,
             required,
         }
+    }
+
+    /// Match the installed publication's encoding rather than inferring DD
+    /// emission from the association's receive capabilities.
+    pub fn bind_publisher(
+        mut self,
+        peer: Self,
+        profile: Profile,
+        publishes_h264_dd: bool,
+    ) -> Result<FabricBinding, WireError> {
+        let dd = ExtensionKind::DependencyDescriptor.bit();
+        let required = if publishes_h264_dd {
+            if profile != Profile::H264 {
+                return Err(WireError::ExtensionProfile);
+            }
+            dd
+        } else {
+            if profile == Profile::H264 {
+                self.supported &= !dd;
+            }
+            0
+        };
+        self.bind(peer, profile, required)
     }
 
     pub fn bind(

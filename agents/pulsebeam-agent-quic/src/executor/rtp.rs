@@ -27,6 +27,7 @@ pub struct Publication {
     pub(crate) publication_id: String,
     pub(crate) ssrc: u32,
     pub(crate) payload_type: u8,
+    pub(crate) publishes_h264_dd: bool,
 }
 
 impl Publication {
@@ -36,6 +37,10 @@ impl Publication {
 
     pub fn publication_id(&self) -> &str {
         &self.publication_id
+    }
+
+    pub const fn publishes_h264_dd(&self) -> bool {
+        self.publishes_h264_dd
     }
 
     pub const fn ssrc(&self) -> u32 {

@@ -505,6 +505,7 @@ struct OwnedCopy {
 #[derive(Clone, Copy)]
 pub(crate) struct QuicRtpIngress {
     profile: Profile,
+    publishes_h264_dd: bool,
 }
 
 impl QuicRtpIngress {
@@ -518,7 +519,10 @@ impl QuicRtpIngress {
             Some(codec_format::Codec::H264(_)) => Profile::H264,
             _ => return Err(DropReason::Binding),
         };
-        Ok(Self { profile })
+        Ok(Self {
+            profile,
+            publishes_h264_dd: binding.publishes_h264_dd(),
+        })
     }
 
     /// Association, binding and extension agreement have already been checked.
@@ -531,6 +535,14 @@ impl QuicRtpIngress {
         let header = packet.header();
         if header.profile != self.profile {
             return Err(DropReason::Binding);
+        }
+        if self.publishes_h264_dd
+            && !packet.payload().is_empty()
+            && !packet
+                .extensions()
+                .any(|extension| extension.kind == ExtensionKind::DependencyDescriptor)
+        {
+            return Err(DropReason::MissingDependencyDescriptor);
         }
         Ok(MediaIngress::from_normalized(
             arrival,

@@ -218,6 +218,7 @@ pub(super) async fn witness(
     endpoint: &str,
     port: u16,
     certificate: CertificateDer<'static>,
+    rtc_probe: impl AsyncFn(&'static [u8]) -> Result<()>,
 ) -> Result<()> {
     let local = Ipv4Addr::LOCALHOST.into();
     let mut roots = RootCertStore::empty();
@@ -304,25 +305,29 @@ pub(super) async fn witness(
             .record(binding, event)
             .map_err(|error| anyhow!("write worker event: {error:?}"))
     };
-    send_read(
-        &mut publisher,
-        &mut subscriber,
-        &source,
-        &mut reader,
-        0,
-        &mut store,
-    )
-    .await?;
+    pulsebeam_runtime::try_join!(
+        send_read(
+            &mut publisher,
+            &mut subscriber,
+            &source,
+            &mut reader,
+            0,
+            &mut store
+        ),
+        rtc_probe(b"RTC DATA during native QUIC media delivery"),
+    )?;
     publisher.rebind(local).await?;
-    send_read(
-        &mut publisher,
-        &mut subscriber,
-        &source,
-        &mut reader,
-        2,
-        &mut store,
-    )
-    .await?;
+    pulsebeam_runtime::try_join!(
+        send_read(
+            &mut publisher,
+            &mut subscriber,
+            &source,
+            &mut reader,
+            2,
+            &mut store
+        ),
+        rtc_probe(b"RTC DATA after native QUIC address change"),
+    )?;
     ensure!(publisher.snapshot().generation == Some(generation) && publisher.quic_peer() == peer);
 
     close(&mut subscriber).await?;

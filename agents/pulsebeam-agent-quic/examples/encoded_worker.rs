@@ -4,7 +4,7 @@ use std::{
     env, fs,
     future::pending,
     io::{self, Write},
-    net::{IpAddr, Ipv4Addr},
+    net::IpAddr,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -30,7 +30,7 @@ use tokio::sync::{mpsc, oneshot};
 
 const USAGE: &str = "encoded_worker ENDPOINT ROOM opus|h264 PUBLICATION_ID QUIC_CA_PEM fresh\n\
 encoded_worker ENDPOINT ROOM opus|h264 PUBLICATION_ID QUIC_CA_PEM record NEW_DIRECTORY\n\
-Set PULSEBEAM_TOKEN. Optional: PULSEBEAM_LOCAL_IP, PULSEBEAM_PLACEMENT_CA_DER.";
+Set PULSEBEAM_TOKEN and PULSEBEAM_LOCAL_IP. Optional: PULSEBEAM_PLACEMENT_CA_DER.";
 const DRAIN_GRACE: Duration = Duration::from_secs(3);
 const RECORD_LIMITS: Limits = Limits {
     units: 100_000,
@@ -224,9 +224,13 @@ async fn shutdown(agent: &mut Agent) -> Result<()> {
 
 async fn run(settings: Settings) -> Result<()> {
     let token = env::var("PULSEBEAM_TOKEN").map_err(|_| "set PULSEBEAM_TOKEN".to_owned())?;
-    let local = env::var("PULSEBEAM_LOCAL_IP")
-        .map_or(Ok(IpAddr::V4(Ipv4Addr::UNSPECIFIED)), |value| value.parse())
+    let local: IpAddr = env::var("PULSEBEAM_LOCAL_IP")
+        .map_err(|_| "set PULSEBEAM_LOCAL_IP to this host's local IP address".to_owned())?
+        .parse()
         .map_err(|_| "invalid PULSEBEAM_LOCAL_IP".to_owned())?;
+    if local.is_unspecified() {
+        return Err("PULSEBEAM_LOCAL_IP must be a concrete address in the edge's IP family".into());
+    }
     let mut agent = Agent::new(
         AgentConfig {
             endpoint: settings.endpoint,

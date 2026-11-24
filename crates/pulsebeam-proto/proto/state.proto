@@ -683,6 +683,7 @@ message QuicRtpParameters {
   fixed64 incarnation = 2;
   RtpCodecParameters codec = 3;
   fixed32 primary_ssrc = 4;
+  bool publishes_h264_dd = 5; // H.264 publication only; requires Dependency Descriptor.
 }
 
 // Explicit DATA_V1 payload negotiation, never an opt-in flag on a legacy

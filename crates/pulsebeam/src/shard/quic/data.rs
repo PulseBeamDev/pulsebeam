@@ -8,7 +8,7 @@ use pulsebeam_agent_quic::{
     records::{Datagram, DatagramKind, PictureLossIndication, RtcpSenderReport},
     transport::{DatagramAdmission, NativeDatagram, framing::Receiver, listener::Association},
 };
-use pulsebeam_core::fabric::{ExtensionKind, MAJOR, Profile};
+use pulsebeam_core::fabric::{MAJOR, Profile};
 use pulsebeam_proto::{
     data_endpoint::Delivery,
     state::{self as wire, validation::QuicRtpBinding},
@@ -186,7 +186,7 @@ impl Installed {
         if self.publishers.owned.len() == MAX_PUBLISHERS {
             return Err(ExecutionFailureKind::Capacity.into());
         }
-        let (wire, emission) = self.publisher_wire(Profile::Data)?;
+        let (wire, emission) = self.publisher_wire(Profile::Data, false)?;
         let frames = Receiver::new(wire.framing, binding.id);
         let publisher = core
             .quic_owner_handle(self.transport)
@@ -306,7 +306,8 @@ impl Installed {
             rid: None,
             payload_type: prepared.payload_type().into(),
         };
-        let (wire, emission) = self.publisher_wire(ingress.profile())?;
+        let (wire, emission) =
+            self.publisher_wire(ingress.profile(), prepared.publishes_h264_dd())?;
         let frames = Receiver::new(wire.framing, binding.binding_id());
         let (source, incarnation) = core
             .install_quic_rtp_source(publisher, id, association, plan.enabled, encoding, emission)
@@ -450,16 +451,11 @@ impl Installed {
     fn publisher_wire(
         &self,
         profile: Profile,
+        publishes_h264_dd: bool,
     ) -> Result<(FabricBinding, Emission), ExecutionFailure> {
         let peer = self.peer_fabric.ok_or(ExecutionFailureKind::Retired)?;
-        let mut local = FabricOffer::CURRENT;
-        // A DD-signaled H.264 source declares a dedicated DD encoding. Do
-        // not infer that encoding from support for decoding descriptors.
-        if profile == Profile::H264 {
-            local.supported &= !ExtensionKind::DependencyDescriptor.bit();
-        }
-        let wire = local
-            .bind(peer, profile, 0)
+        let wire = FabricOffer::CURRENT
+            .bind_publisher(peer, profile, publishes_h264_dd)
             .map_err(|_| ExecutionFailureKind::Unsupported)?;
         let emission = Emission::from_wire_profile(
             profile as u8,

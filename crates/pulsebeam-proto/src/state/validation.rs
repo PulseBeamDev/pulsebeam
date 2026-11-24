@@ -697,7 +697,9 @@ fn validate_binding(
         {
             Ok(())
         }
-        Some(track_binding::Transport::QuicRtp(parameters)) => {
+        Some(track_binding::Transport::QuicRtp(parameters))
+            if publication || !parameters.publishes_h264_dd =>
+        {
             QuicRtpBinding::compile(parameters, kind).map(|_| ())
         }
         Some(track_binding::Transport::Sctp(sctp))
@@ -729,6 +731,7 @@ pub struct QuicRtpBinding<'a> {
     payload_type: u8,
     format: &'a CodecFormat,
     feedback: &'a [String],
+    publishes_h264_dd: bool,
 }
 
 impl<'a> QuicRtpBinding<'a> {
@@ -752,7 +755,7 @@ impl<'a> QuicRtpBinding<'a> {
         validate_format(format)?;
         match (kind, format.known_codec()) {
             (TrackKind::Audio, Some(codec_format::Codec::Opus(_)))
-                if !video_feedback(&codec.feedback) => {}
+                if !rtp.publishes_h264_dd && !video_feedback(&codec.feedback) => {}
             (TrackKind::Video, Some(codec_format::Codec::H264(_))) => {}
             _ => return Err(ValidationError::Format),
         }
@@ -763,6 +766,7 @@ impl<'a> QuicRtpBinding<'a> {
             payload_type: pt,
             format,
             feedback: &codec.feedback,
+            publishes_h264_dd: rtp.publishes_h264_dd,
         })
     }
 
@@ -783,6 +787,9 @@ impl<'a> QuicRtpBinding<'a> {
     }
     pub const fn feedback(self) -> &'a [String] {
         self.feedback
+    }
+    pub const fn publishes_h264_dd(self) -> bool {
+        self.publishes_h264_dd
     }
 }
 

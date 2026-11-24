@@ -7,7 +7,10 @@ const SIM_FLOW_CAPACITY: usize = 4096;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::rc::{Rc, Weak};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{
+    Mutex, OnceLock,
+    atomic::{AtomicBool, Ordering},
+};
 use std::task::{Context, Poll};
 use std::{
     io,
@@ -17,10 +20,15 @@ use turmoil::net::UdpSocket;
 
 type ReuseportKey = (IpAddr, SocketAddr);
 
+type RouteOwner = fn(&[u8], u16) -> Option<u16>;
+
 struct WrongOwnerInjection {
     source: IpAddr,
+    route_owner: RouteOwner,
     applied: tokio::sync::oneshot::Sender<()>,
 }
+
+static WRONG_OWNER_ARMED: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
     /// Reuseport groups already bound on this host, so a second bind to the
@@ -41,13 +49,25 @@ fn wrong_owner_injection_state() -> &'static Mutex<Option<WrongOwnerInjection>> 
     STATE.get_or_init(|| Mutex::new(None))
 }
 
-fn wrong_owner_injection_state_enabled() -> Option<IpAddr> {
-    // A poisoned lock means a test thread panicked while holding it; that test
-    // is already failing, and steering must not take the process down with it.
-    match wrong_owner_injection_state().lock() {
-        Ok(state) => state.as_ref().map(|request| request.source),
-        Err(poisoned) => poisoned.into_inner().as_ref().map(|request| request.source),
+fn take_wrong_owner_injection(
+    source: IpAddr,
+    payload: &[u8],
+    shard_count: u16,
+) -> Option<(u16, tokio::sync::oneshot::Sender<()>)> {
+    if !WRONG_OWNER_ARMED.load(Ordering::Acquire) {
+        return None;
     }
+    let mut pending = match wrong_owner_injection_state().lock() {
+        Ok(state) => state,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let request = pending
+        .as_ref()
+        .filter(|request| request.source == source)?;
+    let owner = (request.route_owner)(payload, shard_count).filter(|owner| *owner < shard_count)?;
+    let request = pending.take()?;
+    WRONG_OWNER_ARMED.store(false, Ordering::Release);
+    Some((owner, request.applied))
 }
 
 /// One member's queue of datagrams the group has already decided belong to it.
@@ -187,41 +207,25 @@ impl SimSteering {
             return;
         };
 
-        // Only a datagram that names its own route can be diverted to a shard
-        // that has never seen the flow. Steering delivers to the tuple hash or
-        // to the route's owner, and both of those have classified the flow
-        // already; a stranger shard has nothing to go on but the ufrag, so
-        // diverting media there would be testing a delivery production never
-        // performs. Naming the route is also what makes the diversion land
-        // somewhere that is definitely not the owner, rather than one shard
-        // over from whatever the hash happened to pick.
+        // Divert only named routes so the receiving shard can still find the
+        // owner and the injection cannot accidentally target the real owner.
         let mut applied = None;
-        if members > 1
-            && let Some(owner) = route_owner(&payload)
-            && (self.wrong_owner_injection.get()
-                || wrong_owner_injection_state_enabled().is_some_and(|source| source == src.ip()))
+        let owner = if members <= 1 {
+            None
+        } else if let Some((owner, receipt)) =
+            take_wrong_owner_injection(src.ip(), &payload, shard_count)
         {
+            applied = Some(receipt);
+            Some(owner)
+        } else if self.wrong_owner_injection.get() {
+            route_owner(&payload, shard_count)
+        } else {
+            None
+        };
+        if let Some(owner) = owner {
             self.wrong_owner_injection.set(false);
-            let mut pending = match wrong_owner_injection_state().lock() {
-                Ok(state) => state,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            if pending
-                .as_ref()
-                .is_some_and(|request| request.source == src.ip())
-            {
-                applied = pending.take().map(|request| request.applied);
-            }
-            drop(pending);
-            idx = usize::from(owner)
-                .saturating_add(1)
-                .checked_rem(members)
-                .unwrap_or(0);
-            debug_assert_ne!(
-                idx,
-                usize::from(owner),
-                "the injected datagram must land on a shard that does not own its route"
-            );
+            idx = usize::from(owner).saturating_add(1) % members;
+            debug_assert_ne!(idx, usize::from(owner));
         }
 
         debug_assert!(idx < members, "resolved member {idx} of {members}");
@@ -289,16 +293,22 @@ pub fn install_steering_flow(source: SocketAddr, destination: SocketAddr, shard:
     })
 }
 
-fn route_owner(payload: &[u8]) -> Option<u16> {
+fn route_owner(payload: &[u8], shard_count: u16) -> Option<u16> {
     let token = pulsebeam_steer::stun::server_ufrag(payload)?;
-    Some(
-        pulsebeam_steer::IceUfrag::decode_ascii(token)?
-            .transport()
-            .shard(),
-    )
+    let shard = pulsebeam_steer::IceUfrag::decode_ascii(token)?
+        .transport()
+        .shard();
+    (shard < shard_count).then_some(shard)
 }
 
 pub fn set_wrong_owner_injection(source: IpAddr) -> tokio::sync::oneshot::Receiver<()> {
+    set_wrong_owner_injection_with(source, route_owner)
+}
+
+pub fn set_wrong_owner_injection_with(
+    source: IpAddr,
+    route_owner: RouteOwner,
+) -> tokio::sync::oneshot::Receiver<()> {
     let (applied, receipt) = tokio::sync::oneshot::channel();
     let mut pending = match wrong_owner_injection_state().lock() {
         Ok(state) => state,
@@ -306,9 +316,14 @@ pub fn set_wrong_owner_injection(source: IpAddr) -> tokio::sync::oneshot::Receiv
     };
     assert!(
         pending
-            .replace(WrongOwnerInjection { source, applied })
+            .replace(WrongOwnerInjection {
+                source,
+                route_owner,
+                applied
+            })
             .is_none()
     );
+    WRONG_OWNER_ARMED.store(true, Ordering::Release);
     receipt
 }
 
@@ -611,7 +626,7 @@ mod tests {
     fn bootstrap_bytes_agree_with_userspace_but_do_not_install_affinity() {
         let steering = new_steering(4);
         let payload = bootstrap_for(3, 12345);
-        assert_eq!(route_owner(&payload), Some(3));
+        assert_eq!(route_owner(&payload, 4), Some(3));
         assert_eq!(
             pulsebeam_steer::classify_bootstrap(
                 &payload,

@@ -565,7 +565,11 @@ async fn witness(
         )?;
         tracing::info!("EXERCISED both recipient application payloads");
         if let Some((endpoint, certificate)) = native_worker {
-            worker::witness(endpoint, port, certificate).await?;
+            let rtc_probe = async |payload: &'static [u8]| {
+                data_a.sender.send(payload.to_vec()).await?;
+                received(&data_b.receiver, &sender_a, payload).await
+            };
+            worker::witness(endpoint, port, certificate, rtc_probe).await?;
         }
         let lossy = if matches!(candidate, DataWitness::LiveUdp { .. }) {
             const LOSSY_TOPIC: &str = "dual-stack-lossy";

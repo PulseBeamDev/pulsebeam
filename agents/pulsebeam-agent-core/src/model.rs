@@ -341,6 +341,10 @@ pub enum ValidationError {
     Duplicate { field: &'static str, value: String },
     #[error("local publication binding conflicts with a reserved slot or track ID: {0}")]
     PublicationBinding(String),
+    #[error("QUIC publication profile must be configured while disconnected")]
+    QuicPublicationProfile,
+    #[error("QUIC publication profiles exceed the configuration limit")]
+    QuicPublicationProfileLimit,
     #[error("retry policy is invalid")]
     RetryPolicy,
     #[error("topic name is invalid: {0}")]

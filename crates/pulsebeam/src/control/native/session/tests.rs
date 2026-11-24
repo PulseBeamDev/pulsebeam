@@ -331,6 +331,7 @@ fn quic_opus_preparation_checks_capabilities_and_receiver_source_format() {
         binding_id: 7,
         incarnation: 9,
         primary_ssrc: 11,
+        publishes_h264_dd: false,
         codec: Some(wire::RtpCodecParameters {
             payload_type: Some(111),
             format: Some(format.clone()),
