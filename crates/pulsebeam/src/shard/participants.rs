@@ -144,6 +144,7 @@ struct QuicOwner {
     data_receivers: BTreeMap<FabricLocalBranch, SubscriberLease>,
     data_control: VecDeque<(SubscriberLease, SubscriberRecord)>,
     publisher_control: VecDeque<(FabricSourceHandle, PublisherRecord)>,
+    publisher_refresh: VecDeque<(FabricSourceHandle, u32, pulsebeam_runtime::time::Instant)>,
 }
 
 impl ShardOwner {
@@ -235,6 +236,7 @@ impl ParticipantRegistry {
                 data_receivers: BTreeMap::new(),
                 data_control: VecDeque::new(),
                 publisher_control: VecDeque::new(),
+                publisher_refresh: VecDeque::new(),
             })));
         self.index.install(connection, None, ingress, handle);
         true
@@ -343,6 +345,38 @@ impl ParticipantRegistry {
         owner.publisher_control.pop_front()
     }
 
+    pub(super) fn enqueue_quic_publisher_refresh(
+        &mut self,
+        handle: ParticipantHandle,
+        source: FabricSourceHandle,
+        ssrc: u32,
+        now: pulsebeam_runtime::time::Instant,
+    ) -> bool {
+        let Some(ShardOwner::Quic(owner)) = self.participants.get_mut(handle).map(Box::as_mut)
+        else {
+            return false;
+        };
+        let pending = &mut owner.publisher_refresh;
+        pending.retain(|(key, _, at)| {
+            *key != source && now.saturating_duration_since(*at) < crate::track::KEYFRAME_DEBOUNCE
+        });
+        if pending.len() >= 8 {
+            return false;
+        }
+        pending.push_back((source, ssrc, now));
+        true
+    }
+
+    pub(super) fn pop_quic_publisher_refresh(
+        &mut self,
+        handle: ParticipantHandle,
+    ) -> Option<(FabricSourceHandle, u32, pulsebeam_runtime::time::Instant)> {
+        let ShardOwner::Quic(owner) = self.participants.get_mut(handle)?.as_mut() else {
+            return None;
+        };
+        owner.publisher_refresh.pop_front()
+    }
+
     pub(super) fn quic_receiver_lease(
         &self,
         handle: ParticipantHandle,
@@ -373,6 +407,17 @@ impl ParticipantRegistry {
             }
             ShardOwner::Quic(_) => None,
         }
+    }
+
+    pub(super) fn current_quic_owner_authorized(
+        &self,
+        handle: ParticipantHandle,
+        now: u64,
+    ) -> bool {
+        let Some(ShardOwner::Quic(owner)) = self.participants.get(handle).map(Box::as_ref) else {
+            return false;
+        };
+        self.quic_owner_authorized(handle, owner.association, now)
     }
 
     pub(super) fn quic_owner_authorized(

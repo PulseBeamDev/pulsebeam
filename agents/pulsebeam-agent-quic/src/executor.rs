@@ -16,7 +16,7 @@ use pulsebeam_udp::ReceivedDatagram;
 
 use crate::{
     frame::{Kind, Phase},
-    records::{Admit, Datagram, DatagramKind, Denial, Renew, RenewResult},
+    records::{Admit, Datagram, DatagramKind, Denial, PictureLossIndication, Renew, RenewResult},
     transport::{
         DatagramAdmission,
         client::{
@@ -252,6 +252,7 @@ impl Association {
                         connection_id: ConnectionId::from_bytes(accepted.connection).as_str(),
                         participant_id: accepted.participant,
                         room: accepted.room,
+                        capabilities: accepted.capabilities,
                     });
                 }
                 Err(error) => {
@@ -290,12 +291,24 @@ impl Association {
                     use crate::transport::read_datagram;
                     const DATA_INPUT_BUDGET: usize = 16;
                     for _ in 0..DATA_INPUT_BUDGET {
-                        let datagram = read_datagram(connection, |datagram| {
-                            (datagram.kind == DatagramKind::Data).then(|| QuicEvent::Data {
+                        let datagram = read_datagram(connection, |datagram| match datagram.kind {
+                            DatagramKind::Data => Some(QuicEvent::Data {
                                 generation,
                                 binding: datagram.binding,
                                 payload: datagram.payload.to_vec(),
-                            })
+                            }),
+                            DatagramKind::Rtp => Some(QuicEvent::Rtp {
+                                generation,
+                                binding: datagram.binding,
+                                payload: datagram.payload.to_vec(),
+                            }),
+                            DatagramKind::Rtcp => PictureLossIndication::decode(datagram.payload)
+                                .ok()
+                                .map(|pli| QuicEvent::PictureLoss {
+                                    generation,
+                                    binding: datagram.binding,
+                                    media_ssrc: pli.media_ssrc,
+                                }),
                         })?;
                         if let Ok(Some(event)) = datagram {
                             return Some(event);

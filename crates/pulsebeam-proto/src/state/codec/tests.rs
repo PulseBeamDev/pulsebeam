@@ -307,6 +307,41 @@ fn quic_binding_uses_new_wire_arm_and_is_scoped_to_the_negotiated_profile() {
 }
 
 #[test]
+fn quic_rtp_binding_compiles_opus_coordinates_without_rtc_fields() {
+    use validation::QuicRtpBinding;
+
+    let mut parameters = QuicRtpParameters {
+        binding_id: 7,
+        incarnation: 9,
+        primary_ssrc: 11,
+        codec: Some(RtpCodecParameters {
+            payload_type: Some(111),
+            format: Some(CodecFormat::from(codec_format::Codec::Opus(
+                OpusParameters::default(),
+            ))),
+            ..Default::default()
+        }),
+    };
+    let binding = QuicRtpBinding::compile(&parameters, TrackKind::Audio).unwrap();
+    assert_eq!(binding.id().get(), 7);
+    assert_eq!(binding.incarnation().get(), 9);
+    assert_eq!(binding.ssrc().get(), 11);
+    assert_eq!(binding.payload_type(), 111);
+    assert_eq!(binding.format().clock_rate, 48_000);
+    assert!(binding.feedback().is_empty());
+    assert_eq!(
+        QuicRtpBinding::compile(&parameters, TrackKind::Video),
+        Err(ValidationError::Format)
+    );
+
+    parameters.codec.as_mut().unwrap().payload_type = Some(72);
+    assert_eq!(
+        QuicRtpBinding::compile(&parameters, TrackKind::Audio),
+        Err(ValidationError::Binding)
+    );
+}
+
+#[test]
 fn installed_data_v1_publication_requires_the_authenticated_source_incarnation() {
     let mut desired_batch = publication(1);
     let Some(desired_state::Value::Present(spec)) = desired(&mut desired_batch).value.as_mut()

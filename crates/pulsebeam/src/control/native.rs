@@ -128,6 +128,7 @@ pub(crate) struct Receiver {
 pub(crate) enum ReceiveTransport {
     FabricData(Box<FabricDataReceiver>),
     QuicData(Box<FabricDataReceiver<wire::QuicDataV1Parameters>>),
+    QuicRtp(Box<wire::QuicRtpParameters>),
     Rtp(Box<ReceiverRtpConfiguration>),
 }
 
@@ -185,7 +186,9 @@ pub(crate) fn receiver_target(
                 .binding
                 .as_ref()
                 .and_then(|binding| binding.transport.as_ref()),
-            Some(wire::track_binding::Transport::Rtp(_))
+            Some(
+                wire::track_binding::Transport::Rtp(_) | wire::track_binding::Transport::QuicRtp(_)
+            )
         ),
     })
 }
@@ -240,6 +243,27 @@ pub(crate) fn receiver(
         }
         (
             Some(wire::track::Kind::Audio(_) | wire::track::Kind::Video(_)),
+            Some(wire::track_binding::Transport::QuicRtp(parameters)),
+        ) => {
+            let kind = wire::TrackKind::try_from(subscription.kind)
+                .map_err(|_| wire::FailureCode::InvalidConfiguration)?;
+            let format = match (kind, source) {
+                (wire::TrackKind::Audio, Track::Audio(audio)) => audio.format.as_ref(),
+                (wire::TrackKind::Video, Track::Video(video)) if video.layers.len() == 1 => {
+                    video.format.as_ref()
+                }
+                _ => return Err(wire::FailureCode::Incompatible),
+            };
+            let binding = compile_quic_rtp(parameters, kind, capabilities)?;
+            if !format.is_some_and(|format| {
+                wire::validation::formats_equivalent(format, binding.format())
+            }) {
+                return Err(wire::FailureCode::Incompatible);
+            }
+            Ok(ReceiveTransport::QuicRtp(Box::new(parameters.clone())))
+        }
+        (
+            Some(wire::track::Kind::Audio(_) | wire::track::Kind::Video(_)),
             Some(wire::track_binding::Transport::Rtp(_)),
         ) => {
             let capabilities = capabilities.ok_or(wire::FailureCode::Unsupported)?;
@@ -253,7 +277,9 @@ pub(crate) fn receiver(
     }?;
     let video = match &transport {
         ReceiveTransport::Rtp(rtp) => rtp.video.clone(),
-        ReceiveTransport::FabricData(_) | ReceiveTransport::QuicData(_) => None,
+        ReceiveTransport::FabricData(_)
+        | ReceiveTransport::QuicData(_)
+        | ReceiveTransport::QuicRtp(_) => None,
     };
     Ok((
         transport,
@@ -301,9 +327,17 @@ pub(crate) struct RtpPublication {
     pub(crate) enabled: bool,
 }
 
+pub(crate) struct QuicRtpPublication {
+    pub(crate) track_id: TrackId,
+    pub(crate) kind: TrackKind,
+    pub(crate) parameters: wire::QuicRtpParameters,
+    pub(crate) enabled: bool,
+}
+
 pub(crate) enum Publication {
     Data(Box<DataPublication>),
     Rtp(Box<RtpPublication>),
+    QuicRtp(Box<QuicRtpPublication>),
 }
 
 impl Publication {
@@ -319,8 +353,61 @@ impl Publication {
                 spec_bytes,
                 rtp.binding.description().encodings.len(),
             ),
+            Self::QuicRtp(_) => Connection::native_rtp_execution_bytes(spec_bytes, 1),
         }
     }
+}
+
+fn quic_rtp_publication(
+    declaration: &wire::PublicationSpec,
+    capabilities: Option<&wire::RtpCapabilities>,
+    enabled: bool,
+) -> Result<Option<QuicRtpPublication>, wire::FailureCode> {
+    let (kind, binding) = match declaration.kind.as_ref() {
+        Some(wire::publication_spec::Kind::Audio(audio)) => {
+            (wire::TrackKind::Audio, &audio.binding)
+        }
+        Some(wire::publication_spec::Kind::Video(video)) => {
+            (wire::TrackKind::Video, &video.binding)
+        }
+        _ => return Ok(None),
+    };
+    let Some(wire::track_binding::Transport::QuicRtp(parameters)) = binding
+        .as_ref()
+        .and_then(|binding| binding.transport.as_ref())
+    else {
+        return Ok(None);
+    };
+    compile_quic_rtp(parameters, kind, capabilities)?;
+    Ok(Some(QuicRtpPublication {
+        track_id: TrackId::new(&declaration.track_id)
+            .map_err(|_| wire::FailureCode::InvalidConfiguration)?,
+        kind: track_kind(kind as i32).ok_or(wire::FailureCode::Unsupported)?,
+        parameters: parameters.clone(),
+        enabled,
+    }))
+}
+
+fn compile_quic_rtp<'a>(
+    parameters: &'a wire::QuicRtpParameters,
+    kind: wire::TrackKind,
+    capabilities: Option<&wire::RtpCapabilities>,
+) -> Result<wire::validation::QuicRtpBinding<'a>, wire::FailureCode> {
+    let binding = wire::validation::QuicRtpBinding::compile(parameters, kind)
+        .map_err(|_| wire::FailureCode::InvalidConfiguration)?;
+    let capabilities = capabilities.ok_or(wire::FailureCode::Unsupported)?;
+    if !capabilities.codecs.iter().any(|candidate| {
+        candidate.format.as_ref().is_some_and(|format| {
+            wire::validation::formats_equivalent(format, binding.format())
+                && binding
+                    .feedback()
+                    .iter()
+                    .all(|feedback| candidate.feedback.contains(feedback))
+        })
+    }) {
+        return Err(wire::FailureCode::Incompatible);
+    }
+    Ok(binding)
 }
 
 pub(crate) fn publication(
@@ -331,6 +418,11 @@ pub(crate) fn publication(
         return Ok(None);
     };
     let enabled = enabled(spec);
+    if let Some(plan) = quic_rtp_publication(declaration, capabilities, enabled)? {
+        let plan = Publication::QuicRtp(Box::new(plan));
+        let bytes = plan.execution_bytes(spec.encoded_len());
+        return Ok(Some((plan, bytes)));
+    }
     let plan = match &declaration.kind {
         Some(wire::publication_spec::Kind::Data(data)) => {
             let lane = match wire::DataDelivery::try_from(data.delivery) {

@@ -307,18 +307,70 @@ fn replay_mixed(delivery: DataV1Delivery) {
     let host = pulsebeam_runtime::testing::test_host_ip("192.168.250.103");
     let mut sim = turmoil::Builder::new().build();
     sim.client(host, async move {
-        witness(delivery, Some(host)).await?;
+        witness(Scenario::Data {
+            delivery,
+            sctp_host: Some(host),
+        })
+        .await?;
         Ok(())
     });
     super::common::run_sim_or_timeout(&mut sim, Duration::from_secs(10))
         .expect("mixed DATA replay");
 }
 
-#[allow(clippy::unwrap_used, reason = "simulated node fixture must complete")]
 fn replay(delivery: DataV1Delivery) {
     let host = pulsebeam_runtime::testing::test_host_ip("192.168.250.103");
+    replay_scenario(
+        host,
+        Scenario::Data {
+            delivery,
+            sctp_host: None,
+        },
+    );
+}
+
+#[test]
+fn quic_media_opus_uses_negotiated_rtp_binding_and_timing() {
+    let host = pulsebeam_runtime::testing::test_host_ip("192.168.250.103");
+    replay_scenario(host, Scenario::Opus);
+}
+
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "mixed simulated Opus exchange must complete"
+)]
+fn quic_media_opus_exchanges_with_webrtc_encoded_endpoints() {
+    let host = pulsebeam_runtime::testing::test_host_ip("192.168.250.103");
+    let mut sim = turmoil::Builder::new().build();
+    sim.client(host, async move {
+        witness(Scenario::MixedOpus { host }).await?;
+        Ok(())
+    });
+    super::common::run_sim_or_timeout(&mut sim, Duration::from_secs(10))
+        .expect("mixed Opus replay");
+}
+
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "mixed simulated H.264 exchange must complete"
+)]
+fn quic_media_h264_exchanges_with_webrtc_encoded_endpoints() {
+    let host = pulsebeam_runtime::testing::test_host_ip("192.168.250.103");
+    let mut sim = turmoil::Builder::new().build();
+    sim.client(host, async move {
+        witness(Scenario::MixedH264 { host }).await?;
+        Ok(())
+    });
+    super::common::run_sim_or_timeout(&mut sim, Duration::from_secs(10))
+        .expect("mixed H.264 replay");
+}
+
+#[allow(clippy::unwrap_used, reason = "simulated node fixture must complete")]
+fn replay_scenario(host: std::net::IpAddr, scenario: Scenario) {
     pulsebeam_runtime::testing::run_local(host, async move {
-        pulsebeam_runtime::time::timeout(Duration::from_secs(10), witness(delivery, None))
+        pulsebeam_runtime::time::timeout(Duration::from_secs(10), witness(scenario))
             .await
             .unwrap()
             .unwrap();
@@ -772,6 +824,50 @@ async fn reject_reliable_expectation(
     Ok(())
 }
 
+fn sim_quic_agent(
+    address: SocketAddr,
+    edge: SocketAddr,
+    roots: RootCertStore,
+    token: &str,
+) -> Result<pulsebeam_agent_quic::executor::linux::LinuxAgent> {
+    use super::common::client::create_http_client;
+    use pulsebeam_agent_core::{AgentConfig, HttpMethod, HttpRequest, HttpResponse};
+    use pulsebeam_agent_quic::executor::linux::LinuxAgent;
+    async fn placement(request: HttpRequest) -> Option<HttpResponse> {
+        if request.method != HttpMethod::Post {
+            return None;
+        }
+        let origin = request.uri.strip_prefix("https://")?;
+        let mut builder = http::Request::post(format!("http://{origin}"));
+        for header in request.headers {
+            builder = builder.header(header.name, header.value);
+        }
+        let response = create_http_client()
+            .execute(builder.body(request.body).ok()?)
+            .await
+            .ok()?;
+        let (parts, body) = response.into_parts();
+        Some(HttpResponse {
+            status: parts.status.as_u16(),
+            headers: Vec::new(),
+            body,
+        })
+    }
+
+    Ok(LinuxAgent::new(
+        AgentConfig {
+            endpoint: format!("https://{address}"),
+            token: token.into(),
+            retry: Default::default(),
+            log_level: Default::default(),
+        },
+        edge.ip(),
+        roots,
+    )
+    .map_err(|error| anyhow::anyhow!("QUIC Agent startup: {error:?}"))?
+    .with_sim_services("edge.example".into(), edge.ip(), placement))
+}
+
 async fn mixed_exchange(
     address: SocketAddr,
     edge: SocketAddr,
@@ -783,11 +879,10 @@ async fn mixed_exchange(
 ) -> Result<()> {
     use super::common::{client::create_http_client, native::NativeHost};
     use pulsebeam_agent_core::{
-        AgentCommand, AgentConfig, DataEvent, HttpMethod, HttpRequest, HttpResponse, Notification,
-        ResourceCommand, ResourceResult, TopicMode, TrackSelector, TrackSpec, ffi as wire,
+        AgentCommand, AgentConfig, DataEvent, Notification, ResourceCommand, ResourceResult,
+        TopicMode, TrackSelector, TrackSpec, ffi as wire,
     };
     use pulsebeam_agent_native::{Agent as RuntimeAgent, Config, Host, ffi::Agent};
-    use pulsebeam_agent_quic::executor::linux::LinuxAgent;
     let (mode, native_mode) = match delivery {
         DataV1Delivery::Unreliable => (TopicMode::Lossy, wire::DataDelivery::Unreliable),
         DataV1Delivery::Latest => (TopicMode::Latest, wire::DataDelivery::Latest),
@@ -822,39 +917,7 @@ async fn mixed_exchange(
         }))?;
     sctp.join("stage".into())?;
 
-    async fn placement(request: HttpRequest) -> Option<HttpResponse> {
-        if request.method != HttpMethod::Post {
-            return None;
-        }
-        let origin = request.uri.strip_prefix("https://")?;
-        let mut builder = http::Request::post(format!("http://{origin}"));
-        for header in request.headers {
-            builder = builder.header(header.name, header.value);
-        }
-        let response = create_http_client()
-            .execute(builder.body(request.body).ok()?)
-            .await
-            .ok()?;
-        let (parts, body) = response.into_parts();
-        Some(HttpResponse {
-            status: parts.status.as_u16(),
-            headers: Vec::new(),
-            body,
-        })
-    }
-
-    let mut quic = LinuxAgent::new(
-        AgentConfig {
-            endpoint: format!("https://{address}"),
-            token: quic_token.into(),
-            retry: Default::default(),
-            log_level: Default::default(),
-        },
-        edge.ip(),
-        roots,
-    )
-    .map_err(|error| anyhow::anyhow!("QUIC Agent startup: {error:?}"))?
-    .with_sim_services("edge.example".into(), edge.ip(), placement);
+    let mut quic = sim_quic_agent(address, edge, roots, quic_token)?;
     let outgoing = TrackSpec::Data {
         track_id: "events".into(),
         delivery: mode,
@@ -1040,11 +1103,685 @@ async fn mixed_exchange(
     Ok(())
 }
 
+async fn prepare_agent_opus_publisher(
+    address: SocketAddr,
+    edge: SocketAddr,
+    roots: RootCertStore,
+    publisher_token: &str,
+) -> Result<(pulsebeam_agent_quic::executor::linux::LinuxAgent, String)> {
+    use pulsebeam_agent_core::{AgentCommand, DesiredState, MediaKind, PublicationIntent};
+    use pulsebeam_agent_quic::executor::linux::OpusSendError;
+    let mut publisher = sim_quic_agent(address, edge, roots, publisher_token)?;
+    publisher.command(AgentCommand::ReplaceDesired(DesiredState {
+        revision: 1,
+        publications: vec![PublicationIntent {
+            slot: "voice".into(),
+            track_id: "voice".into(),
+            kind: MediaKind::Audio,
+            active: true,
+        }],
+        ..Default::default()
+    }))?;
+    publisher.command(AgentCommand::Join("stage".into()))?;
+    ensure!(
+        publisher.send_opus("voice", 960, false, &[0xf8, 0xff, 0xfe])
+            == Err(OpusSendError::NotReady)
+    );
+    let publication_id = loop {
+        let snapshot = publisher.snapshot();
+        ensure!(
+            snapshot.terminal_failure.is_none(),
+            "Opus Agent failed: {:?}",
+            snapshot.terminal_failure
+        );
+        if let Some(publication) = publisher.opus_publication_id("voice") {
+            break publication.to_owned();
+        }
+        publisher
+            .turn()
+            .await
+            .map_err(|error| anyhow::anyhow!("Opus Agent readiness: {error:?}"))?;
+    };
+    Ok((publisher, publication_id))
+}
+
+async fn opus_exchange(
+    address: SocketAddr,
+    edge: SocketAddr,
+    roots: RootCertStore,
+    publisher_token: &str,
+    receiver_token: &str,
+) -> Result<()> {
+    use pulsebeam_agent_core::{AgentCommand, AudioSubscription, DesiredState};
+    use pulsebeam_agent_quic::executor::linux::OpusSendError;
+    let (mut publisher, publication_id) =
+        prepare_agent_opus_publisher(address, edge, roots.clone(), publisher_token).await?;
+    let mut receiver = sim_quic_agent(address, edge, roots, receiver_token)?;
+    receiver.command(AgentCommand::ReplaceDesired(DesiredState {
+        revision: 1,
+        audio: AudioSubscription {
+            pinned: vec![publication_id.clone()],
+            ..Default::default()
+        },
+        ..Default::default()
+    }))?;
+    receiver.command(AgentCommand::Join("stage".into()))?;
+    while !receiver.opus_receiver_ready(&publication_id) {
+        ensure!(
+            receiver.snapshot().terminal_failure.is_none(),
+            "Opus receiver failed: {:?}",
+            receiver.snapshot().terminal_failure
+        );
+        receiver
+            .turn()
+            .await
+            .map_err(|error| anyhow::anyhow!("Opus receiver readiness: {error:?}"))?;
+    }
+    ensure!(matches!(
+        publisher.send_opus(
+            "voice",
+            0,
+            false,
+            &vec![1; usize::from(transport::UDP_PAYLOAD_BYTES)]
+        ),
+        Err(OpusSendError::Datagram(DatagramAdmission::Size))
+    ));
+    let mut previous: Option<(u16, u32)> = None;
+    for (timestamp, marker) in [(960, true), (1920, false)] {
+        loop {
+            match publisher.send_opus("voice", timestamp, marker, &[0xf8, 0xff, 0xfe]) {
+                Ok(()) => break,
+                Err(OpusSendError::Datagram(
+                    DatagramAdmission::Full | DatagramAdmission::ControlTurn,
+                )) => {}
+                Err(error) => anyhow::bail!("Opus send: {error:?}"),
+            }
+            publisher
+                .turn()
+                .await
+                .map_err(|error| anyhow::anyhow!("Opus Agent drive: {error:?}"))?;
+        }
+        let receive = async {
+            loop {
+                if let Some(packet) = receiver.next_opus() {
+                    ensure!(
+                        packet.publication_id == publication_id
+                            && packet.marker == marker
+                            && packet.payload == [0xf8, 0xff, 0xfe],
+                        "unexpected negotiated Opus packet: {packet:?}"
+                    );
+                    return Ok((packet.sequence, packet.timestamp));
+                }
+                receiver
+                    .turn()
+                    .await
+                    .map_err(|error| anyhow::anyhow!("Opus receive: {error:?}"))?;
+            }
+        };
+        let timing = pulsebeam_runtime::select! {
+            result = pulsebeam_runtime::time::timeout(Duration::from_secs(2), receive) =>
+                result.map_err(|_| anyhow::anyhow!("Opus packet at timestamp {timestamp} was not received"))??,
+            error = async { loop { if let Err(error) = publisher.turn().await { break error; } } } =>
+                anyhow::bail!("Opus Agent drive: {error:?}"),
+        };
+        if let Some((sequence, timestamp)) = previous {
+            ensure!(
+                timing.0 == sequence.wrapping_add(1) && timing.1 == timestamp.wrapping_add(960)
+            );
+        }
+        previous = Some(timing);
+    }
+    Ok(())
+}
+
+async fn mixed_opus_exchange(
+    address: SocketAddr,
+    edge: SocketAddr,
+    roots: RootCertStore,
+    rtc_host: std::net::IpAddr,
+    quic_token: &str,
+    rtc_token: &str,
+) -> Result<()> {
+    use super::common::{client::create_http_client, native::NativeHost};
+    use pulsebeam_agent_core::{
+        AgentCommand, AgentConfig, AudioSubscription, DesiredState, MediaKind, PublicationIntent,
+        ffi::PublicationExecution,
+    };
+    use pulsebeam_agent_native::{
+        Agent as RuntimeAgent, AudioInput, Config, Host, InputFrame, MediaStreamUpdate,
+        OutputFrame, ReceiveMode, ffi::Agent,
+    };
+    use pulsebeam_agent_quic::executor::linux::OpusSendError;
+    let (mut quic, publication) =
+        prepare_agent_opus_publisher(address, edge, roots, quic_token).await?;
+    let host = NativeHost::bind(rtc_host)?;
+    let mut config = Config::new(AgentConfig {
+        endpoint: format!("http://{address}"),
+        token: rtc_token.into(),
+        retry: Default::default(),
+        log_level: Default::default(),
+    });
+    config.media.audio_input = AudioInput::EncodedOpus { channels: 2 };
+    let (runtime, actor) =
+        RuntimeAgent::managed_with_services(config, Host::new(create_http_client()), move || {
+            host.runtime()
+        })?;
+    tokio::task::spawn_local(actor);
+    let rtc = Agent::from_runtime(runtime);
+    let subscriber = rtc
+        .room("stage".into())?
+        .participant("alice".into())?
+        .audio("voice".into())?
+        .subscribe()?;
+    let updates = subscriber.updates()?;
+    let source = rtc.create_audio_input().await?;
+    let reverse = rtc.audio("return".into())?.publish(None)?;
+    let _pipe = source.pipe_to(&reverse)?;
+    let demand = reverse.updates()?;
+    rtc.join("stage".into())?;
+    loop {
+        let state = updates
+            .next()
+            .await?
+            .context("WebRTC Opus subscription updates")?;
+        ensure!(
+            state.error.is_none() && state.execution_error.is_none(),
+            "WebRTC Opus subscription: {state:?}"
+        );
+        if state.execution == PublicationExecution::Installed {
+            ensure!(state.source_track_id.as_deref() == Some(publication.as_str()));
+            break;
+        }
+    }
+    let encoded = pulsebeam_runtime::time::timeout(
+        Duration::from_secs(2),
+        subscriber.observe(ReceiveMode::Encoded),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("WebRTC Opus observer did not attach after installation"))??;
+    let opus = super::native_runtime::stock_opus_fixture()
+        .first()
+        .context("stock Opus packet")?;
+    loop {
+        match quic.send_opus("voice", opus.timestamp, true, &opus.payload) {
+            Ok(()) => break,
+            Err(OpusSendError::Datagram(
+                DatagramAdmission::Full | DatagramAdmission::ControlTurn,
+            )) => {}
+            Err(error) => anyhow::bail!("mixed Opus send: {error:?}"),
+        }
+        quic.turn()
+            .await
+            .map_err(|error| anyhow::anyhow!("mixed Opus Agent drive: {error:?}"))?;
+    }
+    let receive = async {
+        loop {
+            match encoded.next().await {
+                MediaStreamUpdate::Track { .. } => {}
+                MediaStreamUpdate::Frame { frame } => {
+                    ensure!(
+                        frame.track.generation == encoded.generation()
+                            && frame.track.receiver == encoded.receiver()
+                    );
+                    ensure!(
+                        matches!(frame.frame, OutputFrame::Opus { payload, .. } if payload == opus.payload)
+                    );
+                    ensure!(
+                        pulsebeam::sim_metrics::routing_counter("fabric_rtp_opus_shard_enqueued")
+                            > 0,
+                        "mixed Opus must cross shard owners"
+                    );
+                    return Ok(());
+                }
+                update => anyhow::bail!("unexpected WebRTC Opus observation: {update:?}"),
+            }
+        }
+    };
+    pulsebeam_runtime::select! {
+        result = pulsebeam_runtime::time::timeout(Duration::from_secs(2), receive) =>
+            result.map_err(|_| anyhow::anyhow!("WebRTC encoded receiver did not observe QUIC Opus"))??,
+        error = async { loop { if let Err(error) = quic.turn().await { break error; } } } =>
+            anyhow::bail!("mixed Opus Agent drive: {error:?}"),
+    }
+
+    let reverse_id = pulsebeam_runtime::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let state = demand
+                .next()
+                .await?
+                .context("WebRTC Opus publication updates")?;
+            ensure!(
+                state.admission.error.is_none() && state.admission.execution_error.is_none(),
+                "WebRTC Opus publication: {state:?}"
+            );
+            if state.admission.execution == PublicationExecution::Installed {
+                return state
+                    .admission
+                    .publication_id
+                    .context("installed WebRTC Opus publication ID");
+            }
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("WebRTC Opus publication did not install"))??;
+    reverse.ready().await?;
+    let revision = quic
+        .snapshot()
+        .desired_revision
+        .checked_add(1)
+        .context("QUIC desired revision exhausted")?;
+    quic.command(AgentCommand::ReplaceDesired(DesiredState {
+        revision,
+        connected: true,
+        publications: vec![PublicationIntent {
+            slot: "voice".into(),
+            track_id: "voice".into(),
+            kind: MediaKind::Audio,
+            active: true,
+        }],
+        audio: AudioSubscription {
+            pinned: vec![reverse_id.clone()],
+            ..Default::default()
+        },
+        ..Default::default()
+    }))?;
+    pulsebeam_runtime::time::timeout(Duration::from_secs(2), async {
+        while !quic.opus_receiver_ready(&reverse_id) {
+            ensure!(
+                quic.snapshot().terminal_failure.is_none(),
+                "QUIC Opus receiver: {:?}",
+                quic.snapshot().terminal_failure
+            );
+            quic.turn()
+                .await
+                .map_err(|error| anyhow::anyhow!("QUIC Opus receiver readiness: {error:?}"))?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("QUIC receiver did not install for WebRTC Opus"))??;
+    pulsebeam_runtime::time::timeout(Duration::from_secs(2), async {
+        while !reverse.state().forwarding_requested {
+            demand
+                .next()
+                .await?
+                .context("WebRTC Opus publication demand")?;
+        }
+        anyhow::Ok(())
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("WebRTC Opus publisher did not observe forwarding demand"))??;
+    source
+        .submit(InputFrame::Opus {
+            frame: opus.clone(),
+        })
+        .await?;
+    pulsebeam_runtime::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(frame) = quic.next_opus() {
+                ensure!(
+                    frame.publication_id == reverse_id && frame.payload == opus.payload,
+                    "unexpected WebRTC Opus frame: {frame:?}"
+                );
+                return Ok(());
+            }
+            quic.turn()
+                .await
+                .map_err(|error| anyhow::anyhow!("QUIC Opus receiver drive: {error:?}"))?;
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("QUIC receiver did not observe WebRTC Opus"))??;
+    rtc.close().await?;
+    Ok(())
+}
+
+fn pinned_video(publication_id: String) -> pulsebeam_agent_core::VideoSubscription {
+    pulsebeam_agent_core::VideoSubscription {
+        slot: 0,
+        publication_id,
+        selector: None,
+        height: 0,
+        min_height: 0,
+        min_fps: 0,
+        priority: 1,
+    }
+}
+
+async fn mixed_h264_exchange(
+    address: SocketAddr,
+    edge: SocketAddr,
+    roots: RootCertStore,
+    rtc_host: std::net::IpAddr,
+    quic_token: &str,
+    rtc_token: &str,
+) -> Result<()> {
+    use super::common::{client::create_http_client, native::NativeHost};
+    use pulsebeam_agent_core::{
+        AgentCommand, AgentConfig, DesiredState, MediaKind, PublicationIntent,
+        ffi::{PublicationExecution, VideoObservation},
+    };
+    use pulsebeam_agent_native::{
+        Agent as RuntimeAgent, Config, H264Frame, Host, InputFrame, MediaStreamUpdate, OutputFrame,
+        ReceiveMode, VideoInput, ffi::Agent,
+    };
+    let mut quic = sim_quic_agent(address, edge, roots, quic_token)?;
+    let camera = PublicationIntent {
+        slot: "camera".into(),
+        track_id: "camera".into(),
+        kind: MediaKind::Video,
+        active: true,
+    };
+    quic.command(AgentCommand::ReplaceDesired(DesiredState {
+        revision: 1,
+        publications: vec![camera.clone()],
+        ..Default::default()
+    }))?;
+    quic.command(AgentCommand::Join("stage".into()))?;
+    let publication = loop {
+        ensure!(
+            quic.snapshot().terminal_failure.is_none(),
+            "QUIC video publication: {:?}",
+            quic.snapshot().terminal_failure
+        );
+        if let Some(id) = quic.h264_publication_id("camera") {
+            break id.to_owned();
+        }
+        quic.turn()
+            .await
+            .map_err(|error| anyhow::anyhow!("QUIC video publication: {error:?}"))?;
+    };
+    let mut units = {
+        use pulsebeam_rtc_simulation::{
+            NativeH264FixtureEncoding, SimulationWorld, stock_h264_fixture_for_encoding,
+        };
+        stock_h264_fixture_for_encoding(
+            &SimulationWorld::acquire(),
+            NativeH264FixtureEncoding {
+                width: 1280,
+                height: 720,
+                bitrate_kbps: 1_000,
+            },
+            1,
+            3,
+        )
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?
+        .into_iter()
+    };
+    let host = NativeHost::bind(rtc_host)?;
+    let unit = units
+        .find(|unit| unit.keyframe)
+        .context("stock H.264 keyframe")?;
+    let delta = units
+        .find(|unit| !unit.keyframe)
+        .context("stock H.264 delta frame")?;
+    let mut config = Config::new(AgentConfig {
+        endpoint: format!("http://{address}"),
+        token: rtc_token.into(),
+        retry: Default::default(),
+        log_level: Default::default(),
+    });
+    config.media.video_input = VideoInput::EncodedH264;
+    let (runtime, actor) =
+        RuntimeAgent::managed_with_services(config, Host::new(create_http_client()), move || {
+            host.runtime()
+        })?;
+    tokio::task::spawn_local(actor);
+    let rtc = Agent::from_runtime(runtime);
+    let subscriber = rtc
+        .room("stage".into())?
+        .participant("alice".into())?
+        .video("camera".into())?
+        .subscribe(Some(VideoObservation {
+            visible: true,
+            height: 720,
+            min_height: 0,
+            min_fps: 0,
+            priority: 1,
+        }))?;
+    let updates = subscriber.updates()?;
+    let source = rtc.create_video_input(Default::default()).await?;
+    let reverse = rtc.video("return".into())?.publish(Default::default())?;
+    let _pipe = source.pipe_to(&reverse)?;
+    let demand = reverse.updates()?;
+    let feedback = source.feedback();
+    rtc.join("stage".into())?;
+    loop {
+        let state = updates
+            .next()
+            .await?
+            .context("WebRTC video subscription updates")?;
+        ensure!(
+            state.error.is_none() && state.execution_error.is_none(),
+            "WebRTC video subscription: {state:?}"
+        );
+        if state.execution == PublicationExecution::Installed {
+            ensure!(state.source_track_id.as_deref() == Some(publication.as_str()));
+            break;
+        }
+    }
+    let encoded = subscriber.observe(ReceiveMode::Encoded).await?;
+    pulsebeam_runtime::time::timeout(Duration::from_secs(2), async {
+        while !quic.take_h264_keyframe_request("camera") {
+            quic.turn()
+                .await
+                .map_err(|error| anyhow::anyhow!("QUIC video refresh: {error:?}"))?;
+        }
+        anyhow::Ok(())
+    })
+    .await
+    .context("QUIC publisher did not receive receiver keyframe request")??;
+    ensure!(
+        unit.data.len() > usize::from(transport::UDP_PAYLOAD_BYTES),
+        "fixture must require multiple QUIC datagrams"
+    );
+    let mut timestamp_offset = None;
+    for sample in [&unit, &delta] {
+        quic.send_h264("camera", sample.rtp_timestamp, sample.data.clone())
+            .map_err(|error| anyhow::anyhow!("QUIC video send: {error:?}"))?;
+        ensure!(
+            quic.send_h264("camera", sample.rtp_timestamp, Vec::new())
+                == Err(pulsebeam_agent_quic::executor::linux::H264SendError::Busy)
+        );
+        let receive = async {
+            loop {
+                match encoded.next().await {
+                    MediaStreamUpdate::Track { .. } => {}
+                    MediaStreamUpdate::Frame { frame } => {
+                        let OutputFrame::H264 {
+                            keyframe,
+                            payload,
+                            timestamp,
+                        } = frame.frame
+                        else {
+                            anyhow::bail!("expected H.264 from WebRTC observer");
+                        };
+                        ensure!(
+                            keyframe == sample.keyframe && payload == sample.data,
+                            "unexpected WebRTC encoded video access unit"
+                        );
+                        return Ok(timestamp);
+                    }
+                    update => anyhow::bail!("unexpected WebRTC H.264 observation: {update:?}"),
+                }
+            }
+        };
+        let timestamp = pulsebeam_runtime::select! {
+            result = pulsebeam_runtime::time::timeout(Duration::from_secs(2), receive) => result.context("WebRTC did not receive QUIC H.264")??,
+            error = async { loop { if let Err(error) = quic.turn().await { break error; } } } => anyhow::bail!("QUIC video drive: {error:?}"),
+        };
+        let offset = timestamp.wrapping_sub(sample.rtp_timestamp);
+        ensure!(
+            *timestamp_offset.get_or_insert(offset) == offset,
+            "H.264 RTP timestamp delta changed"
+        );
+    }
+    ensure!(
+        pulsebeam::sim_metrics::routing_counter("fabric_rtp_h264_shard_enqueued") > 0,
+        "mixed H.264 must cross shard owners"
+    );
+    reverse.ready().await?;
+    let reverse_id = reverse
+        .state()
+        .admission
+        .publication_id
+        .context("WebRTC video publication ID")?;
+    let revision = quic
+        .snapshot()
+        .desired_revision
+        .checked_add(1)
+        .context("QUIC desired revision exhausted")?;
+    quic.command(AgentCommand::ReplaceDesired(DesiredState {
+        revision,
+        connected: true,
+        publications: vec![camera],
+        video: vec![pinned_video(reverse_id.clone())],
+        ..Default::default()
+    }))?;
+    pulsebeam_runtime::time::timeout(Duration::from_secs(2), async {
+        while !quic.h264_receiver_ready(&reverse_id) {
+            ensure!(
+                quic.snapshot().terminal_failure.is_none(),
+                "QUIC video subscription: {:?}",
+                quic.snapshot().terminal_failure
+            );
+            quic.turn()
+                .await
+                .map_err(|error| anyhow::anyhow!("QUIC video subscription: {error:?}"))?;
+        }
+        anyhow::Ok(())
+    })
+    .await
+    .context("QUIC video subscription did not install")??;
+    while !reverse.state().forwarding_requested {
+        demand
+            .next()
+            .await?
+            .context("WebRTC video publication demand")?;
+    }
+    source
+        .submit(InputFrame::H264 {
+            frame: H264Frame {
+                timestamp_us: 0,
+                width: unit.width.try_into()?,
+                height: unit.height.try_into()?,
+                keyframe: true,
+                temporal_index: None,
+                base_layer_sync: false,
+                payload: unit.data.clone(),
+            },
+        })
+        .await?;
+    pulsebeam_runtime::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(frame) = quic.next_h264() {
+                ensure!(
+                    frame.publication_id == reverse_id && frame.access_unit == unit.data,
+                    "unexpected QUIC encoded video access unit"
+                );
+                return Ok(());
+            }
+            quic.turn()
+                .await
+                .map_err(|error| anyhow::anyhow!("QUIC video receiver: {error:?}"))?;
+        }
+    })
+    .await
+    .context("QUIC did not receive WebRTC H.264")??;
+    pulsebeam_runtime::time::sleep(Duration::from_millis(600)).await;
+    loop {
+        match quic.request_h264_keyframe(&reverse_id) {
+            Ok(()) => break,
+            Err(DatagramAdmission::Full | DatagramAdmission::ControlTurn) => {}
+            Err(error) => anyhow::bail!("QUIC keyframe request: {error:?}"),
+        }
+        quic.turn()
+            .await
+            .map_err(|error| anyhow::anyhow!("QUIC keyframe request: {error:?}"))?;
+    }
+    let wait_feedback = async {
+        // The encoded producer reports a keyframe request when libwebrtc
+        // rejects a delta capture in response to the PLI.
+        pulsebeam_runtime::time::sleep(Duration::from_millis(100)).await;
+        source
+            .submit(InputFrame::H264 {
+                frame: H264Frame {
+                    timestamp_us: source.capture_time_us().await?.max(1),
+                    width: delta.width.try_into()?,
+                    height: delta.height.try_into()?,
+                    keyframe: false,
+                    temporal_index: None,
+                    base_layer_sync: false,
+                    payload: delta.data,
+                },
+            })
+            .await?;
+        use pulsebeam_agent_native::ffi::FeedbackUpdate;
+        loop {
+            match feedback.next().await {
+                FeedbackUpdate::Feedback { feedback } if feedback.keyframe_requested => {
+                    return Ok(());
+                }
+                FeedbackUpdate::Feedback { .. } => {}
+                update => anyhow::bail!("unexpected WebRTC H.264 feedback: {update:?}"),
+            }
+        }
+    };
+    pulsebeam_runtime::select! {
+        result = pulsebeam_runtime::time::timeout(Duration::from_secs(2), wait_feedback) => result.context("WebRTC publisher did not receive QUIC PLI")??,
+        error = async { loop { if let Err(error) = quic.turn().await { break error; } } } => anyhow::bail!("QUIC keyframe request drive: {error:?}"),
+    }
+    let revision = quic
+        .snapshot()
+        .desired_revision
+        .checked_add(1)
+        .context("QUIC desired revision exhausted")?;
+    quic.command(AgentCommand::ReplaceDesired(DesiredState {
+        revision,
+        connected: true,
+        ..Default::default()
+    }))?;
+    pulsebeam_runtime::time::timeout(Duration::from_secs(2), async {
+        while quic.h264_receiver_ready(&reverse_id) || quic.h264_publication_id("camera").is_some()
+        {
+            quic.turn()
+                .await
+                .map_err(|error| anyhow::anyhow!("QUIC video retirement: {error:?}"))?;
+        }
+        anyhow::Ok(())
+    })
+    .await
+    .context("QUIC video bindings did not retire")??;
+    ensure!(quic.request_h264_keyframe(&reverse_id) == Err(DatagramAdmission::Unsupported));
+    ensure!(!quic.take_h264_keyframe_request("camera"));
+    ensure!(quic.next_h264().is_none());
+    ensure!(
+        quic.send_h264("camera", unit.rtp_timestamp, unit.data)
+            == Err(pulsebeam_agent_quic::executor::linux::H264SendError::NotReady)
+    );
+    rtc.close().await?;
+    Ok(())
+}
+
+enum Scenario {
+    Data {
+        delivery: DataV1Delivery,
+        sctp_host: Option<std::net::IpAddr>,
+    },
+    Opus,
+    MixedOpus {
+        host: std::net::IpAddr,
+    },
+    MixedH264 {
+        host: std::net::IpAddr,
+    },
+}
+
 #[allow(
     clippy::disallowed_types,
     reason = "Noq and rustls require shared immutable configuration and clocks"
 )]
-async fn witness(delivery: DataV1Delivery, sctp_host: Option<std::net::IpAddr>) -> Result<()> {
+async fn witness(scenario: Scenario) -> Result<()> {
     let host = std::net::Ipv4Addr::LOCALHOST.into();
     let edge = SocketAddr::new(host, 8443);
     let http = TcpListener::bind("127.0.0.1:0".parse()?).await?;
@@ -1105,7 +1842,18 @@ async fn witness(delivery: DataV1Delivery, sctp_host: Option<std::net::IpAddr>) 
         .with_http_api_listener(http)
         .with_key_registry(keys)
         .with_sim_startup_notification(notify);
-    let shards = if sctp_host.is_some() { 2 } else { 1 };
+    let shards = if matches!(
+        scenario,
+        Scenario::Data {
+            sctp_host: Some(_),
+            ..
+        } | Scenario::MixedOpus { .. }
+            | Scenario::MixedH264 { .. }
+    ) {
+        2
+    } else {
+        1
+    };
     let builder = builder
         .workers(shards)
         .room_partition_size(1)
@@ -1129,7 +1877,11 @@ async fn witness(delivery: DataV1Delivery, sctp_host: Option<std::net::IpAddr>) 
         result = &mut node => anyhow::bail!("node stopped before startup: {result:?}"),
     }
     let result = async {
-        if let Some(sctp_host) = sctp_host {
+        if let Scenario::Data {
+            sctp_host: Some(sctp_host),
+            delivery,
+        } = scenario
+        {
             let sctp_token = sign("sctp-peer", 60)?.token;
             return mixed_exchange(
                 address,
@@ -1142,6 +1894,17 @@ async fn witness(delivery: DataV1Delivery, sctp_host: Option<std::net::IpAddr>) 
             )
             .await;
         }
+        if let Scenario::MixedOpus { host } = scenario {
+            return mixed_opus_exchange(address, edge, roots, host, &credential, &subscriber_token)
+                .await;
+        }
+        if let Scenario::MixedH264 { host } = scenario {
+            return mixed_h264_exchange(address, edge, roots, host, &credential, &subscriber_token)
+                .await;
+        }
+        let Scenario::Data { delivery, .. } = scenario else {
+            return opus_exchange(address, edge, roots, &credential, &subscriber_token).await;
+        };
         let owner = issue(address, &credential, None).await?;
         let mut client = Client::new(edge, roots.clone()).await?;
         let (accepted, mut control) = client
@@ -1154,6 +1917,23 @@ async fn witness(delivery: DataV1Delivery, sctp_host: Option<std::net::IpAddr>) 
             })
             .await?;
         ensure!(accepted.room.as_deref() == Some("stage") && accepted.participant == "alice");
+        use pulsebeam_proto::{prelude::Message, state::RtpCapabilities};
+        let caps = RtpCapabilities::decode(accepted.capabilities.as_slice())?;
+        ensure!(
+            caps.codecs
+                .iter()
+                .filter_map(|codec| codec
+                    .format
+                    .as_ref()
+                    .map(|format| format.mime_type.as_str()))
+                .eq(["audio/opus", "video/h264"])
+        );
+        ensure!(
+            caps.codecs
+                .iter()
+                .all(|codec| !codec.rtx_supported && codec.feedback.is_empty())
+        );
+        ensure!(caps.header_extensions.is_empty() && caps.rtcp_modes.is_empty());
         let predecessor = accepted.connection;
         let successor = loop {
             let state = client

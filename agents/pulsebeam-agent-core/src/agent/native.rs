@@ -867,6 +867,74 @@ pub(super) fn project_retired_receivers(session: &Session, snapshot: &mut Snapsh
     changed
 }
 
+fn quic_rtp_binding(
+    session: &mut Session,
+    resource: &Resource,
+    source: Option<&str>,
+    ids: &mut IdGenerator,
+) -> Option<state::TrackBinding> {
+    use state::{publication_spec::Kind, resource_spec::Declaration, track_binding::Transport};
+    if let Some(spec) = session.state.target_spec(resource) {
+        let binding = match spec.declaration.as_ref()? {
+            Declaration::Publication(publication) if source.is_none() => {
+                match publication.kind.as_ref()? {
+                    Kind::Audio(audio) => audio.binding.as_ref()?,
+                    Kind::Video(video) => video.binding.as_ref()?,
+                    _ => return None,
+                }
+            }
+            Declaration::Subscription(subscription)
+                if source == Some(subscription.publication_id.as_str()) =>
+            {
+                subscription.binding.as_ref()?
+            }
+            _ => return None,
+        };
+        return matches!(binding.transport, Some(Transport::QuicRtp(_))).then(|| binding.clone());
+    }
+    let video = match resource {
+        Resource::Publication {
+            kind: state::TrackKind::Video,
+            ..
+        }
+        | Resource::Reception(MediaSlot::RemoteVideo(_)) => true,
+        Resource::Publication {
+            kind: state::TrackKind::Audio,
+            ..
+        }
+        | Resource::Reception(MediaSlot::RemoteAudio(_)) => false,
+        _ => return None,
+    };
+    let format = session
+        .capabilities
+        .rtp
+        .codecs
+        .iter()
+        .filter_map(|codec| codec.format.as_ref())
+        .find(|format| {
+            matches!(
+                (video, format.known_codec()),
+                (false, Some(state::codec_format::Codec::Opus(_)))
+                    | (true, Some(state::codec_format::Codec::H264(_)))
+            )
+        })?
+        .clone();
+    let id = u16::try_from(session.next_stream).ok()?;
+    session.next_stream = session.next_stream.checked_add(1)?;
+    Some(state::TrackBinding {
+        transport: Some(Transport::QuicRtp(state::QuicRtpParameters {
+            binding_id: u32::from(id),
+            incarnation: ids.channel().get(),
+            primary_ssrc: u32::from(id),
+            codec: Some(state::RtpCodecParameters {
+                payload_type: Some(if video { 102 } else { 111 }),
+                format: Some(format),
+                ..Default::default()
+            }),
+        })),
+    })
+}
+
 pub(super) fn reconcile(
     session: &mut Session,
     logs: &mut crate::logging::LogBuffer,
@@ -891,10 +959,16 @@ pub(super) fn reconcile(
             kind: wire_kind,
             track_id: value.track_id.clone(),
         };
-        if let Some(want) = media_want(session, resource.clone(), &slot, None) {
-            media.insert(slot.clone(), want);
-        }
-        if let Some(binding) = rtp(session, logs, &resource, &slot, None) {
+        let binding = if session.state.binding_profile() == state::validation::BindingProfile::Quic
+        {
+            quic_rtp_binding(session, &resource, None, ids)
+        } else {
+            if let Some(want) = media_want(session, resource.clone(), &slot, None) {
+                media.insert(slot.clone(), want);
+            }
+            rtp(session, logs, &resource, &slot, None)
+        };
+        if let Some(binding) = binding {
             let kind = if kind == crate::MediaKind::Audio {
                 state::publication_spec::Kind::Audio(state::AudioPublication {
                     binding: Some(binding),
@@ -926,6 +1000,23 @@ pub(super) fn reconcile(
         }
         let resource = Resource::Reception(slot.clone());
         let track = &video.publication_id;
+        if session.state.binding_profile() == state::validation::BindingProfile::Quic {
+            if let Some(source_room) = session.room_id.clone()
+                && let Some(binding) = quic_rtp_binding(session, &resource, Some(track), ids)
+            {
+                wanted.insert(
+                    resource,
+                    subscription(
+                        track.clone(),
+                        source_room,
+                        state::TrackKind::Video,
+                        binding,
+                        receive,
+                    ),
+                );
+            }
+            continue;
+        }
         if let Some(want) = media_want(session, resource.clone(), &slot, Some(track)) {
             media.insert(slot.clone(), want);
         }
@@ -980,6 +1071,22 @@ pub(super) fn reconcile(
             assigned.push((*index, source.clone()));
         }
     }
+    let quic = session.state.binding_profile() == state::validation::BindingProfile::Quic;
+    if quic {
+        for resource in session.state.resources() {
+            if let Resource::Reception(MediaSlot::RemoteAudio(index)) = resource
+                && let Some(state::resource_spec::Declaration::Subscription(subscription)) = session
+                    .state
+                    .target_spec(resource)
+                    .and_then(|spec| spec.declaration.as_ref())
+            {
+                occupied.insert(*index);
+                if audio.remove(&subscription.publication_id) {
+                    assigned.push((*index, subscription.publication_id.clone()));
+                }
+            }
+        }
+    }
     for (resource, live) in session.state.owned() {
         if let Resource::Reception(MediaSlot::RemoteAudio(index)) = resource
             && !occupied.contains(index)
@@ -1003,6 +1110,18 @@ pub(super) fn reconcile(
     for (index, id) in assigned {
         let slot = MediaSlot::RemoteAudio(index);
         let resource = Resource::Reception(slot.clone());
+        if quic {
+            let Some(room) = session.room_id.clone() else {
+                continue;
+            };
+            if let Some(binding) = quic_rtp_binding(session, &resource, Some(&id), ids) {
+                wanted.insert(
+                    resource,
+                    subscription(id, room, state::TrackKind::Audio, binding, audio_options()),
+                );
+            }
+            continue;
+        }
         if let Some(want) = media_want(session, resource.clone(), &slot, Some(&id)) {
             media.insert(slot.clone(), want);
         }

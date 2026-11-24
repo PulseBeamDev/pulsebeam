@@ -18,6 +18,7 @@ pub enum QuicEvent {
         connection_id: String,
         participant_id: String,
         room: Option<String>,
+        capabilities: Vec<u8>,
     },
     Control {
         generation: Generation,
@@ -31,6 +32,16 @@ pub enum QuicEvent {
         generation: Generation,
         binding: core::num::NonZeroU16,
         payload: Vec<u8>,
+    },
+    Rtp {
+        generation: Generation,
+        binding: core::num::NonZeroU16,
+        payload: Vec<u8>,
+    },
+    PictureLoss {
+        generation: Generation,
+        binding: core::num::NonZeroU16,
+        media_ssrc: core::num::NonZeroU32,
     },
     DataSent {
         generation: Generation,

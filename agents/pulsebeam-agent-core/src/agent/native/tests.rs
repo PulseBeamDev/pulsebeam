@@ -586,6 +586,56 @@ fn quic_reserves_nonreused_payload_ids_without_rtc_effects() {
     };
     assert_eq!(second.binding_id, 2);
     assert!(second.incarnation > first.incarnation);
+    let audio = Resource::Publication {
+        kind: state::TrackKind::Audio,
+        track_id: "voice".into(),
+    };
+    session.capabilities.rtp = state::RtpCapabilities::default();
+    assert!(quic_rtp_binding(session, &audio, None, &mut ids).is_none());
+    session
+        .capabilities
+        .rtp
+        .codecs
+        .push(state::RtpCodecCapability {
+            format: Some(state::CodecFormat::from(state::codec_format::Codec::Opus(
+                state::OpusParameters::default(),
+            ))),
+            ..Default::default()
+        });
+    let binding = quic_rtp_binding(session, &audio, None, &mut ids).unwrap();
+    assert!(
+        matches!(&binding.transport, Some(state::track_binding::Transport::QuicRtp(parameters)) if parameters.binding_id == 3 && parameters.primary_ssrc != 0)
+    );
+    let spec = publication(
+        "voice",
+        true,
+        state::publication_spec::Kind::Audio(state::AudioPublication {
+            binding: Some(binding.clone()),
+        }),
+    );
+    session.state.stage(audio.clone(), Some(spec)).unwrap();
+    assert_eq!(
+        quic_rtp_binding(session, &audio, None, &mut ids),
+        Some(binding)
+    );
+    let receiver = Resource::Reception(MediaSlot::RemoteAudio(0));
+    let binding = quic_rtp_binding(session, &receiver, Some("publication"), &mut ids).unwrap();
+    assert!(
+        matches!(&binding.transport, Some(state::track_binding::Transport::QuicRtp(parameters)) if parameters.binding_id == 4)
+    );
+    let spec = subscription(
+        "publication".into(),
+        "stage".into(),
+        state::TrackKind::Audio,
+        binding.clone(),
+        audio_options(),
+    );
+    session.state.stage(receiver.clone(), Some(spec)).unwrap();
+    assert_eq!(
+        quic_rtp_binding(session, &receiver, Some("publication"), &mut ids),
+        Some(binding)
+    );
+    assert!(quic_rtp_binding(session, &receiver, Some("another"), &mut ids).is_none());
     assert!(effects.is_empty());
 }
 

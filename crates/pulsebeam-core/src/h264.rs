@@ -390,6 +390,22 @@ pub struct Packetizer {
     mtu: usize,
 }
 
+/// A single owned Annex-B access unit. Iteration allocates only the next RTP
+/// payload; a backpressured caller can retain that payload and resume later.
+pub struct Packetization {
+    packetizer: Packetizer,
+    access_unit: Vec<u8>,
+    cursor: PacketCursor,
+}
+
+#[derive(Default)]
+struct PacketCursor {
+    scan: usize,
+    nalu: Option<core::ops::Range<usize>>,
+    next_fragment: usize,
+    started: bool,
+}
+
 impl Packetizer {
     pub fn new(mtu: usize) -> Self {
         debug_assert!(
@@ -401,104 +417,94 @@ impl Packetizer {
         }
     }
 
-    pub fn packetize(&self, access_unit: &[u8]) -> Vec<PacketizedChunk> {
-        let nalus = annex_b_nalus(access_unit);
-        debug_assert!(
-            !nalus.is_empty(),
-            "H.264 access unit must contain at least one NAL unit"
-        );
-        let mut chunks = Vec::new();
-        for nalu in nalus {
-            if nalu.len() <= self.mtu {
-                chunks.push(PacketizedChunk {
-                    payload: nalu.to_vec(),
-                    start_of_frame: false,
-                    end_of_frame: false,
-                });
-                continue;
-            }
+    pub fn into_packets(self, access_unit: Vec<u8>) -> Packetization {
+        Packetization {
+            packetizer: self,
+            access_unit,
+            cursor: PacketCursor::default(),
+        }
+    }
 
-            let Some((&header, body)) = nalu.split_first() else {
-                debug_assert!(false, "Annex-B parser must not return empty NAL units");
-                continue;
-            };
-            debug_assert!(
-                !body.is_empty(),
-                "only a NAL larger than the MTU is fragmented"
+    pub fn packetize(&self, access_unit: &[u8]) -> Vec<PacketizedChunk> {
+        let mut cursor = PacketCursor::default();
+        core::iter::from_fn(|| self.next_packet(access_unit, &mut cursor)).collect()
+    }
+
+    fn next_packet(
+        &self,
+        access_unit: &[u8],
+        cursor: &mut PacketCursor,
+    ) -> Option<PacketizedChunk> {
+        if cursor.nalu.is_none() {
+            cursor.nalu = next_annex_b_nalu(access_unit, &mut cursor.scan);
+        }
+        let nalu = access_unit.get(cursor.nalu.clone()?)?;
+        let (payload, last_fragment) = if nalu.len() <= self.mtu {
+            (nalu.to_vec(), true)
+        } else {
+            let (&header, body) = nalu.split_first()?;
+            let start = cursor.next_fragment;
+            let end = start
+                .saturating_add(self.mtu.saturating_sub(FUA_HEADER_SIZE))
+                .min(body.len());
+            let fragment = body.get(start..end)?;
+            let last = end == body.len();
+            let mut payload = Vec::with_capacity(fragment.len().saturating_add(FUA_HEADER_SIZE));
+            payload.push((header & 0xe0) | FUA_NALU_TYPE);
+            payload.push(
+                (header & NALU_TYPE_MASK)
+                    | if start == 0 { FU_START_MASK } else { 0 }
+                    | if last { FU_END_MASK } else { 0 },
             );
-            let fragment_payload = self.mtu.saturating_sub(FUA_HEADER_SIZE).max(1);
-            let fragments = body.len().div_ceil(fragment_payload);
-            for fragment_index in 0..fragments {
-                let start = fragment_index.saturating_mul(fragment_payload);
-                let end = fragment_index
-                    .saturating_add(1)
-                    .saturating_mul(fragment_payload)
-                    .min(body.len());
-                debug_assert!(start < end && end <= body.len());
-                let start_fragment = fragment_index == 0;
-                let end_fragment = fragment_index.saturating_add(1) == fragments;
-                let mut payload =
-                    Vec::with_capacity(end.saturating_sub(start).saturating_add(FUA_HEADER_SIZE));
-                payload.push((header & 0xe0) | FUA_NALU_TYPE);
-                payload.push(
-                    (header & NALU_TYPE_MASK)
-                        | if start_fragment { FU_START_MASK } else { 0 }
-                        | if end_fragment { FU_END_MASK } else { 0 },
-                );
-                let Some(fragment) = body.get(start..end) else {
-                    debug_assert!(false, "fragment bounds were checked above");
-                    continue;
-                };
-                payload.extend_from_slice(fragment);
-                chunks.push(PacketizedChunk {
-                    payload,
-                    start_of_frame: false,
-                    end_of_frame: false,
-                });
-            }
+            payload.extend_from_slice(fragment);
+            cursor.next_fragment = end;
+            (payload, last)
+        };
+        if last_fragment {
+            cursor.next_fragment = 0;
+            cursor.nalu = next_annex_b_nalu(access_unit, &mut cursor.scan);
         }
-        if let Some(first) = chunks.first_mut() {
-            first.start_of_frame = true;
-        }
-        if let Some(last) = chunks.last_mut() {
-            last.end_of_frame = true;
-        }
-        chunks
+        let start_of_frame = !cursor.started;
+        cursor.started = true;
+        Some(PacketizedChunk {
+            payload,
+            start_of_frame,
+            end_of_frame: last_fragment && cursor.nalu.is_none(),
+        })
     }
 }
 
-fn annex_b_nalus(access_unit: &[u8]) -> Vec<&[u8]> {
-    let mut starts = Vec::new();
-    let mut i = 0usize;
-    while i.saturating_add(3) < access_unit.len() {
-        let start = match (
-            access_unit.get(i),
-            access_unit.get(i.saturating_add(1)),
-            access_unit.get(i.saturating_add(2)),
-            access_unit.get(i.saturating_add(3)),
-        ) {
-            (Some(0), Some(0), Some(1), _) => Some(i.saturating_add(3)),
-            (Some(0), Some(0), Some(0), Some(1)) => Some(i.saturating_add(4)),
-            _ => None,
-        };
-        if let Some(start) = start {
-            starts.push((i, start));
-            i = start;
-        } else {
-            i = i.saturating_add(1);
+impl Iterator for Packetization {
+    type Item = PacketizedChunk;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.packetizer
+            .next_packet(&self.access_unit, &mut self.cursor)
+    }
+}
+
+fn next_annex_b_nalu(access_unit: &[u8], scan: &mut usize) -> Option<core::ops::Range<usize>> {
+    while let Some((_, start)) = annex_b_start(access_unit, *scan) {
+        let end = annex_b_start(access_unit, start).map_or(access_unit.len(), |(prefix, _)| prefix);
+        *scan = end;
+        if start < end {
+            return Some(start..end);
         }
     }
-    starts
-        .iter()
-        .enumerate()
-        .filter_map(|(index, &(_, start))| {
-            let end = starts
-                .get(index.saturating_add(1))
-                .map(|(next, _)| *next)
-                .unwrap_or(access_unit.len());
-            access_unit.get(start..end).filter(|nalu| !nalu.is_empty())
-        })
-        .collect()
+    *scan = access_unit.len();
+    None
+}
+
+fn annex_b_start(access_unit: &[u8], mut offset: usize) -> Option<(usize, usize)> {
+    while let Some(remaining) = access_unit.get(offset..) {
+        match remaining {
+            [0, 0, 1, ..] => return Some((offset, offset.saturating_add(3))),
+            [0, 0, 0, 1, ..] => return Some((offset, offset.saturating_add(4))),
+            [_, _, _, ..] => offset = offset.saturating_add(1),
+            _ => return None,
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -634,6 +640,32 @@ mod tests {
         assert!(
             idr.last()
                 .is_some_and(|chunk| chunk.payload[1] & FU_END_MASK != 0)
+        );
+    }
+
+    #[test]
+    fn owned_packetization_streams_large_access_units_one_packet_at_a_time() {
+        let mut access_unit = vec![0, 0, 0, 1, 0x65];
+        access_unit.resize(48 * 1024, 0xa5);
+        let mut depacketizer = Depacketizer::new();
+        let mut output = None;
+        let mut count = 0_usize;
+        for chunk in Packetizer::new(1_100).into_packets(access_unit.clone()) {
+            assert!(chunk.payload.len() <= 1_100);
+            assert_eq!(chunk.start_of_frame, count == 0);
+            count = count.saturating_add(1);
+            output = depacketizer
+                .push(&chunk.payload, chunk.start_of_frame, chunk.end_of_frame)
+                .unwrap();
+            assert_eq!(chunk.end_of_frame, output.is_some());
+        }
+        assert!(count > 32);
+        assert_eq!(output, Some(access_unit));
+        assert!(
+            Packetizer::new(1_100)
+                .into_packets(vec![0, 0, 1])
+                .next()
+                .is_none()
         );
     }
 

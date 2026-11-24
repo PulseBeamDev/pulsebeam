@@ -161,7 +161,7 @@ struct ExchangeReport {
 
 /// One bounded second of genuine native stereo Opus. Never rewrite packet bits
 /// to reconcile a mono fixture with the SFU's negotiated stereo carrier.
-fn stock_opus_fixture() -> &'static [OpusFrame] {
+pub(super) fn stock_opus_fixture() -> &'static [OpusFrame] {
     static FIXTURE: OnceLock<Vec<OpusFrame>> = OnceLock::new();
     FIXTURE.get_or_init(|| {
         use pulsebeam_rtc_simulation::{

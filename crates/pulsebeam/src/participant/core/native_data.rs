@@ -420,6 +420,13 @@ impl Connection {
                 self.prepare_native_rtp(work, *plan, events);
                 return;
             }
+            PreparedResource::Publication(Publication::QuicRtp(_)) => {
+                self.complete_native_preparation(
+                    work,
+                    Err(ExecutionFailureKind::Unsupported.into()),
+                );
+                return;
+            }
             PreparedResource::Receiver(plan) => {
                 self.execute_native_receiver(work, plan, events);
                 return;

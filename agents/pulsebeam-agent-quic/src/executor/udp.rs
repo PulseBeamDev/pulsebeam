@@ -82,6 +82,24 @@ impl UdpAssociation {
         }
     }
 
+    pub(super) fn datagram_limit(&mut self) -> Option<usize> {
+        self.association.transport.datagram_limit()
+    }
+
+    pub(super) fn offer_media(
+        &mut self,
+        datagram: crate::records::Datagram<'_>,
+    ) -> Result<(), crate::transport::DatagramAdmission> {
+        use crate::transport::DatagramAdmission;
+        if !matches!(self.association.stage, super::Stage::Active { .. }) {
+            return Err(DatagramAdmission::Unsupported);
+        }
+        if !self.association.pending_data.is_empty() {
+            return Err(DatagramAdmission::Full);
+        }
+        self.association.transport.offer_datagram(datagram)
+    }
+
     pub fn submit(&mut self, effect: QuicEffect) -> Result<(), SubmitError> {
         self.association
             .submit(effect, time::Instant::now().into_std())
@@ -89,7 +107,7 @@ impl UdpAssociation {
 
     /// One bounded reactor turn. `None` means the owner can poll again or run
     /// other ready Core work. With no progress, waits for I/O or the next deadline.
-    pub async fn progress(&mut self) -> io::Result<Option<QuicEvent>> {
+    pub async fn progress(&mut self, retry_payload_turn: bool) -> io::Result<Option<QuicEvent>> {
         let now = time::Instant::now().into_std();
         self.association.transport.service_timer(now);
         let event = self.association.poll_event(now);
@@ -123,7 +141,8 @@ impl UdpAssociation {
         if let Some(event) = event {
             return Ok(Some(event));
         }
-        if !more {
+        // A control turn can unlock payload admission without emitting a packet.
+        if !(more || retry_payload_turn && !blocked) {
             let socket = &self.socket;
             let deadline = self.association.deadline().map(time::Instant::from_std);
             let sleep = async {

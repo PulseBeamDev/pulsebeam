@@ -449,7 +449,7 @@ impl Session {
             if installed.admissions.len() < MAX_PENDING_ADMISSIONS
                 && let Some(received) = pulsebeam_agent_quic::transport::read_datagram(
                     &mut peer.connection,
-                    |datagram| installed.ingest_data(self.serial, datagram, core, now),
+                    |datagram| installed.ingest_payload(self.serial, datagram, core, now),
                 )
             {
                 self.data_runnable = true;
@@ -631,6 +631,7 @@ impl Session {
             && self.admitted
             && let Some(installed) = self.installed.as_mut()
         {
+            self.data_runnable |= installed.poll_publisher_refresh(self.serial, peer, core, now);
             self.data_runnable |= installed.poll_data_output(self.serial, peer, core, now);
         }
         live

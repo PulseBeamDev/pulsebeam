@@ -609,11 +609,18 @@ impl AdmissionProjection<'_> {
             Self::Rtc(projection) => projection.validate(pending).map(PreparedAdmission::Rtc),
             Self::Quic => {
                 use pulsebeam_agent_quic::records::{Accepted, encode_admit_result};
+                use pulsebeam_proto::prelude::Message;
+                let capabilities = pending
+                    .native
+                    .as_ref()
+                    .and_then(StateProtocolHandler::rtp_capabilities)
+                    .map(Message::encode_to_vec)
+                    .unwrap_or_default();
                 let result = Accepted {
                     connection: *pending.connection_id().as_bytes(),
                     participant: pending.participant.as_str(),
                     room: pending.scope.room.as_ref().map(RoomId::as_str),
-                    capabilities: &[],
+                    capabilities: &capabilities,
                 };
                 encode_admit_result(Ok(result))
                     .map(PreparedAdmission::Quic)

@@ -18,8 +18,10 @@ use pulsebeam_core::fabric::{
         Rejected,
     },
 };
+use pulsebeam_proto::state::{codec_format, validation::QuicRtpBinding};
 use pulsebeam_rtc::{
-    AuthenticatedRtp, CodecProfile, RtpHeader, RtpReceiveCodec, RtpReceiveExtension,
+    AuthenticatedRtp, CodecProfile, ParsedRtpPacket, RtpHeader, RtpReceiveCodec,
+    RtpReceiveExtension,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -403,29 +405,18 @@ impl RtpIngressShadow {
             .flatten()
             .and_then(|bytes| u16::try_from(bytes).ok())
             .and_then(NonZeroU16::new);
-        Ok(self
-            .normalize_packet(packet)?
-            .map(|(sequence, input)| MediaIngress {
+        Ok(self.normalize_packet(packet)?.map(|(sequence, input)| {
+            MediaIngress::from_normalized(
                 arrival,
                 ready_at,
-                position: primary_index.map_or(
+                primary_index.map_or(
                     Position::LowSequence(sequence),
                     Position::AuthenticatedPrimary,
                 ),
                 protected_bytes,
-                media: (!input.payload.is_empty()).then(|| OwnedCopy {
-                    payload: input.payload.into(),
-                    is_repair: input.is_repair,
-                    marker: input.marker,
-                    timestamp: input.timestamp,
-                    extensions: input
-                        .extensions
-                        .into_iter()
-                        .map(|e| (e.kind, e.value.into()))
-                        .collect(),
-                    extension_width: input.extension_width,
-                }),
-            }))
+                input,
+            )
+        }))
     }
 
     fn normalize_packet<'a>(
@@ -465,7 +456,16 @@ impl RtpIngressShadow {
         extensions: impl Iterator<Item = (u8, &'a [u8])>,
     ) -> Result<Option<(u16, Normalized<'a>)>, DropReason> {
         let packet = normalize(
-            &self.binding,
+            PacketBinding {
+                primary: RepairBinding {
+                    ssrc: self.binding.primary_ssrc,
+                    payload_type: self.binding.codec.payload_type,
+                },
+                repair: self.binding.repair,
+                extension_form: Some(self.binding.extension_form),
+                capture_clock_ssrc: self.binding.capture_clock_ssrc,
+                allow_csrc_stripping: self.binding.allow_csrc_stripping,
+            },
             self.profile,
             &self.selected,
             wire,
@@ -503,7 +503,105 @@ struct OwnedCopy {
     extension_width: Option<ExtensionWidth>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct QuicRtpIngress {
+    primary: RepairBinding,
+    profile: Profile,
+}
+
+impl QuicRtpIngress {
+    pub(crate) const fn profile(self) -> Profile {
+        self.profile
+    }
+
+    pub(crate) fn new(binding: QuicRtpBinding<'_>) -> Result<Self, DropReason> {
+        let profile = match binding.format().known_codec() {
+            Some(codec_format::Codec::Opus(_)) => Profile::Opus,
+            Some(codec_format::Codec::H264(_)) => Profile::H264,
+            _ => return Err(DropReason::Binding),
+        };
+        Ok(Self {
+            primary: RepairBinding {
+                ssrc: binding.ssrc().get(),
+                payload_type: binding.payload_type(),
+            },
+            profile,
+        })
+    }
+
+    /// The association owner must resolve the installed binding and grant before calling.
+    pub(crate) fn prepare(
+        self,
+        arrival: Instant,
+        payload: &[u8],
+    ) -> Result<MediaIngress, DropReason> {
+        let packet = ParsedRtpPacket::parse(payload).map_err(|_| DropReason::Binding)?;
+        let wire = Wire {
+            header: RtpHeader {
+                sequence: packet.sequence(),
+                timestamp: packet.timestamp(),
+                ssrc: packet.ssrc(),
+                payload_type: packet.payload_type(),
+                marker: packet.marker(),
+            },
+            padding: packet.padding_len(),
+            first_csrc: packet.first_csrc(),
+            extension_profile: packet.extension_profile(),
+            is_repair: false,
+            payload: packet.payload(),
+        };
+        let (sequence, input) = normalize(
+            PacketBinding {
+                primary: self.primary,
+                repair: None,
+                extension_form: None,
+                capture_clock_ssrc: None,
+                allow_csrc_stripping: false,
+            },
+            self.profile,
+            &[],
+            wire,
+            core::iter::empty(),
+        )?
+        .ok_or(DropReason::Binding)?;
+        Ok(MediaIngress::from_normalized(
+            arrival,
+            Instant::now(),
+            Position::LowSequence(sequence),
+            None,
+            input,
+        ))
+    }
+}
+
 impl MediaIngress {
+    fn from_normalized(
+        arrival: Instant,
+        ready_at: Instant,
+        position: Position,
+        protected_bytes: Option<NonZeroU16>,
+        input: Normalized<'_>,
+    ) -> Self {
+        Self {
+            arrival,
+            ready_at,
+            position,
+            protected_bytes,
+            media: (!input.payload.is_empty()).then(|| OwnedCopy {
+                payload: input.payload.into(),
+                is_repair: input.is_repair,
+                marker: input.marker,
+                timestamp: input.timestamp,
+                extensions: input
+                    .extensions
+                    .into_iter()
+                    .map(|e| (e.kind, e.value.into()))
+                    .collect(),
+                extension_width: input.extension_width,
+            }),
+        }
+    }
+
     pub(crate) fn with_input<T>(&self, admit: impl FnOnce(Input<'_>) -> T) -> T {
         let Some(media) = &self.media else {
             return admit(Input::PrimaryPadding);
@@ -559,23 +657,33 @@ impl Normalized<'_> {
     }
 }
 
+struct PacketBinding {
+    primary: RepairBinding,
+    repair: Option<RepairBinding>,
+    extension_form: Option<ExtensionForm>,
+    capture_clock_ssrc: Option<u32>,
+    allow_csrc_stripping: bool,
+}
+
 fn normalize<'a>(
-    binding: &EndpointBinding,
+    binding: PacketBinding,
     profile: Profile,
     selected: &[(u8, ExtensionKind)],
     wire: Wire<'a>,
     elements: impl Iterator<Item = (u8, &'a [u8])>,
 ) -> Result<Option<(u16, Normalized<'a>)>, DropReason> {
-    if !binding.extension_form.accepts(wire.extension_profile) {
+    if !binding
+        .extension_form
+        .map_or(wire.extension_profile.is_none(), |form| {
+            form.accepts(wire.extension_profile)
+        })
+    {
         return Err(DropReason::ExtensionForm);
     }
     let expected = if wire.is_repair {
         binding.repair.ok_or(DropReason::Binding)?
     } else {
-        RepairBinding {
-            ssrc: binding.primary_ssrc,
-            payload_type: binding.codec.payload_type,
-        }
+        binding.primary
     };
     if wire.header.ssrc != expected.ssrc || wire.header.payload_type != expected.payload_type {
         return Err(DropReason::Binding);
@@ -595,7 +703,7 @@ fn normalize<'a>(
         }
         seen |= bit;
         if kind == ExtensionKind::AbsoluteCaptureTime
-            && binding.capture_clock_ssrc != Some(wire.first_csrc.unwrap_or(binding.primary_ssrc))
+            && binding.capture_clock_ssrc != Some(wire.first_csrc.unwrap_or(binding.primary.ssrc))
         {
             continue;
         }

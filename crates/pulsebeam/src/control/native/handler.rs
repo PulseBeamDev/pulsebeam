@@ -61,6 +61,12 @@ impl StateProtocolHandler {
         })
     }
 
+    pub(in crate::control) fn rtp_capabilities(
+        &self,
+    ) -> Option<&pulsebeam_proto::state::RtpCapabilities> {
+        self.capabilities.as_ref()
+    }
+
     fn retain(&mut self, command: ExecutionCommand) -> Result<(), OutputError> {
         if self.commands.len() == PENDING_COMMANDS {
             return Err(OutputError::Capacity);

@@ -133,6 +133,20 @@ fn quic_placement_fences_late_http_and_transport_outcomes() {
             connection_id: "conn_00000000001R010000000000004".into(),
             participant_id: "alice".into(),
             room: None,
+            capabilities: if generation == old_generation {
+                vec![0xff]
+            } else {
+                state::RtpCapabilities {
+                    codecs: vec![state::RtpCodecCapability {
+                        format: Some(state::CodecFormat::from(state::codec_format::Codec::Opus(
+                            state::OpusParameters::default(),
+                        ))),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }
+                .encode_to_vec()
+            },
         })
     };
     agent.handle(accepted(old_generation)).unwrap();

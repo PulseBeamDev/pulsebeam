@@ -320,6 +320,119 @@ fn session() -> NativeSession {
     session
 }
 
+#[test]
+fn quic_opus_preparation_checks_capabilities_and_receiver_source_format() {
+    use crate::control::native::{Publication, publication as prepare};
+
+    let format = wire::CodecFormat::from(wire::codec_format::Codec::Opus(
+        wire::OpusParameters::default(),
+    ));
+    let parameters = wire::QuicRtpParameters {
+        binding_id: 7,
+        incarnation: 9,
+        primary_ssrc: 11,
+        codec: Some(wire::RtpCodecParameters {
+            payload_type: Some(111),
+            format: Some(format.clone()),
+            ..Default::default()
+        }),
+    };
+    let spec = wire::ResourceSpec {
+        declaration: Some(wire::resource_spec::Declaration::Publication(
+            wire::PublicationSpec {
+                track_id: "voice".into(),
+                kind: Some(wire::publication_spec::Kind::Audio(
+                    wire::AudioPublication {
+                        binding: Some(wire::TrackBinding {
+                            transport: Some(wire::track_binding::Transport::QuicRtp(
+                                parameters.clone(),
+                            )),
+                        }),
+                    },
+                )),
+            },
+        )),
+        ..Default::default()
+    };
+    assert!(matches!(
+        prepare(&spec, None),
+        Err(wire::FailureCode::Unsupported)
+    ));
+    assert!(matches!(
+        prepare(&spec, Some(&wire::RtpCapabilities::default())),
+        Err(wire::FailureCode::Incompatible)
+    ));
+    let capabilities = wire::RtpCapabilities {
+        codecs: vec![wire::RtpCodecCapability {
+            format: Some(format),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let Some((Publication::QuicRtp(plan), bytes)) = prepare(&spec, Some(&capabilities)).unwrap()
+    else {
+        panic!("QUIC RTP preparation")
+    };
+    assert_eq!(plan.track_id.as_str(), "voice");
+    assert_eq!(plan.kind, crate::entity::TrackKind::Audio);
+    assert_eq!(plan.parameters, parameters);
+    assert_eq!(plan.enabled, crate::control::native::enabled(&spec));
+    assert!(bytes >= spec.encoded_len());
+
+    use crate::control::native::{ReceiveTransport, receiver};
+    use crate::entity::{ConnectionId, ParticipantId, ProjectRoomKey, RoomId, TrackKind};
+    use crate::track::{AudioTrack, TrackMeta};
+    let connection = ConnectionId::new();
+    let meta = TrackMeta {
+        room: ProjectRoomKey::fixture(RoomId::new("room").unwrap()),
+        id: connection.fixture_publication(TrackKind::Audio, "voice"),
+        origin: ParticipantId::new("source").unwrap(),
+        connection_id: connection,
+        track_id: Some(plan.track_id.clone()),
+    };
+    let audio = AudioTrack {
+        meta,
+        format: capabilities
+            .codecs
+            .first()
+            .and_then(|codec| codec.format.clone()),
+        reverse: None,
+    };
+    let source = Track::Audio(audio.clone());
+    let track = track_descriptor(&source).unwrap();
+    let spec = wire::ResourceSpec {
+        declaration: Some(wire::resource_spec::Declaration::Subscription(
+            wire::SubscriptionSpec {
+                publication_id: track.publication_id.clone(),
+                kind: wire::TrackKind::Audio as i32,
+                source_room: "room".into(),
+                binding: Some(wire::TrackBinding {
+                    transport: Some(wire::track_binding::Transport::QuicRtp(parameters.clone())),
+                }),
+            },
+        )),
+        ..Default::default()
+    };
+    assert!(matches!(
+        receiver(&spec, &source, &track, None, None),
+        Err(wire::FailureCode::Unsupported)
+    ));
+    let (ReceiveTransport::QuicRtp(prepared), _) =
+        receiver(&spec, &source, &track, Some(&capabilities), None).unwrap()
+    else {
+        panic!("QUIC RTP receiver preparation")
+    };
+    assert_eq!(*prepared, parameters);
+    let incompatible = Track::Audio(AudioTrack {
+        format: None,
+        ..audio
+    });
+    assert!(matches!(
+        receiver(&spec, &incompatible, &track, Some(&capabilities), None),
+        Err(wire::FailureCode::Incompatible)
+    ));
+}
+
 fn publication(label: &str, enabled: bool) -> wire::ResourceSpec {
     wire::ResourceSpec {
         settings: Some(wire::ResourceSettings {

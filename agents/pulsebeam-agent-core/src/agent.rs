@@ -46,6 +46,8 @@ mod admission;
 mod credentials;
 mod quic;
 pub use admission::placement;
+#[doc(hidden)]
+pub use quic::{QuicRtpPublication, QuicRtpReceiver};
 mod native;
 mod publication;
 mod subscription;

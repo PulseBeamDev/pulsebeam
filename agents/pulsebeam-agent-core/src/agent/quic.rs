@@ -1,5 +1,8 @@
 use alloc::string::{String, ToString};
-use pulsebeam_proto::state::{self, validation};
+use pulsebeam_proto::{
+    prelude::Message,
+    state::{self, validation},
+};
 
 use super::{
     Agent, AgentConfig, AgentError, AttemptStage, Credential, Failure, FailureClass, NativeState,
@@ -16,7 +19,144 @@ pub(super) enum Attempt {
     Dialing(Credential),
 }
 
+#[doc(hidden)]
+pub struct QuicRtpPublication<'a> {
+    pub generation: Generation,
+    pub binding: core::num::NonZeroU16,
+    pub ssrc: u32,
+    pub payload_type: u8,
+    pub ready: bool,
+    pub publication_id: &'a str,
+}
+
+#[doc(hidden)]
+pub struct QuicRtpReceiver<'a> {
+    pub generation: Generation,
+    pub binding: core::num::NonZeroU16,
+    pub ssrc: u32,
+    pub payload_type: u8,
+    pub publication_id: &'a str,
+}
+
 impl Agent {
+    fn active_quic_media(&self) -> Option<&Session> {
+        self.active.as_ref().filter(|session| {
+            self.quic
+                && self.desired.connected
+                && !session.signaling_terminal
+                && self.snapshot.terminal_failure.is_none()
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn quic_rtp_receivers(
+        &self,
+        kind: crate::MediaKind,
+    ) -> impl Iterator<Item = QuicRtpReceiver<'_>> {
+        use state::{resource_spec::Declaration, track_binding::Transport};
+        self.active_quic_media()
+            .into_iter()
+            .flat_map(move |session| {
+                session.state.owned().filter_map(move |(resource, live)| {
+                    use crate::{MediaKind, MediaSlot, native_state::Resource};
+                    if !matches!(
+                        (kind, resource),
+                        (
+                            MediaKind::Audio,
+                            Resource::Reception(MediaSlot::RemoteAudio(_))
+                        ) | (
+                            MediaKind::Video,
+                            Resource::Reception(MediaSlot::RemoteVideo(_))
+                        )
+                    ) || live.execution != state::ExecutionStatus::Installed as i32
+                    {
+                        return None;
+                    }
+                    let spec = live.spec.as_ref()?;
+                    let Some(Declaration::Subscription(subscription)) = spec.declaration.as_ref()
+                    else {
+                        return None;
+                    };
+                    let Some(Transport::QuicRtp(parameters)) =
+                        &subscription.binding.as_ref()?.transport
+                    else {
+                        return None;
+                    };
+                    let binding =
+                        core::num::NonZeroU16::new(u16::try_from(parameters.binding_id).ok()?)?;
+                    let target = session.state.target_spec(resource)?;
+                    if !validation::declarations_equivalent(target, spec)
+                        || target.settings.as_ref()?.enabled != Some(true)
+                    {
+                        return None;
+                    }
+                    Some(QuicRtpReceiver {
+                        generation: session.generation,
+                        binding,
+                        ssrc: parameters.primary_ssrc,
+                        payload_type: u8::try_from(parameters.codec.as_ref()?.payload_type?)
+                            .ok()?,
+                        publication_id: &subscription.publication_id,
+                    })
+                })
+            })
+    }
+
+    #[doc(hidden)]
+    pub fn quic_rtp_publication(
+        &self,
+        kind: crate::MediaKind,
+        track_id: &str,
+    ) -> Option<QuicRtpPublication<'_>> {
+        use state::{
+            confirmed_state::Value, publication_spec::Kind, resource_spec::Declaration,
+            track_binding::Transport,
+        };
+        let session = self.active_quic_media()?;
+        let resource = crate::native_state::Resource::Publication {
+            kind: match kind {
+                crate::MediaKind::Audio => state::TrackKind::Audio,
+                crate::MediaKind::Video => state::TrackKind::Video,
+            },
+            track_id: track_id.into(),
+        };
+        let target = session.state.target_spec(&resource)?;
+        let Some(Value::Owned(live)) = &session.state.confirmed(&resource)?.value else {
+            return None;
+        };
+        let live_spec = live.spec.as_ref()?;
+        if !validation::declarations_equivalent(target, live_spec) {
+            return None;
+        }
+        let Some(Declaration::Publication(publication)) = &live_spec.declaration else {
+            return None;
+        };
+        let track_binding = match (kind, publication.kind.as_ref()?) {
+            (crate::MediaKind::Audio, Kind::Audio(audio)) => audio.binding.as_ref()?,
+            (crate::MediaKind::Video, Kind::Video(video)) => video.binding.as_ref()?,
+            _ => return None,
+        };
+        let Some(Transport::QuicRtp(parameters)) = &track_binding.transport else {
+            return None;
+        };
+        let binding = core::num::NonZeroU16::new(u16::try_from(parameters.binding_id).ok()?)?;
+        let pt = u8::try_from(parameters.codec.as_ref()?.payload_type?).ok()?;
+        let ready = live.execution == state::ExecutionStatus::Installed as i32
+            && target
+                .settings
+                .as_ref()
+                .and_then(|settings| settings.enabled)
+                == Some(true);
+        Some(QuicRtpPublication {
+            generation: session.generation,
+            binding,
+            ssrc: parameters.primary_ssrc,
+            payload_type: pt,
+            ready,
+            publication_id: &live.track.as_ref()?.publication_id,
+        })
+    }
+
     #[doc(hidden)]
     pub fn new_quic(config: AgentConfig) -> Result<Self, AgentError> {
         let mut agent = Self::new(config)?;
@@ -153,6 +293,7 @@ impl Agent {
         connection_id: String,
         participant_id: String,
         room: Option<String>,
+        capabilities: &[u8],
     ) -> Result<(), AgentError> {
         let Some(attempt) = self
             .attempt
@@ -170,6 +311,14 @@ impl Agent {
         };
         if attempt.room != room || !validation::is_application_name(&participant_id) {
             self.fail_attempt(Failure::protocol("QUIC admission identity mismatch"));
+            return Ok(());
+        }
+        let Ok(rtp) = state::RtpCapabilities::decode(capabilities) else {
+            self.fail_attempt(Failure::protocol("invalid QUIC RTP capabilities"));
+            return Ok(());
+        };
+        if validation::validate_capabilities(&rtp).is_err() {
+            self.fail_attempt(Failure::protocol("invalid QUIC RTP capabilities"));
             return Ok(());
         }
         let state = NativeState::with_profile(
@@ -192,7 +341,7 @@ impl Agent {
             state,
             self.ids.channel(),
             crate::BootstrapCapabilities {
-                rtp: state::RtpCapabilities::default(),
+                rtp,
                 data_delivery: alloc::vec::Vec::new(),
                 data_v1: true,
             },
@@ -212,8 +361,15 @@ impl Agent {
                 connection_id,
                 participant_id,
                 room,
+                capabilities,
             } => {
-                return self.quic_accept(generation, connection_id, participant_id, room);
+                return self.quic_accept(
+                    generation,
+                    connection_id,
+                    participant_id,
+                    room,
+                    &capabilities,
+                );
             }
             QuicEvent::Control {
                 generation,
@@ -227,6 +383,7 @@ impl Agent {
                     return Err(error);
                 }
             }
+            QuicEvent::Rtp { .. } | QuicEvent::PictureLoss { .. } => {}
             QuicEvent::Data {
                 generation,
                 binding,

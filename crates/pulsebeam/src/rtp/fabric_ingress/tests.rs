@@ -92,6 +92,52 @@ impl RtpIngressShadow {
 }
 
 #[test]
+fn extension_free_quic_opus_uses_negotiated_packet_coordinates() {
+    use pulsebeam_proto::state as wire;
+    let parameters = wire::QuicRtpParameters {
+        binding_id: 7,
+        incarnation: 9,
+        primary_ssrc: 11,
+        codec: Some(wire::RtpCodecParameters {
+            payload_type: Some(111),
+            format: Some(wire::CodecFormat::from(codec_format::Codec::Opus(
+                wire::OpusParameters::default(),
+            ))),
+            ..Default::default()
+        }),
+    };
+    let binding = QuicRtpBinding::compile(&parameters, wire::TrackKind::Audio).unwrap();
+    let adapter = QuicRtpIngress::new(binding).unwrap();
+    let arrival = Instant::now();
+    let packet = [0x80, 0xef, 0, 90, 0, 0, 0, 100, 0, 0, 0, 11, 0xf8];
+    let ingress = adapter.prepare(arrival, 42, &packet).unwrap();
+    assert!(matches!(ingress.position, Position::LowSequence(90)));
+    assert_eq!((ingress.arrival, ingress.ingress_ntp32), (arrival, 42));
+    ingress.with_input(|input| {
+        let Input::Media(media) = input else {
+            panic!("expected media");
+        };
+        assert_eq!(
+            (media.timestamp, media.marker, media.payload),
+            (100, true, &[0xf8][..])
+        );
+        assert!(media.extensions.is_empty());
+    });
+    let extended = [
+        0x90, 0xef, 0, 90, 0, 0, 0, 100, 0, 0, 0, 11, 0xbe, 0xde, 0, 0, 0xf8,
+    ];
+    assert!(matches!(
+        adapter.prepare(arrival, 42, &extended),
+        Err(DropReason::ExtensionForm)
+    ));
+    let wrong_source = [0x80, 0xef, 0, 90, 0, 0, 0, 100, 0, 0, 0, 12, 0xf8];
+    assert!(matches!(
+        adapter.prepare(arrival, 42, &wrong_source),
+        Err(DropReason::Binding)
+    ));
+}
+
+#[test]
 fn dd_required_encoding_drops_missing_or_malformed_descriptors() {
     let endpoint = h264();
     let binding = pulsebeam_rtc::RtpReceiveBinding {

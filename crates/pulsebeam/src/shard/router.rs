@@ -133,6 +133,7 @@ struct FabricSource {
         pulsebeam_runtime::time::Instant,
         pulsebeam_clock::domain::Projection,
     )>,
+    quic_media: Option<(NonZeroU64, bool)>,
 }
 
 impl FabricSource {
@@ -610,6 +611,7 @@ impl ShardRuntime {
             reliable_installation: None,
             publisher_clock: None,
             publisher_timing: None,
+            quic_media: None,
         });
         bound.media.insert_fabric(source);
         Some(source)
@@ -768,6 +770,7 @@ impl ShardRuntime {
             reliable_installation: None,
             publisher_clock: None,
             publisher_timing: None,
+            quic_media: None,
         });
         bound.media.insert_fabric(source);
         Some(source)
@@ -931,6 +934,7 @@ impl ShardRuntime {
                 reliable_installation: None,
                 publisher_clock: None,
                 publisher_timing: None,
+                quic_media: None,
             });
             track.media.insert_fabric(source);
         }
@@ -1862,6 +1866,35 @@ impl ShardRuntime {
         data.is_some()
     }
 
+    pub(super) fn set_quic_media_binding(
+        &mut self,
+        source: FabricSourceHandle,
+        association: NonZeroU64,
+        enabled: bool,
+    ) -> bool {
+        let Some(bound) = self.fabric_sources.get_mut(source) else {
+            return false;
+        };
+        if bound
+            .quic_media
+            .is_some_and(|(current, _)| current != association)
+        {
+            return false;
+        }
+        bound.quic_media = Some((association, enabled));
+        true
+    }
+
+    pub(super) fn quic_media_association(
+        &self,
+        source: FabricSourceHandle,
+        owner: ParticipantHandle,
+    ) -> Option<NonZeroU64> {
+        let bound = self.fabric_sources.get(source)?;
+        let (association, enabled) = bound.quic_media?;
+        (enabled && bound.ingress.owner() == FabricOwner::Local(owner)).then_some(association)
+    }
+
     pub(super) fn quic_data_association(
         &self,
         source: FabricSourceHandle,
@@ -1925,7 +1958,7 @@ impl ShardRuntime {
         installation: crate::participant::data_fabric::QuicInstallation,
         bytes: &[u8],
         now: pulsebeam_runtime::time::Instant,
-        stamp: u32,
+        time: crate::participant::data_fabric::DataTime,
     ) -> Result<
         crate::participant::event::FabricDataPosition<
             crate::participant::data_fabric::QuicInstallation,

@@ -1,7 +1,8 @@
 //! Stateless wire validity. Authority, cross-record revision order, lifetime
 //! reservations and adapter capability checks belong to their connection owner.
 
-use alloc::collections::BTreeSet;
+use alloc::{collections::BTreeSet, string::String};
+use core::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 
 use super::*;
 
@@ -696,7 +697,9 @@ fn validate_binding(
         {
             Ok(())
         }
-        Some(track_binding::Transport::QuicRtp(parameters)) => validate_quic_rtp(parameters, kind),
+        Some(track_binding::Transport::QuicRtp(parameters)) => {
+            QuicRtpBinding::compile(parameters, kind).map(|_| ())
+        }
         Some(track_binding::Transport::Sctp(sctp))
             if kind == TrackKind::Data && matches!(sctp.stream_id, Some(1..=65534)) =>
         {
@@ -716,30 +719,70 @@ fn validate_binding(
     }
 }
 
-fn validate_quic_rtp(rtp: &QuicRtpParameters, kind: TrackKind) -> Result {
-    if !(1..=u32::from(u16::MAX)).contains(&rtp.binding_id)
-        || rtp.incarnation == 0
-        || rtp.primary_ssrc == 0
-    {
-        return Err(ValidationError::Binding);
-    }
-    let codec = rtp.codec.as_ref().ok_or(ValidationError::Binding)?;
-    if !payload_type(codec.payload_type)
-        || codec.rtx_payload_type.is_some()
-        || !unique_text(&codec.feedback, 32, 128)
-    {
-        return Err(ValidationError::Binding);
-    }
-    let format = codec.format.as_ref().ok_or(ValidationError::Format)?;
-    validate_format(format)?;
-    match (kind, format.known_codec()) {
-        (TrackKind::Audio, Some(codec_format::Codec::Opus(_)))
-            if !video_feedback(&codec.feedback) =>
-        {
-            Ok(())
+/// Wire-valid, single-encoding QUIC RTP binding. Installation still requires
+/// capability negotiation and authorization by the association owner.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct QuicRtpBinding<'a> {
+    id: NonZeroU16,
+    incarnation: NonZeroU64,
+    ssrc: NonZeroU32,
+    payload_type: u8,
+    format: &'a CodecFormat,
+    feedback: &'a [String],
+}
+
+impl<'a> QuicRtpBinding<'a> {
+    pub fn compile(rtp: &'a QuicRtpParameters, kind: TrackKind) -> Result<Self> {
+        let id = u16::try_from(rtp.binding_id)
+            .ok()
+            .and_then(NonZeroU16::new)
+            .ok_or(ValidationError::Binding)?;
+        let incarnation = NonZeroU64::new(rtp.incarnation).ok_or(ValidationError::Binding)?;
+        let ssrc = NonZeroU32::new(rtp.primary_ssrc).ok_or(ValidationError::Binding)?;
+        let codec = rtp.codec.as_ref().ok_or(ValidationError::Binding)?;
+        let pt = codec
+            .payload_type
+            .filter(|pt| payload_type(Some(*pt)))
+            .and_then(|pt| u8::try_from(pt).ok())
+            .ok_or(ValidationError::Binding)?;
+        if codec.rtx_payload_type.is_some() || !unique_text(&codec.feedback, 32, 128) {
+            return Err(ValidationError::Binding);
         }
-        (TrackKind::Video, Some(codec_format::Codec::H264(_))) => Ok(()),
-        _ => Err(ValidationError::Format),
+        let format = codec.format.as_ref().ok_or(ValidationError::Format)?;
+        validate_format(format)?;
+        match (kind, format.known_codec()) {
+            (TrackKind::Audio, Some(codec_format::Codec::Opus(_)))
+                if !video_feedback(&codec.feedback) => {}
+            (TrackKind::Video, Some(codec_format::Codec::H264(_))) => {}
+            _ => return Err(ValidationError::Format),
+        }
+        Ok(Self {
+            id,
+            incarnation,
+            ssrc,
+            payload_type: pt,
+            format,
+            feedback: &codec.feedback,
+        })
+    }
+
+    pub const fn id(self) -> NonZeroU16 {
+        self.id
+    }
+    pub const fn incarnation(self) -> NonZeroU64 {
+        self.incarnation
+    }
+    pub const fn ssrc(self) -> NonZeroU32 {
+        self.ssrc
+    }
+    pub const fn payload_type(self) -> u8 {
+        self.payload_type
+    }
+    pub const fn format(self) -> &'a CodecFormat {
+        self.format
+    }
+    pub const fn feedback(self) -> &'a [String] {
+        self.feedback
     }
 }
 

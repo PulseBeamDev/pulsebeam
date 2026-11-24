@@ -1,6 +1,6 @@
 //! Bounded application records independent of the QUIC endpoint.
 
-use std::num::{NonZeroU16, NonZeroU64};
+use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 
 use pulsebeam_proto::state::{MAX_SUCCESSOR_RECEIPT_BYTES, validation::is_application_name};
 
@@ -9,7 +9,7 @@ use crate::frame::{Error, MAX_TOKEN};
 const MAX_NAME: usize = 36;
 const MAX_PROOF: usize = 256;
 const MAX_CAPABILITIES: usize = 4096;
-const DATAGRAM_HEADER: usize = 3;
+pub(crate) const DATAGRAM_HEADER: usize = 3;
 
 // Do not derive Debug for types that borrow credentials.
 pub struct Admit<'a> {
@@ -249,6 +249,32 @@ impl<'a> Datagram<'a> {
     }
 }
 
+/// Standalone RTCP Picture Loss Indication (RFC 4585). The QUIC envelope
+/// selects the media binding; the media SSRC must also match that binding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PictureLossIndication {
+    pub sender_ssrc: u32,
+    pub media_ssrc: NonZeroU32,
+}
+
+impl PictureLossIndication {
+    pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
+        let [0x81, 206, 0, 2, a, b, c, d, e, f, g, h] = bytes else {
+            return Err(Error::Body);
+        };
+        Ok(Self {
+            sender_ssrc: u32::from_be_bytes([*a, *b, *c, *d]),
+            media_ssrc: NonZeroU32::new(u32::from_be_bytes([*e, *f, *g, *h])).ok_or(Error::Body)?,
+        })
+    }
+
+    pub fn encode(self) -> [u8; 12] {
+        let [a, b, c, d] = self.sender_ssrc.to_be_bytes();
+        let [e, f, g, h] = self.media_ssrc.get().to_be_bytes();
+        [0x81, 206, 0, 2, a, b, c, d, e, f, g, h]
+    }
+}
+
 fn take<const N: usize>(bytes: &mut &[u8]) -> Result<[u8; N], Error> {
     let (value, rest) = bytes.split_first_chunk().ok_or(Error::Body)?;
     *bytes = rest;
@@ -294,6 +320,21 @@ fn visible(bytes: &[u8]) -> Result<&str, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quic_pli_requires_one_exact_rtcp_packet_and_media_ssrc() {
+        let pli = PictureLossIndication {
+            sender_ssrc: 17,
+            media_ssrc: NonZeroU32::MIN,
+        };
+        let packet = pli.encode();
+        assert_eq!(packet, [0x81, 206, 0, 2, 0, 0, 0, 17, 0, 0, 0, 1]);
+        assert_eq!(PictureLossIndication::decode(&packet), Ok(pli));
+        assert!(PictureLossIndication::decode(&[0x81, 206, 0, 2]).is_err());
+        assert!(
+            PictureLossIndication::decode(&[0x81, 206, 0, 2, 0, 0, 0, 17, 0, 0, 0, 0]).is_err()
+        );
+    }
 
     #[test]
     fn bootstrap_is_exact_and_rejects_trailing_and_oversize_fields() {

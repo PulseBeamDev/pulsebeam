@@ -3,7 +3,10 @@ use std::{
     num::{NonZeroU16, NonZeroU64},
 };
 
-use pulsebeam_proto::{data_endpoint::Format, state::QuicDataV1Parameters};
+use pulsebeam_proto::{
+    data_endpoint::Format,
+    state::{QuicDataV1Parameters, validation::QuicRtpBinding},
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DataBinding {
@@ -22,6 +25,43 @@ impl DataBinding {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PayloadBinding {
+    Data(DataBinding),
+    Rtp {
+        id: NonZeroU16,
+        incarnation: NonZeroU64,
+    },
+}
+
+impl From<QuicRtpBinding<'_>> for PayloadBinding {
+    fn from(binding: QuicRtpBinding<'_>) -> Self {
+        Self::Rtp {
+            id: binding.id(),
+            incarnation: binding.incarnation(),
+        }
+    }
+}
+
+impl BindingId for PayloadBinding {
+    fn binding_id(&self) -> NonZeroU16 {
+        match self {
+            Self::Data(data) => data.id,
+            Self::Rtp { id, .. } => *id,
+        }
+    }
+}
+
+pub trait BindingId {
+    fn binding_id(&self) -> NonZeroU16;
+}
+
+impl BindingId for DataBinding {
+    fn binding_id(&self) -> NonZeroU16 {
+        self.id
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum InstallError {
     Capacity,
@@ -30,13 +70,15 @@ pub enum InstallError {
 
 /// One sender's binding namespace within an admitted association. Only the
 /// execution owner may install an accepted binding; packet input is read-only.
-pub struct DataBindings<T> {
+pub struct Bindings<B, T> {
     capacity: usize,
     used: Box<[u64]>,
-    live: BTreeMap<NonZeroU16, (DataBinding, T)>,
+    live: BTreeMap<NonZeroU16, (B, T)>,
 }
 
-impl<T> DataBindings<T> {
+pub type DataBindings<T> = Bindings<DataBinding, T>;
+
+impl<B: BindingId + Copy + Eq, T> Bindings<B, T> {
     pub fn new(capacity: usize) -> Self {
         Self {
             capacity,
@@ -45,8 +87,9 @@ impl<T> DataBindings<T> {
         }
     }
 
-    pub fn install(&mut self, binding: DataBinding, execution: T) -> Result<(), InstallError> {
-        let id = usize::from(binding.id.get());
+    pub fn install(&mut self, binding: B, execution: T) -> Result<(), InstallError> {
+        let binding_id = binding.binding_id();
+        let id = usize::from(binding_id.get());
         let bit = 1u64 << (id % 64);
         let word = self.used.get_mut(id / 64).ok_or(InstallError::Capacity)?;
         if *word & bit != 0 {
@@ -56,23 +99,22 @@ impl<T> DataBindings<T> {
             return Err(InstallError::Capacity);
         }
         *word |= bit;
-        self.live.insert(binding.id, (binding, execution));
+        self.live.insert(binding_id, (binding, execution));
         Ok(())
     }
 
-    pub fn resolve(&self, id: NonZeroU16) -> Option<(DataBinding, &T)> {
+    pub fn resolve(&self, id: NonZeroU16) -> Option<(B, &T)> {
         self.live
             .get(&id)
             .map(|(binding, execution)| (*binding, execution))
     }
 
-    pub fn retire(&mut self, binding: DataBinding) -> Option<T> {
-        if self.resolve(binding.id)?.0 != binding {
+    pub fn retire(&mut self, binding: B) -> Option<T> {
+        let id = binding.binding_id();
+        if self.resolve(id)?.0 != binding {
             return None;
         }
-        self.live
-            .remove(&binding.id)
-            .map(|(_, execution)| execution)
+        self.live.remove(&id).map(|(_, execution)| execution)
     }
 }
 
@@ -89,6 +131,22 @@ mod tests {
             delivery: DataV1Delivery::Reliable as i32,
         })
         .unwrap()
+    }
+
+    #[test]
+    fn data_and_rtp_share_the_sender_namespace() {
+        let data = binding(5, 1);
+        let media = PayloadBinding::Rtp {
+            id: data.id,
+            incarnation: data.incarnation,
+        };
+        let data = PayloadBinding::Data(data);
+        let mut namespace = Bindings::new(2);
+        namespace.install(data, "data").unwrap();
+        assert_eq!(namespace.retire(media), None);
+        assert_eq!(namespace.install(media, "media"), Err(InstallError::Reused));
+        assert_eq!(namespace.retire(data), Some("data"));
+        assert_eq!(namespace.install(media, "media"), Err(InstallError::Reused));
     }
 
     #[test]

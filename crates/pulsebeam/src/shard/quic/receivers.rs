@@ -1,13 +1,15 @@
 use std::collections::{BTreeMap, VecDeque};
-use std::num::NonZeroU64;
+use std::num::{NonZeroU16, NonZeroU64};
 
 use pulsebeam_agent_quic::{
-    data_bindings::{DataBinding, DataBindings, InstallError},
-    records::{Datagram, DatagramKind},
+    data_bindings::{Bindings, DataBinding, InstallError, PayloadBinding},
+    records::{Datagram, DatagramKind, PictureLossIndication},
     transport::{DatagramAdmission, listener::Association},
 };
 use pulsebeam_proto::{
-    data_control::SubscriberBinding, data_endpoint::Delivery, state::DataV1CaptureClock,
+    data_control::SubscriberBinding,
+    data_endpoint::Delivery,
+    state::{DataV1CaptureClock, TrackKind, validation::QuicRtpBinding},
 };
 use pulsebeam_runtime::time::Instant;
 
@@ -19,7 +21,8 @@ use crate::{
         data_fabric::project_sctp_record,
         policy::{ExecutionFailure, ExecutionFailureKind, ReceiverExecution, ResourceObservation},
     },
-    route::fabric::local::DataWrite,
+    route::fabric::local::{DataWrite, PacketView},
+    rtp::fabric_egress::timeline,
     shard::{core::ShardCore, router::FabricLocalBranch},
     track::Track,
 };
@@ -27,25 +30,95 @@ use crate::{
 const MAX_SUBSCRIBERS: usize = 64;
 
 pub(super) struct Subscribers {
-    bindings: DataBindings<()>,
+    bindings: Bindings<PayloadBinding, ()>,
     owned: BTreeMap<u64, Subscriber>,
 }
 
 struct Subscriber {
     owned: u64,
-    binding: DataBinding,
+    binding: PayloadBinding,
     source_room: ProjectRoomKey,
-    endpoint: SubscriberBinding,
-    capture_clock: Option<DataV1CaptureClock>,
+    payload: SubscriberPayload,
     branch: Option<FabricLocalBranch>,
     execution: ReceiverExecution,
     sequence: u64,
 }
 
+enum SubscriberPayload {
+    Data {
+        endpoint: SubscriberBinding,
+        capture_clock: Option<DataV1CaptureClock>,
+    },
+    Rtp(RtpOutput),
+}
+
+struct RtpOutput {
+    profile: pulsebeam_core::fabric::Profile,
+    id: NonZeroU16,
+    ssrc: u32,
+    payload_type: u8,
+    timeline: timeline::Timeline<FabricLocalBranch>,
+    admitted: Option<u64>,
+    last_branch: Option<FabricLocalBranch>,
+}
+
+impl RtpOutput {
+    fn offer(
+        &mut self,
+        branch: FabricLocalBranch,
+        now: Instant,
+        packet: PacketView<'_>,
+        position: u64,
+        peer: &mut Association,
+    ) -> Result<(), DatagramAdmission> {
+        let header = packet.header();
+        if header.profile != self.profile {
+            return Ok(());
+        }
+        let Ok((projected, next)) = self.timeline.prepare(
+            branch,
+            timeline::Input {
+                sequence: position,
+                timestamp: header.timestamp,
+            },
+            now.into_std(),
+            timeline::Transmitted {
+                primary: self.admitted,
+                sender_report: None,
+            },
+            self.last_branch.is_some_and(|previous| previous != branch),
+        ) else {
+            return Ok(());
+        };
+        let mut bytes = Vec::with_capacity(12 + packet.payload().len());
+        bytes.extend_from_slice(&[0x80, self.payload_type | (u8::from(header.marker) << 7)]);
+        let [.., high, low] = projected.sequence.to_be_bytes();
+        bytes.extend_from_slice(&[high, low]);
+        bytes.extend_from_slice(&projected.timestamp.to_be_bytes());
+        bytes.extend_from_slice(&self.ssrc.to_be_bytes());
+        bytes.extend_from_slice(packet.payload());
+        peer.scheduler.offer_bound(
+            &mut peer.connection,
+            Datagram {
+                kind: DatagramKind::Rtp,
+                binding: self.id,
+                payload: &bytes,
+            },
+        )?;
+        self.timeline = next;
+        self.last_branch = Some(branch);
+        self.admitted = Some(
+            self.admitted
+                .map_or(projected.sequence, |high| high.max(projected.sequence)),
+        );
+        Ok(())
+    }
+}
+
 impl Default for Subscribers {
     fn default() -> Self {
         Self {
-            bindings: DataBindings::new(MAX_SUBSCRIBERS),
+            bindings: Bindings::new(MAX_SUBSCRIBERS),
             owned: BTreeMap::new(),
         }
     }
@@ -70,11 +143,55 @@ impl Installed {
         let sequence = work.scope().sequence;
         match plan {
             ReceiverPreparation::Ready(plan) => {
-                let ReceiveTransport::QuicData(fabric) = plan.transport else {
-                    return Err(ExecutionFailureKind::Unsupported.into());
+                let (binding, payload) = match plan.transport {
+                    ReceiveTransport::QuicData(fabric) => (
+                        PayloadBinding::Data(
+                            DataBinding::from_parameters(fabric.parameters)
+                                .ok_or(ExecutionFailureKind::Invalid)?,
+                        ),
+                        SubscriberPayload::Data {
+                            endpoint: fabric.endpoint,
+                            capture_clock: match &plan.source {
+                                Track::Data(data) => data.capture_clock.clone(),
+                                _ => None,
+                            },
+                        },
+                    ),
+                    ReceiveTransport::QuicRtp(parameters) => {
+                        let (profile, kind) = match &plan.source {
+                            Track::Audio(_) => {
+                                (pulsebeam_core::fabric::Profile::Opus, TrackKind::Audio)
+                            }
+                            Track::Video(_) => {
+                                (pulsebeam_core::fabric::Profile::H264, TrackKind::Video)
+                            }
+                            _ => return Err(ExecutionFailureKind::Unsupported.into()),
+                        };
+                        let binding = QuicRtpBinding::compile(&parameters, kind)
+                            .map_err(|_| ExecutionFailureKind::Invalid)?;
+                        let [.., a, b, c, d, e, f] = *self.connection.as_bytes();
+                        let timeline = timeline::Timeline::new(
+                            u16::from_be_bytes([a, b]),
+                            u32::from_be_bytes([c, d, e, f]),
+                            binding.format().clock_rate,
+                            64,
+                        )
+                        .ok_or(ExecutionFailureKind::Invalid)?;
+                        (
+                            PayloadBinding::from(binding),
+                            SubscriberPayload::Rtp(RtpOutput {
+                                profile,
+                                id: binding.id(),
+                                ssrc: binding.ssrc().get(),
+                                payload_type: binding.payload_type(),
+                                timeline,
+                                admitted: None,
+                                last_branch: None,
+                            }),
+                        )
+                    }
+                    _ => return Err(ExecutionFailureKind::Unsupported.into()),
                 };
-                let binding = DataBinding::from_parameters(fabric.parameters)
-                    .ok_or(ExecutionFailureKind::Invalid)?;
                 if self.subscribers.owned.contains_key(&reference) {
                     return Err(ExecutionFailureKind::Conflict.into());
                 }
@@ -91,18 +208,13 @@ impl Installed {
                     ready: false,
                     failed: false,
                 };
-                let capture_clock = match plan.source {
-                    Track::Data(data) => data.capture_clock,
-                    _ => None,
-                };
                 self.subscribers.owned.insert(
                     reference,
                     Subscriber {
                         owned: work.owned(),
                         binding,
                         source_room: plan.source_room,
-                        endpoint: fabric.endpoint,
-                        capture_clock,
+                        payload,
                         branch: None,
                         execution,
                         sequence,
@@ -196,6 +308,34 @@ impl Installed {
         }
     }
 
+    pub(super) fn ingest_receiver_pli(
+        &self,
+        receiver: crate::shard::participants::ParticipantHandle,
+        packet: Datagram<'_>,
+        core: &mut ShardCore,
+    ) {
+        let Ok(pli) = PictureLossIndication::decode(packet.payload) else {
+            return;
+        };
+        let Some((binding, _)) = self.subscribers.bindings.resolve(packet.binding) else {
+            return;
+        };
+        let Some(branch) = self.subscribers.owned.values().find_map(|subscriber| {
+            let SubscriberPayload::Rtp(output) = &subscriber.payload else {
+                return None;
+            };
+            (subscriber.binding == binding
+                && subscriber.execution.enabled
+                && output.profile == pulsebeam_core::fabric::Profile::H264
+                && output.ssrc == pli.media_ssrc.get())
+            .then_some(subscriber.branch)
+            .flatten()
+        }) else {
+            return;
+        };
+        core.request_quic_receiver_refresh(receiver, branch);
+    }
+
     /// Commit the Fabric handoff only when Noq takes the whole datagram.
     pub(super) fn poll_data_output(
         &mut self,
@@ -221,13 +361,24 @@ impl Installed {
                 continue;
             }
             if subscriber.branch.is_none() {
-                subscriber.branch = core.install_quic_data_branch(
-                    receiver,
-                    subscriber.execution.source,
-                    subscriber.endpoint,
-                    (subscriber.binding.format.delivery() == Delivery::Reliable)
-                        .then_some((reference, subscriber.owned)),
-                );
+                subscriber.branch = match (&subscriber.payload, subscriber.binding) {
+                    (SubscriberPayload::Data { endpoint, .. }, PayloadBinding::Data(binding)) => {
+                        core.install_quic_data_branch(
+                            receiver,
+                            subscriber.execution.source,
+                            *endpoint,
+                            (binding.format.delivery() == Delivery::Reliable)
+                                .then_some((reference, subscriber.owned)),
+                        )
+                    }
+                    (SubscriberPayload::Rtp(output), PayloadBinding::Rtp { .. }) => core
+                        .install_quic_rtp_branch(
+                            receiver,
+                            subscriber.execution.source,
+                            output.profile,
+                        ),
+                    _ => None,
+                };
                 if subscriber.branch.is_some() {
                     subscriber.execution.ready = true;
                     if !self
@@ -245,17 +396,44 @@ impl Installed {
             let Some(branch) = subscriber.branch else {
                 continue;
             };
-            let clock = subscriber.capture_clock.as_ref().map(|clock| {
-                pulsebeam_proto::data_record::Clock {
+            let capture_clock = match &mut subscriber.payload {
+                SubscriberPayload::Data { capture_clock, .. } => capture_clock,
+                SubscriberPayload::Rtp(output) => {
+                    if matches!(
+                        core.admit_quic_rtp(branch, receiver, now, |packet, position| {
+                            match output.offer(branch, now, packet, position, peer) {
+                                Ok(())
+                                | Err(DatagramAdmission::Unsupported | DatagramAdmission::Size) => {
+                                    Ok(())
+                                }
+                                Err(DatagramAdmission::ControlTurn) => {
+                                    retry = true;
+                                    Err(())
+                                }
+                                Err(DatagramAdmission::Full) => Err(()),
+                            }
+                        }),
+                        Ok(Some(()))
+                    ) {
+                        retry = true;
+                    }
+                    continue;
+                }
+            };
+            let PayloadBinding::Data(binding) = subscriber.binding else {
+                continue;
+            };
+            let clock = capture_clock
+                .as_ref()
+                .map(|clock| pulsebeam_proto::data_record::Clock {
                     id: &clock.id,
                     epoch: clock.epoch,
-                }
-            });
+                });
             if core.admit_quic_receiver_data(
                 branch,
                 receiver,
                 now,
-                subscriber.binding.format.delivery() == Delivery::Reliable,
+                binding.format.delivery() == Delivery::Reliable,
                 |packet, repair| {
                     if project_sctp_record(&packet, clock, repair).is_err() {
                         return DataWrite::Rejected;
@@ -264,7 +442,7 @@ impl Installed {
                         &mut peer.connection,
                         Datagram {
                             kind: DatagramKind::Data,
-                            binding: subscriber.binding.id,
+                            binding: binding.id,
                             payload: packet.payload(),
                         },
                     ) {

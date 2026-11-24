@@ -26,28 +26,45 @@ pub(crate) fn is_stock_av1(codec: &RtpCodecParameters) -> bool {
         })
 }
 
+fn opus_format() -> wire::CodecFormat {
+    wire::CodecFormat::from(wire::codec_format::Codec::Opus(wire::OpusParameters {
+        min_packet_time_ms: Some(10),
+        in_band_fec: Some(true),
+        ..Default::default()
+    }))
+}
+
+fn h264_format() -> wire::CodecFormat {
+    wire::CodecFormat::from(wire::codec_format::Codec::H264(wire::H264Parameters {
+        profile_level_id: Some(0x42e01f),
+        level_asymmetry_allowed: Some(true),
+    }))
+}
+
+pub(crate) fn quic_capabilities() -> wire::RtpCapabilities {
+    wire::RtpCapabilities {
+        codecs: [opus_format(), h264_format()]
+            .into_iter()
+            .map(|format| wire::RtpCodecCapability {
+                format: Some(format),
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    }
+}
+
 pub(crate) fn capabilities() -> wire::RtpCapabilities {
     wire::RtpCapabilities {
         codecs: vec![
             wire::RtpCodecCapability {
-                format: Some(wire::CodecFormat::from(wire::codec_format::Codec::Opus(
-                    wire::OpusParameters {
-                        min_packet_time_ms: Some(10),
-                        in_band_fec: Some(true),
-                        ..Default::default()
-                    },
-                ))),
+                format: Some(opus_format()),
                 feedback: vec![wire::RtcpFeedback::TransportCc.as_str().into()],
                 rtx_supported: false,
                 scalability_modes: vec![],
             },
             wire::RtpCodecCapability {
-                format: Some(wire::CodecFormat::from(wire::codec_format::Codec::H264(
-                    wire::H264Parameters {
-                        profile_level_id: Some(0x42e01f),
-                        level_asymmetry_allowed: Some(true),
-                    },
-                ))),
+                format: Some(h264_format()),
                 feedback: vec![
                     wire::RtcpFeedback::TransportCc.as_str().into(),
                     wire::RtcpFeedback::Nack.as_str().into(),

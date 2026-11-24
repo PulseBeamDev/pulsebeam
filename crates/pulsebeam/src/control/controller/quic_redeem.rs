@@ -116,7 +116,7 @@ impl ControllerActor {
             old_connection_id: None,
             authorization: Some(lease),
             profile: SignalingProtocol::State,
-            rtp_capabilities: None,
+            rtp_capabilities: Some(crate::control::rtp::quic_capabilities()),
         };
         self.prepare_owned_attempt(
             state,
@@ -136,7 +136,7 @@ impl ControllerActor {
                 let mut native = StateProtocolHandler::with_binding_profile(
                     target.participant,
                     target.scope.room,
-                    None,
+                    state.rtp_capabilities.take(),
                     control,
                     pulsebeam_proto::state::validation::BindingProfile::Quic,
                 )
