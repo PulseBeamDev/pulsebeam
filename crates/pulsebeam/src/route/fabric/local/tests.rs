@@ -482,17 +482,19 @@ fn cached_data_location_requires_an_unambiguous_live_original() {
         index: 1,
     };
     let sequence = 1u64 << 32;
-    let packet = |sequence, timestamp, marker| {
+    let packet = |sequence, unit, marker| {
+        let mut fragment = crate::participant::data_fabric::R4;
+        fragment[11] = unit;
         FabricPacket::new(
             Header {
                 profile: Profile::Data,
                 sequence,
-                timestamp,
+                timestamp: 0x2876_1234,
                 marker,
                 ingress_ntp32: 7,
             },
             &[],
-            Box::<[u8]>::from(crate::participant::data_fabric::R4.as_slice()),
+            Box::<[u8]>::from(fragment.as_slice()),
         )
         .unwrap()
     };
@@ -672,13 +674,12 @@ fn live_and_repair_race_through_one_branch_queue_and_keep_original_content() {
                 expires: now + reliable::LIFETIME,
             };
             if !live_first {
-                let wrong_timestamp = FabricPacket::new(
-                    Header {
-                        timestamp: 4,
-                        ..original.header()
-                    },
+                let mut fragment = crate::participant::data_fabric::R4;
+                fragment[11] = 4;
+                let wrong_unit = FabricPacket::new(
+                    original.header(),
                     &[],
-                    Box::<[u8]>::from(original.payload()),
+                    Box::<[u8]>::from(fragment.as_slice()),
                 )
                 .unwrap();
                 assert_eq!(
@@ -686,7 +687,7 @@ fn live_and_repair_race_through_one_branch_queue_and_keep_original_content() {
                         now,
                         target,
                         demand,
-                        wrong_timestamp,
+                        wrong_unit,
                         NonZeroU64::MIN
                     ),
                     RepairQueue::Unavailable

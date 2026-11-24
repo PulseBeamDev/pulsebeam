@@ -1224,6 +1224,17 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
             .ok_or_else(|| error("unknown source"))?
             .set_enabled(&mut self.session, enabled)
     }
+    pub(crate) fn has_clock_evidence(&self) -> bool {
+        self.session.has_monotonic_capture_clock()
+    }
+
+    pub(crate) fn clock_evidence_nanos(&self) -> Option<i64> {
+        if !self.has_clock_evidence() {
+            return None;
+        }
+        self.session.clock_timestamp().ok()?.microseconds().ok()?.checked_mul(1_000)
+    }
+
     pub fn capture_time_us(
         &self,
         slot: &MediaSlot,

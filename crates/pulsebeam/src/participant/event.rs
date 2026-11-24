@@ -85,6 +85,16 @@ pub(crate) trait ParticipantSink {
         source: crate::shard::router::FabricSourceHandle,
         input: crate::rtp::fabric_ingress::MediaIngress,
     );
+    fn native_clock_control(
+        &mut self,
+        _source: crate::shard::router::FabricSourceHandle,
+        _installation: pulsebeam_rtc::DataChannelInstallation,
+        _now: pulsebeam_runtime::time::Instant,
+        _control: pulsebeam_proto::state::NativeClockExchange,
+    ) -> Option<pulsebeam_proto::state::NativeClockExchange> {
+        None
+    }
+
     fn media_clock(&self) -> Option<&crate::clock::reference::ShardClock> {
         None
     }

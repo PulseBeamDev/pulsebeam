@@ -231,6 +231,18 @@ pub struct PipelineSinkRef<'a> {
 }
 
 impl<'a> ParticipantSink for PipelineSinkRef<'a> {
+    fn native_clock_control(
+        &mut self,
+        source: super::router::FabricSourceHandle,
+        installation: pulsebeam_rtc::DataChannelInstallation,
+        now: pulsebeam_runtime::time::Instant,
+        control: pulsebeam_proto::state::NativeClockExchange,
+    ) -> Option<pulsebeam_proto::state::NativeClockExchange> {
+        let reference = self.media_clock?.estimate_at(now)?;
+        let (publisher, _) = self.runtime.as_deref_mut()?.data_publisher_mut(source, self.key, installation)?;
+        publisher.clock_control(control, now, reference)
+    }
+
     fn media_clock(&self) -> Option<&crate::clock::reference::ShardClock> {
         self.media_clock
     }

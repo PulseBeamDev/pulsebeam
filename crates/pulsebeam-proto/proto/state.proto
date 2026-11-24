@@ -89,7 +89,7 @@ message CatalogPageRecord {
 // Complete values applied individually in reliable stream order, not a map-wide
 // transaction. Send promptly; coalesce unsent updates by key. No batch ACK/cursor.
 message ClientStateBatch {
-  reserved 4, 5; // NativeDataControl, never mixed into a State batch.
+  reserved 4, 5, 6; // Standalone Native controls, never mixed into a State batch.
   // Resource and catalog records share one 16-record, 4096-byte frame budget.
   repeated ClientStateRecord records = 1;
   repeated CatalogClientRecord catalog_records = 3;
@@ -146,7 +146,7 @@ message LogicalReceiverReport {
 }
 
 message ServerStateBatch {
-  reserved 4, 5; // NativeDataControl, never mixed into a State batch.
+  reserved 4, 5, 6; // Standalone Native controls, never mixed into a State batch.
   // Resource and catalog records share one 16-record, 4096-byte frame budget.
   repeated ServerStateRecord records = 1;
 
@@ -171,6 +171,33 @@ message NativeDataControl {
 message OwnedDataControl {
   uint64 owned = 1;
   bytes record = 2; // Canonical directional record from data_control.proto.
+}
+
+// Optional standalone clock exchange on an authenticated Native control stream.
+// The client opts in per owned publication and clock epoch. The server sends a
+// fresh challenge (t1) and observes reply arrival (t4) on its own clock.
+message NativeClockControl {
+  NativeClockExchange exchange = 6;
+}
+
+message NativeClockExchange {
+  uint64 owned = 1;
+  uint64 clock_epoch = 2;
+  oneof message {
+    NativeClockEnable enable = 3;
+    NativeClockChallenge challenge = 4;
+    NativeClockReply reply = 5;
+  }
+}
+
+message NativeClockEnable {}
+message NativeClockChallenge {
+  uint64 nonce = 1;
+}
+message NativeClockReply {
+  uint64 nonce = 1;
+  sint64 received_nanos = 2;
+  sint64 sent_nanos = 3;
 }
 
 // Directional catalog response. An error is not a page fragment.

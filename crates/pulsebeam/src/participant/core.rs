@@ -1768,6 +1768,29 @@ impl Connection {
         self.transport.write_channel(cid, true, &bytes)
     }
 
+    fn receive_native_clock_control(
+        &mut self,
+        frame: pulsebeam_proto::state::NativeClockControl,
+        now: Instant,
+        events: &mut impl ParticipantSink,
+    ) {
+        use pulsebeam_proto::state::{NativeClockControl, codec::{ClockDirection, encode_clock_control}};
+        if !self.fabric_io_authorized() || self.native_handoff.is_none() {
+            return;
+        }
+        let Some(control) = frame.exchange else { return };
+        let Some(FabricDataLease::Input(input)) = self.native_data.publication_channel(control.owned)
+            .and_then(|cid| self.fabric_data.get(&cid))
+        else { return };
+        if let Some(response) = events.native_clock_control(input.source, input.installation, now, control)
+            && let Some(channel) = self.native_channel_id()
+            && !self.transport.signaling_pending()
+            && let Ok(bytes) = encode_clock_control(&NativeClockControl { exchange: Some(response) }, ClockDirection::ServerToClient)
+        {
+            let _ = self.transport.write_channel(channel, true, &bytes);
+        }
+    }
+
     fn receive_fabric_control(
         &mut self,
         frame: pulsebeam_proto::state::NativeDataControl,
@@ -2223,6 +2246,13 @@ impl Connection {
                     return;
                 };
                 if Some(cid) == self.native_channel_id() {
+                    use pulsebeam_proto::state::codec::{ClockDirection, decode_clock_control_frame};
+                    if let Some(control) = decode_clock_control_frame(&bytes, ClockDirection::ClientToServer) {
+                        if let Ok(control) = control {
+                            self.receive_native_clock_control(control, now, events);
+                        }
+                        return;
+                    }
                     if let Some(control) =
                         pulsebeam_proto::state::codec::decode_data_control_frame(&bytes)
                     {

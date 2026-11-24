@@ -8,6 +8,40 @@
 use alloc::{string::String, vec};
 
 use super::*;
+
+#[test]
+fn native_clock_control_pins_direction_and_a_bounded_standalone_image() {
+    use crate::state::{NativeClockChallenge, NativeClockExchange, native_clock_exchange::Message};
+    let frame = NativeClockControl {
+        exchange: Some(NativeClockExchange {
+            owned: 7,
+            clock_epoch: 2,
+            message: Some(Message::Challenge(NativeClockChallenge { nonce: 11 })),
+        }),
+    };
+    let wire = [0x32, 8, 8, 7, 16, 2, 0x22, 2, 8, 11];
+    assert_eq!(
+        encode_clock_control(&frame, ClockDirection::ServerToClient).unwrap(),
+        wire
+    );
+    assert_eq!(
+        decode_clock_control_frame(&wire, ClockDirection::ServerToClient),
+        Some(Ok(frame))
+    );
+    assert_eq!(
+        decode_clock_control_frame(&wire, ClockDirection::ClientToServer),
+        Some(Err(DecodeError::Structure))
+    );
+    assert!(decode_client(&wire).is_err());
+    assert!(decode_server(&wire).is_err());
+    assert!(decode_data_control_frame(&wire).is_none());
+    let mut oversized = [0; 65];
+    oversized[0] = 0x32;
+    assert_eq!(
+        decode_clock_control_frame(&oversized, ClockDirection::ServerToClient),
+        Some(Err(DecodeError::FrameSize))
+    );
+}
 use crate::state::*;
 use validation::ValidationError;
 

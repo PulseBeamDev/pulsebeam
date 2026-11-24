@@ -1011,6 +1011,11 @@ impl<R: SessionRuntime> Session<R> {
 
     /// Owned reading from the factory's effective native clock, including
     /// signed values. No local engine handle is returned to the actor caller.
+    #[doc(hidden)]
+    pub fn has_monotonic_capture_clock(&self) -> bool {
+        self.factory.codec_environment().clock_is_monotonic()
+    }
+
     pub fn clock_timestamp(&self) -> Result<crate::Timestamp, PeerError> {
         self.check_open()?;
         Ok(self.factory.clock_timestamp())

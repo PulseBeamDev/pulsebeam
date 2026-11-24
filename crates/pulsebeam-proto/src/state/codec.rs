@@ -4,7 +4,8 @@ use alloc::vec::Vec;
 use prost::Message;
 
 use super::{
-    ClientStateBatch, NativeDataControl, ServerStateBatch, native_data_control,
+    ClientStateBatch, NativeClockControl, NativeDataControl, ServerStateBatch,
+    native_clock_exchange, native_data_control,
     validation::{self, ValidationError},
 };
 
@@ -18,6 +19,72 @@ const MAX_DATA_CONTROL: usize = crate::data_control::MAX_CONTROL_FRAME_BYTES;
 const MAX_DATA_CONTROL_FRAME: usize = MAX_DATA_CONTROL + 17;
 pub(super) const DATA_PUBLISHER_FIELD: u32 = 4;
 pub(super) const DATA_SUBSCRIBER_FIELD: u32 = 5;
+pub(super) const CLOCK_FIELD: u32 = 6;
+const CLOCK_TAG: u8 = 0x32;
+const MAX_CLOCK_FRAME: usize = 64;
+/// DATA capture clock supplied by the native media environment, not browser time.
+pub const NATIVE_CAPTURE_CLOCK_ID: &str = "pulsebeam.native.capture";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClockDirection {
+    ClientToServer,
+    ServerToClient,
+}
+
+pub fn encode_clock_control(
+    control: &NativeClockControl,
+    direction: ClockDirection,
+) -> Result<Vec<u8>, EncodeError> {
+    if !valid_clock_control(control, direction) {
+        return Err(EncodeError::Validation(ValidationError::Batch));
+    }
+    if control.encoded_len() > MAX_CLOCK_FRAME {
+        return Err(EncodeError::TooLarge);
+    }
+    encode(control)
+}
+
+/// Explicit clock tag on a negotiated Native channel. A malformed or
+/// wrong-direction clock message must not fall through to the State codec.
+pub fn decode_clock_control_frame(
+    frame: &[u8],
+    direction: ClockDirection,
+) -> Option<Result<NativeClockControl, DecodeError>> {
+    if frame.first().copied()? != CLOCK_TAG {
+        return None;
+    }
+    Some((|| {
+        if frame.len() > MAX_CLOCK_FRAME {
+            return Err(DecodeError::FrameSize);
+        }
+        let control =
+            NativeClockControl::decode(frame).map_err(|_| DecodeError::InvalidProtobuf)?;
+        if !valid_clock_control(&control, direction) || control.encode_to_vec() != frame {
+            return Err(DecodeError::Structure);
+        }
+        Ok(control)
+    })())
+}
+
+fn valid_clock_control(control: &NativeClockControl, direction: ClockDirection) -> bool {
+    use native_clock_exchange::Message;
+    let Some(exchange) = control.exchange.as_ref() else {
+        return false;
+    };
+    if exchange.owned == 0 || exchange.clock_epoch == 0 {
+        return false;
+    }
+    match (direction, exchange.message.as_ref()) {
+        (ClockDirection::ClientToServer, Some(Message::Enable(_))) => true,
+        (ClockDirection::ServerToClient, Some(Message::Challenge(challenge))) => {
+            challenge.nonce != 0
+        }
+        (ClockDirection::ClientToServer, Some(Message::Reply(reply))) => {
+            reply.nonce != 0 && reply.sent_nanos >= reply.received_nanos
+        }
+        _ => false,
+    }
+}
 
 #[derive(Debug, PartialEq)]
 pub enum NativeFrame<T> {

@@ -210,8 +210,12 @@ pub(super) struct Input {
     pub(super) reliable_endpoint: Option<pulsebeam_proto::data_control::PublisherBinding>,
 }
 
+mod clock_exchange;
+
 pub(crate) struct PublisherSource {
     source: crate::shard::router::FabricSourceHandle,
+    incarnation: core::num::NonZeroU64,
+    exchange: clock_exchange::Exchange,
     installation: pulsebeam_rtc::DataChannelInstallation,
     reliable_endpoint: Option<PublisherBinding>,
     ledger: Source,
@@ -243,9 +247,14 @@ impl PublisherSource {
         binding: InstalledBinding,
         clock: Option<Clock<'_>>,
     ) -> Option<Self> {
+        let Endpoint::Publisher(endpoint) = binding.endpoint else {
+            return None;
+        };
         let input = Input::from_publisher(source, binding)?;
         Some(Self {
             source,
+            incarnation: endpoint.source,
+            exchange: Default::default(),
             installation: input.installation,
             reliable_endpoint: input.reliable_endpoint,
             ledger: Source::new(clock),
@@ -501,6 +510,7 @@ struct CaptureReference {
     domain: ClockDomain,
     origin: Instant,
     host_generation: u64,
+    assigned_frontier: Option<SourceTime>,
 }
 
 impl CaptureReference {
@@ -573,6 +583,7 @@ impl Source {
             domain,
             origin,
             host_generation,
+            assigned_frontier: None,
         }));
         true
     }
@@ -777,7 +788,7 @@ impl Source {
         }
         let slot = slot_index(unit_id)?;
         let current = self.slots.get(slot).ok_or(Error::Sequence)?;
-        let (is_new, timestamp) = match current {
+        let (is_new, timestamp, assigned_capture) = match current {
             Slot::Closed(id) if *id == unit_id => return Err(Error::Expired),
             Slot::Open(unit) if unit.id == unit_id => {
                 if let Some(sequence) = unit.fragments.get(index).and_then(Option::as_ref) {
@@ -792,18 +803,22 @@ impl Source {
                     self.close(fanout, slot);
                     return Err(Error::UnitConflict);
                 }
-                (false, unit.timestamp)
+                (false, unit.timestamp, None)
             }
-            _ => (
-                true,
-                capture
-                    .and_then(|capture| {
-                        self.capture_reference
-                            .as_ref()?
-                            .timestamp(capture, now, time)
-                    })
-                    .unwrap_or(time.fallback),
-            ),
+            _ => {
+                let projected = capture.and_then(|capture| {
+                    let timestamp = self
+                        .capture_reference
+                        .as_ref()?
+                        .timestamp(capture, now, time)?;
+                    Some((timestamp, SourceTime::from_nanos(capture.0)))
+                });
+                let (timestamp, assigned_capture) = projected
+                    .map_or((time.fallback, None), |(timestamp, source)| {
+                        (timestamp, Some(source))
+                    });
+                (true, timestamp, assigned_capture)
+            }
         };
 
         let (old_floor, new_floor) = self.floors(unit_id);
@@ -884,6 +899,15 @@ impl Source {
         let target = unit.fragments.get_mut(index).ok_or(Error::Sequence)?;
         *target = Some(sequence);
         fanout.retain_endpoint_data(sequence, packet);
+        if let Some(source) = assigned_capture
+            && let Some(reference) = self.capture_reference.as_mut()
+        {
+            reference.assigned_frontier = Some(
+                reference
+                    .assigned_frontier
+                    .map_or(source, |last| last.max(source)),
+            );
+        }
         unit.charge = unit.charge.saturating_add(fragment_charge);
         self.charged = self.charged.saturating_add(charge);
         self.max_seen = Some(self.max_seen.map_or(unit_id, |max| max.max(unit_id)));

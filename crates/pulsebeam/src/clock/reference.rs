@@ -276,6 +276,10 @@ impl ShardClock {
         self.snapshot = snapshot;
     }
 
+    pub(crate) fn estimate_at(&self, at: Instant) -> Option<Estimate> {
+        self.snapshot.at(at)
+    }
+
     pub(crate) fn sender_report_time(
         &self,
         at: Instant,

@@ -403,12 +403,19 @@ struct LatestData {
 }
 
 impl LatestData {
+    fn capture_clock() -> core_ffi::CaptureClock {
+        core_ffi::CaptureClock {
+            id: "native-sensor".into(),
+            epoch: 1,
+        }
+    }
+
     fn new(agent: &Agent, room: &RoomId, remote: &str) -> anyhow::Result<Self> {
         Ok(Self {
             sender: agent.data("latest-state".into())?.publish(Some(
                 core_ffi::DataPublishOptions {
                     delivery: Some(core_ffi::DataDelivery::Latest),
-                    ..Default::default()
+                    capture_clock: Some(Self::capture_clock()),
                 },
             ))?,
             receiver: agent
@@ -426,9 +433,29 @@ impl LatestData {
         remote: &str,
         barrier: &tokio::sync::Barrier,
         marker: u8,
+        source: &pulsebeam_agent_native::ffi::VideoSource,
     ) -> anyhow::Result<String> {
         barrier.wait().await;
-        let expected = [marker];
+        let before_us = super::common::native::now_us()?;
+        let sampled_us = source.capture_time_us().await?;
+        let after_us = super::common::native::now_us()?;
+        anyhow::ensure!(
+            (before_us..=after_us).contains(&sampled_us),
+            "capture clock sampled {sampled_us} us outside Native window {before_us}..={after_us} us"
+        );
+        let nanos = sampled_us
+            .checked_mul(1_000)
+            .ok_or_else(|| anyhow::anyhow!("native sensor timestamp overflow"))?;
+        let mut payload = vec![marker];
+        payload.extend_from_slice(&nanos.to_be_bytes());
+        let clock = Self::capture_clock();
+        let send_options = core_ffi::DataSendOptions {
+            captured_at: Some(core_ffi::CaptureTimestamp {
+                clock: clock.clone(),
+                nanos,
+                uncertainty_ns: Some(1_000),
+            }),
+        };
         let ready = async {
             loop {
                 let update = self.receiver.next().await?;
@@ -437,10 +464,22 @@ impl LatestData {
                         participant_id,
                         publication_id,
                         data,
+                        captured_at,
                         ..
                     }) => {
                         anyhow::ensure!(participant_id == remote);
-                        if data == expected {
+                        if let [observed, witness @ ..] = data.as_slice()
+                            && *observed == marker
+                        {
+                            let witness = i64::from_be_bytes(witness.try_into()?);
+                            anyhow::ensure!(
+                                captured_at == Some(core_ffi::CaptureTimestamp {
+                                    clock: clock.clone(),
+                                    nanos: witness,
+                                    uncertainty_ns: Some(1_000),
+                                }),
+                                "Native DATA capture metadata {captured_at:?} disagrees with sensor witness {witness} ns"
+                            );
                             barrier.wait().await;
                             return Ok(publication_id);
                         }
@@ -458,7 +497,7 @@ impl LatestData {
             loop {
                 tokio::select! {
                     result = &mut ready => break result,
-                    _ = tick.tick() => self.sender.send(expected.to_vec(), None).await?,
+                    _ = tick.tick() => self.sender.send(payload.clone(), Some(send_options.clone())).await?,
                 }
             }
         })
@@ -1637,7 +1676,7 @@ async fn run_peer(
     // The two Lossy cursors share one subscription stream.
     native_payload_channels(&runtime, first_generation, 4, None).await?;
     let old_latest = latest_data
-        .exchange(remote, &barriers.before_media, 1)
+        .exchange(remote, &barriers.before_media, 1, &video)
         .await?;
     owned_data.exchange(&barriers.before_media, 1).await?;
 
@@ -1681,7 +1720,7 @@ async fn run_peer(
     let (reused, _) =
         native_payload_channels(&runtime, first_generation, 4, Some(closed_after)).await?;
     let new_latest = latest_data
-        .exchange(remote, &barriers.before_reconnect, 2)
+        .exchange(remote, &barriers.before_reconnect, 2, &video)
         .await?;
     anyhow::ensure!(
         new_latest != old_latest,
@@ -2008,7 +2047,7 @@ async fn run_peer(
             )
         })?;
     latest_data
-        .exchange(remote, &barriers.after_reconnect, 3)
+        .exchange(remote, &barriers.after_reconnect, 3, &video)
         .await?;
 
     anyhow::ensure!(

@@ -701,12 +701,10 @@ impl SourceFanout {
                 return None;
             }
             let identity = wire_identity(frozen.packet.payload()).ok()?;
-            let [a, b, c, d, ..] = identity.unit_seq.to_le_bytes();
             let header = frozen.packet.header();
             (identity.unit_seq == fragment.unit_seq
                 && identity.index == fragment.index
                 && identity.count == fragment_count
-                && header.timestamp == u32::from_le_bytes([a, b, c, d])
                 && header.marker == identity.final_fragment())
             .then_some(sequence)
         });
@@ -1017,10 +1015,8 @@ impl SourceFanout {
         }
         let valid_fragment = pulsebeam_proto::data_record::wire_identity(packet.payload())
             .is_ok_and(|identity| {
-                let [a, b, c, d, ..] = identity.unit_seq.to_le_bytes();
                 identity.unit_seq == request.fragment.unit_seq
                     && identity.index == request.fragment.index
-                    && packet.header().timestamp == u32::from_le_bytes([a, b, c, d])
                     && packet.header().marker == identity.final_fragment()
                     && self
                         .expectations

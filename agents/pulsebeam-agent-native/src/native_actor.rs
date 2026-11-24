@@ -553,6 +553,7 @@ impl Agent {
             config,
             core,
             clock_origin: Instant::now(),
+            next_clock_probe: Duration::ZERO,
             peer: None,
             peer_owner: None,
             runtime,
@@ -981,6 +982,7 @@ where
     config: Config,
     core: Control,
     clock_origin: Instant,
+    next_clock_probe: Duration,
     // A generation is destroyed before the factory closure (which may own the
     // controlled world's affine services). There is no closed-peer history.
     peer: Option<NativePeer<R>>,
@@ -1130,6 +1132,17 @@ where
     }
 
     fn accept(&mut self, event: HostEvent) {
+        if let HostEvent::DataChannel(agent_core::DataChannelEvent::Message {
+            generation, channel, binary: true, payload,
+        }) = &event
+            && payload.first() == Some(&0x32)
+            && self.core.external(|core| core.try_native_clock_frame(
+                *generation, *channel, payload,
+                || self.peer.as_ref()?.clock_evidence_nanos(),
+            ))
+        {
+            return;
+        }
         #[cfg(feature = "sim")]
         if let HostEvent::Rtc(event) = &event {
             let (generation, kind) = match event {
@@ -1850,6 +1863,13 @@ where
             return false;
         };
         let generation = peer.generation;
+        let now = self.clock_origin.elapsed();
+        if now >= self.next_clock_probe {
+            self.next_clock_probe = now.saturating_add(Duration::from_secs(1));
+            if peer.has_clock_evidence() {
+                self.core.external(|core| core.native_clock_probe(now));
+            }
+        }
         let progress = match peer.progress() {
             Ok(progress) => progress,
             Err(error) => {

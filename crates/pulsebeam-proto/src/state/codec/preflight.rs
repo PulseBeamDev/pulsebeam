@@ -113,7 +113,7 @@ fn message(
             Some(Shape::ClientStateBatch | Shape::ServerStateBatch)
         ) && matches!(
             field,
-            super::DATA_PUBLISHER_FIELD | super::DATA_SUBSCRIBER_FIELD
+            super::DATA_PUBLISHER_FIELD | super::DATA_SUBSCRIBER_FIELD | super::CLOCK_FIELD
         ) {
             return Err(DecodeError::Structure);
         }
