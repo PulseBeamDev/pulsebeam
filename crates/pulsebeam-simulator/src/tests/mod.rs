@@ -10,6 +10,7 @@ pub mod histories;
 pub mod native_runtime;
 pub mod native_state;
 pub mod properties;
+mod quic_data;
 pub mod room_isolation;
 pub mod subscriptions;
 pub mod tcp_transport;

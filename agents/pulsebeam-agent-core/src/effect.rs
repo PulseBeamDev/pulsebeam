@@ -29,6 +29,32 @@ pub enum QuicEffect {
         operation: OperationId,
         payload: Vec<u8>,
     },
+    SendData(QuicDataSend),
+    RetireData {
+        generation: Generation,
+        channel: ChannelId,
+    },
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct QuicDataSend {
+    pub generation: Generation,
+    pub channel: ChannelId,
+    pub binding: core::num::NonZeroU16,
+    pub operation: OperationId,
+    pub payload: Vec<u8>,
+}
+
+impl core::fmt::Debug for QuicDataSend {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("QuicDataSend")
+            .field("generation", &self.generation)
+            .field("channel", &self.channel)
+            .field("binding", &self.binding)
+            .field("operation", &self.operation)
+            .field("bytes", &self.payload.len())
+            .finish()
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]

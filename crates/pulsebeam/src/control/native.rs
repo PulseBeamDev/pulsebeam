@@ -127,11 +127,12 @@ pub(crate) struct Receiver {
 
 pub(crate) enum ReceiveTransport {
     FabricData(Box<FabricDataReceiver>),
+    QuicData(Box<FabricDataReceiver<wire::QuicDataV1Parameters>>),
     Rtp(Box<ReceiverRtpConfiguration>),
 }
 
-pub(crate) struct FabricDataReceiver {
-    pub(crate) parameters: wire::SctpDataV1Parameters,
+pub(crate) struct FabricDataReceiver<P = wire::SctpDataV1Parameters> {
+    pub(crate) parameters: P,
     pub(crate) endpoint: pulsebeam_proto::data_control::SubscriberBinding,
 }
 
@@ -168,7 +169,10 @@ pub(crate) fn receiver_target(
                 .binding
                 .as_ref()
                 .and_then(|binding| binding.transport.as_ref()),
-            Some(wire::track_binding::Transport::SctpDataV1(_))
+            Some(
+                wire::track_binding::Transport::SctpDataV1(_)
+                    | wire::track_binding::Transport::QuicDataV1(_)
+            )
         )
     {
         return Err(wire::FailureCode::Unsupported);
@@ -206,27 +210,33 @@ pub(crate) fn receiver(
     ) {
         (
             Some(wire::track::Kind::Data(data)),
-            Some(wire::track_binding::Transport::SctpDataV1(parameters)),
+            Some(
+                transport @ (wire::track_binding::Transport::SctpDataV1(_)
+                | wire::track_binding::Transport::QuicDataV1(_)),
+            ),
         ) if subscription.kind == wire::TrackKind::Data as i32 => {
-            use pulsebeam_proto::data_endpoint::{Delivery, Format};
             let endpoint = data_v1_endpoint
                 .filter(|endpoint| Some(endpoint.source) == source.fabric_data_source())
                 .ok_or(wire::FailureCode::Incompatible)?;
-            if !matches!(
-                (
-                    wire::DataDelivery::try_from(data.delivery),
-                    parameters.format().map(Format::delivery)
-                ),
-                (Ok(wire::DataDelivery::Lossy), Some(Delivery::Unreliable))
-                    | (Ok(wire::DataDelivery::Latest), Some(Delivery::Latest))
-                    | (Ok(wire::DataDelivery::Ordered), Some(Delivery::Reliable))
-            ) {
-                return Err(wire::FailureCode::InvalidConfiguration);
+            match transport {
+                wire::track_binding::Transport::SctpDataV1(parameters)
+                    if wire::DataV1Binding::Sctp(*parameters).matches_delivery(data.delivery) =>
+                {
+                    Ok(ReceiveTransport::FabricData(Box::new(FabricDataReceiver {
+                        parameters: *parameters,
+                        endpoint,
+                    })))
+                }
+                wire::track_binding::Transport::QuicDataV1(parameters)
+                    if wire::DataV1Binding::Quic(*parameters).matches_delivery(data.delivery) =>
+                {
+                    Ok(ReceiveTransport::QuicData(Box::new(FabricDataReceiver {
+                        parameters: *parameters,
+                        endpoint,
+                    })))
+                }
+                _ => Err(wire::FailureCode::InvalidConfiguration),
             }
-            Ok(ReceiveTransport::FabricData(Box::new(FabricDataReceiver {
-                parameters: *parameters,
-                endpoint,
-            })))
         }
         (
             Some(wire::track::Kind::Audio(_) | wire::track::Kind::Video(_)),
@@ -243,7 +253,7 @@ pub(crate) fn receiver(
     }?;
     let video = match &transport {
         ReceiveTransport::Rtp(rtp) => rtp.video.clone(),
-        ReceiveTransport::FabricData(_) => None,
+        ReceiveTransport::FabricData(_) | ReceiveTransport::QuicData(_) => None,
     };
     Ok((
         transport,
@@ -277,7 +287,7 @@ pub(crate) fn receiver_policy(
 pub(crate) struct DataPublication {
     pub(crate) track_id: TrackId,
     pub(crate) lane: DataLane,
-    pub(crate) parameters: wire::SctpDataV1Parameters,
+    pub(crate) parameters: wire::DataV1Binding,
     pub(crate) capture_clock: Option<wire::DataV1CaptureClock>,
     pub(crate) enabled: bool,
 }
@@ -329,25 +339,14 @@ pub(crate) fn publication(
                 Ok(wire::DataDelivery::Ordered) => DataLane::Ordered,
                 _ => return Err(wire::FailureCode::Unsupported),
             };
-            let parameters = match data
+            let parameters = data
                 .binding
                 .as_ref()
-                .and_then(|binding| binding.transport.as_ref())
-            {
-                Some(wire::track_binding::Transport::SctpDataV1(binding)) => {
-                    use pulsebeam_proto::data_endpoint::{Delivery, Format};
-                    if !matches!(
-                        (lane, binding.format().map(Format::delivery)),
-                        (DataLane::Lossy, Some(Delivery::Unreliable))
-                            | (DataLane::Latest, Some(Delivery::Latest))
-                            | (DataLane::Ordered, Some(Delivery::Reliable))
-                    ) {
-                        return Err(wire::FailureCode::InvalidConfiguration);
-                    }
-                    *binding
-                }
-                _ => return Err(wire::FailureCode::Unsupported),
-            };
+                .and_then(wire::DataV1Binding::from_track)
+                .ok_or(wire::FailureCode::Unsupported)?;
+            if !parameters.matches_delivery(data.delivery) {
+                return Err(wire::FailureCode::InvalidConfiguration);
+            }
             Publication::Data(Box::new(DataPublication {
                 track_id: TrackId::new(&declaration.track_id)
                     .map_err(|_| wire::FailureCode::InvalidConfiguration)?,

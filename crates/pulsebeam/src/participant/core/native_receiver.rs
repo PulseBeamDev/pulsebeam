@@ -737,6 +737,7 @@ impl Connection {
                 };
                 Ok((ReceiveTransport::Sctp { channel, lane }, Some(fabric)))
             }
+            ReceivePlan::QuicData(_) => Err(ExecutionFailureKind::Unsupported),
             ReceivePlan::Rtp(configuration) => {
                 let receiver = rtp::RtpReceiver::new(*configuration);
                 if receiver.video_options.is_some() != (receiver.kind == MediaKind::Video) {

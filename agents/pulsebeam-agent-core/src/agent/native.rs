@@ -71,7 +71,7 @@ fn current_reliable_source<'a>(
     physical: &PayloadChannel,
 ) -> Option<&'a state::Track> {
     if physical.state != PayloadState::Active
-        || physical.data_v1.delivery != state::DataV1Delivery::Reliable as i32
+        || physical.data_v1.delivery() != state::DataV1Delivery::Reliable as i32
     {
         return None;
     }
@@ -89,7 +89,7 @@ pub(super) struct PayloadChannel {
     pub state: PayloadState,
     pub restart: bool,
     pub offer: Option<Offer>,
-    pub(super) data_v1: state::SctpDataV1Parameters,
+    pub(super) data_v1: state::DataV1Binding,
     pub(super) data_v1_receiver: Option<Box<crate::data_v1::ReceiveChannel>>,
     pub(super) data_v1_sender: Option<Box<crate::data_v1::SendChannel>>,
 }
@@ -103,8 +103,8 @@ impl PayloadChannel {
         prepared: Option<&crate::PreparedDataChannel>,
         control: Option<(u64, ChannelId)>,
     ) {
-        use core::num::{NonZeroU16, NonZeroU64};
-        use pulsebeam_proto::data_endpoint::{Binding, Channel, Endpoint};
+        use core::num::NonZeroU64;
+        use pulsebeam_proto::data_endpoint::{Binding, Endpoint};
 
         if !installed_payload(self, logical) {
             self.data_v1_receiver = None;
@@ -121,16 +121,12 @@ impl PayloadChannel {
                 state::logical_subscription_state::Execution::Failure(_) => return None,
             };
             let binding = Binding {
-                channel: Channel {
-                    association: generation,
-                    stream: NonZeroU16::new(self.stream)?,
-                    incarnation: NonZeroU64::new(parameters.channel_incarnation)?,
-                },
+                channel: parameters.payload_channel(generation)?,
                 format: parameters.format()?,
                 endpoint: Endpoint::Subscriber(offer.endpoint()?),
             };
             let channel =
-                crate::data_v1::Channel::from_accepted(channel_id, binding, prepared?, accepted)
+                crate::data_v1::Channel::from_confirmed(channel_id, binding, prepared, accepted)
                     .ok()?;
             let clock = offer
                 .capture_clock
@@ -160,7 +156,7 @@ impl PayloadChannel {
         generation: Generation,
         channel_id: ChannelId,
         live: &state::LiveResource,
-        prepared: &crate::PreparedDataChannel,
+        prepared: Option<&crate::PreparedDataChannel>,
         control: Option<(core::num::NonZeroU64, ChannelId)>,
     ) -> Option<&mut crate::data_v1::SendChannel> {
         use pulsebeam_proto::data_endpoint::Delivery;
@@ -196,7 +192,7 @@ impl PayloadChannel {
         generation: Generation,
         channel: ChannelId,
         live: &state::LiveResource,
-        prepared: &crate::PreparedDataChannel,
+        prepared: Option<&crate::PreparedDataChannel>,
         has_control: bool,
     ) -> Option<(
         pulsebeam_proto::data_endpoint::Binding<Generation>,
@@ -213,7 +209,7 @@ impl PayloadChannel {
             return None;
         }
         let prepared =
-            crate::data_v1::Channel::from_accepted(channel, binding, prepared, accepted).ok()?;
+            crate::data_v1::Channel::from_confirmed(channel, binding, prepared, accepted).ok()?;
         Some((binding, prepared))
     }
 
@@ -266,10 +262,10 @@ impl PayloadChannel {
         pulsebeam_proto::data_endpoint::Binding<Generation>,
         &'a state::TrackBinding,
     )> {
-        use core::num::{NonZeroU16, NonZeroU64};
+        use core::num::NonZeroU64;
         use pulsebeam_proto::{
             data_control::PublisherBinding,
-            data_endpoint::{Binding, Channel, Endpoint},
+            data_endpoint::{Binding, Endpoint},
         };
         let parameters = self.data_v1;
         if self.state != PayloadState::Active {
@@ -290,11 +286,7 @@ impl PayloadChannel {
         let source = NonZeroU64::new(live.data_v1_source?)?;
         Some((
             Binding {
-                channel: Channel {
-                    association: generation,
-                    stream: NonZeroU16::new(self.stream)?,
-                    incarnation: NonZeroU64::new(parameters.channel_incarnation)?,
-                },
+                channel: parameters.payload_channel(generation)?,
                 format: parameters.format()?,
                 endpoint: Endpoint::Publisher(PublisherBinding { source }),
             },
@@ -303,11 +295,7 @@ impl PayloadChannel {
     }
 
     fn binding(&self) -> state::TrackBinding {
-        use state::track_binding::Transport;
-
-        state::TrackBinding {
-            transport: Some(Transport::SctpDataV1(self.data_v1)),
-        }
+        self.data_v1.track_binding()
     }
 }
 
@@ -742,31 +730,51 @@ fn payload(
     ids: &mut IdGenerator,
     effects: &mut VecDeque<Effect>,
 ) -> Option<state::TrackBinding> {
+    use state::validation::BindingProfile;
+    let quic = session.state.binding_profile() == BindingProfile::Quic;
     let channel = if let Some(channel) = session.payload_resources.get(resource).copied() {
         let physical = session.payloads.get(&channel)?;
         if physical.registration != registration
             || physical.offer != offer
             || physical.state != PayloadState::Active
-            || physical.data_v1.delivery != data_v1 as i32
+            || physical.data_v1.delivery() != data_v1 as i32
         {
             return None;
         }
         channel
     } else {
-        let capacity = session
-            .data_preparations
-            .get(&session.signaling_channel)?
-            .as_ref()
-            .ok()?
-            .association_max_channels?;
-        let stream = if session
-            .reusable_streams
-            .first()
-            .is_some_and(|stream| u32::from(*stream) < capacity)
+        let capacity = if quic {
+            const MAX_PER_DIRECTION: usize = 64;
+            let publisher = matches!(registration, crate::TopicChannel::Publisher(_));
+            let count = session
+                .payloads
+                .values()
+                .filter(|physical| {
+                    matches!(physical.registration, crate::TopicChannel::Publisher(_)) == publisher
+                })
+                .count();
+            if count >= MAX_PER_DIRECTION {
+                return None;
+            }
+            u32::from(u16::MAX) + 1
+        } else {
+            session
+                .data_preparations
+                .get(&session.signaling_channel)?
+                .as_ref()
+                .ok()?
+                .association_max_channels?
+                .min(u32::from(u16::MAX))
+        };
+        let stream = if !quic
+            && session
+                .reusable_streams
+                .first()
+                .is_some_and(|stream| u32::from(*stream) < capacity)
         {
             session.reusable_streams.pop_first()?
         } else {
-            if session.next_stream >= capacity || session.next_stream >= u32::from(u16::MAX) {
+            if session.next_stream >= capacity {
                 return None;
             }
             let stream = u16::try_from(session.next_stream).ok()?;
@@ -780,6 +788,22 @@ fn payload(
                 break candidate;
             }
         };
+        let version = u32::from(pulsebeam_proto::data_endpoint::DATA_V1);
+        let parameters = if quic {
+            state::DataV1Binding::Quic(state::QuicDataV1Parameters {
+                binding_id: u32::from(stream),
+                version,
+                incarnation: channel.get(),
+                delivery: data_v1 as i32,
+            })
+        } else {
+            state::DataV1Binding::Sctp(state::SctpDataV1Parameters {
+                stream_id: Some(u32::from(stream)),
+                version,
+                channel_incarnation: channel.get(),
+                delivery: data_v1 as i32,
+            })
+        };
         session.payloads.insert(
             channel,
             PayloadChannel {
@@ -789,31 +813,31 @@ fn payload(
                 state: PayloadState::Active,
                 restart: false,
                 offer,
-                data_v1: state::SctpDataV1Parameters {
-                    stream_id: Some(u32::from(stream)),
-                    version: u32::from(pulsebeam_proto::data_endpoint::DATA_V1),
-                    channel_incarnation: channel.get(),
-                    delivery: data_v1 as i32,
-                },
+                data_v1: parameters,
                 data_v1_receiver: None,
                 data_v1_sender: None,
             },
         );
         session.payload_resources.insert(resource.clone(), channel);
-        effects.push_back(Effect::Rtc(RtcEffect::CreateDataChannel {
-            generation: session.generation,
-            channel,
-            specification: DataChannelSpec {
-                label: format!("native/payload/{}", channel.get()),
-                ordered: false,
-                reliability: DataChannelReliability::MaxRetransmits(0),
-                negotiated_id: Some(stream),
-            },
-        }));
+        if !quic {
+            effects.push_back(Effect::Rtc(RtcEffect::CreateDataChannel {
+                generation: session.generation,
+                channel,
+                specification: DataChannelSpec {
+                    label: format!("native/payload/{}", channel.get()),
+                    ordered: false,
+                    reliability: DataChannelReliability::MaxRetransmits(0),
+                    negotiated_id: Some(stream),
+                },
+            }));
+        }
         channel
     };
-    let prepared = session.data_preparations.get(&channel)?.as_ref().ok()?;
     let physical = session.payloads.get(&channel)?;
+    if quic {
+        return Some(physical.binding());
+    }
+    let prepared = session.data_preparations.get(&channel)?.as_ref().ok()?;
     if prepared.stream_id != physical.stream
         || !prepared.negotiated
         || prepared.ordered
@@ -1080,7 +1104,11 @@ pub(super) fn reconcile(
             let Some(physical) = session.payloads.get_mut(&channel) else {
                 continue;
             };
-            if physical.offer != Some(offer) {
+            if physical.offer != Some(offer)
+                && matches!(physical.data_v1, state::DataV1Binding::Quic(_))
+            {
+                retire_quic_payload(session, &resource, channel, effects);
+            } else if physical.offer != Some(offer) {
                 // The new offer fences the old server binding. Only SID reuse, not
                 // installation on another SID, needs the local reset barrier.
                 session.payload_resources.remove(&resource);
@@ -1126,6 +1154,9 @@ pub(super) fn reconcile(
         .collect::<Vec<_>>();
     for (resource, channel) in replaced {
         session.state.stage(resource.clone(), None)?;
+        if retire_quic_payload(session, &resource, channel, effects) {
+            continue;
+        }
         let Some(physical) = session.payloads.get_mut(&channel) else {
             continue;
         };
@@ -1152,7 +1183,9 @@ pub(super) fn reconcile(
         .collect::<Vec<_>>();
     for (resource, channel) in released {
         session.state.stage(resource.clone(), None)?;
-        if session.state.retaining(&resource) {
+        if retire_quic_payload(session, &resource, channel, effects)
+            || session.state.retaining(&resource)
+        {
             continue;
         }
         let Some(physical) = session.payloads.get_mut(&channel) else {
@@ -1391,6 +1424,27 @@ fn installed_payload(physical: &PayloadChannel, state: &state::LogicalSubscripti
     physical.state == PayloadState::Active
         && matches!(&state.execution, Some(state::logical_subscription_state::Execution::Installed(binding))
             if *binding == physical.binding())
+}
+
+fn retire_quic_payload(
+    session: &mut Session,
+    resource: &Resource,
+    channel: ChannelId,
+    effects: &mut VecDeque<Effect>,
+) -> bool {
+    if !session
+        .payloads
+        .get(&channel)
+        .is_some_and(|physical| matches!(physical.data_v1, state::DataV1Binding::Quic(_)))
+    {
+        return false;
+    }
+    effects.push_back(Effect::Quic(crate::QuicEffect::RetireData {
+        generation: session.generation,
+        channel,
+    }));
+    release_payload(session, resource, channel);
+    true
 }
 
 pub(super) fn release_payload(session: &mut Session, resource: &Resource, channel: ChannelId) {
@@ -2495,6 +2549,12 @@ impl Agent {
                                 );
                                 continue;
                             }
+                            if retire_quic_payload(active, &resource, channel, &mut self.effects) {
+                                continue;
+                            }
+                            let Some(physical) = active.payloads.get_mut(&channel) else {
+                                continue;
+                            };
                             physical.data_v1_receiver = None;
                             if physical.state == PayloadState::Active {
                                 physical.state = PayloadState::Closing;
@@ -2509,6 +2569,10 @@ impl Agent {
                         if let Some(state::confirmed_state::Value::Absent(absent)) =
                             &confirmed.value
                         {
+                            if retire_quic_payload(active, &resource, channel, &mut self.effects) {
+                                self.intent_dirty = true;
+                                continue;
+                            }
                             if let Some(physical) = active.payloads.get_mut(&channel) {
                                 let reason = absent.reason;
                                 physical.restart =

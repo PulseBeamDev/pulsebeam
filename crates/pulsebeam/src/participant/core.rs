@@ -1493,17 +1493,11 @@ impl Connection {
         endpoint: pulsebeam_proto::data_control::PublisherBinding,
         request: pulsebeam_proto::data_control::OriginalDemand,
     ) {
-        use pulsebeam_proto::{
-            data_control::{self, PublisherObservation, publisher_observation},
-            state::{NativeDataControl, OwnedDataControl, native_data_control::Endpoint},
-        };
-        let observation = PublisherObservation {
-            record: Some(publisher_observation::Record::RequestOriginal(request)),
-        };
-        if let Ok(record) = data_control::encode(endpoint, &observation) {
-            self.write_fabric_control(NativeDataControl {
-                endpoint: Some(Endpoint::Publisher(OwnedDataControl { owned, record })),
-            });
+        use pulsebeam_proto::data_control::publisher_observation::Record;
+        if let Ok(control) =
+            data_fabric::publisher_observation(owned, endpoint, Record::RequestOriginal(request))
+        {
+            self.write_fabric_control(control);
         }
     }
 
@@ -1513,9 +1507,6 @@ impl Connection {
         now: Instant,
         events: &mut impl ParticipantSink,
     ) {
-        use pulsebeam_proto::data_control::{
-            self, OriginalUnavailable, PublisherControl, publisher_control::Record,
-        };
         let Some(cid) = self.native_data.publication_channel(frame.owned) else {
             return;
         };
@@ -1530,13 +1521,7 @@ impl Connection {
         if owned != frame.owned {
             return;
         }
-        let Ok(PublisherControl {
-            record:
-                Some(Record::Unavailable(OriginalUnavailable {
-                    demand: Some(demand),
-                })),
-        }) = data_control::decode(endpoint, &frame.record)
-        else {
+        let Some(demand) = data_fabric::decode_original_unavailable(endpoint, &frame.record) else {
             return;
         };
         events.settle_fabric_original_unavailable(input.source, input.installation, demand, now);
@@ -1547,28 +1532,13 @@ impl Connection {
         source: FabricSourceHandle,
         admission: data_fabric::ReliableAdmission,
     ) -> bool {
-        use pulsebeam_proto::{
-            data_control::{self, PublisherObservation, SourceUnit, publisher_observation},
-            state::{NativeDataControl, OwnedDataControl, native_data_control::Endpoint},
-        };
-
         self.observe_native_terminal();
         let Some((owned, endpoint)) = self.reliable_publisher_lease(source, admission.installation)
         else {
             return false;
         };
-        let observation = PublisherObservation {
-            record: Some(publisher_observation::Record::Admission(SourceUnit {
-                source_incarnation: endpoint.source.get(),
-                unit_seq: Some(admission.unit.unit_seq),
-            })),
-        };
-        let Ok(record) = data_control::encode(endpoint, &observation) else {
-            return false;
-        };
-        self.write_fabric_control(NativeDataControl {
-            endpoint: Some(Endpoint::Publisher(OwnedDataControl { owned, record })),
-        })
+        data_fabric::publisher_admission_observation(owned, endpoint, admission.unit.unit_seq)
+            .is_ok_and(|control| self.write_fabric_control(control))
     }
 
     pub(crate) fn write_fabric_delivery_report(
@@ -1577,46 +1547,16 @@ impl Connection {
         installation: pulsebeam_rtc::DataChannelInstallation,
         report: crate::route::fabric::local::DeliveryReport,
     ) -> crate::route::fabric::local::ExpectationWrite {
-        use crate::route::fabric::local::{DeliveryOutcome, ExpectationWrite};
-        use pulsebeam_proto::{
-            data_control::{
-                self, BranchUnit, ControlOutcome, Expectation, PublisherObservation, SourceUnit,
-                publisher_observation,
-            },
-            state::{NativeDataControl, OwnedDataControl, native_data_control::Endpoint},
-        };
+        use crate::route::fabric::local::ExpectationWrite;
         self.observe_native_terminal();
         let Some((owned, endpoint)) = self.reliable_publisher_lease(source, installation) else {
             return ExpectationWrite::Revoked;
         };
-        let outcome = match report.outcome {
-            DeliveryOutcome::Confirmed => ControlOutcome::Confirmed,
-            DeliveryOutcome::Failed => ControlOutcome::Failed,
-            DeliveryOutcome::Unknown => ControlOutcome::Unknown,
-        };
-        let observation = PublisherObservation {
-            record: Some(publisher_observation::Record::Delivery(
-                data_control::DeliveryOutcome {
-                    expectation: Some(Expectation {
-                        unit: Some(BranchUnit {
-                            source: Some(SourceUnit {
-                                source_incarnation: endpoint.source.get(),
-                                unit_seq: Some(report.unit.unit_seq),
-                            }),
-                            branch_incarnation: report.branch_incarnation.get(),
-                        }),
-                        fragment_count: u32::from(report.unit.fragment_count),
-                    }),
-                    outcome: outcome as i32,
-                },
-            )),
-        };
-        let Ok(record) = data_control::encode(endpoint, &observation) else {
+        let record = data_fabric::publisher_delivery_record(endpoint, report);
+        let Ok(control) = data_fabric::publisher_observation(owned, endpoint, record) else {
             return ExpectationWrite::Revoked;
         };
-        if self.write_fabric_control(NativeDataControl {
-            endpoint: Some(Endpoint::Publisher(OwnedDataControl { owned, record })),
-        }) {
+        if self.write_fabric_control(control) {
             ExpectationWrite::Queued
         } else {
             ExpectationWrite::Backpressured
@@ -1669,20 +1609,7 @@ impl Connection {
         )
             -> pulsebeam_proto::data_control::subscriber_observation::Record,
     ) -> bool {
-        use pulsebeam_proto::data_control::{BranchUnit, Expectation, SourceUnit};
-        self.write_fabric_subscriber_observation(
-            lease,
-            observation(Expectation {
-                unit: Some(BranchUnit {
-                    source: Some(SourceUnit {
-                        source_incarnation: lease.endpoint.source.get(),
-                        unit_seq: Some(unit.unit_seq),
-                    }),
-                    branch_incarnation: lease.endpoint.branch.get(),
-                }),
-                fragment_count: u32::from(unit.fragment_count),
-            }),
-        )
+        self.write_fabric_subscriber_observation(lease, observation(lease.expectation(unit)))
     }
 
     pub(crate) fn write_fabric_repair_outcome(
@@ -1691,30 +1618,10 @@ impl Connection {
         request: crate::route::fabric::local::RepairRequest,
         status: pulsebeam_proto::data_control::RepairStatus,
     ) -> bool {
-        use pulsebeam_proto::data_control::{
-            BranchUnit, RepairDemand, RepairOutcome, SourceUnit, subscriber_observation,
-        };
         self.observe_native_terminal();
-        if self.reliable_subscriber_lease(lease.owned) != Some(lease) {
-            return false;
-        }
-        self.write_fabric_subscriber_observation(
-            lease,
-            subscriber_observation::Record::Repair(RepairOutcome {
-                demand: Some(RepairDemand {
-                    unit: Some(BranchUnit {
-                        source: Some(SourceUnit {
-                            source_incarnation: lease.endpoint.source.get(),
-                            unit_seq: Some(request.fragment.unit_seq),
-                        }),
-                        branch_incarnation: lease.endpoint.branch.get(),
-                    }),
-                    fragment_index: Some(u32::from(request.fragment.index)),
-                    request_id: request.id.get(),
-                }),
-                status: status as i32,
-            }),
-        )
+        self.reliable_subscriber_lease(lease.owned) == Some(lease)
+            && self
+                .write_fabric_subscriber_observation(lease, lease.repair_outcome(request, status))
     }
 
     fn write_fabric_subscriber_observation(
@@ -1722,24 +1629,9 @@ impl Connection {
         lease: data_fabric::SubscriberLease,
         record: pulsebeam_proto::data_control::subscriber_observation::Record,
     ) -> bool {
-        use pulsebeam_proto::{
-            data_control::{self, SubscriberObservation},
-            state::{NativeDataControl, OwnedDataControl, native_data_control::Endpoint},
-        };
-        let Ok(record) = data_control::encode(
-            lease.endpoint,
-            &SubscriberObservation {
-                record: Some(record),
-            },
-        ) else {
-            return false;
-        };
-        self.write_fabric_control(NativeDataControl {
-            endpoint: Some(Endpoint::Subscriber(OwnedDataControl {
-                owned: lease.owned,
-                record,
-            })),
-        })
+        lease
+            .observation(record)
+            .is_ok_and(|control| self.write_fabric_control(control))
     }
 
     fn write_fabric_control(&mut self, control: pulsebeam_proto::state::NativeDataControl) -> bool {
@@ -1796,21 +1688,17 @@ impl Connection {
         }
     }
 
-    fn receive_fabric_control(
+    pub(crate) fn receive_fabric_control(
         &mut self,
         frame: pulsebeam_proto::state::NativeDataControl,
         now: Instant,
         events: &mut impl ParticipantSink,
     ) {
-        use super::event::{FabricFeedbackKind, FabricSubscriberFeedback};
-        use crate::route::fabric::local::{
-            DataExpectation, PropagationOutcome, RepairFragment, RepairRequest,
-        };
-        use pulsebeam_proto::{
-            data_control::{self, ControlOutcome, SubscriberControl, subscriber_control::Record},
-            state::native_data_control::Endpoint,
-        };
-        use std::num::NonZeroU64;
+        use super::event::FabricSubscriberFeedback;
+        use pulsebeam_proto::state::native_data_control::Endpoint;
+        if !self.fabric_io_authorized() {
+            return;
+        }
         let frame = match frame.endpoint {
             Some(Endpoint::Subscriber(frame)) => frame,
             Some(Endpoint::Publisher(frame)) => {
@@ -1822,48 +1710,8 @@ impl Connection {
         let Some(lease) = self.reliable_subscriber_lease(frame.owned) else {
             return;
         };
-        let Ok(SubscriberControl {
-            record: Some(record),
-        }) = data_control::decode(lease.endpoint, &frame.record)
-        else {
-            return;
-        };
-        let expectation = |expected: data_control::Expectation| -> Option<DataExpectation> {
-            Some(DataExpectation {
-                unit_seq: expected.unit?.source?.unit_seq?,
-                fragment_count: u16::try_from(expected.fragment_count).ok()?,
-            })
-        };
-        let repair = |demand: data_control::RepairDemand| -> Option<RepairRequest> {
-            Some(RepairRequest {
-                fragment: RepairFragment {
-                    unit_seq: demand.unit?.source?.unit_seq?,
-                    index: u16::try_from(demand.fragment_index?).ok()?,
-                },
-                id: NonZeroU64::new(demand.request_id)?,
-            })
-        };
-        let kind = match record {
-            Record::ExpectationOutcome(ack) => {
-                let Some(unit) = ack.expectation.and_then(expectation) else {
-                    return;
-                };
-                let outcome = match ControlOutcome::try_from(ack.outcome) {
-                    Ok(ControlOutcome::Confirmed) => PropagationOutcome::Confirmed,
-                    Ok(ControlOutcome::Failed) => PropagationOutcome::Failed,
-                    Ok(ControlOutcome::Unknown) => PropagationOutcome::Unknown,
-                    _ => return,
-                };
-                Some(FabricFeedbackKind::Propagation(unit, outcome))
-            }
-            Record::AssemblyReceipt(expected) => {
-                expectation(expected).map(FabricFeedbackKind::Assembled)
-            }
-            Record::RequestRepair(demand) => repair(demand).map(FabricFeedbackKind::Repair),
-            Record::CancelRepair(demand) => repair(demand).map(FabricFeedbackKind::CancelRepair),
-        };
-        if let Some(kind) = kind {
-            events.observe_fabric_subscriber(FabricSubscriberFeedback { lease, kind });
+        if let Some(feedback) = FabricSubscriberFeedback::decode(lease, &frame.record) {
+            events.observe_fabric_subscriber(feedback);
         }
     }
 

@@ -12,7 +12,7 @@ use core::{num::NonZeroU64, time::Duration};
 use pulsebeam_proto::{
     data_endpoint::{Binding, Delivery, Endpoint},
     data_record::MAX_RECORD_BYTES,
-    state::{TrackBinding, track_binding::Transport},
+    state::{DataV1Binding, TrackBinding},
 };
 
 mod control;
@@ -35,17 +35,28 @@ impl Channel {
         prepared: &PreparedDataChannel,
         accepted: &TrackBinding,
     ) -> Result<Self, Error> {
-        let Some(Transport::SctpDataV1(accepted)) = &accepted.transport else {
-            return Err(Error::Binding);
-        };
+        Self::from_confirmed(id, binding, Some(prepared), accepted)
+    }
+
+    pub(crate) fn from_confirmed(
+        id: ChannelId,
+        binding: Binding<Generation>,
+        prepared: Option<&PreparedDataChannel>,
+        accepted: &TrackBinding,
+    ) -> Result<Self, Error> {
+        let accepted = DataV1Binding::from_track(accepted).ok_or(Error::Binding)?;
+        match (accepted, prepared) {
+            (DataV1Binding::Sctp(_), Some(prepared))
+                if prepared.validate().is_ok()
+                    && prepared.negotiated
+                    && !prepared.ordered
+                    && prepared.reliability == DataChannelReliability::MaxRetransmits(0)
+                    && prepared.stream_id == binding.channel.stream.get() => {}
+            (DataV1Binding::Quic(_), None) => {}
+            _ => return Err(Error::Binding),
+        }
         if accepted.format() != Some(binding.format)
-            || accepted.stream_id != Some(u32::from(binding.channel.stream.get()))
-            || accepted.channel_incarnation != binding.channel.incarnation.get()
-            || prepared.validate().is_err()
-            || !prepared.negotiated
-            || prepared.ordered
-            || prepared.reliability != DataChannelReliability::MaxRetransmits(0)
-            || prepared.stream_id != binding.channel.stream.get()
+            || accepted.payload_channel(binding.channel.association) != Some(binding.channel)
         {
             return Err(Error::Binding);
         }

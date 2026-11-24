@@ -658,30 +658,17 @@ fn validate_data_binding(
     delivery: i32,
     profile: BindingProfile,
 ) -> Result {
-    use crate::data_endpoint::{Delivery, Format};
-
     if !known::<DataDelivery>(delivery) {
         return Err(ValidationError::Binding);
     }
-    use track_binding::Transport;
-    let format = match (
-        profile,
-        binding.and_then(|binding| binding.transport.as_ref()),
-    ) {
-        (BindingProfile::Rtc, Some(Transport::SctpDataV1(params))) => Some(params.format()),
-        (BindingProfile::Quic, Some(Transport::QuicDataV1(params))) => Some(params.format()),
-        _ => None,
-    };
-    if let Some(format) = format {
-        return match (
-            format.map(Format::delivery),
-            DataDelivery::try_from(delivery),
-        ) {
-            (Some(Delivery::Unreliable), Ok(DataDelivery::Lossy))
-            | (Some(Delivery::Latest), Ok(DataDelivery::Latest))
-            | (Some(Delivery::Reliable), Ok(DataDelivery::Ordered)) => Ok(()),
-            _ => Err(ValidationError::Binding),
-        };
+    if let Some(data) = binding.and_then(DataV1Binding::from_track) {
+        return (matches!(
+            (profile, data),
+            (BindingProfile::Rtc, DataV1Binding::Sctp(_))
+                | (BindingProfile::Quic, DataV1Binding::Quic(_))
+        ) && data.matches_delivery(delivery))
+        .then_some(())
+        .ok_or(ValidationError::Binding);
     }
     validate_binding(binding, TrackKind::Data, false, profile)
 }

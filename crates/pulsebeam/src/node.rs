@@ -1427,10 +1427,6 @@ mod transport_conformance;
 #[path = "node/link_conformance.rs"]
 mod link_conformance;
 
-#[cfg(all(test, feature = "sim"))]
-#[path = "node/quic_admission.rs"]
-mod quic_admission;
-
 #[cfg(test)]
 mod tests {
     // Convenience only: a test is not a shard, so nothing here is

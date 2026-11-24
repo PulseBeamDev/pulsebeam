@@ -23,7 +23,10 @@ use crate::{
     control::{
         api::creation::Delivery,
         controller::{AdmissionCommand, ControllerCommand, quic_redeem},
-        native::handoff::{EndpointHandoff, Opened},
+        native::{
+            ExecutionAction, ExecutionCompletion, ExecutionDeferral,
+            handoff::{EndpointHandoff, Fact, Opened},
+        },
     },
     entity::{ConnectionId, ParticipantId},
     id::ShardId,
@@ -33,7 +36,11 @@ use crate::{
 };
 use pulsebeam_queue as mailbox;
 
+mod data;
+mod receivers;
+
 const CONTROL_CHANNEL: ChannelId = ChannelId::from_value(0);
+const MAX_PENDING_ADMISSIONS: usize = 64;
 
 pub(super) struct QuicShard {
     ingress: Ingress,
@@ -49,6 +56,7 @@ struct Session {
     installed: Option<Installed>,
     admitted: bool,
     denying: bool,
+    data_runnable: bool,
 }
 
 pub(super) struct Installed {
@@ -56,9 +64,15 @@ pub(super) struct Installed {
     pub participant: ParticipantId,
     pub transport: NodeTransportAddress,
     pub handoff: Box<EndpointHandoff>,
+    scope: crate::entity::ConnectionScope,
+    publishers: data::Publishers,
+    subscribers: receivers::Subscribers,
     output: Option<SignalingOutput>,
+    admissions: VecDeque<(u64, u64)>,
+    data_control_staged: bool,
     renewal: Option<Renewal>,
     last_renewal: u64,
+    failed: bool,
 }
 
 struct Renewal {
@@ -72,6 +86,7 @@ impl Installed {
         connection: ConnectionId,
         participant: ParticipantId,
         transport: NodeTransportAddress,
+        scope: crate::entity::ConnectionScope,
         handoff: Box<EndpointHandoff>,
     ) -> Self {
         Self {
@@ -79,10 +94,45 @@ impl Installed {
             participant,
             transport,
             handoff,
+            scope,
+            publishers: data::Publishers::default(),
+            subscribers: receivers::Subscribers::default(),
             output: None,
+            admissions: VecDeque::new(),
+            data_control_staged: false,
             renewal: None,
             last_renewal: 0,
+            failed: false,
         }
+    }
+    fn next_data_control(
+        &mut self,
+        association: NonZeroU64,
+        core: &mut super::core::ShardCore,
+    ) -> Option<Vec<u8>> {
+        if self.handoff.execution_stopped()
+            || core
+                .current_quic_grant(self.connection, self.transport, association)
+                .is_none()
+        {
+            self.admissions.clear();
+            return None;
+        }
+        while let Some((reference, unit_seq)) = self.admissions.pop_front() {
+            if let Some(frame) = self.publisher_admission(reference, unit_seq) {
+                return Some(frame);
+            }
+        }
+        let owner = core.quic_owner_handle(self.transport)?;
+        if let Some(frame) = core.take_quic_subscriber_control(owner) {
+            return Some(frame);
+        }
+        while let Some((source, record)) = core.pop_quic_publisher_control(owner) {
+            if let Some(frame) = self.publisher_control(source, record) {
+                return Some(frame);
+            }
+        }
+        None
     }
 }
 
@@ -177,8 +227,37 @@ impl QuicShard {
         true
     }
 
-    pub fn wake(&mut self) {
+    pub fn publication_cutoff_result(
+        &mut self,
+        connection: ConnectionId,
+        reference: u64,
+        success: bool,
+    ) -> bool {
+        let Some(installed) = self
+            .sessions
+            .values_mut()
+            .filter_map(|session| session.installed.as_mut())
+            .find(|installed| installed.connection == connection)
+        else {
+            return false;
+        };
+        installed.publication_cutoff_result(reference, success);
         self.ingress.schedule();
+        true
+    }
+
+    pub fn native_ready(&mut self, connection: ConnectionId) -> bool {
+        let Some(installed) = self
+            .sessions
+            .values()
+            .filter_map(|session| session.installed.as_ref())
+            .find(|installed| installed.connection == connection)
+        else {
+            return false;
+        };
+        installed.handoff.acknowledge_wakeup();
+        self.ingress.schedule();
+        true
     }
 
     pub fn deadline(&self) -> Option<Instant> {
@@ -232,17 +311,25 @@ impl QuicShard {
         socket: &mut pulsebeam_udp::UdpSocket,
         now: Instant,
         events: &mut VecDeque<ShardEvent>,
+        core: &mut super::core::ShardCore,
     ) -> std::io::Result<()> {
+        if core.take_quic_data_ready() {
+            self.ingress.schedule();
+        }
         let now_std = now.into_std();
+        let mut commands_pending = false;
         self.ingress.turn(socket, now_std, |handle, peer| {
             if peer.connection.is_closed() {
-                Self::closed(&mut self.sessions, handle, events);
+                Self::closed(&mut self.sessions, handle, events, core);
                 return;
             }
             if let Some(session) = self.sessions.get_mut(&handle) {
-                if !session.poll(peer, now, events) {
+                if !session.poll(peer, now, events, core) {
                     close(&mut peer.connection, now_std);
-                    Self::closed(&mut self.sessions, handle, events);
+                    Self::closed(&mut self.sessions, handle, events, core);
+                } else if let Some(installed) = session.installed.as_mut() {
+                    commands_pending |= session.admitted
+                        && (session.data_runnable || installed.handoff.commands_pending());
                 }
                 return;
             }
@@ -279,20 +366,29 @@ impl QuicShard {
                     installed: None,
                     admitted: false,
                     denying: false,
+                    data_runnable: false,
                 },
             );
-        })
+        })?;
+        if core.take_quic_data_ready() || commands_pending {
+            self.ingress.schedule();
+        }
+        Ok(())
     }
 
     fn closed(
         sessions: &mut HashMap<ConnectionHandle, Session>,
         handle: ConnectionHandle,
         events: &mut VecDeque<ShardEvent>,
+        core: &mut super::core::ShardCore,
     ) {
-        if let Some(installed) = sessions
+        if let Some((serial, installed)) = sessions
             .remove(&handle)
-            .and_then(|session| session.installed)
+            .and_then(|session| Some((session.serial, session.installed?)))
         {
+            installed.retire_publishers(core);
+            installed.retire_receivers(core);
+            core.retire_quic_owner(installed.connection, installed.transport, serial);
             events.push_back(ShardEvent::ParticipantClosed {
                 participant: installed.participant,
                 connection_id: installed.connection,
@@ -307,6 +403,7 @@ impl Session {
         peer: &mut Association,
         now: Instant,
         events: &mut VecDeque<ShardEvent>,
+        core: &mut super::core::ShardCore,
     ) -> bool {
         let Some(control) = peer.control.as_mut() else {
             return false;
@@ -340,14 +437,57 @@ impl Session {
             let Some(installed) = self.installed.as_mut() else {
                 return false;
             };
-            if installed.handoff.failed() {
+            if installed.failed || installed.handoff.failed() {
                 return false;
             }
-            match control.read(&mut peer.connection, Phase::Admitted, now.into_std()) {
+            if let Some(command) = installed.handoff.command() {
+                if !installed.execute(self.serial, command.into_action(), core, events) {
+                    return false;
+                }
+            }
+            self.data_runnable = false;
+            if installed.admissions.len() < MAX_PENDING_ADMISSIONS
+                && let Some(received) = pulsebeam_agent_quic::transport::read_datagram(
+                    &mut peer.connection,
+                    |datagram| installed.ingest_data(self.serial, datagram, core, now),
+                )
+            {
+                self.data_runnable = true;
+                if let Ok(Some(admission)) = received
+                    && !installed.admissions.contains(&admission)
+                {
+                    installed.admissions.push_back(admission);
+                }
+            }
+            let input = control.read(&mut peer.connection, Phase::Admitted, now.into_std());
+            // A single QUIC read can leave another complete frame buffered without a UDP wake.
+            self.data_runnable |= matches!(input, Ok(Read::Frame(_)));
+            match input {
                 Ok(Read::Pending) => {}
                 Ok(Read::Frame(frame)) if frame.kind == Kind::ClientState => {
                     if !installed.handoff.input(frame.body) {
                         return false;
+                    }
+                }
+                Ok(Read::Frame(frame)) if frame.kind == Kind::DataControl => {
+                    let Some(Ok(control)) =
+                        pulsebeam_proto::state::codec::decode_data_control_frame(&frame.body)
+                    else {
+                        return false;
+                    };
+                    if let Some(pulsebeam_proto::state::native_data_control::Endpoint::Publisher(
+                        frame,
+                    )) = control.endpoint
+                    {
+                        installed.receive_publisher_control(self.serial, frame, core, now);
+                    } else {
+                        core.receive_quic_data_control(
+                            installed.connection,
+                            installed.transport,
+                            self.serial,
+                            control,
+                            now,
+                        );
                     }
                 }
                 Ok(Read::Frame(frame)) if frame.kind == Kind::Renew => {
@@ -378,6 +518,7 @@ impl Session {
                 .as_ref()
                 .is_some_and(|renewal| renewal.staged);
             if installed.output.is_none()
+                && !installed.data_control_staged
                 && let Some(renewal) = installed.renewal.as_mut()
                 && let Some(result) = renewal.result.take()
             {
@@ -391,6 +532,7 @@ impl Session {
                 renewal_staged = true;
             }
             if !renewal_staged
+                && !installed.data_control_staged
                 && installed.output.is_none()
                 && let Some(output) = installed.handoff.output()
             {
@@ -402,6 +544,19 @@ impl Session {
                 }
                 installed.output = Some(output);
             }
+            if !renewal_staged
+                && !installed.data_control_staged
+                && installed.output.is_none()
+                && let Some(frame) = installed.next_data_control(self.serial, core)
+            {
+                if control
+                    .offer(Kind::DataControl, &frame, Phase::Admitted)
+                    .is_err()
+                {
+                    return false;
+                }
+                installed.data_control_staged = true;
+            }
             if installed
                 .output
                 .as_ref()
@@ -410,7 +565,7 @@ impl Session {
                 return false;
             }
         }
-        match control.write(&mut peer.connection, now.into_std()) {
+        let live = match control.write(&mut peer.connection, now.into_std()) {
             Ok(Write::Admitted {
                 kind: Kind::AdmitResult,
                 ..
@@ -433,6 +588,7 @@ impl Session {
                 let Some(installed) = self.installed.as_mut() else {
                     return false;
                 };
+                self.data_runnable = true;
                 installed.output.take().is_some_and(|output| {
                     installed.handoff.progress(SignalingProgress {
                         sequence: output.sequence,
@@ -444,10 +600,22 @@ impl Session {
             Ok(Write::Admitted {
                 kind: Kind::RenewResult,
                 ..
-            }) => self
-                .installed
-                .as_mut()
-                .is_some_and(|installed| installed.renewal.take().is_some()),
+            }) => {
+                self.data_runnable = true;
+                self.installed
+                    .as_mut()
+                    .is_some_and(|installed| installed.renewal.take().is_some())
+            }
+            Ok(Write::Admitted {
+                kind: Kind::DataControl,
+                ..
+            }) => {
+                let Some(installed) = self.installed.as_mut() else {
+                    return false;
+                };
+                self.data_runnable = true;
+                std::mem::take(&mut installed.data_control_staged)
+            }
             // Let Noq serialize a denial before the admission timeout.
             Ok(
                 Write::Pending
@@ -458,6 +626,13 @@ impl Session {
                 },
             ) => true,
             _ => false,
+        };
+        if live
+            && self.admitted
+            && let Some(installed) = self.installed.as_mut()
+        {
+            self.data_runnable |= installed.poll_data_output(self.serial, peer, core, now);
         }
+        live
     }
 }

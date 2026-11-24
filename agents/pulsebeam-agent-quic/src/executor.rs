@@ -1,6 +1,7 @@
 //! Linux carrier execution for Core's generation-scoped QUIC effects.
 
 use std::{
+    collections::VecDeque,
     net::SocketAddr,
     num::NonZeroU64,
     time::{Duration, Instant},
@@ -8,15 +9,16 @@ use std::{
 
 use noq_proto::{ClientConfig, Transmit};
 use pulsebeam_agent_core::{
-    Failure, FailureClass, Generation, OperationId, QuicAdmit, QuicEffect, QuicEvent,
+    Failure, FailureClass, Generation, OperationId, QuicAdmit, QuicDataSend, QuicEffect, QuicEvent,
 };
 use pulsebeam_core::identity::ConnectionId;
 use pulsebeam_udp::ReceivedDatagram;
 
 use crate::{
     frame::{Kind, Phase},
-    records::{Admit, Denial, Renew, RenewResult},
+    records::{Admit, Datagram, DatagramKind, Denial, Renew, RenewResult},
     transport::{
+        DatagramAdmission,
         client::{
             ClientTransport,
             admission::{AdmissionError, ClientAdmission},
@@ -36,6 +38,7 @@ pub enum SubmitError {
     Stale,
     NotAdmitted,
     Control(control::Error),
+    Data(DatagramAdmission),
 }
 
 /// Drives one association. The host provides address resolution, a configured TLS
@@ -44,6 +47,8 @@ pub struct Association {
     generation: Generation,
     transport: ClientTransport,
     stage: Stage,
+    pending_data: VecDeque<QuicDataSend>,
+    more_data_work: bool,
 }
 
 enum Stage {
@@ -114,6 +119,8 @@ impl Association {
             generation,
             transport,
             stage: Stage::Admitting(admission),
+            pending_data: VecDeque::new(),
+            more_data_work: false,
         })
     }
 
@@ -128,6 +135,7 @@ impl Association {
                     // A transport close also retires the server's association; no app
                     // record is required to close an incomplete admission.
                     crate::transport::close(self.transport.connection(), now);
+                    self.pending_data.clear();
                     self.stage = Stage::Closing(now.checked_add(CLOSE_GRACE).unwrap_or(now));
                 }
                 Ok(())
@@ -147,6 +155,29 @@ impl Association {
                     operation,
                     payload: Some(payload),
                 });
+                Ok(())
+            }
+            QuicEffect::RetireData {
+                generation,
+                channel,
+            } if generation == self.generation => {
+                self.pending_data.retain(|send| send.channel != channel);
+                Ok(())
+            }
+            QuicEffect::SendData(send) if send.generation == self.generation => {
+                const MAX_PENDING_DATA: usize = 64;
+                if !matches!(self.stage, Stage::Active { .. }) {
+                    return Err(SubmitError::NotAdmitted);
+                }
+                if send.payload.is_empty()
+                    || send.payload.len() > pulsebeam_proto::data_record::MAX_RECORD_BYTES
+                {
+                    return Err(SubmitError::Data(DatagramAdmission::Size));
+                }
+                if self.pending_data.len() >= MAX_PENDING_DATA {
+                    return Err(SubmitError::Data(DatagramAdmission::Full));
+                }
+                self.pending_data.push_back(send);
                 Ok(())
             }
             QuicEffect::Renew(effect) if effect.generation == self.generation => {
@@ -180,7 +211,8 @@ impl Association {
     }
 
     pub fn poll_packet(&mut self, now: Instant, output: &mut Vec<u8>) -> (Option<Transmit>, bool) {
-        self.transport.poll(now, output)
+        let (packet, more) = self.transport.poll(now, output);
+        (packet, more || self.more_data_work)
     }
 
     pub fn deadline(&mut self) -> Option<Instant> {
@@ -203,6 +235,7 @@ impl Association {
     }
 
     pub fn poll_event(&mut self, now: Instant) -> Option<QuicEvent> {
+        self.more_data_work = false;
         let generation = self.generation;
         let connection = self.transport.connection();
         let failure = match &mut self.stage {
@@ -248,7 +281,29 @@ impl Association {
                 pending,
                 renewal,
             } => match poll_active(generation, connection, control, pending, renewal, now) {
-                Ok(event) => return event,
+                Ok(Some(event)) => return Some(event),
+                Ok(None) => {
+                    if let Some(event) = self.poll_data_send() {
+                        return Some(event);
+                    }
+                    let connection = self.transport.connection();
+                    use crate::transport::read_datagram;
+                    const DATA_INPUT_BUDGET: usize = 16;
+                    for _ in 0..DATA_INPUT_BUDGET {
+                        let datagram = read_datagram(connection, |datagram| {
+                            (datagram.kind == DatagramKind::Data).then(|| QuicEvent::Data {
+                                generation,
+                                binding: datagram.binding,
+                                payload: datagram.payload.to_vec(),
+                            })
+                        })?;
+                        if let Ok(Some(event)) = datagram {
+                            return Some(event);
+                        }
+                    }
+                    self.more_data_work = true;
+                    return None;
+                }
                 Err(failure) => failure,
             },
             Stage::Closing(deadline) => {
@@ -264,6 +319,29 @@ impl Association {
         Some(QuicEvent::TransportLost {
             generation,
             failure,
+        })
+    }
+    fn poll_data_send(&mut self) -> Option<QuicEvent> {
+        let pending = self.pending_data.front()?;
+        let result = match self.transport.offer_datagram(Datagram {
+            kind: DatagramKind::Data,
+            binding: pending.binding,
+            payload: &pending.payload,
+        }) {
+            Ok(()) => Ok(()),
+            Err(DatagramAdmission::ControlTurn) => {
+                self.more_data_work = true;
+                return None;
+            }
+            Err(DatagramAdmission::Full) => return None,
+            Err(error) => Err(format!("QUIC DATA admission: {error:?}")),
+        };
+        let sent = self.pending_data.pop_front()?;
+        Some(QuicEvent::DataSent {
+            generation: sent.generation,
+            channel: sent.channel,
+            operation: sent.operation,
+            result,
         })
     }
 }

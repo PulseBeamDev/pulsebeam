@@ -69,7 +69,10 @@ impl NativeSession {
                 );
                 if matches!(
                     transport.transport,
-                    Some(wire::track_binding::Transport::SctpDataV1(_))
+                    Some(
+                        wire::track_binding::Transport::SctpDataV1(_)
+                            | wire::track_binding::Transport::QuicDataV1(_)
+                    )
                 ) != data_v1_requested
                     || data_v1_requested != state.data_v1.is_some()
                 {
@@ -94,7 +97,7 @@ impl NativeSession {
                         },
                     )),
                 };
-                if validation::validate_spec(&exact).is_err() {
+                if validation::validate_spec_for(&exact, self.binding_profile).is_err() {
                     return self.fail_logical_binding(
                         reference,
                         failure(wire::FailureCode::InvalidConfiguration),

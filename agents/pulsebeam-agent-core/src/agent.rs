@@ -836,7 +836,10 @@ impl Agent {
             .filter(|session| !session.signaling_terminal && session.capabilities.data_v1)?;
         let live = active.state.eligible(&resource)?;
         let channel = *active.payload_resources.get(&resource)?;
-        let prepared = active.data_preparations.get(&channel)?.as_ref().ok()?;
+        let prepared = active
+            .data_preparations
+            .get(&channel)
+            .and_then(|result| result.as_ref().ok());
         let physical = active.payloads.get_mut(&channel)?;
         if !matches!(&physical.registration, crate::TopicChannel::Publisher(current) if current == publisher)
         {
@@ -960,8 +963,29 @@ impl Agent {
             if sender.deadline().is_some()
                 && let Ok(Some(effect)) = sender.next_effect(self.ids.operation(), self.data_now)
             {
+                let effect = match physical.data_v1 {
+                    pulsebeam_proto::state::DataV1Binding::Quic(parameters) => {
+                        let binding =
+                            core::num::NonZeroU16::new(u16::try_from(parameters.binding_id).ok()?)?;
+                        let crate::DataChannelEffect::Send {
+                            operation,
+                            generation,
+                            channel,
+                            payload,
+                            ..
+                        } = effect;
+                        Effect::Quic(crate::QuicEffect::SendData(crate::QuicDataSend {
+                            generation,
+                            channel,
+                            binding,
+                            operation,
+                            payload,
+                        }))
+                    }
+                    pulsebeam_proto::state::DataV1Binding::Sctp(_) => Effect::DataChannel(effect),
+                };
                 self.schedule_data_expiry();
-                return Some(Effect::DataChannel(effect));
+                return Some(effect);
             }
         }
         None
@@ -1077,7 +1101,7 @@ impl Agent {
                 if !matches!(&physical.registration, crate::TopicChannel::Publisher(current) if current == registration) {
                     return None;
                 }
-                let prepared = session.data_preparations.get(&channel)?.as_ref().ok()?;
+                let prepared = session.data_preparations.get(&channel).and_then(|result| result.as_ref().ok());
                 let has_control = session.reliable_data_enabled
                     && session.state.reference(&resource).is_some_and(|reference| reference != 0);
                 physical.prepared_publisher(session.generation, channel, live, prepared, has_control)?;

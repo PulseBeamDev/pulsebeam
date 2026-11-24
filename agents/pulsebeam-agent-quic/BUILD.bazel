@@ -20,7 +20,7 @@ rust_library(
     lint_config = ":lints",
     aliases = aliases(),
     deps = _TRANSPORT_DEPS + [
-        "//crates/pulsebeam-proto:pulsebeam-proto",
+        "//crates/pulsebeam-proto:pulsebeam-proto-json",
         "//crates/pulsebeam-udp:pulsebeam-udp",
     ],
     target_compatible_with = ["@platforms//os:linux"],
@@ -42,26 +42,26 @@ rust_library(
     target_compatible_with = ["@platforms//os:linux"],
 )
 
-rust_library(
-    name = "executor",
+[rust_library(
+    name = "executor" + ("-sim" if sim else ""),
     crate_name = "pulsebeam_agent_quic",
     crate_root = "src/lib.rs",
     srcs = glob(["src/**/*.rs"]),
     edition = crate_edition(),
-    crate_features = ["executor"],
+    crate_features = ["executor"] + (["sim"] if sim else []),
     lint_config = ":lints",
     aliases = aliases(),
     deps = _TRANSPORT_DEPS + [
         "@crates//:reqwest",
         "@crates//:tokio",
-        "//agents/pulsebeam-agent-core:pulsebeam-agent-core",
-        "//crates/pulsebeam-core:pulsebeam-core-http",
+        "//agents/pulsebeam-agent-core:pulsebeam-agent-core" + ("-sim" if sim else ""),
+        "//crates/pulsebeam-core:pulsebeam-core-http" + ("-sim" if sim else ""),
         "//crates/pulsebeam-proto:pulsebeam-proto",
-        "//crates/pulsebeam-runtime:pulsebeam-runtime",
-        "//crates/pulsebeam-udp:pulsebeam-udp",
+        "//crates/pulsebeam-runtime:pulsebeam-runtime" + ("-sim" if sim else ""),
+        "//crates/pulsebeam-udp:pulsebeam-udp" + ("-sim" if sim else ""),
     ],
     target_compatible_with = ["@platforms//os:linux"],
-)
+) for sim in [False, True]]
 
 rust_test(
     name = "unit_tests",
@@ -72,5 +72,5 @@ rust_test(
     target_compatible_with = ["@platforms//os:linux"],
 )
 
-rust_clippy_test(name = "clippy", targets = [":pulsebeam-agent-quic", ":executor", ":unit_tests"])
+rust_clippy_test(name = "clippy", targets = [":pulsebeam-agent-quic", ":executor", ":executor-sim", ":unit_tests"])
 rustfmt_test(name = "format", targets = [":pulsebeam-agent-quic", ":executor", ":unit_tests"])

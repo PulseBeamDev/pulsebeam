@@ -31,6 +31,78 @@ pub mod state {
         }
     }
 
+    /// Physical coordinates of a validated DATA_V1 binding, without granting installation authority.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum DataV1Binding {
+        Sctp(SctpDataV1Parameters),
+        Quic(QuicDataV1Parameters),
+    }
+
+    impl DataV1Binding {
+        pub fn from_track(binding: &TrackBinding) -> Option<Self> {
+            use track_binding::Transport;
+            match binding.transport.as_ref()? {
+                Transport::SctpDataV1(parameters) => Some(Self::Sctp(*parameters)),
+                Transport::QuicDataV1(parameters) => Some(Self::Quic(*parameters)),
+                _ => None,
+            }
+        }
+
+        pub fn format(self) -> Option<crate::data_endpoint::Format> {
+            match self {
+                Self::Sctp(parameters) => parameters.format(),
+                Self::Quic(parameters) => parameters.format(),
+            }
+        }
+
+        pub fn track_binding(self) -> TrackBinding {
+            use track_binding::Transport;
+            TrackBinding {
+                transport: Some(match self {
+                    Self::Sctp(parameters) => Transport::SctpDataV1(parameters),
+                    Self::Quic(parameters) => Transport::QuicDataV1(parameters),
+                }),
+            }
+        }
+
+        pub fn payload_channel<A>(
+            self,
+            association: A,
+        ) -> Option<crate::data_endpoint::Channel<A>> {
+            use core::num::{NonZeroU16, NonZeroU64};
+            self.format()?;
+            let (stream, incarnation) = match self {
+                Self::Sctp(parameters) => (parameters.stream_id?, parameters.channel_incarnation),
+                Self::Quic(parameters) => (parameters.binding_id, parameters.incarnation),
+            };
+            Some(crate::data_endpoint::Channel {
+                association,
+                stream: NonZeroU16::new(u16::try_from(stream).ok()?)?,
+                incarnation: NonZeroU64::new(incarnation)?,
+            })
+        }
+
+        pub fn delivery(self) -> i32 {
+            match self {
+                Self::Sctp(parameters) => parameters.delivery,
+                Self::Quic(parameters) => parameters.delivery,
+            }
+        }
+
+        pub fn matches_delivery(self, delivery: i32) -> bool {
+            use crate::data_endpoint::{Delivery, Format};
+            matches!(
+                (
+                    self.format().map(Format::delivery),
+                    DataDelivery::try_from(delivery)
+                ),
+                (Some(Delivery::Unreliable), Ok(DataDelivery::Lossy))
+                    | (Some(Delivery::Latest), Ok(DataDelivery::Latest))
+                    | (Some(Delivery::Reliable), Ok(DataDelivery::Ordered))
+            )
+        }
+    }
+
     fn data_format(version: u32, delivery: i32) -> Option<crate::data_endpoint::Format> {
         use crate::data_endpoint::{Delivery, Format};
         let delivery = match DataV1Delivery::try_from(delivery).ok()? {

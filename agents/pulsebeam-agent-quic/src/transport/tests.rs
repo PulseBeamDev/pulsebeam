@@ -280,9 +280,22 @@ fn no_data_admission_without_datagram_negotiation() {
 fn control_progresses_between_full_payloads_without_displacing_admitted_data() {
     let mut pair = Pair::new("edge.example", true);
     pair.advance(100);
-    let payload = [1; MAX_ENDPOINT_RECORD_BYTES + DATA_ENVELOPE_BYTES];
-    pair.client.offer(&payload).unwrap();
-    assert_eq!(pair.client.offer(&payload), Err(DatagramAdmission::Full));
+    use crate::records::DatagramKind;
+    use std::num::NonZeroU16;
+
+    let payload = [1; MAX_ENDPOINT_RECORD_BYTES];
+    let offer = |peer: &mut Peer| {
+        peer.scheduler.offer_bound(
+            &mut peer.connection.as_mut().unwrap().1,
+            Datagram {
+                kind: DatagramKind::Data,
+                binding: NonZeroU16::MIN,
+                payload: &payload,
+            },
+        )
+    };
+    offer(&mut pair.client).unwrap();
+    assert_eq!(offer(&mut pair.client), Err(DatagramAdmission::Full));
 
     let id = pair
         .client
@@ -298,10 +311,13 @@ fn control_progresses_between_full_payloads_without_displacing_admitted_data() {
     pair.client.control_runnable = true;
     pair.advance(100);
 
-    assert_eq!(
-        pair.server.conn().datagrams().recv().unwrap().as_ref(),
-        payload
-    );
+    read_datagram(pair.server.conn(), |record| {
+        assert_eq!(record.kind, DatagramKind::Data);
+        assert_eq!(record.binding, NonZeroU16::MIN);
+        assert_eq!(record.payload, payload);
+    })
+    .unwrap()
+    .unwrap();
     assert_eq!(
         pair.server.conn().streams().accept(noq_proto::Dir::Bi),
         Some(id)
@@ -314,7 +330,7 @@ fn control_progresses_between_full_payloads_without_displacing_admitted_data() {
     );
     let _ = chunks.finalize();
     pair.client.control_runnable = false;
-    pair.client.offer(&payload).unwrap();
+    offer(&mut pair.client).unwrap();
 }
 
 #[test]

@@ -62,6 +62,22 @@ pub(crate) struct DataHandoff {
 }
 
 pub type OwnedPacket = FabricPacket<Box<[u8]>>;
+pub(crate) enum DataWrite {
+    Written,
+    Rejected,
+    Deferred,
+}
+
+impl From<bool> for DataWrite {
+    fn from(written: bool) -> Self {
+        if written {
+            Self::Written
+        } else {
+            Self::Rejected
+        }
+    }
+}
+
 pub type PacketView<'a> = FabricPacket<&'a [u8], &'a [u8]>;
 
 pub struct OutputEvidence {
@@ -1139,14 +1155,14 @@ impl SourceFanout {
         }
     }
 
-    pub(crate) fn admit_data(
+    pub(crate) fn admit_data<W: Into<DataWrite>>(
         &mut self,
         now: Instant,
         handle: FabricBranchHandle,
         destination: ParticipantHandle,
         current_incarnation: Option<NonZeroU64>,
         permits: impl Fn(Option<NonZeroU64>) -> bool,
-        write: impl FnOnce(u64, PacketView<'_>, Option<RepairRequest>) -> bool,
+        write: impl FnOnce(u64, PacketView<'_>, Option<RepairRequest>) -> W,
     ) -> Option<DataHandoff> {
         if self.emission.profile() != Profile::Data || !self.authorizes(handle, destination) {
             return None;
@@ -1193,7 +1209,11 @@ impl SourceFanout {
                 branch.discard_front();
                 continue;
             }
-            let written = write(sequence, packet, request);
+            let written = match write(sequence, packet, request).into() {
+                DataWrite::Written => true,
+                DataWrite::Rejected => false,
+                DataWrite::Deferred => return None,
+            };
             if !written && request.is_some() {
                 return Some(DataHandoff {
                     written,

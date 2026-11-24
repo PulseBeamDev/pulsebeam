@@ -746,7 +746,7 @@ fn live_and_repair_race_through_one_branch_queue_and_keep_original_content() {
                 destination,
                 Some(target.incarnation),
                 |_| true,
-                |_, _, _| panic!("duplicate")
+                |_, _, _| -> bool { panic!("duplicate") }
             ),
             None
         );
@@ -771,7 +771,7 @@ fn live_and_repair_race_through_one_branch_queue_and_keep_original_content() {
                 destination,
                 Some(target.incarnation),
                 |_| true,
-                |_, _, _| panic!("cancelled repeat")
+                |_, _, _| -> bool { panic!("cancelled repeat") }
             ),
             None
         );
@@ -857,6 +857,17 @@ fn ordered_handoff_requires_membership_in_the_original_cohort() {
             receiver,
             Some(incarnation),
             |_| true,
+            |_, _, _| DataWrite::Deferred
+        ),
+        None
+    );
+    assert_eq!(
+        fanout.admit_data(
+            now,
+            branch,
+            receiver,
+            Some(incarnation),
+            |_| true,
             |_, _, _| true
         ),
         Some(DataHandoff {
@@ -875,7 +886,7 @@ fn ordered_handoff_requires_membership_in_the_original_cohort() {
                 receiver,
                 Some(incarnation),
                 |_| true,
-                |_, _, _| panic!("wrong ordered cohort")
+                |_, _, _| -> bool { panic!("wrong ordered cohort") }
             ),
             None
         );

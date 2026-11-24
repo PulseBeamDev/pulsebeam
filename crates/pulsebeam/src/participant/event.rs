@@ -12,12 +12,12 @@ pub(crate) struct FabricPublication {
     pub reliable: Option<super::data_fabric::ReliableAdmission>,
 }
 
-pub(crate) struct FabricDataPosition {
+pub(crate) struct FabricDataPosition<I = pulsebeam_rtc::DataChannelInstallation> {
     pub source: crate::shard::router::FabricSourceHandle,
-    pub installation: pulsebeam_rtc::DataChannelInstallation,
+    pub installation: I,
     pub arrival: pulsebeam_runtime::time::Instant,
     pub sequence: u64,
-    pub reliable: Option<super::data_fabric::ReliableAdmission>,
+    pub reliable: Option<super::data_fabric::ReliableAdmission<I>>,
 }
 
 #[derive(Debug)]
@@ -35,6 +35,57 @@ pub(crate) enum FabricFeedbackKind {
     Assembled(crate::route::fabric::local::DataExpectation),
     Repair(crate::route::fabric::local::RepairRequest),
     CancelRepair(crate::route::fabric::local::RepairRequest),
+}
+
+impl FabricSubscriberFeedback {
+    pub(crate) fn decode(lease: super::data_fabric::SubscriberLease, bytes: &[u8]) -> Option<Self> {
+        use crate::route::fabric::local::{
+            DataExpectation, PropagationOutcome, RepairFragment, RepairRequest,
+        };
+        use pulsebeam_proto::data_control::{
+            self, ControlOutcome, SubscriberControl, subscriber_control::Record,
+        };
+        use std::num::NonZeroU64;
+        let Ok(SubscriberControl {
+            record: Some(record),
+        }) = data_control::decode(lease.endpoint, bytes)
+        else {
+            return None;
+        };
+        let expectation = |expected: data_control::Expectation| -> Option<DataExpectation> {
+            Some(DataExpectation {
+                unit_seq: expected.unit?.source?.unit_seq?,
+                fragment_count: u16::try_from(expected.fragment_count).ok()?,
+            })
+        };
+        let repair = |demand: data_control::RepairDemand| -> Option<RepairRequest> {
+            Some(RepairRequest {
+                fragment: RepairFragment {
+                    unit_seq: demand.unit?.source?.unit_seq?,
+                    index: u16::try_from(demand.fragment_index?).ok()?,
+                },
+                id: NonZeroU64::new(demand.request_id)?,
+            })
+        };
+        let kind = match record {
+            Record::ExpectationOutcome(ack) => {
+                let unit = ack.expectation.and_then(expectation)?;
+                let outcome = match ControlOutcome::try_from(ack.outcome) {
+                    Ok(ControlOutcome::Confirmed) => PropagationOutcome::Confirmed,
+                    Ok(ControlOutcome::Failed) => PropagationOutcome::Failed,
+                    Ok(ControlOutcome::Unknown) => PropagationOutcome::Unknown,
+                    _ => return None,
+                };
+                Some(FabricFeedbackKind::Propagation(unit, outcome))
+            }
+            Record::AssemblyReceipt(expected) => {
+                expectation(expected).map(FabricFeedbackKind::Assembled)
+            }
+            Record::RequestRepair(demand) => repair(demand).map(FabricFeedbackKind::Repair),
+            Record::CancelRepair(demand) => repair(demand).map(FabricFeedbackKind::CancelRepair),
+        };
+        kind.map(|kind| Self { lease, kind })
+    }
 }
 
 pub(crate) trait ParticipantSink {

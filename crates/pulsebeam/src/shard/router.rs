@@ -111,11 +111,13 @@ pub(super) enum FabricOwner {
 
 pub(super) enum FabricRepairSource {
     Publisher(ParticipantHandle, pulsebeam_rtc::DataChannelInstallation),
+    QuicPublisher(ParticipantHandle),
     Shard(ShardBinding),
 }
 
 pub(super) enum FabricDeliveryTarget {
     Publisher(ParticipantHandle, pulsebeam_rtc::DataChannelInstallation),
+    QuicPublisher(ParticipantHandle),
     ShardShadow(ShardBinding),
 }
 
@@ -134,6 +136,25 @@ struct FabricSource {
 }
 
 impl FabricSource {
+    fn reliable_quic_publisher(
+        &self,
+    ) -> Option<
+        &crate::participant::data_fabric::PublisherSource<
+            crate::participant::data_fabric::QuicInstallation,
+        >,
+    > {
+        let FabricIngress::Publisher {
+            data: Some(data), ..
+        } = &self.ingress
+        else {
+            return None;
+        };
+        let DataPublisher::Quic(data) = data.as_ref() else {
+            return None;
+        };
+        (data.reliable() && data.sequence_anchor().is_some()).then_some(data)
+    }
+
     fn freeze_publisher_expectation(
         &mut self,
         unit: crate::route::fabric::local::DataExpectation,
@@ -241,11 +262,49 @@ impl Drop for NetworkChild {
     }
 }
 
+enum DataPublisher {
+    Rtc(crate::participant::data_fabric::PublisherSource),
+    Quic(
+        crate::participant::data_fabric::PublisherSource<
+            crate::participant::data_fabric::QuicInstallation,
+        >,
+    ),
+}
+
+impl DataPublisher {
+    fn expiry(&self) -> Option<pulsebeam_runtime::time::Instant> {
+        match self {
+            Self::Rtc(source) => source.expiry(),
+            Self::Quic(source) => source.expiry(),
+        }
+    }
+
+    fn cached_original<'a>(
+        &self,
+        fanout: &'a SourceFanout,
+        unit_seq: u64,
+        index: u16,
+        now: pulsebeam_runtime::time::Instant,
+    ) -> Option<(u64, &'a OwnedPacket, pulsebeam_runtime::time::Instant)> {
+        match self {
+            Self::Rtc(source) => source.cached_original(fanout, unit_seq, index, now),
+            Self::Quic(source) => source.cached_original(fanout, unit_seq, index, now),
+        }
+    }
+
+    fn expire(&mut self, fanout: &mut SourceFanout, now: pulsebeam_runtime::time::Instant) {
+        match self {
+            Self::Rtc(source) => source.expire(fanout, now),
+            Self::Quic(source) => source.expire(fanout, now),
+        }
+    }
+}
+
 enum FabricIngress {
     Publisher {
         participant: ParticipantHandle,
         incarnation: NonZeroU64,
-        data: Option<Box<crate::participant::data_fabric::PublisherSource>>,
+        data: Option<Box<DataPublisher>>,
         refresh: Option<FabricRefresh>,
         destinations: Vec<ShardFabricDestination>,
         publisher_sends: Vec<PublisherHop>,
@@ -1798,8 +1857,96 @@ impl ShardRuntime {
             return false;
         }
         *data = crate::participant::data_fabric::PublisherSource::new(source, binding, clock)
+            .map(DataPublisher::Rtc)
             .map(Box::new);
         data.is_some()
+    }
+
+    pub(super) fn quic_data_association(
+        &self,
+        source: FabricSourceHandle,
+        publisher: ParticipantHandle,
+    ) -> Option<NonZeroU64> {
+        let bound = self.fabric_sources.get(source)?;
+        let FabricIngress::Publisher {
+            participant, data, ..
+        } = &bound.ingress
+        else {
+            return None;
+        };
+        if *participant != publisher {
+            return None;
+        }
+        let DataPublisher::Quic(data) = data.as_deref()? else {
+            return None;
+        };
+        data.sequence_anchor().map(|_| data.association())
+    }
+
+    pub(super) fn bind_quic_data_publisher(
+        &mut self,
+        source: FabricSourceHandle,
+        publisher: ParticipantHandle,
+        installation: crate::participant::data_fabric::QuicInstallation,
+        clock: Option<pulsebeam_proto::data_record::Clock<'_>>,
+    ) -> bool {
+        use crate::participant::data_fabric::PublisherSource;
+        let Some(bound) = self.fabric_sources.get_mut(source) else {
+            return false;
+        };
+        let FabricIngress::Publisher {
+            participant,
+            incarnation,
+            data,
+            ..
+        } = &mut bound.ingress
+        else {
+            return false;
+        };
+        if *participant != publisher
+            || data.is_some()
+            || bound.fanout.emission().profile() != pulsebeam_core::fabric::Profile::Data
+        {
+            return false;
+        }
+        let endpoint = pulsebeam_proto::data_control::PublisherBinding {
+            source: *incarnation,
+        };
+        *data = Some(Box::new(DataPublisher::Quic(
+            PublisherSource::installed_quic(source, installation, endpoint, clock),
+        )));
+        true
+    }
+
+    pub(super) fn admit_quic_data(
+        &mut self,
+        source: FabricSourceHandle,
+        publisher: ParticipantHandle,
+        installation: crate::participant::data_fabric::QuicInstallation,
+        bytes: &[u8],
+        now: pulsebeam_runtime::time::Instant,
+        stamp: u32,
+    ) -> Result<
+        crate::participant::event::FabricDataPosition<
+            crate::participant::data_fabric::QuicInstallation,
+        >,
+        crate::participant::data_fabric::Error,
+    > {
+        use crate::participant::data_fabric::Error;
+        let bound = self.fabric_sources.get_mut(source).ok_or(Error::Fenced)?;
+        let FabricIngress::Publisher {
+            participant, data, ..
+        } = &mut bound.ingress
+        else {
+            return Err(Error::Fenced);
+        };
+        let Some(DataPublisher::Quic(data)) = data.as_deref_mut() else {
+            return Err(Error::Fenced);
+        };
+        if *participant != publisher || !data.matches(installation) {
+            return Err(Error::Fenced);
+        }
+        data.publish_quic(&mut bound.fanout, bytes, now, time)
     }
 
     pub(super) fn data_publisher(
@@ -1818,9 +1965,10 @@ impl ShardRuntime {
         else {
             return None;
         };
-        data.as_deref()
-            .filter(|data| *participant == publisher && data.matches(installation))
-            .map(|data| (data, &bound.fanout))
+        let DataPublisher::Rtc(data) = data.as_deref()? else {
+            return None;
+        };
+        (*participant == publisher && data.matches(installation)).then_some((data, &bound.fanout))
     }
 
     pub(super) fn data_publisher_mut(
@@ -1839,9 +1987,11 @@ impl ShardRuntime {
         else {
             return None;
         };
-        data.as_deref_mut()
-            .filter(|data| *participant == publisher && data.matches(installation))
-            .map(|data| (data, &mut bound.fanout))
+        let DataPublisher::Rtc(data) = data.as_deref_mut()? else {
+            return None;
+        };
+        (*participant == publisher && data.matches(installation))
+            .then_some((data, &mut bound.fanout))
     }
 
     pub(super) fn offer_fabric_data(
@@ -1849,6 +1999,31 @@ impl ShardRuntime {
         publisher: ParticipantHandle,
         now: pulsebeam_runtime::time::Instant,
         publication: &crate::participant::event::FabricDataPosition,
+    ) -> Result<Offers, Rejection> {
+        self.offer_installed_data(publisher, now, publication, |source, installation| {
+            matches!(source, DataPublisher::Rtc(data) if data.matches(installation) && data.sequence_anchor().is_some())
+        })
+    }
+
+    pub(super) fn offer_quic_fabric_data(
+        &mut self,
+        publisher: ParticipantHandle,
+        now: pulsebeam_runtime::time::Instant,
+        publication: &crate::participant::event::FabricDataPosition<
+            crate::participant::data_fabric::QuicInstallation,
+        >,
+    ) -> Result<Offers, Rejection> {
+        self.offer_installed_data(publisher, now, publication, |source, installation| {
+            matches!(source, DataPublisher::Quic(data) if data.matches(installation) && data.sequence_anchor().is_some())
+        })
+    }
+
+    fn offer_installed_data<I: Copy>(
+        &mut self,
+        publisher: ParticipantHandle,
+        now: pulsebeam_runtime::time::Instant,
+        publication: &crate::participant::event::FabricDataPosition<I>,
+        matches_live: impl FnOnce(&DataPublisher, I) -> bool,
     ) -> Result<Offers, Rejection> {
         let bound = self
             .fabric_sources
@@ -1862,10 +2037,7 @@ impl ShardRuntime {
         else {
             return Err(Rejection::Binding);
         };
-        if *participant != publisher
-            || !data.matches(publication.installation)
-            || data.sequence_anchor().is_none()
-        {
+        if *participant != publisher || !matches_live(data, publication.installation) {
             return Err(Rejection::Binding);
         }
         let sequence = publication.sequence;
@@ -2076,7 +2248,7 @@ impl ShardRuntime {
                 }
                 let outcome = frozen.work.enqueue(now, &mut destination.admissions, || {
                     #[cfg(feature = "sim")]
-                    if ordered.is_some()
+                    if frozen.packet.header().profile == pulsebeam_core::fabric::Profile::Data
                         && destination.binding.origin != destination.binding.destination.shard()
                         && crate::sim_metrics::drop_shard_data_offer(frozen.packet.payload())
                     {
@@ -2280,7 +2452,7 @@ impl ShardRuntime {
         publisher: ParticipantHandle,
         admission: crate::participant::data_fabric::ReliableAdmission,
         now: pulsebeam_runtime::time::Instant,
-        mut eligible: impl FnMut(FabricLocalBranch, ParticipantHandle) -> Option<NonZeroU64>,
+        eligible: impl FnMut(FabricLocalBranch, ParticipantHandle) -> Option<NonZeroU64>,
     ) -> bool {
         if self.local_fabric_publication(source, publisher).is_none() {
             return false;
@@ -2289,59 +2461,102 @@ impl ShardRuntime {
             if bound
                 .reliable_installation
                 .is_some_and(|installed| installed != admission.installation)
+                || !Self::accept_publisher_cohort(
+                    bound,
+                    source,
+                    now,
+                    admission.unit,
+                    admission.expires,
+                    eligible,
+                )
             {
                 return false;
-            }
-            let FabricIngress::Publisher { destinations, .. } = &bound.ingress else {
-                return false;
-            };
-            let Ok(accepted) = bound.fanout.accept_data_cohort(
-                now,
-                Some(admission.expires),
-                admission.unit,
-                |branch, dest| eligible(FabricLocalBranch { source, branch }, dest),
-                || {
-                    let mut count = 0usize;
-                    let mut cohort = Vec::new();
-                    for destination in destinations.iter().filter(|dest| {
-                        dest.route.tx.is_live() && !dest.ordered_receivers.is_empty()
-                    }) {
-                        let remaining = MAX_BRANCHES.saturating_add(1).saturating_sub(count);
-                        let receivers: Box<[_]> = destination
-                            .ordered_receivers
-                            .iter()
-                            .take(remaining)
-                            .copied()
-                            .collect();
-                        count = count.saturating_add(receivers.len());
-                        cohort.push(crate::route::fabric::local::ShardDataCohort {
-                            binding: destination.binding,
-                            route: destination.route.clone(),
-                            receivers,
-                        });
-                        if count > MAX_BRANCHES {
-                            break;
-                        }
-                    }
-                    cohort
-                },
-            ) else {
-                return false;
-            };
-            if accepted == crate::route::fabric::local::ExpectationAdmission::First {
-                bound.freeze_publisher_expectation(admission.unit, admission.expires, now);
-                // The first expectation must enter the same mailbox before live fragments.
-                bound
-                    .fanout
-                    .send_initial_shard_notices(now, admission.unit, |route, notice| {
-                        #[cfg(feature = "sim")]
-                        crate::sim_metrics::record_shard_data_notice(&notice);
-                        Self::send_shard_data_notice(route, notice);
-                    });
             }
             bound.reliable_installation = Some(admission.installation);
             true
         })
+    }
+
+    pub(super) fn accept_quic_data_expectation(
+        &mut self,
+        source: FabricSourceHandle,
+        publisher: ParticipantHandle,
+        admission: crate::participant::data_fabric::ReliableAdmission<
+            crate::participant::data_fabric::QuicInstallation,
+        >,
+        now: pulsebeam_runtime::time::Instant,
+        eligible: impl FnMut(FabricLocalBranch, ParticipantHandle) -> Option<NonZeroU64>,
+    ) -> bool {
+        if now >= admission.expires || self.local_fabric_publication(source, publisher).is_none() {
+            return false;
+        }
+        self.fabric_sources.get_mut(source).is_some_and(|bound| {
+            if !matches!(&bound.ingress, FabricIngress::Publisher { data: Some(data), .. }
+                if matches!(data.as_ref(), DataPublisher::Quic(installed) if installed.matches(admission.installation)))
+            {
+                return false;
+            }
+            Self::accept_publisher_cohort(bound, source, now, admission.unit, admission.expires, eligible)
+        })
+    }
+
+    fn accept_publisher_cohort(
+        bound: &mut FabricSource,
+        source: FabricSourceHandle,
+        now: pulsebeam_runtime::time::Instant,
+        unit: crate::route::fabric::local::DataExpectation,
+        expires: pulsebeam_runtime::time::Instant,
+        mut eligible: impl FnMut(FabricLocalBranch, ParticipantHandle) -> Option<NonZeroU64>,
+    ) -> bool {
+        let FabricIngress::Publisher { destinations, .. } = &bound.ingress else {
+            return false;
+        };
+        let Ok(accepted) = bound.fanout.accept_data_cohort(
+            now,
+            Some(expires),
+            unit,
+            |branch, dest| eligible(FabricLocalBranch { source, branch }, dest),
+            || {
+                let mut count = 0usize;
+                let mut cohort = Vec::new();
+                for destination in destinations
+                    .iter()
+                    .filter(|dest| dest.route.tx.is_live() && !dest.ordered_receivers.is_empty())
+                {
+                    let remaining = MAX_BRANCHES.saturating_add(1).saturating_sub(count);
+                    let receivers: Box<[_]> = destination
+                        .ordered_receivers
+                        .iter()
+                        .take(remaining)
+                        .copied()
+                        .collect();
+                    count = count.saturating_add(receivers.len());
+                    cohort.push(crate::route::fabric::local::ShardDataCohort {
+                        binding: destination.binding,
+                        route: destination.route.clone(),
+                        receivers,
+                    });
+                    if count > MAX_BRANCHES {
+                        break;
+                    }
+                }
+                cohort
+            },
+        ) else {
+            return false;
+        };
+        if accepted == crate::route::fabric::local::ExpectationAdmission::First {
+            bound.freeze_publisher_expectation(unit, expires, now);
+            // The first expectation must enter the same mailbox before live fragments.
+            bound
+                .fanout
+                .send_initial_shard_notices(now, unit, |route, notice| {
+                    #[cfg(feature = "sim")]
+                    crate::sim_metrics::record_shard_data_notice(&notice);
+                    Self::send_shard_data_notice(route, notice);
+                });
+        }
+        true
     }
 
     fn send_shard_data_notice(
@@ -2412,7 +2627,7 @@ impl ShardRuntime {
     ) -> Option<(
         FabricSourceHandle,
         ParticipantHandle,
-        pulsebeam_rtc::DataChannelInstallation,
+        Option<pulsebeam_rtc::DataChannelInstallation>,
         &crate::shard_update::CompiledRoute,
         u16,
     )> {
@@ -2435,13 +2650,32 @@ impl ShardRuntime {
         let count = bound
             .fanout
             .shard_repair_window(now, &destination.route, repair)?;
+        if bound.reliable_installation.is_none() && bound.reliable_quic_publisher().is_none() {
+            return None;
+        }
         Some((
             source,
             *participant,
-            bound.reliable_installation?,
+            bound.reliable_installation,
             &destination.route,
             count,
         ))
+    }
+
+    pub(super) fn cached_data_original(
+        &self,
+        source: FabricSourceHandle,
+        fragment: crate::route::fabric::local::RepairFragment,
+        now: pulsebeam_runtime::time::Instant,
+    ) -> Option<(u64, &OwnedPacket, pulsebeam_runtime::time::Instant)> {
+        let bound = self.fabric_sources.get(source)?;
+        let FabricIngress::Publisher {
+            data: Some(data), ..
+        } = &bound.ingress
+        else {
+            return None;
+        };
+        data.cached_original(&bound.fanout, fragment.unit_seq, fragment.index, now)
     }
 
     pub(super) fn record_shard_data_receipt(
@@ -2861,7 +3095,13 @@ impl ShardRuntime {
                 let deadline = bound.fanout.data_delivery_deadline()?;
                 let target = match bound.ingress.owner() {
                     FabricOwner::Local(publisher) => {
-                        FabricDeliveryTarget::Publisher(publisher, bound.reliable_installation?)
+                        if let Some(installation) = bound.reliable_installation {
+                            FabricDeliveryTarget::Publisher(publisher, installation)
+                        } else if bound.reliable_quic_publisher().is_some() {
+                            FabricDeliveryTarget::QuicPublisher(publisher)
+                        } else {
+                            return None;
+                        }
                     }
                     FabricOwner::Shard(binding) => FabricDeliveryTarget::ShardShadow(binding),
                     FabricOwner::Network => return None,
@@ -2950,13 +3190,65 @@ impl ShardRuntime {
         self.fabric_sources.get(source)?.reliable_installation
     }
 
+    pub(super) fn request_quic_data_original(
+        &mut self,
+        source: FabricSourceHandle,
+        publisher: ParticipantHandle,
+        fragment: crate::route::fabric::local::RepairFragment,
+        now: pulsebeam_runtime::time::Instant,
+    ) -> crate::participant::data_fabric::OriginalResolution {
+        use crate::participant::data_fabric::OriginalResolution;
+        let Some((data, fanout)) = self.quic_repair_publisher(source, publisher) else {
+            return OriginalResolution::Revoked;
+        };
+        data.request_original(fanout, fragment.unit_seq, fragment.index, now)
+    }
+
+    pub(super) fn settle_quic_original_unavailable(
+        &mut self,
+        source: FabricSourceHandle,
+        publisher: ParticipantHandle,
+        demand: pulsebeam_proto::data_control::OriginalDemand,
+        now: pulsebeam_runtime::time::Instant,
+    ) -> bool {
+        self.quic_repair_publisher(source, publisher)
+            .is_some_and(|(data, fanout)| data.original_unavailable(fanout, demand, now))
+    }
+
+    fn quic_repair_publisher(
+        &mut self,
+        source: FabricSourceHandle,
+        publisher: ParticipantHandle,
+    ) -> Option<(
+        &mut crate::participant::data_fabric::PublisherSource<
+            crate::participant::data_fabric::QuicInstallation,
+        >,
+        &mut SourceFanout,
+    )> {
+        let bound = self.fabric_sources.get_mut(source)?;
+        let FabricIngress::Publisher {
+            participant, data, ..
+        } = &mut bound.ingress
+        else {
+            return None;
+        };
+        let DataPublisher::Quic(data) = data.as_deref_mut()? else {
+            return None;
+        };
+        (*participant == publisher && data.reliable() && data.sequence_anchor().is_some())
+            .then_some((data, &mut bound.fanout))
+    }
+
     pub(super) fn repair_fanout(
         &mut self,
         source: FabricSourceHandle,
     ) -> Option<&mut SourceFanout> {
         let bound = self.fabric_sources.get_mut(source)?;
         match bound.ingress.owner() {
-            FabricOwner::Local(_) if bound.reliable_installation.is_some() => {
+            FabricOwner::Local(_)
+                if bound.reliable_installation.is_some()
+                    || bound.reliable_quic_publisher().is_some() =>
+            {
                 Some(&mut bound.fanout)
             }
             FabricOwner::Shard(_) => Some(&mut bound.fanout),
@@ -2996,7 +3288,13 @@ impl ShardRuntime {
             .filter_map(|(source, bound)| {
                 let owner = match bound.ingress.owner() {
                     FabricOwner::Local(publisher) => {
-                        FabricRepairSource::Publisher(publisher, bound.reliable_installation?)
+                        if let Some(installation) = bound.reliable_installation {
+                            FabricRepairSource::Publisher(publisher, installation)
+                        } else if bound.reliable_quic_publisher().is_some() {
+                            FabricRepairSource::QuicPublisher(publisher)
+                        } else {
+                            return None;
+                        }
                     }
                     FabricOwner::Shard(binding) => FabricRepairSource::Shard(binding),
                     FabricOwner::Network => return None,
@@ -3006,17 +3304,13 @@ impl ShardRuntime {
             .min_by_key(|(source, _, work)| (work.due, *source))
     }
 
-    pub(super) fn admit_fabric_data(
+    pub(super) fn admit_fabric_data<W: Into<crate::route::fabric::local::DataWrite>>(
         &mut self,
         handle: FabricLocalBranch,
         destination: ParticipantHandle,
         now: pulsebeam_runtime::time::Instant,
         current_branch: Option<NonZeroU64>,
-        write: impl FnOnce(
-            u64,
-            PacketView<'_>,
-            Option<crate::route::fabric::local::RepairRequest>,
-        ) -> bool,
+        write: impl FnOnce(u64, PacketView<'_>, Option<crate::route::fabric::local::RepairRequest>) -> W,
     ) -> Option<crate::route::fabric::local::DataHandoff> {
         let source = self.fabric_sources.get_mut(handle.source)?;
         if let FabricIngress::Network {

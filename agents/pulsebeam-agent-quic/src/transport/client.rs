@@ -7,7 +7,11 @@ use noq_proto::{
 };
 use pulsebeam_udp::ReceivedDatagram;
 
-use super::{PacketScheduler, endpoint, forward_endpoint_event, service_timeout};
+use crate::records::Datagram;
+
+use super::{
+    DatagramAdmission, PacketScheduler, endpoint, forward_endpoint_event, service_timeout,
+};
 
 pub mod admission;
 
@@ -48,6 +52,20 @@ impl ClientTransport {
 
     pub fn connection(&mut self) -> &mut Connection {
         &mut self.connection
+    }
+
+    /// The association owner must resolve the accepted binding before offering payload.
+    pub fn offer_datagram(&mut self, datagram: Datagram<'_>) -> Result<(), DatagramAdmission> {
+        self.scheduler.offer_bound(&mut self.connection, datagram)
+    }
+
+    /// Consume at most one received datagram. The callback must resolve the binding
+    /// before inspecting its payload.
+    pub fn read_datagram<T>(
+        &mut self,
+        receive: impl FnOnce(Datagram<'_>) -> T,
+    ) -> Option<Result<T, crate::frame::Error>> {
+        super::read_datagram(&mut self.connection, receive)
     }
 
     pub fn deadline(&mut self) -> Option<Instant> {

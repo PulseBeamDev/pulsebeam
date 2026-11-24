@@ -19,6 +19,7 @@ chitchat = "=0.13.0"
 pulsebeam-membership = { path = "../pulsebeam-membership" }
 pulsebeam-server = { path = "../../server/rust" }
 anyhow.workspace = true
+base64 = "0.22.1"
 bytes = "1"
 fastrand.workspace = true
 ctor = "1.0.10"
@@ -28,6 +29,8 @@ http-body-util = "0.1"  # Crucial for .collect().await
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1"] }
 libc = "0.2"
+noq-proto = { version = "=1.4.0", default-features = false, features = ["rustls", "aws-lc-rs"] }
+rcgen = { version = "0.14.7", default-features = false, features = ["crypto", "aws_lc_rs"] }
 openh264.workspace = true
 opus.workspace = true
 opusic-sys.workspace = true
@@ -38,12 +41,14 @@ proptest = "1.11.0"
 pulsebeam = { path = "../pulsebeam", features = ["sim"] }
 pulsebeam-agent-native = { path = "../../agents/pulsebeam-agent-native", features = ["sim"] }
 pulsebeam-agent-core = { path = "../../agents/pulsebeam-agent-core" }
+pulsebeam-agent-quic = { path = "../../agents/pulsebeam-agent-quic", features = ["executor", "sim"] }
 pulsebeam-core = { path = "../pulsebeam-core", features = ["sim"] }
 pulsebeam-link = { path = "../pulsebeam-link" }
 pulsebeam-proto = { path = "../pulsebeam-proto" }
 pulsebeam-rtc-simulation = { path = "../pulsebeam-rtc/simulation" }
 pulsebeam-runtime = { path = "../pulsebeam-runtime", features = ["sim"] }
 pulsebeam-testdata = { path = "../pulsebeam-testdata" }
+pulsebeam-udp = { path = "../pulsebeam-udp", features = ["sim"] }
 reqwest = "0.13.4"
 serde_json = "1.0.150"
 tempfile = "3.24"

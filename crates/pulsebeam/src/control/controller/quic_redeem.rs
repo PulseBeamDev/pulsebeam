@@ -168,6 +168,11 @@ impl ControllerActor {
                         participant: target.participant,
                         transport,
                         handoff: Box::new(handoff),
+                        grant: crate::shard::participants::QuicGrant {
+                            revision: authorization.revision(),
+                            expiry: authorization.expiry(),
+                        },
+                        scope: target.scope,
                         ack: ack_tx,
                     }),
                     ack: Some(ack_rx),

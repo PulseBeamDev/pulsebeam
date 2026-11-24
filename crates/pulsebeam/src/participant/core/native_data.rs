@@ -436,6 +436,10 @@ impl Connection {
             capture_clock,
             enabled,
         } = plan;
+        let wire::DataV1Binding::Sctp(parameters) = parameters else {
+            self.complete_native_preparation(work, Err(ExecutionFailureKind::Unsupported.into()));
+            return;
+        };
         let Some(channel) =
             super::super::transport::fabric_data_config(parameters).and_then(|config| config.id)
         else {

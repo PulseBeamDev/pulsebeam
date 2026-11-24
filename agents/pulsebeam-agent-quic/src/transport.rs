@@ -13,6 +13,8 @@ use noq_proto::{
     Transmit, TransportConfig,
 };
 use pulsebeam_proto::data_record::MAX_ENDPOINT_RECORD_BYTES;
+
+use crate::records::Datagram;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{RootCertStore, time_provider::TimeProvider};
 
@@ -263,7 +265,38 @@ enum Turn {
     },
 }
 
+/// Read one application envelope without exposing Noq's owned packet buffer.
+/// `None` means no packet was queued; malformed envelopes are reported separately.
+pub fn read_datagram<T>(
+    connection: &mut Connection,
+    receive: impl FnOnce(Datagram<'_>) -> T,
+) -> Option<Result<T, crate::frame::Error>> {
+    let packet = connection.datagrams().recv()?;
+    Some(Datagram::decode(&packet, usize::from(UDP_PAYLOAD_BYTES)).map(receive))
+}
+
 impl PacketScheduler {
+    /// Call after resolving the binding in the sender's current association.
+    pub fn offer_bound(
+        &mut self,
+        connection: &mut Connection,
+        datagram: Datagram<'_>,
+    ) -> Result<(), DatagramAdmission> {
+        match self.turn {
+            Turn::Control => return Err(DatagramAdmission::ControlTurn),
+            Turn::Queued { .. } => return Err(DatagramAdmission::Full),
+            Turn::Payload => {}
+        }
+        let limit = connection
+            .datagrams()
+            .max_size()
+            .ok_or(DatagramAdmission::Unsupported)?;
+        let bytes = datagram
+            .encode(limit)
+            .map_err(|_| DatagramAdmission::Size)?;
+        self.offer(connection, &bytes)
+    }
+
     /// Call only after the association and binding have been admitted.
     pub fn offer(
         &mut self,

@@ -1723,7 +1723,7 @@ impl NativeSession {
             &plan.source_id,
             match &plan.transport {
                 ReceiveTransport::Rtp(rtp) => Some(rtp.kind),
-                ReceiveTransport::FabricData(_) => None,
+                ReceiveTransport::FabricData(_) | ReceiveTransport::QuicData(_) => None,
             },
         );
         self.reserve_receiver_source(work, bytes, participant, track)

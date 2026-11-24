@@ -27,6 +27,17 @@ pub enum QuicEvent {
         generation: Generation,
         operation: OperationId,
     },
+    Data {
+        generation: Generation,
+        binding: core::num::NonZeroU16,
+        payload: Vec<u8>,
+    },
+    DataSent {
+        generation: Generation,
+        channel: ChannelId,
+        operation: OperationId,
+        result: Result<(), String>,
+    },
     Renewed {
         generation: Generation,
         operation: OperationId,

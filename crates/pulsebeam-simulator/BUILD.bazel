@@ -49,6 +49,7 @@ rust_library(
     rustc_flags = ["-Copt-level=2", "-Cdebug-assertions=yes", "-Coverflow-checks=yes"],
     aliases = aliases(normal_dev = True, proc_macro_dev = True) | {
         ("//crates/pulsebeam:pulsebeam-sim" if variant == "control" else "//crates/pulsebeam:pulsebeam-sim-" + variant): "pulsebeam",
+        "//agents/pulsebeam-agent-quic:executor-sim": "pulsebeam_agent_quic",
     },
     deps = all_crate_deps(normal_dev = True) + [
         "//crates/pulsebeam:pulsebeam-sim" if variant == "control" else "//crates/pulsebeam:pulsebeam-sim-" + variant,
@@ -61,6 +62,8 @@ rust_library(
         "//server/rust:pulsebeam-server",
         "//agents/pulsebeam-agent-core:pulsebeam-agent-core-sim",
         "//agents/pulsebeam-agent-native:pulsebeam-agent-native-sim",
+        "//agents/pulsebeam-agent-quic:executor-sim",
+        "//crates/pulsebeam-udp:pulsebeam-udp-sim",
     ],
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),
     tags = ["manual"],

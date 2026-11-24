@@ -165,6 +165,8 @@ pub(crate) enum ShardCommand {
         participant: crate::entity::ParticipantId,
         transport: crate::route::NodeTransportAddress,
         handoff: Box<crate::control::native::handoff::EndpointHandoff>,
+        grant: super::participants::QuicGrant,
+        scope: crate::entity::ConnectionScope,
         ack: pulsebeam_runtime::sync::oneshot::Sender<bool>,
     },
     MaterializeParticipant {
@@ -535,6 +537,7 @@ impl Service for ShardWorker {
                     socket,
                     at.monotonic,
                     &mut self.shard_event_backlog,
+                    &mut self.core,
                 )?;
             }
             self.flush_shard_events()
@@ -732,29 +735,57 @@ impl ShardWorker {
                     participant,
                     transport,
                     handoff,
+                    grant,
+                    scope,
                     ack,
                 } => {
-                    let installed =
-                        super::quic::Installed::new(connection, participant, transport, handoff);
-                    let accepted = self
-                        .quic
-                        .as_mut()
-                        .is_some_and(|quic| quic.install(association, installed));
+                    let installed = super::quic::Installed::new(
+                        connection,
+                        participant,
+                        transport,
+                        scope,
+                        handoff,
+                    );
+                    let accepted = self.quic.as_mut().is_some_and(|quic| {
+                        if !self
+                            .core
+                            .register_quic_owner(connection, transport, association, grant)
+                        {
+                            return false;
+                        }
+                        if quic.install(association, installed) {
+                            true
+                        } else {
+                            self.core
+                                .retire_quic_owner(connection, transport, association);
+                            false
+                        }
+                    });
                     let _ = ack.send(accepted);
                 }
+                ShardCommand::PublicationCutoffResult {
+                    connection_id,
+                    reference,
+                    success,
+                } if self.quic.as_mut().is_some_and(|quic| {
+                    quic.publication_cutoff_result(connection_id, reference, success)
+                }) => {}
                 ShardCommand::AuthorizationResult {
                     connection_id,
                     revision,
                     expiry,
                 } if self.quic.as_mut().is_some_and(|quic| {
                     quic.authorization_result(connection_id, revision, expiry)
-                }) => {}
+                }) =>
+                {
+                    self.core.update_quic_grant(connection_id, revision, expiry);
+                }
+                ShardCommand::NativeReady { connection_id }
+                    if self
+                        .quic
+                        .as_mut()
+                        .is_some_and(|quic| quic.native_ready(connection_id)) => {}
                 cmd => {
-                    if matches!(cmd, ShardCommand::NativeReady { .. })
-                        && let Some(quic) = &mut self.quic
-                    {
-                        quic.wake();
-                    }
                     let _ = self.core.on_command(cmd, &self.router);
                 }
             }

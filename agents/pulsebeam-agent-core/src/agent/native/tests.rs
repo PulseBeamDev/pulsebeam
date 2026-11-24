@@ -527,6 +527,69 @@ fn media_retirement_is_correlated_and_cannot_clear_replacement_facts() {
 }
 
 #[test]
+fn quic_reserves_nonreused_payload_ids_without_rtc_effects() {
+    let (mut agent, _, _) = connected(crate::TopicRegistrations::default());
+    let session = agent.active.as_mut().unwrap();
+    session.state = crate::native_state::NativeState::with_profile(
+        1 << 20,
+        None,
+        state::validation::BindingProfile::Quic,
+    )
+    .unwrap();
+    session.data_preparations.clear();
+    let resource = Resource::Publication {
+        kind: state::TrackKind::Data,
+        track_id: "events".into(),
+    };
+    let mut ids = IdGenerator::new();
+    let mut effects = VecDeque::new();
+    let reserve = |session: &mut Session, ids: &mut IdGenerator, effects: &mut VecDeque<Effect>| {
+        payload(
+            session,
+            &resource,
+            crate::TopicChannel::Publisher(crate::TopicPublisher {
+                topic: "events".into(),
+                mode: crate::TopicMode::Ordered,
+            }),
+            None,
+            state::DataV1Delivery::Reliable,
+            ids,
+            effects,
+        )
+        .and_then(|binding| state::DataV1Binding::from_track(&binding))
+    };
+    let Some(state::DataV1Binding::Quic(first)) = reserve(session, &mut ids, &mut effects) else {
+        panic!("QUIC reservation")
+    };
+    assert_eq!(first.binding_id, 1);
+    assert_eq!(
+        reserve(session, &mut ids, &mut effects),
+        Some(state::DataV1Binding::Quic(first))
+    );
+    let previous = session.payload_resources[&resource];
+    assert!(retire_quic_payload(
+        session,
+        &resource,
+        previous,
+        &mut effects
+    ));
+    assert_eq!(
+        effects.pop_front(),
+        Some(Effect::Quic(crate::QuicEffect::RetireData {
+            generation: session.generation,
+            channel: previous,
+        }))
+    );
+    session.reusable_streams.insert(1);
+    let Some(state::DataV1Binding::Quic(second)) = reserve(session, &mut ids, &mut effects) else {
+        panic!("replacement QUIC reservation")
+    };
+    assert_eq!(second.binding_id, 2);
+    assert!(second.incarnation > first.incarnation);
+    assert!(effects.is_empty());
+}
+
+#[test]
 fn active_control_declares_only_prepared_payloads_and_retries_the_exact_serialized_frame() {
     let publisher = crate::TopicPublisher {
         topic: "Literal_name".into(),

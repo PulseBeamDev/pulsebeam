@@ -53,7 +53,7 @@ pub(crate) enum WriteError {
     Sctp(pulsebeam_rtc::WriteError),
 }
 
-pub(crate) type InstalledBinding = Binding<pulsebeam_rtc::DataChannelInstallation>;
+pub(crate) type InstalledBinding<I = pulsebeam_rtc::DataChannelInstallation> = Binding<I>;
 
 pub(crate) struct ReceiverStage {
     pub(crate) source: crate::entity::PublicationKey,
@@ -69,12 +69,159 @@ pub(crate) struct SubscriberLease {
     pub(crate) endpoint: pulsebeam_proto::data_control::SubscriberBinding,
 }
 
-pub(crate) struct PreparedSctp {
-    channel: pulsebeam_proto::data_endpoint::Channel<pulsebeam_rtc::DataChannelInstallation>,
+impl SubscriberLease {
+    pub(crate) fn expectation(
+        self,
+        unit: crate::route::fabric::local::DataExpectation,
+    ) -> pulsebeam_proto::data_control::Expectation {
+        use pulsebeam_proto::data_control::{BranchUnit, Expectation, SourceUnit};
+        Expectation {
+            unit: Some(BranchUnit {
+                source: Some(SourceUnit {
+                    source_incarnation: self.endpoint.source.get(),
+                    unit_seq: Some(unit.unit_seq),
+                }),
+                branch_incarnation: self.endpoint.branch.get(),
+            }),
+            fragment_count: u32::from(unit.fragment_count),
+        }
+    }
+
+    pub(crate) fn repair_outcome(
+        self,
+        request: crate::route::fabric::local::RepairRequest,
+        status: pulsebeam_proto::data_control::RepairStatus,
+    ) -> pulsebeam_proto::data_control::subscriber_observation::Record {
+        use pulsebeam_proto::data_control::{
+            BranchUnit, RepairDemand, RepairOutcome, SourceUnit, subscriber_observation,
+        };
+        subscriber_observation::Record::Repair(RepairOutcome {
+            demand: Some(RepairDemand {
+                unit: Some(BranchUnit {
+                    source: Some(SourceUnit {
+                        source_incarnation: self.endpoint.source.get(),
+                        unit_seq: Some(request.fragment.unit_seq),
+                    }),
+                    branch_incarnation: self.endpoint.branch.get(),
+                }),
+                fragment_index: Some(u32::from(request.fragment.index)),
+                request_id: request.id.get(),
+            }),
+            status: status as i32,
+        })
+    }
+
+    pub(crate) fn observation(
+        self,
+        record: pulsebeam_proto::data_control::subscriber_observation::Record,
+    ) -> Result<pulsebeam_proto::state::NativeDataControl, pulsebeam_proto::data_control::Error>
+    {
+        use pulsebeam_proto::{
+            data_control::{self, SubscriberObservation},
+            state::{NativeDataControl, OwnedDataControl, native_data_control::Endpoint},
+        };
+        let record = data_control::encode(
+            self.endpoint,
+            &SubscriberObservation {
+                record: Some(record),
+            },
+        )?;
+        Ok(NativeDataControl {
+            endpoint: Some(Endpoint::Subscriber(OwnedDataControl {
+                owned: self.owned,
+                record,
+            })),
+        })
+    }
+}
+
+pub(crate) fn publisher_admission_observation(
+    owned: u64,
+    endpoint: PublisherBinding,
+    unit_seq: u64,
+) -> Result<pulsebeam_proto::state::NativeDataControl, pulsebeam_proto::data_control::Error> {
+    use pulsebeam_proto::data_control::{SourceUnit, publisher_observation};
+    publisher_observation(
+        owned,
+        endpoint,
+        publisher_observation::Record::Admission(SourceUnit {
+            source_incarnation: endpoint.source.get(),
+            unit_seq: Some(unit_seq),
+        }),
+    )
+}
+
+pub(crate) fn publisher_observation(
+    owned: u64,
+    endpoint: PublisherBinding,
+    record: pulsebeam_proto::data_control::publisher_observation::Record,
+) -> Result<pulsebeam_proto::state::NativeDataControl, pulsebeam_proto::data_control::Error> {
+    use pulsebeam_proto::{
+        data_control::{self, PublisherObservation},
+        state::{NativeDataControl, OwnedDataControl, native_data_control::Endpoint},
+    };
+    let record = data_control::encode(
+        endpoint,
+        &PublisherObservation {
+            record: Some(record),
+        },
+    )?;
+    Ok(NativeDataControl {
+        endpoint: Some(Endpoint::Publisher(OwnedDataControl { owned, record })),
+    })
+}
+
+pub(crate) fn publisher_delivery_record(
+    endpoint: PublisherBinding,
+    report: crate::route::fabric::local::DeliveryReport,
+) -> pulsebeam_proto::data_control::publisher_observation::Record {
+    use crate::route::fabric::local::DeliveryOutcome;
+    use pulsebeam_proto::data_control::{
+        self, BranchUnit, ControlOutcome, Expectation, SourceUnit, publisher_observation::Record,
+    };
+    let outcome = match report.outcome {
+        DeliveryOutcome::Confirmed => ControlOutcome::Confirmed,
+        DeliveryOutcome::Failed => ControlOutcome::Failed,
+        DeliveryOutcome::Unknown => ControlOutcome::Unknown,
+    };
+    Record::Delivery(data_control::DeliveryOutcome {
+        expectation: Some(Expectation {
+            unit: Some(BranchUnit {
+                source: Some(SourceUnit {
+                    source_incarnation: endpoint.source.get(),
+                    unit_seq: Some(report.unit.unit_seq),
+                }),
+                branch_incarnation: report.branch_incarnation.get(),
+            }),
+            fragment_count: u32::from(report.unit.fragment_count),
+        }),
+        outcome: outcome as i32,
+    })
+}
+
+pub(crate) fn decode_original_unavailable(
+    endpoint: PublisherBinding,
+    bytes: &[u8],
+) -> Option<OriginalDemand> {
+    use pulsebeam_proto::data_control::{
+        self, OriginalUnavailable, PublisherControl, publisher_control::Record,
+    };
+    match data_control::decode::<PublisherControl>(endpoint, bytes)
+        .ok()?
+        .record?
+    {
+        Record::Unavailable(OriginalUnavailable { demand }) => demand,
+    }
+}
+
+pub(crate) type PreparedSctp = PreparedBinding<pulsebeam_rtc::DataChannelInstallation>;
+
+pub(crate) struct PreparedBinding<I> {
+    channel: pulsebeam_proto::data_endpoint::Channel<I>,
     format: pulsebeam_proto::data_endpoint::Format,
 }
 
-impl PreparedSctp {
+impl PreparedBinding<pulsebeam_rtc::DataChannelInstallation> {
     pub(crate) fn from_negotiation(
         parameters: pulsebeam_proto::state::SctpDataV1Parameters,
         installation: pulsebeam_rtc::DataChannelInstallation,
@@ -93,8 +240,10 @@ impl PreparedSctp {
             format: parameters.format()?,
         })
     }
+}
 
-    pub(crate) fn bind(self, endpoint: Endpoint) -> InstalledBinding {
+impl<I> PreparedBinding<I> {
+    pub(crate) fn bind(self, endpoint: Endpoint) -> InstalledBinding<I> {
         Binding {
             channel: self.channel,
             format: self.format,
@@ -196,12 +345,12 @@ impl Lease {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct ReliableAdmission {
+pub(crate) struct ReliableAdmission<I = pulsebeam_rtc::DataChannelInstallation> {
     pub(crate) unit: crate::route::fabric::local::DataExpectation,
     pub(crate) expires: Instant,
     pub(crate) acknowledge: bool,
     pub(crate) fragment_index: u16,
-    pub(crate) installation: pulsebeam_rtc::DataChannelInstallation,
+    pub(crate) installation: I,
 }
 
 pub(super) struct Input {
@@ -212,11 +361,11 @@ pub(super) struct Input {
 
 mod clock_exchange;
 
-pub(crate) struct PublisherSource {
+pub(crate) struct PublisherSource<I = pulsebeam_rtc::DataChannelInstallation> {
     source: crate::shard::router::FabricSourceHandle,
     incarnation: core::num::NonZeroU64,
     exchange: clock_exchange::Exchange,
-    installation: pulsebeam_rtc::DataChannelInstallation,
+    installation: I,
     reliable_endpoint: Option<PublisherBinding>,
     ledger: Source,
 }
@@ -251,14 +400,63 @@ impl PublisherSource {
             return None;
         };
         let input = Input::from_publisher(source, binding)?;
-        Some(Self {
+        Some(Self::with_installation(
             source,
-            incarnation: endpoint.source,
+            endpoint.source,
+            input.installation,
+            input.reliable_endpoint,
+            clock,
+        ))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct QuicInstallation {
+    pub(crate) association: core::num::NonZeroU64,
+    pub(crate) binding: pulsebeam_agent_quic::data_bindings::DataBinding,
+}
+
+impl PublisherSource<QuicInstallation> {
+    pub(crate) fn association(&self) -> core::num::NonZeroU64 {
+        self.installation.association
+    }
+
+    pub(crate) fn reliable(&self) -> bool {
+        self.reliable_endpoint.is_some()
+    }
+
+    pub(crate) fn installed_quic(
+        source: crate::shard::router::FabricSourceHandle,
+        installation: QuicInstallation,
+        endpoint: PublisherBinding,
+        clock: Option<Clock<'_>>,
+    ) -> Self {
+        Self::with_installation(
+            source,
+            endpoint.source,
+            installation,
+            (installation.binding.format.delivery() == Delivery::Reliable).then_some(endpoint),
+            clock,
+        )
+    }
+}
+
+impl<I: Copy + Eq> PublisherSource<I> {
+    fn with_installation(
+        source: crate::shard::router::FabricSourceHandle,
+        incarnation: core::num::NonZeroU64,
+        installation: I,
+        reliable_endpoint: Option<PublisherBinding>,
+        clock: Option<Clock<'_>>,
+    ) -> Self {
+        Self {
+            source,
+            incarnation,
             exchange: Default::default(),
-            installation: input.installation,
-            reliable_endpoint: input.reliable_endpoint,
+            installation,
+            reliable_endpoint,
             ledger: Source::new(clock),
-        })
+        }
     }
 
     pub(crate) fn expiry(&self) -> Option<Instant> {
@@ -269,7 +467,7 @@ impl PublisherSource {
         self.ledger.expire(fanout, now);
     }
 
-    pub(crate) fn matches(&self, installation: pulsebeam_rtc::DataChannelInstallation) -> bool {
+    pub(crate) fn matches(&self, installation: I) -> bool {
         self.installation == installation
     }
 
@@ -329,25 +527,15 @@ impl PublisherSource {
             .install_capture_reference(clock, domain, origin, host_generation)
     }
 
-    pub(crate) fn publish(
+    fn admit(
         &mut self,
         fanout: &mut SourceFanout,
         bytes: &[u8],
         now: Instant,
         time: DataTime,
-    ) -> Result<super::event::FabricDataPosition, Error> {
-        // Protected SCTP DD is not qualified for this binding.
+    ) -> Result<super::event::FabricDataPosition<I>, Error> {
+        // Protected DATA DD is not qualified for this binding.
         let admission = self.ledger.admit_record(fanout, bytes, now, time, false)?;
-        #[cfg(feature = "sim")]
-        if let Some(endpoint) = self.reliable_endpoint {
-            crate::sim_metrics::record_wan_data_sctp(
-                endpoint.source.get(),
-                admission.unit.unit_seq,
-                admission.index,
-                bytes,
-                true,
-            );
-        }
         Ok(super::event::FabricDataPosition {
             source: self.source,
             installation: self.installation,
@@ -364,6 +552,41 @@ impl PublisherSource {
                 installation: self.installation,
             }),
         })
+    }
+}
+
+impl PublisherSource {
+    pub(crate) fn publish(
+        &mut self,
+        fanout: &mut SourceFanout,
+        bytes: &[u8],
+        now: Instant,
+        time: DataTime,
+    ) -> Result<super::event::FabricDataPosition, Error> {
+        let position = self.admit(fanout, bytes, now, time)?;
+        #[cfg(feature = "sim")]
+        if let (Some(endpoint), Some(admission)) = (self.reliable_endpoint, position.reliable) {
+            crate::sim_metrics::record_wan_data_sctp(
+                endpoint.source.get(),
+                admission.unit.unit_seq,
+                admission.fragment_index,
+                bytes,
+                true,
+            );
+        }
+        Ok(position)
+    }
+}
+
+impl PublisherSource<QuicInstallation> {
+    pub(crate) fn publish_quic(
+        &mut self,
+        fanout: &mut SourceFanout,
+        bytes: &[u8],
+        now: Instant,
+        time: DataTime,
+    ) -> Result<super::event::FabricDataPosition<QuicInstallation>, Error> {
+        self.admit(fanout, bytes, now, time)
     }
 }
 
@@ -1015,7 +1238,7 @@ fn packet_descriptor<P: AsRef<[u8]>, E: AsRef<[u8]>>(packet: &FabricPacket<P, E>
         .map(|ext| ext.value)
 }
 
-fn project_sctp_record<'data, 'clock>(
+pub(crate) fn project_sctp_record<'data, 'clock>(
     packet: &'data FabricPacket<impl AsRef<[u8]>, impl AsRef<[u8]>>,
     clock: Option<Clock<'clock>>,
     repair: Option<crate::route::fabric::local::RepairFragment>,

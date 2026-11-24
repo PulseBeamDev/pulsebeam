@@ -353,7 +353,15 @@ fn data_v1_publication_keeps_its_exact_transport_in_the_execution_plan() {
         channel_incarnation: u64::MAX,
         delivery: wire::DataV1Delivery::Unreliable as i32,
     };
-    let spec = |delivery: wire::DataDelivery| {
+    let sctp = wire::track_binding::Transport::SctpDataV1(parameters);
+    let quic_parameters = wire::QuicDataV1Parameters {
+        binding_id: 1,
+        version,
+        incarnation: u64::MAX,
+        delivery: wire::DataV1Delivery::Unreliable as i32,
+    };
+    let quic = wire::track_binding::Transport::QuicDataV1(quic_parameters);
+    let spec = |delivery: wire::DataDelivery, transport| {
         let mut spec = publication("events", true);
         let Some(wire::resource_spec::Declaration::Publication(publication)) =
             &mut spec.declaration
@@ -365,32 +373,53 @@ fn data_v1_publication_keeps_its_exact_transport_in_the_execution_plan() {
         };
         data.delivery = delivery as i32;
         data.binding = Some(wire::TrackBinding {
-            transport: Some(wire::track_binding::Transport::SctpDataV1(parameters)),
+            transport: Some(transport),
         });
         spec
     };
     let Some((Publication::Data(data), _)) =
-        crate::control::native::publication(&spec(wire::DataDelivery::Lossy), None).unwrap()
+        crate::control::native::publication(&spec(wire::DataDelivery::Lossy, sctp.clone()), None)
+            .unwrap()
     else {
         panic!("DATA execution plan")
     };
-    assert!(data.parameters == parameters);
+    assert_eq!(data.parameters, wire::DataV1Binding::Sctp(parameters));
     assert!(matches!(
-        crate::control::native::publication(&spec(wire::DataDelivery::Latest), None),
+        crate::control::native::publication(&spec(wire::DataDelivery::Latest, sctp.clone()), None),
         Err(wire::FailureCode::InvalidConfiguration)
     ));
 
     let mut session = session();
     input(
         &mut session,
-        vec![present(1, 1, spec(wire::DataDelivery::Lossy))],
+        vec![present(1, 1, spec(wire::DataDelivery::Lossy, sctp))],
     )
     .unwrap();
     let work = session.take_preparation().unwrap().unwrap();
     assert!(
         matches!(session.compile_execution(&work, None, |_| None).unwrap().into_action(),
         ExecutionAction::Prepare { resource: crate::control::native::PreparedResource::Publication(Publication::Data(data)), .. }
-            if data.parameters == parameters)
+            if data.parameters == wire::DataV1Binding::Sctp(parameters))
+    );
+
+    let mut model = NativeSession::with_binding_profile(validation::BindingProfile::Quic);
+    model
+        .authorization(900, 1, ResourcePermissions::RoomBound)
+        .unwrap();
+    model.set_cid(
+        ChannelId::from_value(0),
+        pulsebeam_runtime::time::Instant::now(),
+    );
+    input(
+        &mut model,
+        vec![present(1, 1, spec(wire::DataDelivery::Lossy, quic))],
+    )
+    .unwrap();
+    let work = model.take_preparation().unwrap().unwrap();
+    assert!(
+        matches!(model.compile_execution(&work, None, |_| None).unwrap().into_action(),
+        ExecutionAction::Prepare { resource: crate::control::native::PreparedResource::Publication(Publication::Data(data)), .. }
+            if data.parameters == wire::DataV1Binding::Quic(quic_parameters))
     );
 }
 
@@ -2476,7 +2505,11 @@ fn fabric_receiver_offers_are_versioned_and_rotate_with_the_authenticated_source
     assert_eq!(offer(&mut model, &legacy), (3, None));
     assert_eq!(offer(&mut model, &first), (4, Some((10, 3))));
     let mut other_subscriber = session();
-    input(&mut other_subscriber, vec![present(1, 1, subscription)]).unwrap();
+    input(
+        &mut other_subscriber,
+        vec![present(1, 1, subscription.clone())],
+    )
+    .unwrap();
     assert_eq!(offer(&mut other_subscriber, &first), (1, Some((10, 4))));
     assert_eq!(offer(&mut model, &first), (4, Some((10, 3))));
 
@@ -2486,7 +2519,7 @@ fn fabric_receiver_offers_are_versioned_and_rotate_with_the_authenticated_source
         channel_incarnation: 19,
         delivery: wire::DataV1Delivery::Latest as i32,
     };
-    let report = wire::ClientStateBatch {
+    let report = |source_revision, transport| wire::ClientStateBatch {
         records: vec![wire::ClientStateRecord {
             owned: 1,
             desired: None,
@@ -2494,12 +2527,10 @@ fn fabric_receiver_offers_are_versioned_and_rotate_with_the_authenticated_source
                 revision: 2,
                 outcome: Some(wire::execution_report::Outcome::LogicalReceiver(
                     wire::LogicalReceiverReport {
-                        source_revision: 4,
+                        source_revision,
                         outcome: Some(wire::logical_receiver_report::Outcome::Prepared(
                             wire::TrackBinding {
-                                transport: Some(wire::track_binding::Transport::SctpDataV1(
-                                    parameters,
-                                )),
+                                transport: Some(transport),
                             },
                         )),
                     },
@@ -2510,7 +2541,14 @@ fn fabric_receiver_offers_are_versioned_and_rotate_with_the_authenticated_source
     };
     assert!(
         model
-            .receive_input(&codec::encode_client(&report).unwrap(), 100)
+            .receive_input(
+                &codec::encode_client(&report(
+                    4,
+                    wire::track_binding::Transport::SctpDataV1(parameters)
+                ))
+                .unwrap(),
+                100
+            )
             .unwrap()
             .is_empty()
     );
@@ -2542,6 +2580,53 @@ fn fabric_receiver_offers_are_versioned_and_rotate_with_the_authenticated_source
     assert_eq!(fabric.parameters, parameters);
     assert_eq!(fabric.endpoint.source.get(), 10);
     assert_eq!(fabric.endpoint.branch.get(), 3);
+
+    let mut quic = NativeSession::with_binding_profile(validation::BindingProfile::Quic);
+    quic.authorization(900, 1, ResourcePermissions::RoomBound)
+        .unwrap();
+    quic.set_cid(
+        ChannelId::from_value(0),
+        pulsebeam_runtime::time::Instant::now(),
+    );
+    input(&mut quic, vec![present(1, 1, subscription)]).unwrap();
+    assert_eq!(offer(&mut quic, &first), (1, Some((10, 5))));
+    let parameters = wire::QuicDataV1Parameters {
+        binding_id: 2,
+        version: u32::from(pulsebeam_proto::data_endpoint::DATA_V1),
+        incarnation: 19,
+        delivery: wire::DataV1Delivery::Latest as i32,
+    };
+    quic.receive_input(
+        &codec::encode_quic_client(&report(
+            1,
+            wire::track_binding::Transport::QuicDataV1(parameters),
+        ))
+        .unwrap(),
+        100,
+    )
+    .unwrap();
+    let work = quic.take_preparation().unwrap().unwrap();
+    let ExecutionAction::Prepare {
+        resource: PreparedResource::Receiver(ReceiverPreparation::Ready(plan)),
+        ..
+    } = quic
+        .compile_execution(&work, None, |_| {
+            Some(super::super::ResolvedSource {
+                track: &first,
+                publisher: &publisher,
+            })
+        })
+        .unwrap()
+        .into_action()
+    else {
+        panic!("QUIC receiver preparation")
+    };
+    let ReceiveTransport::QuicData(fabric) = plan.transport else {
+        panic!("QUIC DATA receiver")
+    };
+    assert_eq!(fabric.parameters, parameters);
+    assert_eq!(fabric.endpoint.source.get(), 10);
+    assert_eq!(fabric.endpoint.branch.get(), 5);
 }
 
 #[test]

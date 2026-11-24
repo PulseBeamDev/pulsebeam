@@ -1170,6 +1170,334 @@ fn packet(sequence: u32) -> OwnedPacket {
 }
 
 #[test]
+fn quic_data_ingress_fences_owner_association_and_binding_before_admission() {
+    use crate::participant::data_fabric::{Error, QuicInstallation, r3_record};
+    use pulsebeam_agent_quic::data_bindings::DataBinding;
+    use pulsebeam_proto::state::{DataV1Delivery, QuicDataV1Parameters};
+    use std::num::NonZeroU64;
+
+    let _rng = pulsebeam_runtime::rand::seeded_rng(1);
+    let now = Instant::now();
+    let mut execution = ShardExecution::new(
+        ShardId::new(0),
+        8,
+        1,
+        WallAnchor::new(std::time::SystemTime::UNIX_EPOCH, now),
+    );
+    let connection = ConnectionId::new();
+    let transport =
+        NodeTransportAddress::new(crate::route::TransportRoute::new(ShardId::new(0), 7), 1);
+    assert!(execution.registry.insert_quic(
+        connection,
+        transport,
+        NonZeroU64::MIN,
+        crate::shard::participants::QuicGrant {
+            revision: 1,
+            expiry: pulsebeam_core::auth::AuthorizationExpiry::from_unix_seconds(100)
+        },
+    ));
+    let publisher = execution.registry.resolve_connection(connection).unwrap();
+    let subscriber_connection = ConnectionId::new();
+    let subscriber_transport =
+        NodeTransportAddress::new(TransportRoute::new(ShardId::new(0), 8), 1);
+    assert!(execution.registry.insert_quic(
+        subscriber_connection,
+        subscriber_transport,
+        NonZeroU64::new(2).unwrap(),
+        crate::shard::participants::QuicGrant {
+            revision: 1,
+            expiry: pulsebeam_core::auth::AuthorizationExpiry::from_unix_seconds(100)
+        },
+    ));
+    let other = execution
+        .registry
+        .resolve_connection(subscriber_connection)
+        .unwrap();
+    let publication = connection.fixture_publication(TrackKind::Data, "quic-data");
+    let track = execution
+        .runtime
+        .install_track(publication, None, Some(publisher), None);
+    let source = execution
+        .runtime
+        .install_fabric_source(track, publisher, Emission::DATA, None, None)
+        .unwrap();
+    let installation = QuicInstallation {
+        association: NonZeroU64::MIN,
+        binding: DataBinding::from_parameters(QuicDataV1Parameters {
+            binding_id: 7,
+            version: 1,
+            incarnation: 1,
+            delivery: DataV1Delivery::Reliable as i32,
+        })
+        .unwrap(),
+    };
+    let wrong_association = QuicInstallation {
+        association: NonZeroU64::new(2).unwrap(),
+        ..installation
+    };
+    let wrong_incarnation = QuicInstallation {
+        binding: DataBinding {
+            incarnation: NonZeroU64::new(2).unwrap(),
+            ..installation.binding
+        },
+        ..installation
+    };
+    assert!(
+        !execution
+            .runtime
+            .bind_quic_data_publisher(source, other, installation, None)
+    );
+    assert!(
+        execution
+            .runtime
+            .bind_quic_data_publisher(source, publisher, installation, None)
+    );
+    assert!(execution.fabric_publisher_authorized(publisher, source));
+    let branch = execution
+        .runtime
+        .install_fabric_branch(
+            track,
+            source,
+            other,
+            Emission::DATA,
+            &crate::shard::router::InstalledTrackPlan {
+                local: vec![other],
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+    let lease = crate::participant::data_fabric::SubscriberLease {
+        owned: 1,
+        branch,
+        endpoint: pulsebeam_proto::data_control::SubscriberBinding {
+            source: execution.runtime.fabric_incarnation(source).unwrap(),
+            branch: NonZeroU64::new(11).unwrap(),
+        },
+    };
+    assert!(execution.registry.bind_quic_data_receiver(other, lease));
+    assert_eq!(
+        execution
+            .registry
+            .reliable_receiver(other, branch, Some(99)),
+        Some(lease)
+    );
+    assert!(
+        execution
+            .registry
+            .reliable_receiver(other, branch, Some(100))
+            .is_none()
+    );
+    assert!(
+        execution
+            .registry
+            .reliable_receiver(publisher, branch, Some(99))
+            .is_none()
+    );
+    let unit = crate::route::fabric::local::DataExpectation {
+        unit_seq: 3,
+        fragment_count: 1,
+    };
+    let receipt = pulsebeam_proto::data_control::SubscriberControl {
+        record: Some(
+            pulsebeam_proto::data_control::subscriber_control::Record::AssemblyReceipt(
+                lease.expectation(unit),
+            ),
+        ),
+    };
+    let bytes = pulsebeam_proto::data_control::encode(lease.endpoint, &receipt).unwrap();
+    assert!(
+        matches!(crate::participant::event::FabricSubscriberFeedback::decode(lease, &bytes),
+        Some(feedback) if matches!(feedback.kind, crate::participant::event::FabricFeedbackKind::Assembled(received) if received == unit))
+    );
+    let stale = crate::participant::data_fabric::SubscriberLease {
+        endpoint: pulsebeam_proto::data_control::SubscriberBinding {
+            branch: NonZeroU64::MIN,
+            ..lease.endpoint
+        },
+        ..lease
+    };
+    assert!(crate::participant::event::FabricSubscriberFeedback::decode(stale, &bytes).is_none());
+    let request = crate::route::fabric::local::RepairRequest {
+        id: NonZeroU64::MIN,
+        fragment: crate::route::fabric::local::RepairFragment {
+            unit_seq: unit.unit_seq,
+            index: 0,
+        },
+    };
+    let status = pulsebeam_proto::data_control::RepairStatus::HandedOff;
+    execution.report_fabric_repair(other, lease, request, status);
+    assert!(execution.quic_data_ready);
+    assert_eq!(
+        execution.registry.pop_quic_subscriber_control(other),
+        Some((lease, lease.repair_outcome(request, status)))
+    );
+    let record = pulsebeam_proto::data_control::subscriber_observation::Record::Expectation(
+        lease.expectation(unit),
+    );
+    for _ in 0..64 {
+        assert!(
+            execution
+                .registry
+                .enqueue_quic_subscriber_control(other, lease, record.clone())
+        );
+    }
+    assert!(
+        !execution
+            .registry
+            .enqueue_quic_subscriber_control(other, lease, record.clone())
+    );
+    assert_eq!(
+        execution.registry.pop_quic_subscriber_control(other),
+        Some((lease, record))
+    );
+    execution.registry.unbind_quic_data_receiver(other, branch);
+    assert!(
+        execution
+            .registry
+            .pop_quic_subscriber_control(other)
+            .is_none()
+    );
+    assert!(
+        execution
+            .registry
+            .reliable_receiver(other, branch, Some(99))
+            .is_none()
+    );
+    for (owner, candidate) in [
+        (other, installation),
+        (publisher, wrong_association),
+        (publisher, wrong_incarnation),
+    ] {
+        assert!(matches!(
+            execution
+                .runtime
+                .admit_quic_data(source, owner, candidate, &[], now, 0),
+            Err(Error::Fenced)
+        ));
+    }
+    let packet = r3_record();
+    let admitted = execution
+        .runtime
+        .admit_quic_data(source, publisher, installation, &packet, now, 0)
+        .unwrap();
+    assert_eq!(admitted.installation, installation);
+    let reliable = admitted.reliable.unwrap();
+    assert_eq!(reliable.installation, installation);
+    assert_eq!(reliable.unit.unit_seq, 3);
+    assert_eq!(
+        execution
+            .runtime
+            .request_quic_data_original(source, publisher, request.fragment, now),
+        crate::participant::data_fabric::OriginalResolution::Cached {
+            sequence: admitted.sequence,
+            expires: reliable.expires
+        }
+    );
+    assert_eq!(
+        execution
+            .runtime
+            .request_quic_data_original(source, other, request.fragment, now),
+        crate::participant::data_fabric::OriginalResolution::Revoked
+    );
+    assert_eq!(
+        execution.runtime.request_quic_data_original(
+            source,
+            publisher,
+            request.fragment,
+            reliable.expires
+        ),
+        crate::participant::data_fabric::OriginalResolution::Unavailable
+    );
+    let missing = crate::route::fabric::local::RepairFragment {
+        index: 1,
+        ..request.fragment
+    };
+    let crate::participant::data_fabric::OriginalResolution::Request(demand) = execution
+        .runtime
+        .request_quic_data_original(source, publisher, missing, now)
+    else {
+        panic!("missing original request")
+    };
+    assert!(
+        !execution
+            .runtime
+            .settle_quic_original_unavailable(source, other, demand, now)
+    );
+    let stale = pulsebeam_proto::data_control::OriginalDemand {
+        request_id: demand.request_id + 1,
+        ..demand
+    };
+    assert!(
+        !execution
+            .runtime
+            .settle_quic_original_unavailable(source, publisher, stale, now)
+    );
+    assert!(
+        execution
+            .runtime
+            .settle_quic_original_unavailable(source, publisher, demand, now)
+    );
+    assert_eq!(
+        execution
+            .runtime
+            .request_quic_data_original(source, publisher, missing, now),
+        crate::participant::data_fabric::OriginalResolution::Unavailable
+    );
+    assert!(!execution.runtime.accept_quic_data_expectation(
+        source,
+        other,
+        reliable,
+        now,
+        |_, _| None
+    ));
+    assert!(!execution.runtime.accept_quic_data_expectation(
+        source,
+        publisher,
+        reliable,
+        reliable.expires,
+        |_, _| None
+    ));
+    assert!(execution.runtime.accept_quic_data_expectation(
+        source,
+        publisher,
+        reliable,
+        now,
+        |_, _| None
+    ));
+    assert!(matches!(
+        execution
+            .runtime
+            .offer_quic_fabric_data(other, now, &admitted),
+        Err(crate::route::fabric::local::Rejection::Binding)
+    ));
+    execution
+        .runtime
+        .offer_quic_fabric_data(publisher, now, &admitted)
+        .unwrap();
+    execution
+        .wall
+        .observe_execution(pulsebeam_runtime::net::ReceiveTime {
+            wall: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(100),
+            monotonic: now,
+        });
+    assert!(!execution.fabric_publisher_authorized(publisher, source));
+    assert!(execution.runtime.retire_fabric_source(source));
+    assert!(matches!(
+        execution
+            .runtime
+            .offer_quic_fabric_data(publisher, now, &admitted),
+        Err(crate::route::fabric::local::Rejection::Binding)
+    ));
+    assert!(matches!(
+        execution
+            .runtime
+            .admit_quic_data(source, publisher, installation, &packet, now, 0),
+        Err(Error::Fenced)
+    ));
+}
+
+#[test]
 fn opus_anchor_samples_only_the_exact_live_publisher_emission() {
     use crate::shard_update::PublisherAnchor;
     let _rng = pulsebeam_runtime::rand::seeded_rng(1);

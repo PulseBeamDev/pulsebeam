@@ -105,6 +105,7 @@ pub(crate) struct ShardExecution {
     dirty: DirtyTracker,
     udp_send_batch: GsoSendBatch,
     pipeline: EventPipeline,
+    quic_data_ready: bool,
     wall: WallAnchor,
     global_clock: Option<crate::clock::reference::ShardClock>,
 }
@@ -128,6 +129,390 @@ impl ShardCore {
         match &mut self.execution.global_clock {
             Some(clock) => clock.update(snapshot),
             clock @ None => *clock = Some(crate::clock::reference::ShardClock::new(snapshot)),
+        }
+    }
+
+    pub(super) fn register_quic_owner(
+        &mut self,
+        connection: crate::entity::ConnectionId,
+        transport: crate::route::NodeTransportAddress,
+        association: std::num::NonZeroU64,
+        grant: super::participants::QuicGrant,
+    ) -> bool {
+        self.execution
+            .registry
+            .insert_quic(connection, transport, association, grant)
+    }
+
+    pub(super) fn update_quic_grant(
+        &mut self,
+        connection: crate::entity::ConnectionId,
+        revision: u64,
+        expiry: Option<i64>,
+    ) {
+        if let Some(expiry) = expiry.and_then(|expiry| u64::try_from(expiry).ok()) {
+            self.execution.registry.update_quic_grant(
+                connection,
+                super::participants::QuicGrant {
+                    revision,
+                    expiry: pulsebeam_core::auth::AuthorizationExpiry::from_unix_seconds(expiry),
+                },
+            );
+        }
+    }
+
+    pub(super) fn retire_quic_owner(
+        &mut self,
+        connection: crate::entity::ConnectionId,
+        transport: crate::route::NodeTransportAddress,
+        association: std::num::NonZeroU64,
+    ) {
+        self.execution
+            .registry
+            .retire_quic(connection, transport, association);
+    }
+
+    pub(super) fn quic_owner_handle(
+        &self,
+        transport: crate::route::NodeTransportAddress,
+    ) -> Option<ParticipantHandle> {
+        self.execution.registry.resolve_transport(transport)
+    }
+
+    pub(super) fn install_quic_data_source(
+        &mut self,
+        publisher: ParticipantHandle,
+        publication: crate::entity::PublicationKey,
+        installation: crate::participant::data_fabric::QuicInstallation,
+        clock: Option<pulsebeam_proto::data_record::Clock<'_>>,
+    ) -> Option<(FabricSourceHandle, std::num::NonZeroU64)> {
+        let runtime = &mut self.execution.runtime;
+        if runtime.track_handle(publication).is_some() {
+            return None;
+        }
+        let track = runtime.install_track(publication, None, Some(publisher), None);
+        let result = (|| {
+            let source =
+                runtime.install_fabric_source(track, publisher, Emission::DATA, None, None)?;
+            let incarnation = runtime.fabric_incarnation(source)?;
+            runtime
+                .bind_quic_data_publisher(source, publisher, installation, clock)
+                .then_some((source, incarnation))
+        })();
+        if result.is_none() {
+            runtime.retire_track(publication);
+        }
+        result
+    }
+
+    pub(super) fn retire_quic_data_source(&mut self, publication: crate::entity::PublicationKey) {
+        self.execution.runtime.retire_track(publication);
+    }
+
+    pub(super) fn ingest_quic_data(
+        &mut self,
+        source: FabricSourceHandle,
+        publisher: ParticipantHandle,
+        installation: crate::participant::data_fabric::QuicInstallation,
+        bytes: &[u8],
+        now: Instant,
+    ) -> Option<u64> {
+        let execution = &mut self.execution;
+        if !execution.fabric_publisher_authorized(publisher, source) {
+            return None;
+        }
+        let data_time = crate::participant::data_fabric::DataTime::from_reference(
+            execution.global_clock.as_mut().and_then(|clock| clock.now(now)),
+        );
+        let position = execution
+            .runtime
+            .admit_quic_data(source, publisher, installation, bytes, now, data_time)
+            .ok()?;
+        if let Some(admission) = position.reliable {
+            let unix_now = execution.fabric_unix_time();
+            let registry = &execution.registry;
+            if !execution.runtime.accept_quic_data_expectation(
+                source,
+                publisher,
+                admission,
+                now,
+                |branch, destination| {
+                    registry
+                        .reliable_receiver(destination, branch, unix_now)
+                        .map(|lease| lease.endpoint.branch)
+                },
+            ) {
+                return None;
+            }
+        }
+        if let Ok(report) = execution
+            .runtime
+            .offer_quic_fabric_data(publisher, now, &position)
+        {
+            execution.drain_after_data_offer(
+                now,
+                source,
+                position.sequence,
+                position.reliable,
+                &report,
+            );
+        }
+        position
+            .reliable
+            .filter(|admission| admission.acknowledge)
+            .map(|admission| admission.unit.unit_seq)
+    }
+
+    pub(super) fn take_quic_data_ready(&mut self) -> bool {
+        std::mem::take(&mut self.execution.quic_data_ready)
+    }
+
+    pub(super) fn pop_quic_publisher_control(
+        &mut self,
+        publisher: ParticipantHandle,
+    ) -> Option<(
+        FabricSourceHandle,
+        pulsebeam_proto::data_control::publisher_observation::Record,
+    )> {
+        let execution = &mut self.execution;
+        while let Some((source, record)) = execution.registry.pop_quic_publisher_control(publisher)
+        {
+            if execution.fabric_publisher_authorized(publisher, source) {
+                return Some((source, record));
+            }
+        }
+        None
+    }
+
+    pub(super) fn settle_quic_original_unavailable(
+        &mut self,
+        source: FabricSourceHandle,
+        publisher: ParticipantHandle,
+        demand: pulsebeam_proto::data_control::OriginalDemand,
+        now: Instant,
+    ) {
+        let execution = &mut self.execution;
+        if execution.fabric_publisher_authorized(publisher, source) {
+            execution
+                .runtime
+                .settle_quic_original_unavailable(source, publisher, demand, now);
+        }
+    }
+
+    pub(super) fn take_quic_subscriber_control(
+        &mut self,
+        receiver: ParticipantHandle,
+    ) -> Option<Vec<u8>> {
+        use crate::shard::router::FabricOwner;
+        use pulsebeam_proto::state::codec;
+        let execution = &mut self.execution;
+        let unix_now = execution.fabric_unix_time();
+        while let Some((lease, record)) = execution.registry.pop_quic_subscriber_control(receiver) {
+            if execution
+                .registry
+                .reliable_receiver(receiver, lease.branch, unix_now)
+                != Some(lease)
+            {
+                continue;
+            }
+            let authorized = match execution
+                .runtime
+                .fabric_handoff_owner(lease.branch, receiver)
+            {
+                Some(FabricOwner::Local(publisher)) => {
+                    execution.fabric_publisher_authorized(publisher, lease.branch.source())
+                }
+                Some(FabricOwner::Shard(_) | FabricOwner::Network) => true,
+                None => false,
+            };
+            if authorized
+                && let Ok(frame) = lease.observation(record)
+                && let Ok(bytes) = codec::encode_data_control(&frame)
+            {
+                return Some(bytes);
+            }
+        }
+        None
+    }
+
+    pub(super) fn install_quic_data_branch(
+        &mut self,
+        receiver: ParticipantHandle,
+        publication: crate::entity::PublicationKey,
+        endpoint: pulsebeam_proto::data_control::SubscriberBinding,
+        reliable_receiver: Option<(u64, u64)>,
+    ) -> Option<FabricLocalBranch> {
+        let execution = &mut self.execution;
+        let track = execution.runtime.track_handle(publication)?;
+        let source = execution.runtime.fabric_source_for_track(track)?;
+        let authorized = match execution.runtime.source_origin(track) {
+            Some(publisher) => execution.fabric_publisher_authorized(publisher, source),
+            None => execution.runtime.is_shard_fabric_source(source),
+        };
+        if execution.runtime.fabric_incarnation(source) != Some(endpoint.source) || !authorized {
+            return None;
+        }
+        let branch = execution.runtime.install_fabric_branch(
+            track,
+            source,
+            receiver,
+            Emission::DATA,
+            execution.plans.get(track)?,
+            None,
+        )?;
+        if let Some((reference, owned)) = reliable_receiver {
+            if !execution.registry.bind_quic_data_receiver(
+                receiver,
+                crate::participant::data_fabric::SubscriberLease {
+                    owned,
+                    branch,
+                    endpoint,
+                },
+            ) {
+                execution.runtime.retire_fabric_branch(branch, receiver);
+                return None;
+            }
+            execution.announce_shard_data_receiver(receiver, branch, reference);
+        }
+        Some(branch)
+    }
+
+    pub(super) fn retire_quic_data_branch(
+        &mut self,
+        branch: FabricLocalBranch,
+        receiver: ParticipantHandle,
+    ) {
+        self.execution
+            .registry
+            .unbind_quic_data_receiver(receiver, branch);
+        self.execution
+            .runtime
+            .retire_fabric_branch(branch, receiver);
+    }
+
+    pub(super) fn admit_quic_receiver_data(
+        &mut self,
+        branch: FabricLocalBranch,
+        receiver: ParticipantHandle,
+        now: Instant,
+        reliable: bool,
+        write: impl FnOnce(
+            crate::route::fabric::local::PacketView<'_>,
+            Option<crate::route::fabric::local::RepairFragment>,
+        ) -> crate::route::fabric::local::DataWrite,
+    ) -> bool {
+        use crate::{route::fabric::local::DataWrite, shard::router::FabricOwner};
+        let execution = &mut self.execution;
+        let publication = match execution.runtime.fabric_handoff_owner(branch, receiver) {
+            Some(FabricOwner::Local(publisher))
+                if execution.fabric_publisher_authorized(publisher, branch.source()) =>
+            {
+                execution
+                    .runtime
+                    .local_fabric_publication(branch.source(), publisher)
+            }
+            Some(FabricOwner::Shard(binding)) => Some(binding.publication),
+            _ => None,
+        };
+        let member = publication
+            .and_then(|publication| execution.runtime.track_handle(publication))
+            .and_then(|track| execution.plans.get(track))
+            .is_some_and(|plan| plan.local.contains(&receiver));
+        if !member {
+            return false;
+        }
+        let lease = if reliable {
+            let Some(lease) = execution.registry.reliable_receiver(
+                receiver,
+                branch,
+                execution.fabric_unix_time(),
+            ) else {
+                return false;
+            };
+            Some(lease)
+        } else {
+            None
+        };
+        let current = lease.map(|lease| lease.endpoint.branch);
+        let mut had_repair = false;
+        let Some(handoff) = execution.runtime.admit_fabric_data(
+            branch,
+            receiver,
+            now,
+            current,
+            |_, packet, repair| {
+                had_repair = repair.is_some();
+                if had_repair && !reliable {
+                    DataWrite::Rejected
+                } else {
+                    write(packet, repair.map(|repair| repair.fragment))
+                }
+            },
+        ) else {
+            return false;
+        };
+        if let Some((request, lease)) = handoff.completed.zip(lease) {
+            execution.report_fabric_repair(
+                receiver,
+                lease,
+                request,
+                pulsebeam_proto::data_control::RepairStatus::HandedOff,
+            );
+        }
+        handoff.written || !had_repair
+    }
+
+    pub(super) fn current_quic_grant(
+        &self,
+        connection: crate::entity::ConnectionId,
+        transport: crate::route::NodeTransportAddress,
+        association: std::num::NonZeroU64,
+    ) -> Option<(super::participants::QuicGrant, u64)> {
+        let unix_now = self
+            .execution
+            .wall
+            .execution_time()
+            .wall
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs();
+        let grant =
+            self.execution
+                .registry
+                .quic_grant(connection, transport, association, unix_now)?;
+        Some((grant, unix_now))
+    }
+
+    pub(super) fn receive_quic_data_control(
+        &mut self,
+        connection: crate::entity::ConnectionId,
+        transport: crate::route::NodeTransportAddress,
+        association: std::num::NonZeroU64,
+        frame: pulsebeam_proto::state::NativeDataControl,
+        now: Instant,
+    ) {
+        if self
+            .current_quic_grant(connection, transport, association)
+            .is_none()
+        {
+            return;
+        }
+        let execution = &mut self.execution;
+        let Some(key) = execution.registry.resolve_transport(transport) else {
+            return;
+        };
+        let Some(pulsebeam_proto::state::native_data_control::Endpoint::Subscriber(frame)) =
+            frame.endpoint
+        else {
+            return;
+        };
+        let Some(lease) = execution.registry.quic_receiver_lease(key, frame.owned) else {
+            return;
+        };
+        if let Some(feedback) =
+            crate::participant::event::FabricSubscriberFeedback::decode(lease, &frame.record)
+        {
+            execution.observe_fabric_subscriber(key, feedback, now, Some(connection));
         }
     }
 
@@ -405,6 +790,7 @@ impl ShardExecution {
             dirty: DirtyTracker::with_capacity(PARTICIPANT_CAPACITY_HINT),
             udp_send_batch: GsoSendBatch::preallocated(),
             pipeline: EventPipeline::with_capacity(PARTICIPANT_CAPACITY_HINT),
+            quic_data_ready: false,
             wall,
             global_clock: None,
         }
@@ -544,7 +930,9 @@ impl ShardExecution {
             self.bind_installed_fabric_rtp_receivers(track, publication);
         } else if let Some(plan) = self.plans.get(track) {
             for member in &plan.local {
-                if let Some(receiver) = self.registry.resolve_mut(*member) {
+                if self.registry.is_quic_owner(*member) {
+                    self.quic_data_ready = true;
+                } else if let Some(receiver) = self.registry.resolve_mut(*member) {
                     receiver.wake_fabric_receiver(publication);
                     self.dirty.mark(*member, receiver);
                 }
@@ -1242,7 +1630,7 @@ impl ShardExecution {
                     plan.compiled_reverse.is_some(),
                     "reverse plans must be compiled by the controller"
                 );
-                let local = plan
+                let local: Vec<_> = plan
                     .local
                     .iter()
                     .filter_map(|connection| {
@@ -1251,6 +1639,9 @@ impl ShardExecution {
                         handle
                     })
                     .collect();
+                self.quic_data_ready |= local
+                    .iter()
+                    .any(|&handle| self.registry.is_quic_owner(handle));
                 self.plans.insert(
                     track_handle,
                     crate::shard::router::InstalledTrackPlan {
@@ -1494,6 +1885,7 @@ impl ShardExecution {
         destination: ParticipantHandle,
         feedback: crate::participant::event::FabricSubscriberFeedback,
         now: Instant,
+        quic_connection: Option<crate::entity::ConnectionId>,
     ) {
         use crate::{
             participant::event::FabricFeedbackKind, route::fabric::local::ReceiptAcceptance,
@@ -1507,11 +1899,23 @@ impl ShardExecution {
         {
             return;
         }
-        let Some(connection) = self.registry.resolve_mut(destination).and_then(|receiver| {
-            (receiver.reliable_subscriber_lease(feedback.lease.owned) == Some(feedback.lease))
-                .then_some(receiver.connection_id)
-        }) else {
-            return;
+        let connection = if let Some(connection) = quic_connection {
+            if self
+                .registry
+                .reliable_receiver(destination, branch, self.fabric_unix_time())
+                != Some(feedback.lease)
+            {
+                return;
+            }
+            connection
+        } else {
+            let Some(connection) = self.registry.resolve_mut(destination).and_then(|receiver| {
+                (receiver.reliable_subscriber_lease(feedback.lease.owned) == Some(feedback.lease))
+                    .then_some(receiver.connection_id)
+            }) else {
+                return;
+            };
+            connection
         };
         match feedback.kind {
             FabricFeedbackKind::Propagation(unit, outcome) => {
@@ -1535,7 +1939,14 @@ impl ShardExecution {
                 if receipt == ReceiptAcceptance::First {
                     metrics::counter!("fabric_data_assembly_receipts").increment(1);
                 }
-                if let Some(owner) = self.registry.resolve_mut(destination)
+                if quic_connection.is_some() {
+                    use pulsebeam_proto::data_control::subscriber_observation::Record;
+                    self.quic_data_ready |= self.registry.enqueue_quic_subscriber_control(
+                        destination,
+                        feedback.lease,
+                        Record::ReceiptAck(feedback.lease.expectation(unit)),
+                    );
+                } else if let Some(owner) = self.registry.resolve_mut(destination)
                     && owner.write_fabric_receipt_ack(feedback.lease, unit)
                 {
                     #[cfg(feature = "sim")]
@@ -1611,7 +2022,19 @@ impl ShardExecution {
         request: crate::route::fabric::local::RepairRequest,
         status: pulsebeam_proto::data_control::RepairStatus,
     ) {
-        if let Some(receiver) = self.registry.resolve_mut(destination)
+        if self.registry.is_quic_owner(destination) {
+            if self
+                .registry
+                .reliable_receiver(destination, lease.branch, self.fabric_unix_time())
+                == Some(lease)
+            {
+                self.quic_data_ready |= self.registry.enqueue_quic_subscriber_control(
+                    destination,
+                    lease,
+                    lease.repair_outcome(request, status),
+                );
+            }
+        } else if let Some(receiver) = self.registry.resolve_mut(destination)
             && receiver.write_fabric_repair_outcome(lease, request, status)
         {
             self.dirty.mark(destination, receiver);
@@ -1694,19 +2117,30 @@ impl ShardExecution {
             self.runtime.retire_fabric_branch(branch, receiver);
             return;
         }
+        self.announce_shard_data_receiver(receiver, branch, work.reference);
+    }
+
+    fn announce_shard_data_receiver(
+        &mut self,
+        receiver: ParticipantHandle,
+        branch: FabricLocalBranch,
+        reference: u64,
+    ) {
         if let Some(crate::shard::router::FabricOwner::Shard(binding)) =
             self.runtime.fabric_handoff_owner(branch, receiver)
-            && let Some(owner) = self.registry.resolve_mut(receiver)
-            && let Some(lease) = owner.reliable_subscriber_branch(branch)
+            && let Some(connection) = self.registry.connection_id(receiver)
+            && let Some(lease) =
+                self.registry
+                    .reliable_receiver(receiver, branch, self.fabric_unix_time())
             && lease.endpoint.source == binding.incarnation
         {
             self.pipeline
                 .push_shard_event(ShardEvent::ShardDataReceiverReady(
                     crate::route::fabric::ShardDataReady {
                         binding,
-                        reference: work.reference,
+                        reference,
                         receiver: crate::route::fabric::ShardDataReceiver {
-                            connection: owner.connection_id,
+                            connection,
                             branch: lease.endpoint.branch,
                         },
                     },
@@ -1819,11 +2253,52 @@ impl ShardExecution {
         result
     }
 
+    fn resolve_quic_data_original(
+        &mut self,
+        publisher: ParticipantHandle,
+        source: FabricSourceHandle,
+        fragment: crate::route::fabric::local::RepairFragment,
+        now: Instant,
+    ) -> crate::participant::data_fabric::OriginalResolution {
+        use crate::participant::data_fabric::OriginalResolution;
+        use pulsebeam_proto::data_control::publisher_observation::Record;
+        let result = self
+            .runtime
+            .request_quic_data_original(source, publisher, fragment, now);
+        if let OriginalResolution::Request(demand) = &result {
+            self.quic_data_ready |= self.registry.enqueue_quic_publisher_control(
+                publisher,
+                source,
+                Record::RequestOriginal(*demand),
+            );
+        }
+        result
+    }
+
+    fn fabric_unix_time(&self) -> Option<u64> {
+        self.wall
+            .execution_time()
+            .wall
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|duration| duration.as_secs())
+    }
+
     fn fabric_publisher_authorized(
         &mut self,
         publisher: ParticipantHandle,
         source: FabricSourceHandle,
     ) -> bool {
+        if self.registry.is_quic_owner(publisher) {
+            return self
+                .runtime
+                .quic_data_association(source, publisher)
+                .zip(self.fabric_unix_time())
+                .is_some_and(|(association, now)| {
+                    self.registry
+                        .quic_owner_authorized(publisher, association, now)
+                });
+        }
         if !self.fabric_io_authorized(publisher) {
             self.runtime.retire_fabric_participant(publisher);
             return false;
@@ -1862,6 +2337,7 @@ impl ShardExecution {
         {
             return false;
         }
+        let unix_now = self.fabric_unix_time();
         let registry = &mut self.registry;
         let accepted = self.runtime.accept_local_data_expectation(
             source,
@@ -1870,8 +2346,7 @@ impl ShardExecution {
             now,
             |branch, destination| {
                 registry
-                    .resolve_mut(destination)
-                    .and_then(|owner| owner.reliable_subscriber_branch(branch))
+                    .reliable_receiver(destination, branch, unix_now)
                     .map(|lease| lease.endpoint.branch)
             },
         );
@@ -1980,12 +2455,12 @@ impl ShardExecution {
         }
     }
 
-    fn drain_after_data_offer(
+    fn drain_after_data_offer<I>(
         &mut self,
         now: Instant,
         source: FabricSourceHandle,
         sequence: u64,
-        reliable: Option<crate::participant::data_fabric::ReliableAdmission>,
+        reliable: Option<crate::participant::data_fabric::ReliableAdmission<I>>,
         report: &Offers,
     ) {
         if report.enqueued != 0 || (reliable.is_some() && report.duplicates != 0) {
@@ -2450,6 +2925,10 @@ impl ShardExecution {
         {
             return;
         }
+        if self.registry.is_quic_owner(destination) {
+            self.quic_data_ready = true;
+            return;
+        }
         if !self.fabric_io_authorized(destination) {
             self.runtime.retire_fabric_participant(destination);
             return;
@@ -2815,7 +3294,7 @@ impl ShardExecution {
                         destination,
                         feedback,
                     } => {
-                        self.observe_fabric_subscriber(destination, feedback, now());
+                        self.observe_fabric_subscriber(destination, feedback, now(), None);
                     }
                     crate::shard::events::ShardInternalEvent::StageLocalRtpReceiver {
                         receiver,
@@ -3048,14 +3527,15 @@ impl ShardExecution {
                 }
             }
             ShardFrame::FabricDataExpectation(notice) => {
-                let registry = &mut self.registry;
+                let unix_now = self.fabric_unix_time();
+                let registry = &self.registry;
                 self.runtime
                     .accept_shard_data_expectation(&notice, now, |branch, destination| {
-                        let owner = registry.resolve_mut(destination)?;
-                        let lease = owner.reliable_subscriber_branch(branch)?;
+                        let connection = registry.connection_id(destination)?;
+                        let lease = registry.reliable_receiver(destination, branch, unix_now)?;
                         (lease.endpoint.source == notice.binding.incarnation).then_some(
                             crate::route::fabric::ShardDataReceiver {
-                                connection: owner.connection_id,
+                                connection,
                                 branch: lease.endpoint.branch,
                             },
                         )
@@ -3125,17 +3605,17 @@ impl ShardExecution {
             return;
         }
         let fragment = repair.request.fragment;
-        let OriginalResolution::Cached { sequence, expires } =
-            self.resolve_data_original(publisher, source, installation, fragment, now)
-        else {
-            return;
+        let resolution = match installation {
+            Some(installation) => {
+                self.resolve_data_original(publisher, source, installation, fragment, now)
+            }
+            None => self.resolve_quic_data_original(publisher, source, fragment, now),
         };
-        let Some((data, fanout)) = self.runtime.data_publisher(source, publisher, installation)
-        else {
+        let OriginalResolution::Cached { sequence, expires } = resolution else {
             return;
         };
         let Some((position, packet, deadline)) =
-            data.cached_original(fanout, fragment.unit_seq, fragment.index, now)
+            self.runtime.cached_data_original(source, fragment, now)
         else {
             return;
         };
@@ -3173,10 +3653,9 @@ impl ShardExecution {
         let Some(branch) = self.runtime.remote_fabric_branch(source, receiver) else {
             return;
         };
-        let Some(lease) = self
-            .registry
-            .resolve_mut(receiver)
-            .and_then(|owner| owner.reliable_subscriber_branch(branch))
+        let Some(lease) =
+            self.registry
+                .reliable_receiver(receiver, branch, self.fabric_unix_time())
         else {
             return;
         };
@@ -3347,12 +3826,9 @@ impl ShardExecution {
             let branch = FabricLocalBranch::for_repair(source, target);
             let lease = self
                 .registry
-                .resolve_mut(target.destination)
-                .and_then(|receiver| {
-                    let lease = receiver.reliable_subscriber_branch(branch)?;
-                    (lease.endpoint.branch == target.incarnation)
-                        .then_some((receiver.connection_id, lease))
-                });
+                .reliable_receiver(target.destination, branch, self.fabric_unix_time())
+                .filter(|lease| lease.endpoint.branch == target.incarnation)
+                .and_then(|lease| Some((self.registry.connection_id(target.destination)?, lease)));
             let Some((connection, lease)) = lease else {
                 if let Some(fanout) = self.runtime.repair_fanout(source) {
                     fanout.cancel_data_repair(target, request);
@@ -3372,11 +3848,35 @@ impl ShardExecution {
                     self.drain_fabric_data_branch(branch, target.destination, now);
                     continue;
                 }
-                let (publisher, installation) = match owner {
+                let resolution = match owner {
                     crate::shard::router::FabricRepairSource::Publisher(
                         publisher,
                         installation,
-                    ) => (publisher, installation),
+                    ) => {
+                        if self.fabric_publisher_authorized(publisher, source) {
+                            self.resolve_data_original(
+                                publisher,
+                                source,
+                                installation,
+                                request.fragment,
+                                now,
+                            )
+                        } else {
+                            OriginalResolution::Revoked
+                        }
+                    }
+                    crate::shard::router::FabricRepairSource::QuicPublisher(publisher) => {
+                        if self.fabric_publisher_authorized(publisher, source) {
+                            self.resolve_quic_data_original(
+                                publisher,
+                                source,
+                                request.fragment,
+                                now,
+                            )
+                        } else {
+                            OriginalResolution::Revoked
+                        }
+                    }
                     crate::shard::router::FabricRepairSource::Shard(binding) => {
                         if self.runtime.shard_fabric_source(binding) == Some(source)
                             && lease.endpoint.source == binding.incarnation
@@ -3397,17 +3897,6 @@ impl ShardExecution {
                         }
                         continue;
                     }
-                };
-                let resolution = if self.fabric_publisher_authorized(publisher, source) {
-                    self.resolve_data_original(
-                        publisher,
-                        source,
-                        installation,
-                        request.fragment,
-                        now,
-                    )
-                } else {
-                    OriginalResolution::Revoked
                 };
                 match resolution {
                     OriginalResolution::Cached { sequence, expires } if now < expires => {
@@ -3521,6 +4010,35 @@ impl ShardExecution {
                                 ExpectationWrite::Backpressured
                             });
                     }
+                    FabricDeliveryTarget::QuicPublisher(publisher) => {
+                        let endpoint = self
+                            .runtime
+                            .fabric_incarnation(source)
+                            .filter(|_| self.fabric_publisher_authorized(publisher, source))
+                            .map(|source| pulsebeam_proto::data_control::PublisherBinding {
+                                source,
+                            });
+                        let registry = &mut self.registry;
+                        let ready = &mut self.quic_data_ready;
+                        self.runtime
+                            .tick_fabric_delivery_report(source, now, |report| {
+                                let Some(endpoint) = endpoint else {
+                                    return ExpectationWrite::Revoked;
+                                };
+                                let record =
+                                    crate::participant::data_fabric::publisher_delivery_record(
+                                        endpoint, report,
+                                    );
+                                if registry
+                                    .enqueue_quic_publisher_control(publisher, source, record)
+                                {
+                                    *ready = true;
+                                    ExpectationWrite::Queued
+                                } else {
+                                    ExpectationWrite::Backpressured
+                                }
+                            });
+                    }
                     FabricDeliveryTarget::Publisher(publisher, installation) => {
                         let authorized = self.fabric_publisher_authorized(publisher, source);
                         let (registry, dirty) = (&mut self.registry, &mut self.dirty);
@@ -3560,13 +4078,36 @@ impl ShardExecution {
                     self.runtime.shard_fabric_source(binding) == Some(source)
                 }
             };
+            let unix_now = self.fabric_unix_time();
             let (registry, dirty) = (&mut self.registry, &mut self.dirty);
+            let quic_ready = &mut self.quic_data_ready;
             let step = self.runtime.tick_fabric_data_propagation(
                 source,
                 now,
                 |branch, destination, unit, incarnation| {
-                    let Some(receiver) = registry.resolve_mut(destination).filter(|_| authorized)
-                    else {
+                    if !authorized {
+                        return ExpectationWrite::Revoked;
+                    }
+                    if registry.is_quic_owner(destination) {
+                        let Some(lease) = registry
+                            .reliable_receiver(destination, branch, unix_now)
+                            .filter(|lease| lease.endpoint.branch == incarnation)
+                        else {
+                            return ExpectationWrite::Revoked;
+                        };
+                        use pulsebeam_proto::data_control::subscriber_observation::Record;
+                        return if registry.enqueue_quic_subscriber_control(
+                            destination,
+                            lease,
+                            Record::Expectation(lease.expectation(unit)),
+                        ) {
+                            *quic_ready = true;
+                            ExpectationWrite::Queued
+                        } else {
+                            ExpectationWrite::Backpressured
+                        };
+                    }
+                    let Some(receiver) = registry.resolve_mut(destination) else {
                         return ExpectationWrite::Revoked;
                     };
                     let written = receiver.write_fabric_expectation(branch, unit, incarnation);

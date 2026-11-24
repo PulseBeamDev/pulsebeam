@@ -293,6 +293,10 @@ impl NativeState {
         )
     }
 
+    pub(crate) fn binding_profile(&self) -> validation::BindingProfile {
+        self.profile
+    }
+
     pub(crate) fn with_profile(
         memory_limit: usize,
         self_participant: impl Into<Option<wire::Participant>>,

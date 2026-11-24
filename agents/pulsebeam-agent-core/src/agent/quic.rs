@@ -181,7 +181,7 @@ impl Agent {
             validation::BindingProfile::Quic,
         )?;
         let join_revision = attempt.join_revision;
-        let session = Session::new(
+        let mut session = Session::new(
             generation,
             credential.clone(),
             SessionIdentity {
@@ -194,9 +194,10 @@ impl Agent {
             crate::BootstrapCapabilities {
                 rtp: state::RtpCapabilities::default(),
                 data_delivery: alloc::vec::Vec::new(),
-                data_v1: false,
+                data_v1: true,
             },
         );
+        session.reliable_data_enabled = true;
         self.attempt = None;
         self.activate_session(session, join_revision);
         self.refresh_resources()?;
@@ -226,6 +227,29 @@ impl Agent {
                     return Err(error);
                 }
             }
+            QuicEvent::Data {
+                generation,
+                binding,
+                payload,
+            } => {
+                let channel = self.active.as_ref()
+                    .filter(|active| active.generation == generation && !active.signaling_terminal)
+                    .and_then(|active| active.payloads.iter().find_map(|(&channel, physical)| {
+                        (physical.state == super::native::PayloadState::Active
+                            && physical.data_v1_receiver.is_some()
+                            && matches!(physical.data_v1, pulsebeam_proto::state::DataV1Binding::Quic(parameters)
+                                if parameters.binding_id == u32::from(binding.get())))
+                        .then_some(channel)
+                    }));
+                if let Some(channel) = channel {
+                    self.handle_data_channel(crate::DataChannelEvent::Message {
+                        generation,
+                        channel,
+                        binary: true,
+                        payload,
+                    })?;
+                }
+            }
             QuicEvent::ControlSent {
                 generation,
                 operation,
@@ -235,6 +259,37 @@ impl Agent {
                 }) {
                     self.pending_signal = None;
                     self.request_reconciliation();
+                }
+            }
+            QuicEvent::DataSent {
+                generation,
+                channel,
+                operation,
+                result,
+            } => {
+                if self.active.as_ref().is_some_and(|active| {
+                    active.generation == generation
+                        && active.payloads.get(&channel).is_some_and(|physical| {
+                            matches!(
+                                physical.data_v1,
+                                pulsebeam_proto::state::DataV1Binding::Quic(_)
+                            )
+                        })
+                }) {
+                    let event = match result {
+                        Ok(()) => crate::DataChannelEvent::Sent {
+                            generation,
+                            channel,
+                            operation,
+                        },
+                        Err(message) => crate::DataChannelEvent::SendFailed {
+                            generation,
+                            channel,
+                            operation,
+                            message,
+                        },
+                    };
+                    self.handle_data_channel(event)?;
                 }
             }
             QuicEvent::Renewed {

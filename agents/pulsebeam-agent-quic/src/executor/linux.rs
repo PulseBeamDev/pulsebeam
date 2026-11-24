@@ -26,6 +26,13 @@ const EFFECTS_PER_TURN: usize = 32;
 type Work<T> = Pin<Box<dyn Future<Output = T>>>;
 type DialResult = Result<Box<UdpAssociation>, QuicEvent>;
 
+#[cfg(feature = "sim")]
+struct SimServices {
+    placement: Box<dyn Fn(HttpRequest) -> Work<Option<HttpResponse>>>,
+    authority: String,
+    address: IpAddr,
+}
+
 #[derive(Debug)]
 pub enum Error {
     Core(AgentError),
@@ -47,6 +54,8 @@ pub struct LinuxAgent {
     dialing: Option<(Generation, Work<DialResult>)>,
     sockets: [Option<Box<UdpAssociation>>; 2],
     timers: BTreeMap<TimerId, Instant>,
+    #[cfg(feature = "sim")]
+    sim: Option<SimServices>,
 }
 
 impl LinuxAgent {
@@ -73,11 +82,48 @@ impl LinuxAgent {
             dialing: None,
             sockets: [None, None],
             timers: BTreeMap::new(),
+            #[cfg(feature = "sim")]
+            sim: None,
         })
     }
 
     pub fn command(&mut self, command: AgentCommand) -> Result<(), AgentError> {
         self.core.command_at(command, self.clock_origin.elapsed())
+    }
+
+    #[cfg(feature = "sim")]
+    pub fn with_sim_services<F, Fut>(
+        mut self,
+        authority: String,
+        address: IpAddr,
+        placement: F,
+    ) -> Self
+    where
+        F: Fn(HttpRequest) -> Fut + 'static,
+        Fut: Future<Output = Option<HttpResponse>> + 'static,
+    {
+        self.sim = Some(SimServices {
+            placement: Box::new(move |request| Box::pin(placement(request))),
+            authority,
+            address,
+        });
+        self
+    }
+
+    pub fn resource(
+        &mut self,
+        command: pulsebeam_agent_core::ResourceCommand,
+    ) -> Result<pulsebeam_agent_core::ResourceResult, AgentError> {
+        self.core.resource(command)
+    }
+
+    pub fn send_data(
+        &mut self,
+        spec: pulsebeam_agent_core::TrackSpec,
+        payload: Vec<u8>,
+    ) -> Result<OperationId, AgentError> {
+        self.core
+            .send_data_at(spec, payload, self.clock_origin.elapsed())
     }
 
     pub fn snapshot(&self) -> &Snapshot {
@@ -106,6 +152,15 @@ impl LinuxAgent {
             .map_err(Error::Core)
     }
 
+    fn request_placement(&self, request: HttpRequest) -> Work<Option<HttpResponse>> {
+        #[cfg(feature = "sim")]
+        if let Some(sim) = &self.sim {
+            return (sim.placement)(request);
+        }
+        let client = self.http.clone();
+        Box::pin(async move { execute_placement(&client, request).await })
+    }
+
     fn execute(&mut self, effect: Effect) -> Result<(), Error> {
         match effect {
             Effect::Http(HttpEffect::Request {
@@ -114,11 +169,11 @@ impl LinuxAgent {
                 if self.request.is_some() {
                     return Err(Error::Capacity);
                 }
-                let client = self.http.clone();
+                let response = self.request_placement(request);
                 self.request = Some((
                     operation,
                     Box::pin(async move {
-                        match execute_placement(&client, request).await {
+                        match response.await {
                             Some(response) => HttpEvent::Response {
                                 operation,
                                 response,
@@ -156,6 +211,14 @@ impl LinuxAgent {
                 let tls = self.tls.clone();
                 let local = self.local;
                 let origin = self.clock_origin;
+                #[cfg(feature = "sim")]
+                let sim_address = self.sim.as_ref().map(|sim| {
+                    (sim.authority == admit.placement.host
+                        && sim.address.is_ipv4() == local.is_ipv4())
+                    .then_some(sim.address)
+                });
+                #[cfg(not(feature = "sim"))]
+                let sim_address: Option<Option<IpAddr>> = None;
                 self.dialing = Some((
                     generation,
                     Box::pin(async move {
@@ -166,27 +229,26 @@ impl LinuxAgent {
                         let deadline =
                             origin.checked_add(admit.deadline).ok_or_else(unavailable)?;
                         let connect = async {
-                            let remote = tokio::net::lookup_host((
-                                admit.placement.host.as_str(),
-                                admit.placement.port.get(),
-                            ))
-                            .await
-                            .map_err(|_| unavailable())?
-                            .find(|address| address.is_ipv4() == local.is_ipv4())
-                            .ok_or_else(unavailable)?;
-                            UdpAssociation::connect(
-                                origin.into_std(),
-                                local,
-                                remote.ip(),
-                                tls,
-                                admit,
-                            )
-                            .await
-                            .map(Box::new)
-                            .map_err(|error| match error {
-                                OpenError::Admission(event) => event,
-                                OpenError::Socket(_) => unavailable(),
-                            })
+                            let remote = if let Some(sim_address) = sim_address {
+                                sim_address.ok_or_else(unavailable)?
+                            } else {
+                                tokio::net::lookup_host((
+                                    admit.placement.host.as_str(),
+                                    admit.placement.port.get(),
+                                ))
+                                .await
+                                .map_err(|_| unavailable())?
+                                .find(|address| address.is_ipv4() == local.is_ipv4())
+                                .ok_or_else(unavailable)?
+                                .ip()
+                            };
+                            UdpAssociation::connect(origin.into_std(), local, remote, tls, admit)
+                                .await
+                                .map(Box::new)
+                                .map_err(|error| match error {
+                                    OpenError::Admission(event) => event,
+                                    OpenError::Socket(_) => unavailable(),
+                                })
                         };
                         time::timeout_at(deadline, connect)
                             .await
@@ -211,6 +273,35 @@ impl LinuxAgent {
                     socket.submit(effect).map_err(|_| Error::UnexpectedEffect)?;
                 } else {
                     self.accept(HostEvent::Quic(QuicEvent::Closed { generation }))?;
+                }
+            }
+            Effect::Quic(effect @ QuicEffect::RetireData { generation, .. }) => {
+                if let Some(socket) = self
+                    .sockets
+                    .iter_mut()
+                    .flatten()
+                    .find(|socket| socket.generation() == generation)
+                {
+                    socket.submit(effect).map_err(|_| Error::UnexpectedEffect)?;
+                }
+            }
+            Effect::Quic(QuicEffect::SendData(send)) => {
+                let (generation, channel, operation) =
+                    (send.generation, send.channel, send.operation);
+                let result = self
+                    .sockets
+                    .iter_mut()
+                    .flatten()
+                    .find(|socket| socket.generation() == generation)
+                    .ok_or(super::SubmitError::NotAdmitted)
+                    .and_then(|socket| socket.submit(QuicEffect::SendData(send)));
+                if let Err(error) = result {
+                    self.accept(HostEvent::Quic(QuicEvent::DataSent {
+                        generation,
+                        channel,
+                        operation,
+                        result: Err(format!("QUIC DATA submission: {error:?}")),
+                    }))?;
                 }
             }
             Effect::Quic(effect @ (QuicEffect::SendControl { .. } | QuicEffect::Renew(_))) => {

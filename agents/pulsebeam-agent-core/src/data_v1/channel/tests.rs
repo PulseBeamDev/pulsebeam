@@ -9,7 +9,10 @@ use core::num::{NonZeroU16, NonZeroU64};
 use pulsebeam_proto::{
     data_control::{PublisherBinding, SubscriberBinding},
     data_endpoint::{self, Delivery, Endpoint, Format},
-    state::{DataV1Delivery, SctpDataV1Parameters, SctpParameters},
+    state::{
+        DataV1Delivery, QuicDataV1Parameters, SctpDataV1Parameters, SctpParameters,
+        track_binding::Transport,
+    },
 };
 
 fn accepted(parameters: SctpDataV1Parameters) -> TrackBinding {
@@ -98,6 +101,61 @@ fn pair(ids: &mut IdGenerator) -> (Channel, Channel) {
         Err(Error::Binding)
     );
     (tx, rx)
+}
+
+#[test]
+fn quic_confirmation_matches_exact_binding_without_sctp_preparation() {
+    let mut ids = IdGenerator::new();
+    let (tx, rx) = pair(&mut ids);
+    let parameters = QuicDataV1Parameters {
+        binding_id: u32::from(tx.binding.channel.stream.get()),
+        version: u32::from(data_endpoint::DATA_V1),
+        incarnation: tx.binding.channel.incarnation.get(),
+        delivery: DataV1Delivery::Unreliable as i32,
+    };
+    let quic = |parameters| TrackBinding {
+        transport: Some(Transport::QuicDataV1(parameters)),
+    };
+    for channel in [tx, rx] {
+        assert_eq!(
+            Channel::from_confirmed(channel.id, channel.binding, None, &quic(parameters)),
+            Ok(channel)
+        );
+        for wrong in [
+            QuicDataV1Parameters {
+                binding_id: 2,
+                ..parameters
+            },
+            QuicDataV1Parameters {
+                version: 2,
+                ..parameters
+            },
+            QuicDataV1Parameters {
+                incarnation: 2,
+                ..parameters
+            },
+            QuicDataV1Parameters {
+                delivery: DataV1Delivery::Latest as i32,
+                ..parameters
+            },
+        ] {
+            assert_eq!(
+                Channel::from_confirmed(channel.id, channel.binding, None, &quic(wrong)),
+                Err(Error::Binding)
+            );
+        }
+        let prepared = PreparedDataChannel {
+            stream_id: channel.binding.channel.stream.get(),
+            negotiated: true,
+            ordered: false,
+            reliability: DataChannelReliability::MaxRetransmits(0),
+            association_max_channels: Some(16),
+        };
+        assert_eq!(
+            Channel::from_accepted(channel.id, channel.binding, &prepared, &quic(parameters)),
+            Err(Error::Binding)
+        );
+    }
 }
 
 #[test]

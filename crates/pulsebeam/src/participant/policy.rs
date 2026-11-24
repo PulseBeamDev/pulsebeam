@@ -100,6 +100,7 @@ impl ExecutionFailureKind {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct PublicationExecution {
     pub track: crate::track::Track,
     pub data_v1_source: Option<std::num::NonZeroU64>,
