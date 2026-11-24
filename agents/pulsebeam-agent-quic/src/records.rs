@@ -366,6 +366,94 @@ mod tests {
     }
 
     #[test]
+    fn maximum_fabric_data_record_exceeds_the_noq_floor_with_binding() {
+        use pulsebeam_core::fabric::{
+            Extension, ExtensionKind, FabricPacket, Header, Profile,
+            packet::{Agreement, MAX_PACKET_BYTES, Offer},
+        };
+        use pulsebeam_proto::data_record::{self, Capture, Clock, Record};
+
+        let clock = Clock {
+            id: "camera",
+            epoch: 7,
+        };
+        let capture = Capture {
+            clock,
+            nanos: -2,
+            uncertainty_ns: Some(0x1234_5678),
+        };
+        let descriptor = [0xdb; 96];
+        let act = [0x24; 16];
+        let fragment = [0x7b; 1024];
+        let record = Record::new(
+            data_record::Header {
+                unit_seq: 0x89ab_cdef_0123_4567,
+                index: 63,
+                count: 64,
+                unit_len: 65_536,
+                capture: Some(capture),
+            },
+            &fragment,
+            Some(clock),
+        )
+        .unwrap();
+        let mut payload = [0; data_record::MAX_RECORD_BYTES];
+        assert_eq!(record.write(&mut payload).unwrap(), 1058);
+        let packet = FabricPacket::new(
+            Header {
+                profile: Profile::Data,
+                marker: true,
+                sequence: 0x1122_3344,
+                timestamp: 0x5566_7788,
+            },
+            &[
+                Extension {
+                    kind: ExtensionKind::DependencyDescriptor,
+                    value: &descriptor,
+                },
+                Extension {
+                    kind: ExtensionKind::AbsoluteCaptureTime,
+                    value: &act,
+                },
+            ],
+            &payload,
+        )
+        .unwrap();
+        let offer = Offer::current(Profile::Data, 0x000c);
+        let agreement = Agreement::negotiate(Profile::Data, offer, offer).unwrap();
+        let mut output = [0; MAX_PACKET_BYTES];
+        let len = agreement.write(&packet, &mut output).unwrap();
+        assert_eq!(len, 1186);
+        let bytes = output.get(..len).unwrap();
+        let datagram = Datagram {
+            kind: DatagramKind::Data,
+            binding: NonZeroU16::new(0x0104).unwrap(),
+            payload: bytes,
+        };
+        assert_eq!(datagram.encode(1162), Err(Error::Length));
+        let image = datagram.encode(1189).unwrap();
+        // Independent wire fixture including the three-byte binding overhead.
+        let mut expected = vec![
+            1, 1, 4, 99, 3, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0, 116, 2, 96,
+        ];
+        expected.extend([0xdb; 96]);
+        expected.extend([3, 16]);
+        expected.extend([0x24; 16]);
+        expected.extend([
+            0x50, 0x44, 1, 3, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0, 63, 0, 64, 4, 0,
+            0, 1, 0, 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe, 0x12, 0x34, 0x56, 0x78,
+        ]);
+        expected.extend([0x7b; 1024]);
+        assert_eq!(image, expected);
+        let decoded = agreement.decode(bytes).unwrap();
+        assert_eq!(
+            Record::decode_without_descriptor(decoded.payload(), Some(clock)).unwrap(),
+            record
+        );
+        assert!(decoded.same_content(&agreement.decode(expected.get(3..).unwrap()).unwrap()));
+    }
+
+    #[test]
     fn datagram_keeps_binding_and_rejects_zero_or_insufficient_budget() {
         let datagram = Datagram {
             kind: DatagramKind::Rtp,

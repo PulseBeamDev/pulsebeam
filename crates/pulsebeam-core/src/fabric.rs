@@ -1,5 +1,5 @@
-//! Typed Fabric packets shared by shard mailboxes and the authenticated WAN codec.
-//! See `fabric::wan` for the network layout and limits.
+//! Typed Fabric packets shared by shard mailboxes, canonical endpoint bindings,
+//! and the authenticated WAN projection.
 
 use std::num::NonZeroU16;
 
@@ -53,7 +53,7 @@ impl Profile {
     }
 }
 
-/// Optional registered elements; the codec always supplies ID 1 itself.
+/// Registered metadata. IDs 0 and 1 are not legal packet extensions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum ExtensionKind {
@@ -75,7 +75,7 @@ impl ExtensionKind {
         }
     }
 
-    pub fn from_id(id: u8) -> Result<Self, WireError> {
+    pub const fn from_id(id: u8) -> Result<Self, WireError> {
         match id {
             2 => Ok(Self::DependencyDescriptor),
             3 => Ok(Self::AbsoluteCaptureTime),
@@ -89,10 +89,10 @@ impl ExtensionKind {
         }
     }
 
-    pub fn is_permitted_on(self, profile: Profile) -> bool {
+    pub const fn is_permitted_on(self, profile: Profile) -> bool {
         match self {
             Self::DependencyDescriptor | Self::AbsoluteCaptureTime => true,
-            Self::AudioLevel => profile == Profile::Opus,
+            Self::AudioLevel => matches!(profile, Profile::Opus),
             _ => matches!(profile, Profile::H264 | Profile::Av1),
         }
     }
@@ -119,6 +119,15 @@ impl ExtensionKind {
         };
         valid.then_some(()).ok_or(WireError::ExtensionValue)
     }
+
+    pub const fn bit(self) -> u16 {
+        1_u16.wrapping_shl(self as u32)
+    }
+
+    /// Dependency and timing facts must not be erased by a downgrade.
+    const fn can_omit(self) -> bool {
+        !matches!(self, Self::DependencyDescriptor | Self::AbsoluteCaptureTime)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -139,8 +148,14 @@ pub struct Header {
 pub enum WireError {
     #[error("Fabric packet exceeds its envelope")]
     Oversize,
-    #[error("invalid canonical RTP header")]
+    #[error("invalid Fabric packet header")]
     Header,
+    #[error("no supported Fabric packet version for this binding")]
+    Version,
+    #[error("binding cannot preserve a required Fabric feature")]
+    RequiredFeature,
+    #[error("extension was not negotiated for this Fabric binding")]
+    UnnegotiatedExtension,
     #[error("unexpected WAN SSRC")]
     RouteKey,
     #[error("unassigned Fabric payload type")]
@@ -314,8 +329,6 @@ impl<P: AsRef<[u8]>, E: AsRef<[u8]>> FabricPacket<P, E> {
         })
     }
 
-    /// Associate the authenticated publisher primary size with this in-process copy.
-    /// Neither Fabric wire codec carries this evidence.
     /// Set the canonical timestamp on a newly admitted endpoint media image,
     /// before it becomes visible to any branch or repair store.
     #[must_use]
@@ -325,6 +338,8 @@ impl<P: AsRef<[u8]>, E: AsRef<[u8]>> FabricPacket<P, E> {
         self
     }
 
+    /// Associate the authenticated publisher primary size with this in-process copy.
+    /// Neither Fabric wire codec carries this evidence.
     pub fn with_source_protected_bytes(mut self, bytes: NonZeroU16) -> Self {
         self.source_protected_bytes = Some(bytes);
         self
@@ -433,6 +448,7 @@ impl Form {
 }
 
 pub mod media_source;
+pub mod packet;
 pub mod wan;
 
 #[cfg(test)]

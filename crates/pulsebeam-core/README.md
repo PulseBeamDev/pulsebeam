@@ -15,6 +15,12 @@ The crate must remain independent of the server's shard runtime. Types here may
 be used on either side of the wire, so parsing must validate hostile input and
 avoid assumptions tied to one executor or operating system.
 
+## Fabric packet wire contract
+
+Use the [FabricPacket wire reference](docs/fabric-packet.md) to implement a
+compatible native payload reader or writer. It defines the binding agreement,
+packet layout and extension registry separately from the WAN RTP projection.
+
 ## Fabric packet timing
 
 Fabric uses a single sampling timeline for audio, video, and DATA. At first
