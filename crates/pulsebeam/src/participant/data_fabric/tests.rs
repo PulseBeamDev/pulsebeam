@@ -18,7 +18,10 @@ impl Fixture {
             fanout: SourceFanout::new(
                 crate::route::fabric::local::Emission::new(
                     Profile::Data,
-                    &[ExtensionKind::DependencyDescriptor],
+                    &[
+                        ExtensionKind::DependencyDescriptor,
+                        ExtensionKind::AbsoluteCaptureTime,
+                    ],
                 )
                 .unwrap(),
             ),
@@ -124,6 +127,85 @@ fn fixture(unit_seq: u64, index: u16, count: u16, len: u32, bytes: &[u8]) -> Vec
     let mut out = vec![0; record.encoded_len()];
     record.write(&mut out).unwrap();
     out
+}
+
+#[test]
+fn canonical_data_checks_marker_before_admission_and_retimes_without_losing_metadata() {
+    use pulsebeam_core::fabric::packet::{Agreement, MAX_PACKET_BYTES, Offer};
+    let fragment = [0xa5; 1024];
+    let record = Record::new(
+        data_record::Header {
+            unit_seq: 0x1234_5678,
+            index: 0,
+            count: 1,
+            unit_len: 1024,
+            capture: Some(Capture {
+                clock: CLOCK,
+                nanos: -42,
+                uncertainty_ns: Some(200),
+            }),
+        },
+        &fragment,
+        Some(CLOCK),
+    )
+    .unwrap();
+    let mut payload = [0; MAX_RECORD_BYTES];
+    assert_eq!(record.write(&mut payload).unwrap(), 1058);
+    let metadata = [
+        Extension {
+            kind: ExtensionKind::DependencyDescriptor,
+            value: &[0x63; 96],
+        },
+        Extension {
+            kind: ExtensionKind::AbsoluteCaptureTime,
+            value: &[0x39; 16],
+        },
+    ];
+    let offer = Offer::current(Profile::Data, 0x000c);
+    let agreement = Agreement::negotiate(Profile::Data, offer, offer).unwrap();
+    let mut fixture = Fixture::new(Some(CLOCK));
+    let now = Instant::now();
+    for marker in [false, true] {
+        let source_assertions = Header {
+            profile: Profile::Data,
+            marker,
+            sequence: u32::MAX,
+            timestamp: 77,
+        };
+        let packet = FabricPacket::new(source_assertions, &metadata, &payload).unwrap();
+        let mut bytes = [0; MAX_PACKET_BYTES];
+        let len = agreement.write(&packet, &mut bytes).unwrap();
+        let packet = agreement.decode(bytes.get(..len).unwrap()).unwrap();
+        let result = fixture.ledger.admit_input(
+            &mut fixture.fanout,
+            DataIngress::Canonical(&packet),
+            now,
+            DataTime {
+                fallback: 999,
+                reference: None,
+            },
+        );
+        if !marker {
+            assert!(matches!(result, Err(Error::Projection)));
+            assert_eq!(fixture.fanout.endpoint_data_count(), 0);
+            continue;
+        }
+        let sequence = result.unwrap().sequence;
+        let normalized = fixture.fanout.endpoint_data(sequence).unwrap();
+        assert_eq!(
+            normalized.header(),
+            Header {
+                sequence: 0,
+                timestamp: 999,
+                ..source_assertions
+            }
+        );
+        assert!(normalized.extensions().eq(metadata));
+        assert_eq!(
+            Record::decode_without_descriptor(normalized.payload(), Some(CLOCK)).unwrap(),
+            record
+        );
+    }
 }
 
 #[test]

@@ -617,6 +617,7 @@ impl AdmissionProjection<'_> {
                     .map(Message::encode_to_vec)
                     .unwrap_or_default();
                 let result = Accepted {
+                    fabric: pulsebeam_agent_quic::data_bindings::FabricOffer::CURRENT,
                     connection: *pending.connection_id().as_bytes(),
                     participant: pending.participant.as_str(),
                     room: pending.scope.room.as_ref().map(RoomId::as_str),
@@ -4681,6 +4682,7 @@ mod replacement_tests {
         actor.set_key_registry(Some(registry));
         let proof_text = result.proof.encode();
         let request = pulsebeam_agent_quic::records::Admit {
+            fabric: pulsebeam_agent_quic::data_bindings::FabricOffer::CURRENT,
             attempt: std::num::NonZeroU64::MIN,
             room: Some("stage"),
             owner: &proof_text,
@@ -4723,6 +4725,7 @@ mod replacement_tests {
             Some(Denial::Placement)
         );
         let wrong_room = pulsebeam_agent_quic::records::Admit {
+            fabric: pulsebeam_agent_quic::data_bindings::FabricOffer::CURRENT,
             room: Some("other"),
             ..request
         }
@@ -4781,6 +4784,7 @@ mod replacement_tests {
             .unwrap();
         let owner = next.proof.encode();
         let attempt = pulsebeam_agent_quic::records::Admit {
+            fabric: pulsebeam_agent_quic::data_bindings::FabricOffer::CURRENT,
             owner: &owner,
             ..request
         }

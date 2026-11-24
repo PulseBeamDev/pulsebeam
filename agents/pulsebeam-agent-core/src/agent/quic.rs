@@ -43,6 +43,7 @@ pub struct QuicRtpReceiver<'a> {
     pub binding: core::num::NonZeroU16,
     pub ssrc: u32,
     pub payload_type: u8,
+    pub ready: bool,
     pub publication_id: &'a str,
 }
 
@@ -61,6 +62,15 @@ impl Agent {
         &self,
         kind: crate::MediaKind,
     ) -> impl Iterator<Item = QuicRtpReceiver<'_>> {
+        self.quic_rtp_receiver_bindings(kind)
+            .filter(|binding| binding.ready)
+    }
+
+    #[doc(hidden)]
+    pub fn quic_rtp_receiver_bindings(
+        &self,
+        kind: crate::MediaKind,
+    ) -> impl Iterator<Item = QuicRtpReceiver<'_>> {
         use state::{resource_spec::Declaration, track_binding::Transport};
         self.active_quic_media()
             .into_iter()
@@ -76,8 +86,7 @@ impl Agent {
                             MediaKind::Video,
                             Resource::Reception(MediaSlot::RemoteVideo(_))
                         )
-                    ) || live.execution != state::ExecutionStatus::Installed as i32
-                    {
+                    ) {
                         return None;
                     }
                     let spec = live.spec.as_ref()?;
@@ -92,13 +101,17 @@ impl Agent {
                     };
                     let binding =
                         core::num::NonZeroU16::new(u16::try_from(parameters.binding_id).ok()?)?;
-                    let target = session.state.target_spec(resource)?;
-                    if !validation::declarations_equivalent(target, spec)
-                        || target.settings.as_ref()?.enabled != Some(true)
-                    {
-                        return None;
-                    }
+                    let ready = live.execution == state::ExecutionStatus::Installed as i32
+                        && session.state.target_spec(resource).is_some_and(|target| {
+                            validation::declarations_equivalent(target, spec)
+                                && target
+                                    .settings
+                                    .as_ref()
+                                    .and_then(|settings| settings.enabled)
+                                    == Some(true)
+                        });
                     Some(QuicRtpReceiver {
+                        ready,
                         generation: session.generation,
                         binding,
                         ssrc: parameters.primary_ssrc,
@@ -402,6 +415,28 @@ impl Agent {
         Ok(())
     }
 
+    #[doc(hidden)]
+    pub fn quic_data_receiver(
+        &self,
+        generation: Generation,
+        binding: core::num::NonZeroU16,
+    ) -> Option<(crate::ChannelId, bool)> {
+        self.active_quic_media()
+            .filter(|active| active.generation == generation)?
+            .payloads
+            .iter()
+            .find_map(|(&channel, physical)| {
+                (physical.offer.is_some()
+                    && matches!(physical.data_v1, state::DataV1Binding::Quic(parameters)
+                        if parameters.binding_id == u32::from(binding.get())))
+                .then_some((
+                    channel,
+                    physical.state == super::native::PayloadState::Active
+                        && physical.data_v1_receiver.is_some(),
+                ))
+            })
+    }
+
     pub(super) fn handle_quic(&mut self, event: QuicEvent) -> Result<(), AgentError> {
         match event {
             QuicEvent::Accepted {
@@ -437,16 +472,7 @@ impl Agent {
                 binding,
                 payload,
             } => {
-                let channel = self.active.as_ref()
-                    .filter(|active| active.generation == generation && !active.signaling_terminal)
-                    .and_then(|active| active.payloads.iter().find_map(|(&channel, physical)| {
-                        (physical.state == super::native::PayloadState::Active
-                            && physical.data_v1_receiver.is_some()
-                            && matches!(physical.data_v1, pulsebeam_proto::state::DataV1Binding::Quic(parameters)
-                                if parameters.binding_id == u32::from(binding.get())))
-                        .then_some(channel)
-                    }));
-                if let Some(channel) = channel {
+                if let Some((channel, true)) = self.quic_data_receiver(generation, binding) {
                     self.handle_data_channel(crate::DataChannelEvent::Message {
                         generation,
                         channel,

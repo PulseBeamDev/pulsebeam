@@ -12,7 +12,7 @@ use std::{num::NonZeroU16, time::Instant};
 
 use arrayvec::ArrayVec;
 use pulsebeam_core::fabric::{
-    Extension, ExtensionKind, ExtensionWidth, Profile,
+    BorrowedPacket, Extension, ExtensionKind, ExtensionWidth, Profile,
     media_source::{
         Admission, Anchors, Input, Limits, MediaCopy, MediaIdentity, MediaSource, Position,
         Rejected,
@@ -20,8 +20,7 @@ use pulsebeam_core::fabric::{
 };
 use pulsebeam_proto::state::{codec_format, validation::QuicRtpBinding};
 use pulsebeam_rtc::{
-    AuthenticatedRtp, CodecProfile, ParsedRtpPacket, RtpHeader, RtpReceiveCodec,
-    RtpReceiveExtension,
+    AuthenticatedRtp, CodecProfile, RtpHeader, RtpReceiveCodec, RtpReceiveExtension,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -505,7 +504,6 @@ struct OwnedCopy {
 
 #[derive(Clone, Copy)]
 pub(crate) struct QuicRtpIngress {
-    primary: RepairBinding,
     profile: Profile,
 }
 
@@ -520,56 +518,33 @@ impl QuicRtpIngress {
             Some(codec_format::Codec::H264(_)) => Profile::H264,
             _ => return Err(DropReason::Binding),
         };
-        Ok(Self {
-            primary: RepairBinding {
-                ssrc: binding.ssrc().get(),
-                payload_type: binding.payload_type(),
-            },
-            profile,
-        })
+        Ok(Self { profile })
     }
 
-    /// The association owner must resolve the installed binding and grant before calling.
-    pub(crate) fn prepare(
+    /// Association, binding and extension agreement have already been checked.
+    /// The source ledger, not the sender, owns extended sequence and time.
+    pub(crate) fn prepare_packet(
         self,
         arrival: Instant,
-        payload: &[u8],
+        packet: &BorrowedPacket<'_>,
     ) -> Result<MediaIngress, DropReason> {
-        let packet = ParsedRtpPacket::parse(payload).map_err(|_| DropReason::Binding)?;
-        let wire = Wire {
-            header: RtpHeader {
-                sequence: packet.sequence(),
-                timestamp: packet.timestamp(),
-                ssrc: packet.ssrc(),
-                payload_type: packet.payload_type(),
-                marker: packet.marker(),
-            },
-            padding: packet.padding_len(),
-            first_csrc: packet.first_csrc(),
-            extension_profile: packet.extension_profile(),
-            is_repair: false,
-            payload: packet.payload(),
-        };
-        let (sequence, input) = normalize(
-            PacketBinding {
-                primary: self.primary,
-                repair: None,
-                extension_form: None,
-                capture_clock_ssrc: None,
-                allow_csrc_stripping: false,
-            },
-            self.profile,
-            &[],
-            wire,
-            core::iter::empty(),
-        )?
-        .ok_or(DropReason::Binding)?;
+        let header = packet.header();
+        if header.profile != self.profile {
+            return Err(DropReason::Binding);
+        }
         Ok(MediaIngress::from_normalized(
             arrival,
             Instant::now(),
-            Position::LowSequence(sequence),
+            Position::CanonicalSequence(header.sequence),
             None,
-            input,
+            Normalized {
+                payload: packet.payload(),
+                is_repair: false,
+                marker: header.marker,
+                timestamp: header.timestamp,
+                extensions: packet.extensions().collect(),
+                extension_width: None,
+            },
         ))
     }
 }

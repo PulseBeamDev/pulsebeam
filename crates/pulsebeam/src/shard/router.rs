@@ -1956,7 +1956,7 @@ impl ShardRuntime {
         source: FabricSourceHandle,
         publisher: ParticipantHandle,
         installation: crate::participant::data_fabric::QuicInstallation,
-        bytes: &[u8],
+        input: crate::participant::data_fabric::QuicDataInput<'_>,
         now: pulsebeam_runtime::time::Instant,
         time: crate::participant::data_fabric::DataTime,
     ) -> Result<
@@ -1979,7 +1979,7 @@ impl ShardRuntime {
         if *participant != publisher || !data.matches(installation) {
             return Err(Error::Fenced);
         }
-        data.publish_quic(&mut bound.fanout, bytes, now, time)
+        data.publish_quic(&mut bound.fanout, input, now, time)
     }
 
     pub(super) fn data_publisher(

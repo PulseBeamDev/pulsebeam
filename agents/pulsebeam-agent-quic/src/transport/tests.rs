@@ -314,7 +314,7 @@ impl Pair {
         };
         tx.largest_delivered = 0;
         let mut progress = tx.offer_frame(self.now, sender);
-        if progress == framing::SendProgress::Deferred {
+        if matches!(progress, framing::SendProgress::Deferred(_)) {
             self.advance(1);
             let tx = if forward {
                 &mut self.client
@@ -502,7 +502,7 @@ fn control_progresses_between_full_payloads_without_displacing_admitted_data() {
         peer.scheduler.offer_bound(
             &mut peer.connection.as_mut().unwrap().1,
             Datagram {
-                kind: DatagramKind::Data,
+                kind: DatagramKind::Rtcp,
                 binding: NonZeroU16::MIN,
                 payload: &payload,
             },
@@ -526,7 +526,7 @@ fn control_progresses_between_full_payloads_without_displacing_admitted_data() {
     pair.advance(100);
 
     read_datagram(pair.server.conn(), |record| {
-        assert_eq!(record.kind, DatagramKind::Data);
+        assert_eq!(record.kind, DatagramKind::Rtcp);
         assert_eq!(record.binding, NonZeroU16::MIN);
         assert_eq!(record.payload, payload);
     })
@@ -570,7 +570,9 @@ fn listener_emits_exact_admit_once_and_fences_stalled_controller() {
             "edge.example",
         )
         .unwrap();
+    let fabric = crate::data_bindings::FabricOffer::decode([1, 1, 0, 0, 0, 12]);
     let body = Admit {
+        fabric,
         attempt: NonZeroU64::MIN,
         room: Some("stage"),
         owner: "proof",
@@ -620,6 +622,7 @@ fn listener_emits_exact_admit_once_and_fences_stalled_controller() {
                 && let Some(attempt) = peer.take_admit(now).unwrap()
             {
                 assert_eq!(attempt, body);
+                assert_eq!(peer.peer_fabric(), Some(fabric));
                 assert!(admitted.replace(handle).is_none());
             }
         }) {
@@ -696,7 +699,7 @@ fn executor_admits_and_renews_a_core_session() {
     let mut renewal_started = false;
     for step in 0..1_000 {
         let now = start + Duration::from_millis(step);
-        if let Some(event) = carrier.poll_event(now) {
+        if let Some(event) = carrier.poll_event(now, |_| None) {
             if matches!(event, pulsebeam_agent_core::QuicEvent::Accepted { .. }) {
                 assert_eq!(core.snapshot().connection, ConnectionState::Joining);
             }
@@ -752,6 +755,7 @@ fn executor_admits_and_renews_a_core_session() {
                 assert_eq!(admit.attempt.get(), carrier.generation().get());
                 assert_eq!((admit.owner, admit.token), ("owner", "token"));
                 let accepted = encode_admit_result(Ok(Accepted {
+                    fabric: crate::data_bindings::FabricOffer::CURRENT,
                     connection: [0, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 1],
                     participant: "alice",
                     room: None,
@@ -869,7 +873,7 @@ fn control_frame_reports_only_full_write_and_keeps_original_partial_deadline() {
     let mut pair = Pair::new("edge.example", true);
     pair.advance(100);
     let mut client = ControlStream::open(pair.client.conn()).unwrap().unwrap();
-    let body = [0x61; 18];
+    let body = [0x61; 24];
     client.offer(Kind::Admit, &body, Phase::Bootstrap).unwrap();
     assert_eq!(
         client.offer(Kind::Admit, &body, Phase::Bootstrap),

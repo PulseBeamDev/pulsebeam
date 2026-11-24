@@ -87,6 +87,44 @@ fn authenticated_primary_resumes_idle_without_reopening_old_positions() {
 }
 
 #[test]
+fn canonical_sequence_retains_high_bits_across_wrap_and_rejects_window_jumps() {
+    let mut identity = source(8, Anchors::default()).into_identity();
+    let now = Instant::now();
+    let mut admit = |raw| {
+        identity.admit(
+            now,
+            now,
+            Position::CanonicalSequence(raw),
+            media(false, 500, &[]),
+            |_| None,
+        )
+    };
+    assert!(matches!(
+        admit(u32::MAX - 1),
+        Ok(IdentityAdmission::Media {
+            sequence: 0xffff_fffe,
+            ..
+        })
+    ));
+    assert!(matches!(admit(0x7fff_fffe), Err(Rejected::Ambiguous)));
+    assert!(matches!(admit(0x1_0000), Err(Rejected::Epoch)));
+    assert!(matches!(
+        admit(0),
+        Ok(IdentityAdmission::Media {
+            sequence: 0x1_0000_0000,
+            ..
+        })
+    ));
+    assert!(matches!(
+        admit(u32::MAX),
+        Ok(IdentityAdmission::Media {
+            sequence: 0xffff_ffff,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn rtx_first_freezes_image_but_later_primary_fixes_presence() {
     let now = Instant::now();
     let mut source = source(4, Anchors::default());

@@ -111,8 +111,16 @@ impl UdpAssociation {
         self.association.data_staging
     }
 
-    pub(super) fn datagram_limit(&mut self) -> Option<usize> {
-        self.association.transport.datagram_limit()
+    pub(super) fn peer_fabric(&self) -> Option<crate::data_bindings::FabricOffer> {
+        self.association.peer_fabric()
+    }
+
+    pub(super) fn offer_media_packet(
+        &mut self,
+        sender: &mut crate::transport::framing::Sender,
+        now: std::time::Instant,
+    ) -> Result<crate::transport::framing::SendProgress, crate::transport::framing::SendError> {
+        self.association.offer_media_packet(sender, now)
     }
 
     pub(super) fn offer_media(
@@ -129,10 +137,14 @@ impl UdpAssociation {
 
     /// One bounded reactor turn. `None` means the owner can poll again or run
     /// other ready Core work. With no progress, waits for I/O or the next deadline.
-    pub async fn progress(&mut self, retry_payload_turn: bool) -> io::Result<Option<QuicEvent>> {
+    pub(super) async fn progress(
+        &mut self,
+        retry_payload_turn: bool,
+        authorize: impl Fn(std::num::NonZeroU16) -> Option<(super::ReceiveBinding, bool)>,
+    ) -> io::Result<Option<QuicEvent>> {
         let now = time::Instant::now().into_std();
         self.association.transport.service_timer(now);
-        let event = self.association.poll_event(now);
+        let event = self.association.poll_event(now, authorize);
         let mut more = false;
         self.egress.stage(self.socket.local_addr(), |out| {
             let (packet, pending) = self.association.poll_packet(now, out);

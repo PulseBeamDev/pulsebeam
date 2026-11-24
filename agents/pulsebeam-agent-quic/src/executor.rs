@@ -1,29 +1,39 @@
 //! Linux carrier execution for Core's generation-scoped QUIC effects.
 
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     net::SocketAddr,
-    num::NonZeroU64,
+    num::{NonZeroU16, NonZeroU64},
     time::{Duration, Instant},
 };
 
 use noq_proto::{ClientConfig, Transmit};
 use pulsebeam_agent_core::{
-    Failure, FailureClass, Generation, OperationId, QuicAdmit, QuicDataSend, QuicEffect, QuicEvent,
+    ChannelId, Failure, FailureClass, Generation, OperationId, QuicAdmit, QuicDataSend, QuicEffect,
+    QuicEvent,
 };
-use pulsebeam_core::identity::ConnectionId;
+use pulsebeam_core::{
+    fabric::{
+        FabricPacket, Header, Profile,
+        packet::{Agreement, MAX_PACKET_BYTES},
+    },
+    identity::ConnectionId,
+};
 use pulsebeam_udp::ReceivedDatagram;
 
 use crate::{
+    data_bindings::FabricOffer,
     frame::{Kind, Phase},
     records::{Admit, Datagram, DatagramKind, Denial, PictureLossIndication, Renew, RenewResult},
     transport::{
-        DatagramAdmission,
+        DatagramAdmission, NativeDatagram,
         client::{
             ClientTransport,
             admission::{AdmissionError, ClientAdmission},
         },
         control::{self, ControlStream, Read, Write},
+        framing::{Receiver, SendError, SendProgress, Sender},
+        read_native_datagram,
     },
 };
 
@@ -49,10 +59,34 @@ pub struct Association {
     transport: ClientTransport,
     stage: Stage,
     pending_data: VecDeque<PendingData>,
+    data_senders: BTreeMap<NonZeroU16, DataSender>,
+    receivers: BTreeMap<NonZeroU16, PacketReceiver>,
     #[cfg(feature = "sim")]
     data_staging: DataStaging,
     bulk_due: bool,
     more_data_work: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReceiveBinding {
+    Data,
+    Media {
+        profile: Profile,
+        ssrc: u32,
+        payload_type: u8,
+    },
+}
+
+struct PacketReceiver {
+    binding: ReceiveBinding,
+    agreement: Agreement,
+    framer: Receiver,
+}
+
+struct DataSender {
+    channel: ChannelId,
+    agreement: Agreement,
+    framer: Sender,
 }
 
 struct PendingData {
@@ -85,6 +119,7 @@ enum Stage {
         control: ControlStream,
         pending: Option<PendingControl>,
         renewal: Option<PendingRenewal>,
+        peer_fabric: crate::data_bindings::FabricOffer,
     },
     Closing(Instant),
     Finished,
@@ -131,6 +166,7 @@ impl Association {
             .ok_or_else(|| failed(protocol("invalid QUIC generation")))?;
         let admission = ClientAdmission::new(
             &Admit {
+                fabric: crate::data_bindings::FabricOffer::CURRENT,
                 attempt,
                 room: admit.room.as_deref(),
                 owner: &admit.placement.owner,
@@ -148,11 +184,20 @@ impl Association {
             transport,
             stage: Stage::Admitting(admission),
             pending_data: VecDeque::new(),
+            data_senders: BTreeMap::new(),
+            receivers: BTreeMap::new(),
             #[cfg(feature = "sim")]
             data_staging: DataStaging::default(),
             bulk_due: false,
             more_data_work: false,
         })
+    }
+
+    pub fn peer_fabric(&self) -> Option<crate::data_bindings::FabricOffer> {
+        match self.stage {
+            Stage::Active { peer_fabric, .. } => Some(peer_fabric),
+            _ => None,
+        }
     }
 
     pub fn generation(&self) -> Generation {
@@ -194,20 +239,38 @@ impl Association {
             } if generation == self.generation => {
                 self.pending_data
                     .retain(|data| data.send.channel != channel);
+                self.data_senders
+                    .retain(|_, sender| sender.channel != channel);
                 Ok(())
             }
             QuicEffect::SendData(send) if send.generation == self.generation => {
                 const MAX_PENDING_DATA: usize = 64;
-                if !matches!(self.stage, Stage::Active { .. }) {
-                    return Err(SubmitError::NotAdmitted);
-                }
-                if send.payload.is_empty()
-                    || send.payload.len() > pulsebeam_proto::data_record::MAX_RECORD_BYTES
-                {
+                let peer = self.peer_fabric().ok_or(SubmitError::NotAdmitted)?;
+                if pulsebeam_proto::data_record::wire_identity(&send.payload).is_err() {
                     return Err(SubmitError::Data(DatagramAdmission::Size));
                 }
                 if self.pending_data.len() >= MAX_PENDING_DATA {
                     return Err(SubmitError::Data(DatagramAdmission::Full));
+                }
+                if let Some(sender) = self.data_senders.get(&send.binding) {
+                    if sender.channel != send.channel {
+                        return Err(SubmitError::Stale);
+                    }
+                } else {
+                    if self.data_senders.len() >= MAX_PENDING_DATA {
+                        return Err(SubmitError::Data(DatagramAdmission::Full));
+                    }
+                    let selected = FabricOffer::CURRENT
+                        .bind(peer, Profile::Data, 0)
+                        .map_err(|_| SubmitError::Data(DatagramAdmission::Unsupported))?;
+                    self.data_senders.insert(
+                        send.binding,
+                        DataSender {
+                            channel: send.channel,
+                            agreement: selected.agreement,
+                            framer: Sender::new(selected.framing, send.binding),
+                        },
+                    );
                 }
                 self.pending_data.push_back(PendingData::new(send, now));
                 #[cfg(feature = "sim")]
@@ -274,10 +337,19 @@ impl Association {
         application
             .into_iter()
             .chain(self.transport.deadline())
+            .chain(
+                self.receivers
+                    .values()
+                    .filter_map(|receiver| receiver.framer.next_deadline()),
+            )
             .min()
     }
 
-    pub fn poll_event(&mut self, now: Instant) -> Option<QuicEvent> {
+    pub(crate) fn poll_event(
+        &mut self,
+        now: Instant,
+        authorize: impl Fn(NonZeroU16) -> Option<(ReceiveBinding, bool)>,
+    ) -> Option<QuicEvent> {
         self.more_data_work = false;
         let generation = self.generation;
         let connection = self.transport.connection();
@@ -289,6 +361,7 @@ impl Association {
                         control,
                         pending: None,
                         renewal: None,
+                        peer_fabric: accepted.fabric,
                     };
                     return Some(QuicEvent::Accepted {
                         generation,
@@ -324,35 +397,52 @@ impl Association {
                 control,
                 pending,
                 renewal,
+                ..
             } => match poll_active(generation, connection, control, pending, renewal, now) {
                 Ok(Some(event)) => return Some(event),
                 Ok(None) => {
                     if let Some(event) = self.poll_data_send(now) {
                         return Some(event);
                     }
+                    let offer = self.peer_fabric()?;
                     let connection = self.transport.connection();
-                    use crate::transport::read_datagram;
+                    let receivers = &mut self.receivers;
+                    receivers.retain(|&id, receiver| match authorize(id) {
+                        Some((binding, ready)) if binding == receiver.binding => {
+                            if ready {
+                                receiver.framer.expire(now);
+                            } else {
+                                receiver.framer.discard_active();
+                            }
+                            true
+                        }
+                        _ => false,
+                    });
                     const DATA_INPUT_BUDGET: usize = 16;
                     for _ in 0..DATA_INPUT_BUDGET {
-                        let datagram = read_datagram(connection, |datagram| match datagram.kind {
-                            DatagramKind::Data => Some(QuicEvent::Data {
-                                generation,
-                                binding: datagram.binding,
-                                payload: datagram.payload.to_vec(),
-                            }),
-                            DatagramKind::Rtp => Some(QuicEvent::Rtp {
-                                generation,
-                                binding: datagram.binding,
-                                payload: datagram.payload.to_vec(),
-                            }),
-                            DatagramKind::Rtcp => PictureLossIndication::decode(datagram.payload)
-                                .ok()
-                                .map(|pli| QuicEvent::PictureLoss {
-                                    generation,
-                                    binding: datagram.binding,
-                                    media_ssrc: pli.media_ssrc,
-                                }),
-                        })?;
+                        let datagram =
+                            read_native_datagram(connection, |datagram| match datagram {
+                                NativeDatagram::Packet { binding, wire } => {
+                                    let (selected, true) = authorize(binding)? else {
+                                        return None;
+                                    };
+                                    receive_packet(
+                                        receivers, offer, generation, binding, selected, now, wire,
+                                    )
+                                }
+                                NativeDatagram::Endpoint(datagram)
+                                    if datagram.kind == DatagramKind::Rtcp =>
+                                {
+                                    PictureLossIndication::decode(datagram.payload).ok().map(
+                                        |pli| QuicEvent::PictureLoss {
+                                            generation,
+                                            binding: datagram.binding,
+                                            media_ssrc: pli.media_ssrc,
+                                        },
+                                    )
+                                }
+                                NativeDatagram::Endpoint(_) => None,
+                            })?;
                         if let Ok(Some(event)) = datagram {
                             return Some(event);
                         }
@@ -391,19 +481,48 @@ impl Association {
         Ok(())
     }
 
+    fn offer_media_packet(
+        &mut self,
+        sender: &mut Sender,
+        now: Instant,
+    ) -> Result<SendProgress, SendError> {
+        if self.peer_fabric().is_none() {
+            return Err(SendError::Unsupported);
+        }
+        if self.bulk_due && !self.pending_data.is_empty() {
+            return Ok(SendProgress::Deferred(DatagramAdmission::Full));
+        }
+        let status = self.transport.offer_packet(sender, now)?;
+        if matches!(status, SendProgress::Partial | SendProgress::Admitted) {
+            self.bulk_due = true;
+        }
+        Ok(status)
+    }
+
     fn poll_data_send(&mut self, _now: Instant) -> Option<QuicEvent> {
         let pending = &self.pending_data.front()?.send;
-        let result = match self.transport.offer_datagram(Datagram {
-            kind: DatagramKind::Data,
-            binding: pending.binding,
-            payload: &pending.payload,
-        }) {
-            Ok(()) => Ok(()),
-            Err(DatagramAdmission::ControlTurn) => {
+        let result = self
+            .data_senders
+            .get_mut(&pending.binding)
+            .ok_or(SendError::Unsupported)
+            .and_then(|sender| {
+                if !sender.framer.is_pending() {
+                    let bytes = encode_data(sender.agreement, &pending.payload)?;
+                    sender.framer.start(_now, bytes)?;
+                }
+                self.transport.offer_packet(&mut sender.framer, _now)
+            });
+        let result = match result {
+            Ok(SendProgress::Admitted) => Ok(()),
+            Ok(SendProgress::Partial) => {
                 self.more_data_work = true;
                 return None;
             }
-            Err(DatagramAdmission::Full) => return None,
+            Ok(SendProgress::Deferred(reason)) => {
+                self.more_data_work = reason == DatagramAdmission::ControlTurn;
+                return None;
+            }
+            Ok(SendProgress::Idle) => Err("QUIC DATA framer lost its pending record".into()),
             Err(error) => Err(format!("QUIC DATA admission: {error:?}")),
         };
         let pending = self.pending_data.pop_front()?;
@@ -423,6 +542,91 @@ impl Association {
             result,
         })
     }
+}
+
+fn receive_packet(
+    receivers: &mut BTreeMap<NonZeroU16, PacketReceiver>,
+    offer: FabricOffer,
+    generation: Generation,
+    id: NonZeroU16,
+    binding: ReceiveBinding,
+    now: Instant,
+    wire: &[u8],
+) -> Option<QuicEvent> {
+    let room = receivers.len() < 64;
+    let receiver = match receivers.entry(id) {
+        std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+        std::collections::btree_map::Entry::Vacant(entry) if room => {
+            let profile = match binding {
+                ReceiveBinding::Data => Profile::Data,
+                ReceiveBinding::Media { profile, .. } => profile,
+            };
+            let selected = FabricOffer::CURRENT.bind(offer, profile, 0).ok()?;
+            entry.insert(PacketReceiver {
+                binding,
+                agreement: selected.agreement,
+                framer: Receiver::new(selected.framing, id),
+            })
+        }
+        _ => return None,
+    };
+    if receiver.binding != binding {
+        return None;
+    }
+    let packet = receiver.framer.receive(now, wire).ok()??;
+    let packet = receiver.agreement.decode(packet.as_ref()).ok()?;
+    let header = packet.header();
+    match binding {
+        ReceiveBinding::Data => {
+            let identity = pulsebeam_proto::data_record::wire_identity(packet.payload()).ok()?;
+            (header.marker == identity.final_fragment()).then(|| QuicEvent::Data {
+                generation,
+                binding: id,
+                payload: packet.payload().to_vec(),
+            })
+        }
+        ReceiveBinding::Media {
+            ssrc, payload_type, ..
+        } => {
+            // Reuse the Linux encoded depacketizer's RTP-shaped input locally.
+            // Packet authority and extensions are resolved before this adapter.
+            let mut payload = Vec::with_capacity(12 + packet.payload().len());
+            payload.extend_from_slice(&[0x80, payload_type | (u8::from(header.marker) << 7)]);
+            let [.., a, b] = header.sequence.to_be_bytes();
+            payload.extend_from_slice(&[a, b]);
+            payload.extend_from_slice(&header.timestamp.to_be_bytes());
+            payload.extend_from_slice(&ssrc.to_be_bytes());
+            payload.extend_from_slice(packet.payload());
+            Some(QuicEvent::Rtp {
+                generation,
+                binding: id,
+                payload,
+            })
+        }
+    }
+}
+
+fn encode_data(agreement: Agreement, record: &[u8]) -> Result<Box<[u8]>, SendError> {
+    let identity =
+        pulsebeam_proto::data_record::wire_identity(record).map_err(|_| SendError::Size)?;
+    // The edge allocates DATA packet sequence and canonical timestamp on
+    // admission. The independent unit and fragment coordinates stay in DATA.
+    let packet = FabricPacket::new(
+        Header {
+            profile: Profile::Data,
+            marker: identity.final_fragment(),
+            sequence: 0,
+            timestamp: 0,
+        },
+        &[],
+        record,
+    )
+    .map_err(|_| SendError::Size)?;
+    let mut bytes = [0; MAX_PACKET_BYTES];
+    let len = agreement
+        .write(&packet, &mut bytes)
+        .map_err(|_| SendError::Size)?;
+    Ok(Box::from(bytes.get(..len).ok_or(SendError::Size)?))
 }
 
 fn poll_active(

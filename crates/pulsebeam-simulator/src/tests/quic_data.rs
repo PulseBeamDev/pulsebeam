@@ -1,6 +1,7 @@
 use std::{
+    collections::BTreeMap,
     net::SocketAddr,
-    num::{NonZeroU64, NonZeroUsize},
+    num::{NonZeroU16, NonZeroU64, NonZeroUsize},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -15,15 +16,21 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use noq_proto::rustls;
 use pulsebeam::node::{IceTcpConfig, NodeBuilder, QuicListener};
 use pulsebeam_agent_quic::{
+    data_bindings::{FabricBinding, FabricOffer},
+    fabric::{
+        FabricPacket, Header, Profile,
+        packet::{BASE_BYTES, MAX_PACKET_BYTES},
+    },
     frame::{Frame, Kind, Phase},
     records::{Admit, Renew, RenewResult},
     transport::{
-        self, DatagramAdmission,
+        self, DatagramAdmission, NativeDatagram,
         client::{
             ClientTransport,
             admission::{Admission, ClientAdmission},
         },
         control::{ControlStream, Read, Write},
+        framing::{Receiver, SendProgress, Sender},
         socket::{Egress, Flush},
     },
 };
@@ -45,6 +52,9 @@ struct Client {
     transport: ClientTransport,
     socket: pulsebeam_udp::UdpSocket,
     out: Egress,
+    data_wire: Option<FabricBinding>,
+    data_senders: BTreeMap<NonZeroU16, Sender>,
+    data_receivers: BTreeMap<NonZeroU16, Receiver>,
 }
 
 impl Client {
@@ -65,6 +75,9 @@ impl Client {
             transport,
             socket,
             out: Egress::default(),
+            data_wire: None,
+            data_senders: BTreeMap::new(),
+            data_receivers: BTreeMap::new(),
         })
     }
 
@@ -117,6 +130,8 @@ impl Client {
                 .poll(self.transport.connection(), Instant::now().into_std())
                 .map_err(|error| anyhow::anyhow!("admission failed: {error:?}"))?
             {
+                self.data_wire =
+                    Some(FabricOffer::CURRENT.bind(accepted.0.fabric, Profile::Data, 0)?);
                 return Ok(accepted);
             }
             self.progress().await?;
@@ -156,17 +171,42 @@ impl Client {
         binding: std::num::NonZeroU16,
         payload: &[u8],
     ) -> Result<std::result::Result<(), DatagramAdmission>> {
-        use pulsebeam_agent_quic::records::{Datagram, DatagramKind};
+        let selected = self.data_wire.context("DATA framing not negotiated")?;
+        let Ok(identity) = pulsebeam_proto::data_record::wire_identity(payload) else {
+            return Ok(Err(DatagramAdmission::Size));
+        };
+        let packet = FabricPacket::new(
+            Header {
+                profile: Profile::Data,
+                marker: identity.final_fragment(),
+                sequence: 0,
+                timestamp: 0,
+            },
+            &[],
+            payload,
+        )?;
+        let mut bytes = [0; MAX_PACKET_BYTES];
+        let len = selected.agreement.write(&packet, &mut bytes)?;
+        self.data_senders
+            .entry(binding)
+            .or_insert_with(|| Sender::new(selected.framing, binding))
+            .start(
+                Instant::now().into_std(),
+                Box::from(bytes.get(..len).context("DATA fixture encoding")?),
+            )
+            .map_err(|error| anyhow::anyhow!("starting DATA packet: {error:?}"))?;
         loop {
-            match self.transport.offer_datagram(Datagram {
-                kind: DatagramKind::Data,
-                binding,
-                payload,
-            }) {
-                Err(DatagramAdmission::Full | DatagramAdmission::ControlTurn) => {
-                    self.progress().await?;
-                }
-                result => return Ok(result),
+            let sender = self
+                .data_senders
+                .get_mut(&binding)
+                .context("missing DATA fixture sender")?;
+            match self
+                .transport
+                .offer_packet(sender, Instant::now().into_std())
+            {
+                Ok(SendProgress::Partial | SendProgress::Deferred(_)) => self.progress().await?,
+                Ok(SendProgress::Admitted) => return Ok(Ok(())),
+                result => anyhow::bail!("offering DATA packet: {result:?}"),
             }
         }
     }
@@ -181,19 +221,52 @@ impl Client {
         expected_binding: u16,
         matches_payload: impl Fn(&[u8]) -> bool,
     ) -> Result<()> {
+        let selected = self.data_wire.context("DATA framing not negotiated")?;
+        let binding = NonZeroU16::new(expected_binding).context("zero DATA binding")?;
         loop {
-            if let Some(result) = self.transport.read_datagram(|datagram| {
-                datagram.kind == pulsebeam_agent_quic::records::DatagramKind::Data
-                    && datagram.binding.get() == expected_binding
-                    && matches_payload(datagram.payload)
-            }) {
-                ensure!(
-                    matches!(result, Ok(true)),
-                    "unexpected DATA datagram: {result:?}"
-                );
-                return Ok(());
+            let receiver = self
+                .data_receivers
+                .entry(binding)
+                .or_insert_with(|| Receiver::new(selected.framing, binding));
+            let result = transport::read_native_datagram(
+                self.transport.connection(),
+                |datagram| -> Result<Option<bool>> {
+                    let NativeDatagram::Packet {
+                        binding: actual,
+                        wire,
+                    } = datagram
+                    else {
+                        anyhow::bail!("unexpected non-Fabric datagram");
+                    };
+                    ensure!(actual == binding, "unexpected DATA binding {actual}");
+                    let Some(bytes) =
+                        receiver
+                            .receive(Instant::now().into_std(), wire)
+                            .map_err(|error| {
+                                anyhow::anyhow!("invalid DATA transport frame: {error:?}")
+                            })?
+                    else {
+                        return Ok(None);
+                    };
+                    let packet = selected.agreement.decode(bytes.as_ref())?;
+                    let identity = pulsebeam_proto::data_record::wire_identity(packet.payload())
+                        .map_err(|error| anyhow::anyhow!("invalid DATA packet: {error:?}"))?;
+                    ensure!(
+                        identity.final_fragment() == packet.header().marker,
+                        "DATA marker mismatch"
+                    );
+                    Ok(Some(matches_payload(packet.payload())))
+                },
+            );
+            match result {
+                Some(Ok(Ok(Some(matched)))) => {
+                    ensure!(matched, "unexpected DATA payload");
+                    return Ok(());
+                }
+                Some(Ok(Ok(None))) => continue,
+                None => self.progress().await?,
+                other => anyhow::bail!("unexpected DATA frame: {other:?}"),
             }
-            self.progress().await?;
         }
     }
 
@@ -824,6 +897,7 @@ async fn open_subscriber(
     let mut client = Client::new(edge, roots).await?;
     let (_, mut control) = client
         .admit(Admit {
+            fabric: pulsebeam_agent_quic::data_bindings::FabricOffer::CURRENT,
             attempt: NonZeroU64::MIN,
             room: Some("stage"),
             owner: &owner,
@@ -1436,12 +1510,7 @@ async fn opus_exchange(
             .map_err(|error| anyhow::anyhow!("Opus receiver readiness: {error:?}"))?;
     }
     ensure!(matches!(
-        publisher.send_opus(
-            "voice",
-            0,
-            false,
-            &vec![1; usize::from(transport::UDP_PAYLOAD_BYTES)]
-        ),
+        publisher.send_opus("voice", 0, false, &vec![1; MAX_PACKET_BYTES]),
         Err(OpusSendError::Datagram(DatagramAdmission::Size))
     ));
     let generation = publisher
@@ -1449,12 +1518,16 @@ async fn opus_exchange(
         .generation
         .context("admitted QUIC generation")?;
     let mut previous: Option<(u16, u32)> = None;
-    for (timestamp, marker) in [(960, true), (1920, false)] {
+    let sliced = [0xf8; transport::framing::WHOLE_CAPACITY - BASE_BYTES + 1];
+    for (timestamp, marker, payload) in [
+        (960, true, &[0xf8, 0xff, 0xfe][..]),
+        (1920, false, &sliced[..]),
+    ] {
         if rebind && previous.is_some() {
             publisher.rebind(edge.ip()).await?;
         }
         loop {
-            match publisher.send_opus("voice", timestamp, marker, &[0xf8, 0xff, 0xfe]) {
+            match publisher.send_opus("voice", timestamp, marker, payload) {
                 Ok(()) => break,
                 Err(OpusSendError::Datagram(
                     DatagramAdmission::Full | DatagramAdmission::ControlTurn,
@@ -1472,7 +1545,7 @@ async fn opus_exchange(
                     ensure!(
                         packet.publication_id == publication_id
                             && packet.marker == marker
-                            && packet.payload == [0xf8, 0xff, 0xfe],
+                            && packet.payload == payload,
                         "unexpected negotiated Opus packet: {packet:?}"
                     );
                     return Ok((packet.sequence, packet.timestamp));
@@ -1831,8 +1904,9 @@ async fn mixed_h264_exchange(
     rtc_host: std::net::IpAddr,
     quic_token: &str,
     rtc_token: &str,
-    cross_shard: bool,
+    native_receiver_token: Option<&str>,
 ) -> Result<()> {
+    let cross_shard = native_receiver_token.is_none();
     use super::common::{client::create_http_client, native::NativeHost};
     use pulsebeam_agent_core::{
         AgentCommand, AgentConfig, DesiredState, MediaKind, PublicationIntent,
@@ -1842,7 +1916,7 @@ async fn mixed_h264_exchange(
         Agent as RuntimeAgent, Config, H264Frame, Host, InputFrame, MediaStreamUpdate, OutputFrame,
         ReceiveMode, VideoInput, ffi::Agent,
     };
-    let mut quic = sim_quic_agent(address, edge, roots, quic_token)?;
+    let mut quic = sim_quic_agent(address, edge, roots.clone(), quic_token)?;
     let camera = PublicationIntent {
         slot: "camera".into(),
         track_id: "camera".into(),
@@ -1867,6 +1941,29 @@ async fn mixed_h264_exchange(
         quic.turn()
             .await
             .map_err(|error| anyhow::anyhow!("QUIC video publication: {error:?}"))?;
+    };
+    let mut native_receiver = if let Some(token) = native_receiver_token {
+        let mut receiver = sim_quic_agent(address, edge, roots, token)?;
+        receiver.command(AgentCommand::ReplaceDesired(DesiredState {
+            revision: 1,
+            video: vec![pinned_video(publication.clone())],
+            ..Default::default()
+        }))?;
+        receiver.command(AgentCommand::Join("stage".into()))?;
+        pulsebeam_runtime::time::timeout(Duration::from_secs(2), async {
+            while !receiver.h264_receiver_ready(&publication) {
+                receiver
+                    .turn()
+                    .await
+                    .map_err(|error| anyhow::anyhow!("native H.264 receiver: {error:?}"))?;
+            }
+            anyhow::Ok(())
+        })
+        .await
+        .context("native H.264 receiver did not install")??;
+        Some(receiver)
+    } else {
+        None
     };
     let mut units = {
         use pulsebeam_rtc_simulation::{
@@ -1952,7 +2049,7 @@ async fn mixed_h264_exchange(
         unit.data.len() > usize::from(transport::UDP_PAYLOAD_BYTES),
         "fixture must require multiple QUIC datagrams"
     );
-    let mut timestamp_offset = None;
+    let (mut timestamp_offset, mut native_timestamp_offset) = (None, None);
     for sample in [&unit, &delta] {
         quic.send_h264("camera", sample.rtp_timestamp, sample.data.clone())
             .map_err(|error| anyhow::anyhow!("QUIC video send: {error:?}"))?;
@@ -1983,8 +2080,35 @@ async fn mixed_h264_exchange(
                 }
             }
         };
+        let receive_native = async {
+            let Some(receiver) = &mut native_receiver else {
+                return Ok(());
+            };
+            loop {
+                if let Some(frame) = receiver.next_h264() {
+                    ensure!(
+                        frame.publication_id == publication && frame.access_unit == sample.data,
+                        "native H.264 receiver did not preserve the access unit"
+                    );
+                    let offset = frame.timestamp.wrapping_sub(sample.rtp_timestamp);
+                    ensure!(
+                        *native_timestamp_offset.get_or_insert(offset) == offset,
+                        "native H.264 timestamp delta changed"
+                    );
+                    return Ok(());
+                }
+                receiver
+                    .turn()
+                    .await
+                    .map_err(|error| anyhow::anyhow!("native H.264 receiver: {error:?}"))?;
+            }
+        };
+        let receive_both = async {
+            let (timestamp, ()) = tokio::try_join!(receive, receive_native)?;
+            anyhow::Ok(timestamp)
+        };
         let timestamp = pulsebeam_runtime::select! {
-            result = pulsebeam_runtime::time::timeout(Duration::from_secs(2), receive) => result.context("WebRTC did not receive QUIC H.264")??,
+            result = pulsebeam_runtime::time::timeout(Duration::from_secs(2), receive_both) => result.context("H.264 receivers did not both observe the published unit")??,
             error = async { loop { if let Err(error) = quic.turn().await { break error; } } } => anyhow::bail!("QUIC video drive: {error:?}"),
         };
         let offset = timestamp.wrapping_sub(sample.rtp_timestamp);
@@ -2302,6 +2426,9 @@ async fn witness(scenario: Scenario) -> Result<()> {
             .await;
         }
         if let Scenario::MixedH264 { host, cross_shard } = scenario {
+            let native_receiver = (!cross_shard)
+                .then(|| sign("native-viewer", 60))
+                .transpose()?;
             return mixed_h264_exchange(
                 address,
                 edge,
@@ -2309,7 +2436,7 @@ async fn witness(scenario: Scenario) -> Result<()> {
                 host,
                 &credential,
                 &subscriber_token,
-                cross_shard,
+                native_receiver.as_ref().map(|signed| signed.token.as_str()),
             )
             .await;
         }
@@ -2331,6 +2458,7 @@ async fn witness(scenario: Scenario) -> Result<()> {
         let mut client = Client::new(edge, roots.clone()).await?;
         let (accepted, mut control) = client
             .admit(Admit {
+                fabric: pulsebeam_agent_quic::data_bindings::FabricOffer::CURRENT,
                 attempt: NonZeroU64::MIN,
                 room: Some("stage"),
                 owner: &owner,
@@ -2551,6 +2679,7 @@ async fn witness(scenario: Scenario) -> Result<()> {
         let mut next = Client::new(edge, roots).await?;
         let (accepted, mut control) = next
             .admit(Admit {
+                fabric: pulsebeam_agent_quic::data_bindings::FabricOffer::CURRENT,
                 attempt: NonZeroU64::new(2).context("valid attempt")?,
                 room: Some("stage"),
                 owner: &owner,

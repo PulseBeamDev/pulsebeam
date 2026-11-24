@@ -11,14 +11,41 @@ use std::{
 use anyhow::{Context, Result, anyhow, ensure};
 use noq_proto::{FourTuple, PathId, Transmit, rustls};
 use pulsebeam_agent_quic::{
-    records::{Datagram, DatagramKind},
-    transport::{self, DatagramAdmission, Readiness, client::ClientTransport, listener::Listener},
+    records::PacketFraming,
+    transport::{
+        self, NativeDatagram, Readiness,
+        client::ClientTransport,
+        framing::{Receiver, Sender, WHOLE_CAPACITY},
+        listener::Listener,
+    },
 };
 use pulsebeam_udp::ReceivedDatagram;
 use rustls::{RootCertStore, pki_types::PrivatePkcs8KeyDer, time_provider::DefaultTimeProvider};
 
 const AUTHORITY: &str = "edge.example";
-const PAYLOAD_BYTES: usize = pulsebeam_proto::data_record::MAX_ENDPOINT_RECORD_BYTES;
+const PAYLOAD_BYTES: usize = WHOLE_CAPACITY + 1;
+const BINDING: NonZeroU16 = NonZeroU16::MIN;
+
+fn received_packet(
+    connection: &mut noq_proto::Connection,
+    receiver: &mut Receiver,
+    now: Instant,
+    expected: &[u8],
+) -> bool {
+    transport::read_native_datagram(connection, |datagram| {
+        let NativeDatagram::Packet {
+            binding: BINDING,
+            wire,
+        } = datagram
+        else {
+            return false;
+        };
+        receiver
+            .receive(now, wire)
+            .is_ok_and(|complete| complete.is_some_and(|bytes| bytes.as_ref() == expected))
+    })
+    .is_some_and(|result| result == Ok(true))
+}
 
 fn bind(ip: IpAddr) -> io::Result<UdpSocket> {
     let socket = UdpSocket::bind(SocketAddr::new(ip, 0))?;
@@ -77,6 +104,12 @@ fn witness(ip: IpAddr) -> Result<()> {
         .map_err(|error| anyhow!("client start: {error:?}"))?;
     let mut out = Vec::new();
     let mut association = None;
+    let framing =
+        PacketFraming::negotiate(1).map_err(|error| anyhow!("packet framing: {error:?}"))?;
+    let mut upload = Sender::new(framing, BINDING);
+    let mut echo = Sender::new(framing, BINDING);
+    let mut server_receive = Receiver::new(framing, BINDING);
+    let mut client_receive = Receiver::new(framing, BINDING);
 
     // Drive Noq's clock deterministically. The UDP traffic itself goes through
     // the kernel, with distinct source ports for both rebinding modes.
@@ -92,22 +125,18 @@ fn witness(ip: IpAddr) -> Result<()> {
             }
         }
         let payload = [value; PAYLOAD_BYTES];
-        let datagram = || Datagram {
-            kind: DatagramKind::Data,
-            binding: NonZeroU16::MIN,
-            payload: &payload,
-        };
-        let mut uploaded = false;
+        upload
+            .start(now, Box::from(payload.as_slice()))
+            .map_err(|error| anyhow!("starting client packet: {error:?}"))?;
         let (mut server_received, mut downloaded) = (false, false);
-        let mut echoed = false;
         for _ in 0..1200 {
             now += Duration::from_millis(1);
-            if !uploaded && transport::data_readiness(client.connection()) == Readiness::Ready {
-                match client.offer_datagram(datagram()) {
-                    Ok(()) => uploaded = true,
-                    Err(DatagramAdmission::ControlTurn | DatagramAdmission::Full) => {}
-                    Err(error) => return Err(anyhow!("client DATAGRAM admission: {error:?}")),
-                }
+            if upload.is_pending()
+                && transport::data_readiness(client.connection()) == Readiness::Ready
+            {
+                client
+                    .offer_packet(&mut upload, now)
+                    .map_err(|error| anyhow!("client packet admission: {error:?}"))?;
             }
             if let (Some(packet), _) = client.poll(now, &mut out) {
                 send(&socket, packet, &out)?;
@@ -126,19 +155,19 @@ fn witness(ip: IpAddr) -> Result<()> {
                 if transport::data_readiness(&mut peer.connection) != Readiness::Ready {
                     return;
                 }
-                if let Some(Ok(matched)) =
-                    transport::read_datagram(&mut peer.connection, |actual| actual == datagram())
+                if !server_received
+                    && received_packet(&mut peer.connection, &mut server_receive, now, &payload)
                 {
-                    server_received |= matched;
-                }
-                if server_received && !echoed {
-                    match peer.scheduler.offer_bound(&mut peer.connection, datagram()) {
-                        Ok(()) => echoed = true,
-                        Err(DatagramAdmission::ControlTurn | DatagramAdmission::Full) => {}
-                        Err(error) => {
-                            offered = Err(anyhow!("server DATAGRAM admission: {error:?}"));
-                        }
+                    server_received = true;
+                    if let Err(error) = echo.start(now, Box::from(payload.as_slice())) {
+                        offered = Err(anyhow!("starting server packet: {error:?}"));
+                        return;
                     }
+                }
+                if echo.is_pending()
+                    && let Err(error) = echo.offer(&mut peer.scheduler, &mut peer.connection, now)
+                {
+                    offered = Err(anyhow!("server packet admission: {error:?}"));
                 }
             }) {
                 offered?;
@@ -160,9 +189,7 @@ fn witness(ip: IpAddr) -> Result<()> {
                 );
                 Ok(())
             })?;
-            if let Some(Ok(matched)) = client.read_datagram(|actual| actual == datagram()) {
-                downloaded |= matched;
-            }
+            downloaded |= received_packet(client.connection(), &mut client_receive, now, &payload);
             let selected = association
                 .and_then(|handle| listener.get(handle))
                 .and_then(|peer| peer.connection.network_path(PathId::ZERO).ok())

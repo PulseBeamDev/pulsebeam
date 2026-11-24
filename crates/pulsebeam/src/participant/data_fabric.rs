@@ -16,7 +16,9 @@ use pulsebeam_clock::{
     domain::{ClockDomain, DataCapture, DataReceipt, Provenance, Quality},
     time::{ClockRate, GlobalDuration, MonotonicTime, SourceTime},
 };
-use pulsebeam_core::fabric::{Extension, ExtensionKind, FabricPacket, Header, Profile, WireError};
+use pulsebeam_core::fabric::{
+    BorrowedPacket, Extension, ExtensionKind, FabricPacket, Header, Profile, WireError,
+};
 use pulsebeam_proto::{
     data_control::{OriginalDemand, PublisherBinding, SourceUnit},
     data_endpoint::{Binding, Delivery, Endpoint},
@@ -530,12 +532,11 @@ impl<I: Copy + Eq> PublisherSource<I> {
     fn admit(
         &mut self,
         fanout: &mut SourceFanout,
-        bytes: &[u8],
+        input: DataIngress<'_>,
         now: Instant,
         time: DataTime,
     ) -> Result<super::event::FabricDataPosition<I>, Error> {
-        // Protected DATA DD is not qualified for this binding.
-        let admission = self.ledger.admit_record(fanout, bytes, now, time, false)?;
+        let admission = self.ledger.admit_input(fanout, input, now, time)?;
         Ok(super::event::FabricDataPosition {
             source: self.source,
             installation: self.installation,
@@ -563,7 +564,8 @@ impl PublisherSource {
         now: Instant,
         time: DataTime,
     ) -> Result<super::event::FabricDataPosition, Error> {
-        let position = self.admit(fanout, bytes, now, time)?;
+        // Protected DATA DD is not qualified for this SCTP binding.
+        let position = self.admit(fanout, DataIngress::Endpoint(bytes, false), now, time)?;
         #[cfg(feature = "sim")]
         if let (Some(endpoint), Some(admission)) = (self.reliable_endpoint, position.reliable) {
             crate::sim_metrics::record_wan_data_sctp(
@@ -582,12 +584,28 @@ impl PublisherSource<QuicInstallation> {
     pub(crate) fn publish_quic(
         &mut self,
         fanout: &mut SourceFanout,
-        bytes: &[u8],
+        input: QuicDataInput<'_>,
         now: Instant,
         time: DataTime,
     ) -> Result<super::event::FabricDataPosition<QuicInstallation>, Error> {
-        self.admit(fanout, bytes, now, time)
+        let input = match input {
+            #[cfg(test)]
+            QuicDataInput::Record(bytes) => DataIngress::Endpoint(bytes, false),
+            QuicDataInput::Packet(packet) => DataIngress::Canonical(packet),
+        };
+        self.admit(fanout, input, now, time)
     }
+}
+
+pub(crate) enum QuicDataInput<'a> {
+    #[cfg(test)]
+    Record(&'a [u8]),
+    Packet(&'a BorrowedPacket<'a>),
+}
+
+enum DataIngress<'a> {
+    Endpoint(&'a [u8], bool),
+    Canonical(&'a BorrowedPacket<'a>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -956,6 +974,7 @@ impl Source {
         true
     }
 
+    #[cfg(test)]
     fn admit_record<'a>(
         &mut self,
         fanout: &'a mut SourceFanout,
@@ -964,6 +983,21 @@ impl Source {
         time: DataTime,
         allow_descriptor: bool,
     ) -> Result<Admission<'a>, Error> {
+        self.admit_input(
+            fanout,
+            DataIngress::Endpoint(bytes, allow_descriptor),
+            now,
+            time,
+        )
+    }
+
+    fn admit_input<'a>(
+        &mut self,
+        fanout: &'a mut SourceFanout,
+        input: DataIngress<'_>,
+        now: Instant,
+        time: DataTime,
+    ) -> Result<Admission<'a>, Error> {
         if self.fenced {
             return Err(Error::Fenced);
         }
@@ -971,23 +1005,40 @@ impl Source {
             .clock
             .as_ref()
             .map(|(id, epoch)| Clock { id, epoch: *epoch });
-        let record = if allow_descriptor {
-            Record::decode(bytes, clock)
-        } else {
-            Record::decode_without_descriptor(bytes, clock)
-        }
-        .map_err(Error::Record)?;
-        let descriptor = record.dependency_descriptor();
         let mut projected;
-        let payload = if descriptor.is_some() {
-            projected = [0; data_record::MAX_RECORD_BYTES];
-            let len = record
-                .without_dependency_descriptor()
-                .write(&mut projected)
+        let (record, payload, extensions) = match input {
+            DataIngress::Canonical(packet) => {
+                let record = project_record(packet, clock, None)?;
+                (
+                    record,
+                    packet.payload(),
+                    packet.extensions().collect::<arrayvec::ArrayVec<_, 2>>(),
+                )
+            }
+            DataIngress::Endpoint(bytes, allow_descriptor) => {
+                let record = if allow_descriptor {
+                    Record::decode(bytes, clock)
+                } else {
+                    Record::decode_without_descriptor(bytes, clock)
+                }
                 .map_err(Error::Record)?;
-            projected.get(..len).ok_or(Error::Projection)?
-        } else {
-            bytes
+                let mut extensions = arrayvec::ArrayVec::new();
+                let payload = if let Some(value) = record.dependency_descriptor() {
+                    extensions.push(Extension {
+                        kind: ExtensionKind::DependencyDescriptor,
+                        value,
+                    });
+                    projected = [0; data_record::MAX_RECORD_BYTES];
+                    let len = record
+                        .without_dependency_descriptor()
+                        .write(&mut projected)
+                        .map_err(Error::Record)?;
+                    projected.get(..len).ok_or(Error::Projection)?
+                } else {
+                    bytes
+                };
+                (record, payload, extensions)
+            }
         };
         let header = record.header();
         let shape = UnitShape::from(header);
@@ -1012,7 +1063,9 @@ impl Source {
             Slot::Open(unit) if unit.id == unit_id => {
                 if let Some(sequence) = unit.fragments.get(index).and_then(Option::as_ref) {
                     let packet = fanout.endpoint_data(*sequence).ok_or(Error::Sequence)?;
-                    if packet.payload() != payload || packet_descriptor(packet) != descriptor {
+                    if packet.payload() != payload
+                        || !packet.extensions().eq(extensions.iter().copied())
+                    {
                         self.fenced = true;
                         return Err(Error::SourceConflict);
                     }
@@ -1048,11 +1101,18 @@ impl Source {
         } else {
             0
         };
-        // The endpoint length covers the retained payload and DD value. A
-        // two-byte element header can cost one more byte than the record field.
-        let fragment_charge = bytes
-            .len()
-            .saturating_add(usize::from(descriptor.is_some_and(|dd| dd.len() > 16)))
+        let extension_header = if extensions.iter().any(|ext| ext.value.len() > 16) {
+            2
+        } else {
+            1
+        };
+        let fragment_charge = extensions
+            .iter()
+            .fold(payload.len(), |charge, ext| {
+                charge
+                    .saturating_add(extension_header)
+                    .saturating_add(ext.value.len())
+            })
             .saturating_add(size_of::<(u64, OwnedPacket)>());
         let charge = unit_charge.saturating_add(fragment_charge);
         let (mut remaining_live, mut remaining_bytes) = (self.live, self.charged);
@@ -1072,10 +1132,6 @@ impl Source {
         let sequence = self.next_sequence;
         let next_sequence = sequence.checked_add(1).ok_or(Error::Sequence)?;
         let expires = now.checked_add(LIFETIME).ok_or(Error::Sequence)?;
-        let extension = descriptor.map(|value| Extension {
-            kind: ExtensionKind::DependencyDescriptor,
-            value,
-        });
         let packet = FabricPacket::new(
             Header {
                 profile: Profile::Data,
@@ -1083,7 +1139,7 @@ impl Source {
                 timestamp,
                 marker,
             },
-            extension.as_slice(),
+            &extensions,
             Box::from(payload),
         )
         .map_err(Error::Fabric)?;
@@ -1250,7 +1306,7 @@ pub(crate) fn project_sctp_record<'data, 'clock>(
     Ok(record)
 }
 
-fn project_record<'data, 'clock>(
+pub(crate) fn project_record<'data, 'clock>(
     packet: &'data FabricPacket<impl AsRef<[u8]>, impl AsRef<[u8]>>,
     clock: Option<Clock<'clock>>,
     repair: Option<crate::route::fabric::local::RepairFragment>,

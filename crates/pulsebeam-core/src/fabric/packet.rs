@@ -8,7 +8,7 @@ use super::{
     REGISTRY_REVISION, WireError,
 };
 
-const BASE_BYTES: usize = 12;
+pub const BASE_BYTES: usize = 12;
 pub const MAX_PACKET_BYTES: usize = 1280;
 
 /// Each side declares its capabilities for the profile and the direction

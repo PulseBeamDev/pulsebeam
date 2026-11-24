@@ -1,8 +1,10 @@
 use std::{mem, time::Instant};
 
 use noq_proto::Connection;
+use pulsebeam_core::fabric::Profile;
 
 use crate::{
+    data_bindings::FabricOffer,
     frame::{self, Kind, Phase},
     records::{Admit, Denial, decode_admit_result},
     transport::{
@@ -18,6 +20,7 @@ pub struct Admission {
     pub participant: String,
     pub room: Option<String>,
     pub capabilities: Vec<u8>,
+    pub fabric: FabricOffer,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -44,6 +47,7 @@ pub struct ClientAdmission {
     stage: Stage,
     deadline: Instant,
     room: Option<String>,
+    fabric: FabricOffer,
 }
 
 impl ClientAdmission {
@@ -52,6 +56,7 @@ impl ClientAdmission {
             stage: Stage::Handshake(admit.encode().map_err(AdmissionError::Record)?),
             deadline,
             room: admit.room.map(str::to_owned),
+            fabric: admit.fabric,
         })
     }
 
@@ -114,7 +119,9 @@ impl ClientAdmission {
                     let accepted = decode_admit_result(&frame.body)
                         .map_err(AdmissionError::Record)?
                         .map_err(AdmissionError::Denied)?;
-                    if accepted.room != self.room.as_deref() {
+                    if accepted.room != self.room.as_deref()
+                        || self.fabric.bind(accepted.fabric, Profile::Data, 0).is_err()
+                    {
                         return Err(AdmissionError::UnexpectedResult);
                     }
                     return Ok(Some((
@@ -123,6 +130,7 @@ impl ClientAdmission {
                             participant: accepted.participant.to_owned(),
                             room: accepted.room.map(str::to_owned),
                             capabilities: accepted.capabilities.to_vec(),
+                            fabric: accepted.fabric,
                         },
                         control,
                     )));

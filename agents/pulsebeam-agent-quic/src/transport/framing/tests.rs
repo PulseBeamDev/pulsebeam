@@ -71,6 +71,39 @@ fn reorder_and_duplicates_cannot_complete_missing_or_terminal_transfers() {
 }
 
 #[test]
+fn disabling_a_binding_abandons_its_incomplete_transfers_without_reopening_ids() {
+    let mut receiver = Receiver::new(framing(), BINDING);
+    let now = Instant::now();
+    let frame = |id, offset, bytes| {
+        encode(
+            BINDING,
+            PacketFrame::Slice {
+                transfer: NonZeroU32::new(id).unwrap(),
+                total: 6,
+                offset,
+                bytes,
+            },
+        )
+    };
+    let head = frame(1, 0, b"abc");
+    let tail = frame(1, 3, b"def");
+    assert_eq!(receiver.receive(now, &head), Ok(None));
+    receiver.discard_active();
+    assert_eq!(receiver.next_deadline(), None);
+    assert_eq!(receiver.receive(now, &tail), Ok(None));
+    assert_eq!(receiver.receive(now, &head), Ok(None));
+    assert_eq!(receiver.receive(now, &frame(2, 0, b"abc")), Ok(None));
+    assert_eq!(
+        receiver
+            .receive(now, &frame(2, 3, b"def"))
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+        b"abcdef"
+    );
+}
+
+#[test]
 fn sender_keeps_fixed_offsets_on_backpressure_and_fails_without_replanning() {
     let mut sender = Sender::new(framing(), BINDING);
     let now = Instant::now();
@@ -88,7 +121,7 @@ fn sender_keeps_fixed_offsets_on_backpressure_and_fails_without_replanning() {
     assert_eq!(sender.offer_with(now, |bytes| {
         assert!(matches!(PacketFrame::decode(framing(), bytes).unwrap(), PacketFrame::Slice { transfer, offset: 1139, .. } if transfer.get() == 1));
         Err(DatagramAdmission::Full)
-    }), Ok(SendProgress::Deferred));
+    }), Ok(SendProgress::Deferred(DatagramAdmission::Full)));
     assert_eq!(
         sender.offer_with(now, &mut submit),
         Ok(SendProgress::Admitted)

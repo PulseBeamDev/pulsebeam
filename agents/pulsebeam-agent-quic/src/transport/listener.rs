@@ -6,6 +6,9 @@ use noq_proto::{
 };
 
 pub use noq_proto::ConnectionHandle;
+use pulsebeam_core::fabric::Profile;
+
+use crate::data_bindings::FabricOffer;
 
 use crate::frame::{Kind, Phase};
 use crate::records::Admit;
@@ -38,6 +41,7 @@ pub struct Association {
     admission_deadline: Option<Instant>,
     pre_admission: bool,
     redeem_started: bool,
+    peer_fabric: Option<FabricOffer>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -57,6 +61,10 @@ impl Association {
         self.admission_deadline = None;
         self.pre_admission = false;
         true
+    }
+
+    pub const fn peer_fabric(&self) -> Option<FabricOffer> {
+        self.peer_fabric
     }
 
     /// Consume the exact attempt body once, after TLS, ALPN and path budget
@@ -85,7 +93,11 @@ impl Association {
             Read::Pending => Ok(None),
             Read::Finished => Err(AdmitError::Missing),
             Read::Frame(frame) if frame.kind == Kind::Admit => {
-                Admit::decode(&frame.body).map_err(|_| AdmitError::Malformed)?;
+                let admit = Admit::decode(&frame.body).map_err(|_| AdmitError::Malformed)?;
+                FabricOffer::CURRENT
+                    .bind(admit.fabric, Profile::Data, 0)
+                    .map_err(|_| AdmitError::Malformed)?;
+                self.peer_fabric = Some(admit.fabric);
                 self.redeem_started = true;
                 Ok(Some(frame.body))
             }
@@ -198,6 +210,7 @@ impl Listener {
                                 admission_deadline: deadline,
                                 pre_admission: true,
                                 redeem_started: false,
+                                peer_fabric: None,
                             },
                         );
                         self.pre_admission = self.pre_admission.saturating_add(1);

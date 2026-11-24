@@ -92,7 +92,8 @@ impl RtpIngressShadow {
 }
 
 #[test]
-fn extension_free_quic_opus_uses_negotiated_packet_coordinates() {
+fn quic_opus_uses_canonical_packet_coordinates() {
+    use pulsebeam_core::fabric::{FabricPacket, Header};
     use pulsebeam_proto::state as wire;
     let parameters = wire::QuicRtpParameters {
         binding_id: 7,
@@ -109,9 +110,19 @@ fn extension_free_quic_opus_uses_negotiated_packet_coordinates() {
     let binding = QuicRtpBinding::compile(&parameters, wire::TrackKind::Audio).unwrap();
     let adapter = QuicRtpIngress::new(binding).unwrap();
     let arrival = Instant::now();
-    let packet = [0x80, 0xef, 0, 90, 0, 0, 0, 100, 0, 0, 0, 11, 0xf8];
-    let ingress = adapter.prepare(arrival, &packet).unwrap();
-    assert!(matches!(ingress.position, Position::LowSequence(90)));
+    let header = Header {
+        profile: Profile::Opus,
+        marker: true,
+        sequence: 0x1_005a,
+        timestamp: 100,
+    };
+    let packet = FabricPacket::new(header, &[], &[0xf8][..]).unwrap();
+    let view = packet.arrival_view(packet.remaining_hops()).unwrap();
+    let ingress = adapter.prepare_packet(arrival, &view).unwrap();
+    assert!(matches!(
+        ingress.position,
+        Position::CanonicalSequence(0x1_005a)
+    ));
     assert_eq!(ingress.arrival, arrival);
     ingress.with_input(|input| {
         let Input::Media(media) = input else {
@@ -123,16 +134,20 @@ fn extension_free_quic_opus_uses_negotiated_packet_coordinates() {
         );
         assert!(media.extensions.is_empty());
     });
-    let extended = [
-        0x90, 0xef, 0, 90, 0, 0, 0, 100, 0, 0, 0, 11, 0xbe, 0xde, 0, 0, 0xf8,
-    ];
+    let wrong_profile = FabricPacket::new(
+        Header {
+            profile: Profile::H264,
+            ..header
+        },
+        &[],
+        &[0xf8][..],
+    )
+    .unwrap();
+    let view = wrong_profile
+        .arrival_view(wrong_profile.remaining_hops())
+        .unwrap();
     assert!(matches!(
-        adapter.prepare(arrival, &extended),
-        Err(DropReason::ExtensionForm)
-    ));
-    let wrong_source = [0x80, 0xef, 0, 90, 0, 0, 0, 100, 0, 0, 0, 12, 0xf8];
-    assert!(matches!(
-        adapter.prepare(arrival, &wrong_source),
+        adapter.prepare_packet(arrival, &view),
         Err(DropReason::Binding)
     ));
 }

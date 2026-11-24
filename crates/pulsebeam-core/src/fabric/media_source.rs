@@ -54,6 +54,9 @@ pub enum Input<'a> {
 #[derive(Clone, Copy)]
 pub enum Position {
     LowSequence(u16),
+    /// Full sequence from an authenticated native binding, not a trusted
+    /// absolute index. Resolve wraps and enforce the same source window here.
+    CanonicalSequence(u32),
     AuthenticatedPrimary(u64),
 }
 
@@ -268,7 +271,14 @@ impl MediaIdentity {
                 self.high
                     .map_or(Ok(low), |high| unwrap(low, high, SEQUENCE_CYCLE))?
             }
-            Position::AuthenticatedPrimary(_) | Position::LowSequence(_) => {
+            Position::CanonicalSequence(raw) if !idle => {
+                let low = u64::from(raw);
+                self.high
+                    .map_or(Ok(low), |high| unwrap(low, high, 1_u64 << 32))?
+            }
+            Position::AuthenticatedPrimary(_)
+            | Position::LowSequence(_)
+            | Position::CanonicalSequence(_) => {
                 return Err(Rejected::Epoch);
             }
         };

@@ -2,10 +2,13 @@ use std::collections::{BTreeMap, VecDeque};
 use std::num::{NonZeroU32, NonZeroU64};
 
 use pulsebeam_agent_quic::{
-    data_bindings::{Bindings, DataBinding, InstallError, PayloadBinding},
+    data_bindings::{
+        BindingId, Bindings, DataBinding, FabricBinding, FabricOffer, InstallError, PayloadBinding,
+    },
     records::{Datagram, DatagramKind, PictureLossIndication},
-    transport::{DatagramAdmission, listener::Association},
+    transport::{DatagramAdmission, NativeDatagram, framing::Receiver, listener::Association},
 };
+use pulsebeam_core::fabric::{ExtensionKind, MAJOR, Profile};
 use pulsebeam_proto::{
     data_endpoint::Delivery,
     state::{self as wire, validation::QuicRtpBinding},
@@ -20,11 +23,12 @@ use crate::{
     },
     entity::{PublicationId, PublicationKey},
     participant::{
-        data_fabric::QuicInstallation,
+        data_fabric::{QuicDataInput, QuicInstallation},
         policy::{
             ExecutionFailure, ExecutionFailureKind, PublicationExecution, ResourceObservation,
         },
     },
+    route::fabric::local::Emission,
     shard::{core::ShardCore, router::FabricSourceHandle},
     track::{Track, TrackMeta},
 };
@@ -40,6 +44,8 @@ pub(super) struct Publishers {
 struct Publisher {
     source: FabricSourceHandle,
     binding: PayloadBinding,
+    wire: FabricBinding,
+    frames: Receiver,
     rtp: Option<(
         wire::QuicRtpParameters,
         crate::rtp::fabric_ingress::QuicRtpIngress,
@@ -168,6 +174,9 @@ impl Installed {
             {
                 return Err(ExecutionFailureKind::Conflict.into());
             }
+            if !plan.enabled {
+                previous.frames.discard_active();
+            }
             previous.execution.enabled = plan.enabled;
             previous.sequence = work.scope().sequence;
             return Ok(ResourceExecution::Publication(Box::new(
@@ -177,6 +186,8 @@ impl Installed {
         if self.publishers.owned.len() == MAX_PUBLISHERS {
             return Err(ExecutionFailureKind::Capacity.into());
         }
+        let (wire, emission) = self.publisher_wire(Profile::Data)?;
+        let frames = Receiver::new(wire.framing, binding.id);
         let publisher = core
             .quic_owner_handle(self.transport)
             .ok_or(ExecutionFailureKind::Retired)?;
@@ -193,7 +204,7 @@ impl Installed {
                 epoch: clock.epoch,
             });
         let (source, incarnation) = core
-            .install_quic_data_source(publisher, id, installation, clock)
+            .install_quic_data_source(publisher, id, installation, clock, emission)
             .ok_or(ExecutionFailureKind::Capacity)?;
         if let Err(error) = self
             .publishers
@@ -228,6 +239,8 @@ impl Installed {
             Publisher {
                 source,
                 binding: PayloadBinding::Data(binding),
+                wire,
+                frames,
                 rtp: None,
                 retiring: false,
                 sequence: work.scope().sequence,
@@ -245,11 +258,7 @@ impl Installed {
         core: &mut ShardCore,
         events: &mut VecDeque<ShardEvent>,
     ) -> Result<ResourceExecution, ExecutionFailure> {
-        use crate::{
-            entity::TrackKind,
-            route::fabric::{RtpSourceEncoding, local::Emission},
-            track::AudioTrack,
-        };
+        use crate::{entity::TrackKind, route::fabric::RtpSourceEncoding, track::AudioTrack};
         let kind = match plan.kind {
             TrackKind::Audio => wire::TrackKind::Audio,
             TrackKind::Video => wire::TrackKind::Video,
@@ -276,6 +285,9 @@ impl Installed {
             if !core.set_quic_media_enabled(previous.source, association, plan.enabled) {
                 return Err(ExecutionFailureKind::Retired.into());
             }
+            if !plan.enabled {
+                previous.frames.discard_active();
+            }
             previous.execution.enabled = plan.enabled;
             previous.sequence = sequence;
             return Ok(ResourceExecution::Publication(Box::new(
@@ -294,8 +306,8 @@ impl Installed {
             rid: None,
             payload_type: prepared.payload_type().into(),
         };
-        let emission =
-            Emission::new(ingress.profile(), &[]).ok_or(ExecutionFailureKind::Invalid)?;
+        let (wire, emission) = self.publisher_wire(ingress.profile())?;
+        let frames = Receiver::new(wire.framing, binding.binding_id());
         let (source, incarnation) = core
             .install_quic_rtp_source(publisher, id, association, plan.enabled, encoding, emission)
             .ok_or(ExecutionFailureKind::Capacity)?;
@@ -359,6 +371,8 @@ impl Installed {
             Publisher {
                 source,
                 binding,
+                wire,
+                frames,
                 rtp: Some((plan.parameters, ingress)),
                 retiring: false,
                 execution: execution.clone(),
@@ -433,10 +447,61 @@ impl Installed {
         true
     }
 
-    pub(super) fn ingest_payload(
+    fn publisher_wire(
         &self,
+        profile: Profile,
+    ) -> Result<(FabricBinding, Emission), ExecutionFailure> {
+        let peer = self.peer_fabric.ok_or(ExecutionFailureKind::Retired)?;
+        let mut local = FabricOffer::CURRENT;
+        // A DD-signaled H.264 source declares a dedicated DD encoding. Do
+        // not infer that encoding from support for decoding descriptors.
+        if profile == Profile::H264 {
+            local.supported &= !ExtensionKind::DependencyDescriptor.bit();
+        }
+        let wire = local
+            .bind(peer, profile, 0)
+            .map_err(|_| ExecutionFailureKind::Unsupported)?;
+        let emission = Emission::from_wire_profile(
+            profile as u8,
+            wire.agreement.extension_mask(),
+            MAJOR,
+            wire.agreement.revision(),
+        )
+        .ok_or(ExecutionFailureKind::Invalid)?;
+        Ok((wire, emission))
+    }
+
+    pub(super) fn ingest_native_datagram(
+        &mut self,
         association: NonZeroU64,
-        packet: Datagram<'_>,
+        datagram: NativeDatagram<'_>,
+        core: &mut ShardCore,
+        now: Instant,
+    ) -> Option<(u64, u64)> {
+        match datagram {
+            NativeDatagram::Packet { binding, wire } => {
+                self.ingest_packet(association, binding, wire, core, now)
+            }
+            NativeDatagram::Endpoint(packet) => {
+                if packet.kind == DatagramKind::Rtcp
+                    && !self.handoff.execution_stopped()
+                    && core
+                        .current_quic_grant(self.connection, self.transport, association)
+                        .is_some()
+                {
+                    let receiver = core.quic_owner_handle(self.transport)?;
+                    self.ingest_receiver_pli(receiver, packet, core);
+                }
+                None
+            }
+        }
+    }
+
+    fn ingest_packet(
+        &mut self,
+        association: NonZeroU64,
+        id: std::num::NonZeroU16,
+        wire: &[u8],
         core: &mut ShardCore,
         now: Instant,
     ) -> Option<(u64, u64)> {
@@ -447,37 +512,33 @@ impl Installed {
         {
             return None;
         }
-        if packet.kind == DatagramKind::Rtcp {
-            let receiver = core.quic_owner_handle(self.transport)?;
-            self.ingest_receiver_pli(receiver, packet, core);
-            return None;
-        }
-        let (binding, (source, reference)) = self.publishers.bindings.resolve(packet.binding)?;
-        let installed = self.publishers.owned.get(reference)?;
-        if !installed.execution.enabled || installed.retiring {
-            return None;
-        }
         let publisher = core.quic_owner_handle(self.transport)?;
-        let binding = match (packet.kind, binding) {
-            (DatagramKind::Data, PayloadBinding::Data(binding)) => binding,
-            (DatagramKind::Rtp, PayloadBinding::Rtp { .. }) => {
+        let (binding, &(source, reference)) = self.publishers.bindings.resolve(id)?;
+        let installed = self.publishers.owned.get_mut(&reference)?;
+        if !installed.execution.enabled || installed.retiring || installed.binding != binding {
+            return None;
+        }
+        let bytes = installed.frames.receive(now.into_std(), wire).ok()??;
+        let packet = installed.wire.agreement.decode(bytes.as_ref()).ok()?;
+        match binding {
+            PayloadBinding::Data(binding) => core
+                .ingest_quic_data(
+                    source,
+                    publisher,
+                    QuicInstallation {
+                        association,
+                        binding,
+                    },
+                    QuicDataInput::Packet(&packet),
+                    now,
+                )
+                .map(|unit_seq| (reference, unit_seq)),
+            PayloadBinding::Rtp { .. } => {
                 let (_, ingress) = installed.rtp.as_ref()?;
-                core.ingest_quic_rtp(*source, publisher, *ingress, packet.payload, now);
-                return None;
+                core.ingest_quic_media_packet(source, publisher, *ingress, &packet, now);
+                None
             }
-            _ => return None,
-        };
-        core.ingest_quic_data(
-            *source,
-            publisher,
-            QuicInstallation {
-                association,
-                binding,
-            },
-            packet.payload,
-            now,
-        )
-        .map(|unit_seq| (*reference, unit_seq))
+        }
     }
 
     pub(super) fn publisher_admission(&self, reference: u64, unit_seq: u64) -> Option<Vec<u8>> {

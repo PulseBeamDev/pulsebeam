@@ -2,9 +2,17 @@ use std::collections::{BTreeMap, VecDeque};
 use std::num::{NonZeroU16, NonZeroU64};
 
 use pulsebeam_agent_quic::{
-    data_bindings::{Bindings, DataBinding, InstallError, PayloadBinding},
-    records::{Datagram, DatagramKind, PictureLossIndication},
-    transport::{DatagramAdmission, listener::Association},
+    data_bindings::{BindingId, Bindings, DataBinding, FabricOffer, InstallError, PayloadBinding},
+    records::{Datagram, PictureLossIndication},
+    transport::{
+        DatagramAdmission,
+        framing::{SendProgress, Sender},
+        listener::Association,
+    },
+};
+use pulsebeam_core::fabric::{
+    MAJOR, Profile,
+    packet::{Agreement, MAX_PACKET_BYTES},
 };
 use pulsebeam_proto::{
     data_control::SubscriberBinding,
@@ -18,10 +26,10 @@ use crate::{
     control::native::{Preparation, ReceiveTransport, ReceiverPreparation, ResourceExecution},
     entity::ProjectRoomKey,
     participant::{
-        data_fabric::project_sctp_record,
+        data_fabric::project_record,
         policy::{ExecutionFailure, ExecutionFailureKind, ReceiverExecution, ResourceObservation},
     },
-    route::fabric::local::{DataWrite, PacketView},
+    route::fabric::local::{DataWrite, Emission, PacketView, RepairRequest},
     rtp::fabric_egress::timeline,
     shard::{core::ShardCore, router::FabricLocalBranch},
     track::Track,
@@ -39,6 +47,7 @@ struct Subscriber {
     binding: PayloadBinding,
     source_room: ProjectRoomKey,
     payload: SubscriberPayload,
+    emission: Emission,
     branch: Option<FabricLocalBranch>,
     execution: ReceiverExecution,
     sequence: u64,
@@ -48,18 +57,115 @@ enum SubscriberPayload {
     Data {
         endpoint: SubscriberBinding,
         capture_clock: Option<DataV1CaptureClock>,
+        wire: FramedOutput<()>,
     },
     Rtp(RtpOutput),
 }
 
 struct RtpOutput {
-    profile: pulsebeam_core::fabric::Profile,
-    id: NonZeroU16,
+    profile: Profile,
     ssrc: u32,
-    payload_type: u8,
+    wire: FramedOutput<(timeline::Projected, timeline::Timeline<FabricLocalBranch>)>,
     timeline: timeline::Timeline<FabricLocalBranch>,
     admitted: Option<u64>,
     last_branch: Option<FabricLocalBranch>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct OutputKey {
+    branch: FabricLocalBranch,
+    position: u64,
+    repair: Option<RepairRequest>,
+}
+
+struct FramedOutput<T> {
+    agreement: Agreement,
+    sender: Sender,
+    pending: Option<(OutputKey, T)>,
+}
+
+enum OutputError {
+    Deferred { runnable: bool },
+    Rejected,
+}
+
+impl<T> FramedOutput<T> {
+    fn new(
+        peer: FabricOffer,
+        profile: Profile,
+        binding: NonZeroU16,
+    ) -> Result<(Self, Emission), ExecutionFailure> {
+        let wire = FabricOffer::CURRENT
+            .bind(peer, profile, 0)
+            .map_err(|_| ExecutionFailureKind::Unsupported)?;
+        let emission = Emission::from_wire_profile(
+            profile as u8,
+            wire.agreement.extension_mask(),
+            MAJOR,
+            wire.agreement.revision(),
+        )
+        .ok_or(ExecutionFailureKind::Invalid)?;
+        Ok((
+            Self {
+                agreement: wire.agreement,
+                sender: Sender::new(wire.framing, binding),
+                pending: None,
+            },
+            emission,
+        ))
+    }
+
+    fn discard(&mut self) {
+        self.pending = None;
+        self.sender.discard_pending();
+    }
+
+    fn offer<'a>(
+        &mut self,
+        key: OutputKey,
+        now: Instant,
+        peer: &mut Association,
+        prepare: impl FnOnce() -> Option<(PacketView<'a>, T)>,
+    ) -> Result<T, OutputError> {
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|(current, _)| *current != key)
+        {
+            self.discard();
+        }
+        if self.pending.is_none() {
+            let (packet, commit) = prepare().ok_or(OutputError::Rejected)?;
+            let mut bytes = [0; MAX_PACKET_BYTES];
+            let len = self
+                .agreement
+                .write(&packet, &mut bytes)
+                .map_err(|_| OutputError::Rejected)?;
+            let bytes = bytes.get(..len).ok_or(OutputError::Rejected)?;
+            self.sender
+                .start(now.into_std(), Box::from(bytes))
+                .map_err(|_| OutputError::Rejected)?;
+            self.pending = Some((key, commit));
+        }
+        let result = self
+            .sender
+            .offer(&mut peer.scheduler, &mut peer.connection, now.into_std());
+        match result {
+            Ok(SendProgress::Admitted) => self
+                .pending
+                .take()
+                .map(|(_, state)| state)
+                .ok_or(OutputError::Rejected),
+            Ok(SendProgress::Partial) => Err(OutputError::Deferred { runnable: true }),
+            Ok(SendProgress::Deferred(reason)) => Err(OutputError::Deferred {
+                runnable: reason == DatagramAdmission::ControlTurn,
+            }),
+            Ok(SendProgress::Idle) | Err(_) => {
+                self.discard();
+                Err(OutputError::Rejected)
+            }
+        }
+    }
 }
 
 impl RtpOutput {
@@ -70,41 +176,38 @@ impl RtpOutput {
         packet: PacketView<'_>,
         position: u64,
         peer: &mut Association,
-    ) -> Result<(), DatagramAdmission> {
-        let header = packet.header();
-        if header.profile != self.profile {
-            return Ok(());
-        }
-        let Ok((projected, next)) = self.timeline.prepare(
+    ) -> Result<(), OutputError> {
+        let key = OutputKey {
             branch,
-            timeline::Input {
-                sequence: position,
-                timestamp: header.timestamp,
-            },
-            now.into_std(),
-            timeline::Transmitted {
-                primary: self.admitted,
-                sender_report: None,
-            },
-            self.last_branch.is_some_and(|previous| previous != branch),
-        ) else {
-            return Ok(());
+            position,
+            repair: None,
         };
-        let mut bytes = Vec::with_capacity(packet.payload().len().saturating_add(12));
-        bytes.extend_from_slice(&[0x80, self.payload_type | (u8::from(header.marker) << 7)]);
-        let [.., high, low] = projected.sequence.to_be_bytes();
-        bytes.extend_from_slice(&[high, low]);
-        bytes.extend_from_slice(&projected.timestamp.to_be_bytes());
-        bytes.extend_from_slice(&self.ssrc.to_be_bytes());
-        bytes.extend_from_slice(packet.payload());
-        peer.scheduler.offer_bound(
-            &mut peer.connection,
-            Datagram {
-                kind: DatagramKind::Rtp,
-                binding: self.id,
-                payload: &bytes,
-            },
-        )?;
+        let (projected, next) = self.wire.offer(key, now, peer, || {
+            let header = packet.header();
+            if header.profile != self.profile {
+                return None;
+            }
+            let (projected, next) = self
+                .timeline
+                .prepare(
+                    branch,
+                    timeline::Input {
+                        sequence: position,
+                        timestamp: header.timestamp,
+                    },
+                    now.into_std(),
+                    timeline::Transmitted {
+                        primary: self.admitted,
+                        sender_report: None,
+                    },
+                    self.last_branch.is_some_and(|previous| previous != branch),
+                )
+                .ok()?;
+            Some((
+                packet.with_receiver_media_position(projected.sequence as u32, projected.timestamp),
+                (projected, next),
+            ))
+        })?;
         self.timeline = next;
         self.last_branch = Some(branch);
         self.admitted = Some(
@@ -143,20 +246,25 @@ impl Installed {
         let sequence = work.scope().sequence;
         match plan {
             ReceiverPreparation::Ready(plan) => {
-                let (binding, payload) = match plan.transport {
-                    ReceiveTransport::QuicData(fabric) => (
-                        PayloadBinding::Data(
-                            DataBinding::from_parameters(fabric.parameters)
-                                .ok_or(ExecutionFailureKind::Invalid)?,
-                        ),
-                        SubscriberPayload::Data {
-                            endpoint: fabric.endpoint,
-                            capture_clock: match &plan.source {
-                                Track::Data(data) => data.capture_clock.clone(),
-                                _ => None,
+                let peer = self.peer_fabric.ok_or(ExecutionFailureKind::Retired)?;
+                let (binding, payload, emission) = match plan.transport {
+                    ReceiveTransport::QuicData(fabric) => {
+                        let binding = DataBinding::from_parameters(fabric.parameters)
+                            .ok_or(ExecutionFailureKind::Invalid)?;
+                        let (wire, emission) = FramedOutput::new(peer, Profile::Data, binding.id)?;
+                        (
+                            PayloadBinding::Data(binding),
+                            SubscriberPayload::Data {
+                                endpoint: fabric.endpoint,
+                                capture_clock: match &plan.source {
+                                    Track::Data(data) => data.capture_clock.clone(),
+                                    _ => None,
+                                },
+                                wire,
                             },
-                        },
-                    ),
+                            emission,
+                        )
+                    }
                     ReceiveTransport::QuicRtp(parameters) => {
                         let (profile, kind) = match &plan.source {
                             Track::Audio(_) => {
@@ -177,17 +285,19 @@ impl Installed {
                             64,
                         )
                         .ok_or(ExecutionFailureKind::Invalid)?;
+                        let binding_id = binding.id();
+                        let (wire, emission) = FramedOutput::new(peer, profile, binding_id)?;
                         (
                             PayloadBinding::from(binding),
                             SubscriberPayload::Rtp(RtpOutput {
                                 profile,
-                                id: binding.id(),
                                 ssrc: binding.ssrc().get(),
-                                payload_type: binding.payload_type(),
+                                wire,
                                 timeline,
                                 admitted: None,
                                 last_branch: None,
                             }),
+                            emission,
                         )
                     }
                     _ => return Err(ExecutionFailureKind::Unsupported.into()),
@@ -215,6 +325,7 @@ impl Installed {
                         binding,
                         source_room: plan.source_room,
                         payload,
+                        emission,
                         branch: None,
                         execution,
                         sequence,
@@ -233,6 +344,10 @@ impl Installed {
                 subscriber.sequence = sequence;
                 subscriber.execution.enabled = policy.enabled;
                 if !policy.enabled {
+                    match &mut subscriber.payload {
+                        SubscriberPayload::Data { wire, .. } => wire.discard(),
+                        SubscriberPayload::Rtp(output) => output.wire.discard(),
+                    }
                     if let Some((branch, receiver)) = subscriber
                         .branch
                         .take()
@@ -336,7 +451,7 @@ impl Installed {
         core.request_quic_receiver_refresh(receiver, branch);
     }
 
-    /// Commit the Fabric handoff only when Noq takes the whole datagram.
+    /// Commit the Fabric handoff only after Noq admits every frame.
     pub(super) fn poll_data_output(
         &mut self,
         association: NonZeroU64,
@@ -369,13 +484,14 @@ impl Installed {
                             *endpoint,
                             (binding.format.delivery() == Delivery::Reliable)
                                 .then_some((reference, subscriber.owned)),
+                            subscriber.emission,
                         )
                     }
-                    (SubscriberPayload::Rtp(output), PayloadBinding::Rtp { .. }) => core
+                    (SubscriberPayload::Rtp(_), PayloadBinding::Rtp { .. }) => core
                         .install_quic_rtp_branch(
                             receiver,
                             subscriber.execution.source,
-                            output.profile,
+                            subscriber.emission,
                         ),
                     _ => None,
                 };
@@ -400,21 +516,21 @@ impl Installed {
             let Some(branch) = subscriber.branch else {
                 continue;
             };
-            let capture_clock = match &mut subscriber.payload {
-                SubscriberPayload::Data { capture_clock, .. } => capture_clock,
+            let (capture_clock, wire) = match &mut subscriber.payload {
+                SubscriberPayload::Data {
+                    capture_clock,
+                    wire,
+                    ..
+                } => (capture_clock, wire),
                 SubscriberPayload::Rtp(output) => {
                     if matches!(
                         core.admit_quic_rtp(branch, receiver, now, |packet, position| {
                             match output.offer(branch, now, packet, position, peer) {
-                                Ok(())
-                                | Err(DatagramAdmission::Unsupported | DatagramAdmission::Size) => {
-                                    Ok(())
-                                }
-                                Err(DatagramAdmission::ControlTurn) => {
-                                    retry = true;
+                                Ok(()) | Err(OutputError::Rejected) => Ok(()),
+                                Err(OutputError::Deferred { runnable }) => {
+                                    retry |= runnable;
                                     Err(())
                                 }
-                                Err(DatagramAdmission::Full) => Err(()),
                             }
                         }),
                         Ok(Some(()))
@@ -438,27 +554,23 @@ impl Installed {
                 receiver,
                 now,
                 binding.format.delivery() == Delivery::Reliable,
-                |packet, repair| {
-                    if project_sctp_record(&packet, clock, repair).is_err() {
-                        return DataWrite::Rejected;
-                    }
-                    match peer.scheduler.offer_bound(
-                        &mut peer.connection,
-                        Datagram {
-                            kind: DatagramKind::Data,
-                            binding: binding.id,
-                            payload: packet.payload(),
-                        },
-                    ) {
+                |position, packet, repair| {
+                    let key = OutputKey {
+                        branch,
+                        position,
+                        repair,
+                    };
+                    match wire.offer(key, now, peer, || {
+                        project_record(&packet, clock, repair.map(|repair| repair.fragment))
+                            .ok()?;
+                        Some((packet, ()))
+                    }) {
                         Ok(()) => DataWrite::Written,
-                        Err(DatagramAdmission::ControlTurn) => {
-                            retry = true;
+                        Err(OutputError::Deferred { runnable }) => {
+                            retry |= runnable;
                             DataWrite::Deferred
                         }
-                        Err(DatagramAdmission::Full) => DataWrite::Deferred,
-                        Err(DatagramAdmission::Unsupported | DatagramAdmission::Size) => {
-                            DataWrite::Rejected
-                        }
+                        Err(OutputError::Rejected) => DataWrite::Rejected,
                     }
                 },
             ) {

@@ -1376,7 +1376,7 @@ fn quic_data_ingress_fences_owner_association_and_binding_before_admission() {
                 source,
                 owner,
                 candidate,
-                &[],
+                crate::participant::data_fabric::QuicDataInput::Record(&[]),
                 now,
                 Default::default()
             ),
@@ -1390,7 +1390,7 @@ fn quic_data_ingress_fences_owner_association_and_binding_before_admission() {
             source,
             publisher,
             installation,
-            &packet,
+            crate::participant::data_fabric::QuicDataInput::Record(&packet),
             now,
             Default::default(),
         )
@@ -1508,7 +1508,7 @@ fn quic_data_ingress_fences_owner_association_and_binding_before_admission() {
             source,
             publisher,
             installation,
-            &packet,
+            crate::participant::data_fabric::QuicDataInput::Record(&packet),
             now,
             Default::default()
         ),

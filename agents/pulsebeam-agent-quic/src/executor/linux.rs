@@ -15,18 +15,28 @@ use pulsebeam_agent_core::{
     Notification, OperationId, QuicEffect, QuicEvent, Snapshot, TimerEffect, TimerEvent, TimerId,
 };
 use pulsebeam_core::{
-    fabric::MAX_WAN_RTP_BYTES,
+    fabric::{
+        FabricPacket, Header, Profile,
+        packet::{Agreement, BASE_BYTES, MAX_PACKET_BYTES},
+    },
     h264::{Depacketizer, MAX_ACCESS_UNIT_SIZE, Packetization, PacketizedChunk, Packetizer},
 };
 use pulsebeam_runtime::time::{self, Instant};
 use rustls::RootCertStore;
 
 use crate::{
+    data_bindings::FabricOffer,
     records::{Datagram, DatagramKind, PictureLossIndication},
-    transport,
+    transport::{
+        self, DatagramAdmission,
+        framing::{SendError, SendProgress, Sender, WHOLE_CAPACITY},
+    },
 };
 
-use super::udp::{OpenError, UdpAssociation};
+use super::{
+    ReceiveBinding,
+    udp::{OpenError, UdpAssociation},
+};
 
 const PLACEMENT_BODY_LIMIT: usize = 1_024;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -161,6 +171,14 @@ const MAX_QUEUED_OPUS: usize = 32;
 const MAX_QUEUED_H264: usize = 2;
 const MAX_H264_ASSEMBLIES: usize = 8;
 
+struct MediaSender {
+    generation: Generation,
+    binding: NonZeroU16,
+    sequence: u32,
+    agreement: Agreement,
+    framer: Sender,
+}
+
 /// Caller-driven Linux Agent. Run its turns on the reactor that owns the UDP
 /// sockets. It does not dispatch a background task or retain an RTC host.
 pub struct LinuxAgent {
@@ -172,8 +190,7 @@ pub struct LinuxAgent {
     request: Option<(OperationId, Work<HttpEvent>)>,
     dialing: Option<(Generation, Work<DialResult>)>,
     sockets: [Option<Box<UdpAssociation>>; 2],
-    rtp_sequence:
-        BTreeMap<(pulsebeam_agent_core::MediaKind, String), (Generation, NonZeroU16, u16)>,
+    media_senders: BTreeMap<(MediaKind, String), MediaSender>,
     pending_video: Option<PendingVideo>,
     video_refresh: VecDeque<VideoRefresh>,
     video_assemblies: BTreeMap<(Generation, NonZeroU16), VideoAssembly>,
@@ -202,7 +219,7 @@ impl LinuxAgent {
             request: None,
             dialing: None,
             sockets: [None, None],
-            rtp_sequence: BTreeMap::new(),
+            media_senders: BTreeMap::new(),
             pending_video: None,
             video_refresh: VecDeque::new(),
             video_assemblies: BTreeMap::new(),
@@ -280,8 +297,8 @@ impl LinuxAgent {
     }
 
     /// Admit a single encoded Opus packet for an installed audio publication.
-    /// The timestamp is in the caller's 48 kHz RTP clock. Success transfers
-    /// the complete datagram to QUIC, not to the remote application's queue.
+    /// The timestamp is in the caller's 48 kHz RTP clock. On success the
+    /// carrier owns the packet. Drive Agent turns to finish any sliced send.
     pub fn send_opus(
         &mut self,
         track_id: &str,
@@ -309,34 +326,19 @@ impl LinuxAgent {
         if payload.is_empty() {
             return Err(OpusSendError::Empty);
         }
-        let wire_len = payload.len().saturating_add(RTP_HEADER);
-        if wire_len.saturating_add(crate::records::DATAGRAM_HEADER)
-            > usize::from(transport::UDP_PAYLOAD_BYTES)
-        {
-            return Err(OpusSendError::Datagram(transport::DatagramAdmission::Size));
+        if payload.len().saturating_add(BASE_BYTES) > MAX_PACKET_BYTES {
+            return Err(OpusSendError::Datagram(DatagramAdmission::Size));
         }
-        let pulsebeam_agent_core::QuicRtpPublication {
-            generation,
-            binding,
-            ssrc,
-            payload_type,
-            ..
-        } = self
+        let live = self
             .core
             .quic_rtp_publication(kind, track_id)
             .filter(|publication| publication.ready)
             .ok_or(OpusSendError::NotReady)?;
+        let (generation, binding) = (live.generation, live.binding);
         let key = (kind, track_id.to_owned());
-        if !self.rtp_sequence.contains_key(&key) && self.rtp_sequence.len() >= 64 {
-            self.rtp_sequence
-                .retain(|(kind, track), (generation, binding, _)| {
-                    self.core
-                        .quic_rtp_publication(*kind, track)
-                        .is_some_and(|live| {
-                            *generation == live.generation && *binding == live.binding
-                        })
-                });
-            if self.rtp_sequence.len() >= 64 {
+        if !self.media_senders.contains_key(&key) && self.media_senders.len() >= 64 {
+            self.retain_media_senders();
+            if self.media_senders.len() >= 64 {
                 return Err(OpusSendError::NotReady);
             }
         }
@@ -346,33 +348,116 @@ impl LinuxAgent {
             .flatten()
             .find(|socket| socket.generation() == generation)
             .ok_or(OpusSendError::NotReady)?;
-        let sequence = self
-            .rtp_sequence
+        let profile = match kind {
+            MediaKind::Audio => Profile::Opus,
+            MediaKind::Video => Profile::H264,
+        };
+        if !self
+            .media_senders
             .get(&key)
-            .filter(|(live_generation, live_binding, _)| {
-                *live_generation == generation && *live_binding == binding
-            })
-            .map_or(0, |(_, _, next)| *next);
-        let mut packet = Vec::with_capacity(wire_len);
-        packet.extend_from_slice(&[0x80, payload_type | (u8::from(marker) << 7)]);
-        packet.extend_from_slice(&sequence.to_be_bytes());
-        packet.extend_from_slice(&timestamp.to_be_bytes());
-        packet.extend_from_slice(&ssrc.to_be_bytes());
-        packet.extend_from_slice(payload);
-        socket
-            .offer_media(Datagram {
-                kind: DatagramKind::Rtp,
-                binding,
-                payload: &packet,
-            })
-            .map_err(OpusSendError::Datagram)?;
-        let next = (generation, binding, sequence.wrapping_add(1));
-        if let Some(slot) = self.rtp_sequence.get_mut(&key) {
-            *slot = next;
-        } else {
-            self.rtp_sequence.insert(key, next);
+            .is_some_and(|sender| sender.generation == generation && sender.binding == binding)
+        {
+            let offer = socket.peer_fabric().ok_or(OpusSendError::NotReady)?;
+            let selected = FabricOffer::CURRENT
+                .bind(offer, profile, 0)
+                .map_err(|_| OpusSendError::NotReady)?;
+            self.media_senders.insert(
+                key.clone(),
+                MediaSender {
+                    generation,
+                    binding,
+                    sequence: 0,
+                    agreement: selected.agreement,
+                    framer: Sender::new(selected.framing, binding),
+                },
+            );
         }
-        Ok(())
+        let sender = self
+            .media_senders
+            .get_mut(&key)
+            .ok_or(OpusSendError::NotReady)?;
+        if sender.framer.is_pending() {
+            return Err(OpusSendError::Datagram(DatagramAdmission::Full));
+        }
+        let header = Header {
+            profile,
+            marker,
+            sequence: sender.sequence,
+            timestamp,
+        };
+        let packet = FabricPacket::new(header, &[], payload)
+            .map_err(|_| OpusSendError::Datagram(DatagramAdmission::Size))?;
+        let mut wire = [0; MAX_PACKET_BYTES];
+        let size = sender
+            .agreement
+            .write(&packet, &mut wire)
+            .map_err(|_| OpusSendError::Datagram(DatagramAdmission::Size))?;
+        let now = Instant::now().into_std();
+        let bytes = wire
+            .get(..size)
+            .ok_or(OpusSendError::Datagram(DatagramAdmission::Size))?;
+        sender
+            .framer
+            .start(now, Box::from(bytes))
+            .map_err(media_send_error)?;
+        match socket
+            .offer_media_packet(&mut sender.framer, now)
+            .map_err(media_send_error)?
+        {
+            SendProgress::Admitted | SendProgress::Partial => {
+                sender.sequence = sender.sequence.wrapping_add(1);
+                Ok(())
+            }
+            SendProgress::Deferred(reason) => {
+                sender.framer.discard_pending();
+                Err(OpusSendError::Datagram(reason))
+            }
+            SendProgress::Idle => Err(OpusSendError::NotReady),
+        }
+    }
+
+    fn retain_media_senders(&mut self) {
+        self.media_senders.retain(|(kind, track), sender| {
+            let current = self
+                .core
+                .quic_rtp_publication(*kind, track)
+                .is_some_and(|live| {
+                    if !live.ready {
+                        sender.framer.discard_pending();
+                    }
+                    sender.generation == live.generation && sender.binding == live.binding
+                });
+            current
+        });
+    }
+
+    fn offer_pending_media(&mut self) -> Option<Generation> {
+        self.retain_media_senders();
+        let now = Instant::now().into_std();
+        for sender in self
+            .media_senders
+            .values_mut()
+            .filter(|sender| sender.framer.is_pending())
+        {
+            let Some(socket) = self
+                .sockets
+                .iter_mut()
+                .flatten()
+                .find(|socket| socket.generation() == sender.generation)
+            else {
+                sender.framer.discard_pending();
+                continue;
+            };
+            match socket.offer_media_packet(&mut sender.framer, now) {
+                Ok(
+                    SendProgress::Partial | SendProgress::Deferred(DatagramAdmission::ControlTurn),
+                ) => {
+                    return Some(sender.generation);
+                }
+                Ok(_) | Err(_) => {}
+            }
+        }
+        None
     }
 
     pub fn h264_publication_id(&self, track_id: &str) -> Option<&str> {
@@ -428,21 +513,16 @@ impl LinuxAgent {
             .quic_rtp_publication(pulsebeam_agent_core::MediaKind::Video, track_id)
             .filter(|live| live.ready)
             .ok_or(H264SendError::NotReady)?;
-        let limit = self
+        if !self
             .sockets
-            .iter_mut()
+            .iter()
             .flatten()
-            .find(|socket| socket.generation() == live.generation)
-            .and_then(|socket| socket.datagram_limit())
-            .ok_or(H264SendError::NotReady)?;
-        let budget = limit
-            .saturating_sub(crate::records::DATAGRAM_HEADER)
-            .min(MAX_WAN_RTP_BYTES)
-            .saturating_sub(RTP_HEADER);
-        if budget <= 2 {
-            return Err(H264SendError::Size);
+            .any(|socket| socket.generation() == live.generation && socket.peer_fabric().is_some())
+        {
+            return Err(H264SendError::NotReady);
         }
-        let mut packets = Packetizer::new(budget).into_packets(access_unit);
+        // The packetizer's ordinary output fits a Whole frame on every path.
+        let mut packets = Packetizer::new(WHOLE_CAPACITY - BASE_BYTES).into_packets(access_unit);
         let next = packets.next().ok_or(H264SendError::InvalidAccessUnit)?;
         self.pending_video = Some(PendingVideo {
             track_id: track_id.into(),
@@ -947,7 +1027,9 @@ impl LinuxAgent {
     }
 
     async fn wait(&mut self) -> Result<(), Error> {
-        let retry_payload_turn = self.offer_pending_video();
+        let retry_payload_turn = self
+            .offer_pending_media()
+            .or_else(|| self.offer_pending_video());
         let next_timer = self
             .timers
             .iter()
@@ -966,8 +1048,8 @@ impl LinuxAgent {
             http = work(&mut self.request) => Input::Http(http),
             dial = work(&mut self.dialing) => Input::Dial(dial),
             timer = timer => Input::Timer(timer),
-            event = socket_turn(first, retry_payload_turn) => Input::Socket(event),
-            event = socket_turn(second, retry_payload_turn) => Input::Socket(event),
+            event = socket_turn(first, &self.core, retry_payload_turn) => Input::Socket(event),
+            event = socket_turn(second, &self.core, retry_payload_turn) => Input::Socket(event),
         };
         match input {
             Input::Http(event) => {
@@ -999,6 +1081,14 @@ impl LinuxAgent {
     }
 }
 
+fn media_send_error(error: SendError) -> OpusSendError {
+    OpusSendError::Datagram(match error {
+        SendError::Size => DatagramAdmission::Size,
+        SendError::Busy => DatagramAdmission::Full,
+        _ => DatagramAdmission::Unsupported,
+    })
+}
+
 enum Input {
     Http(HttpEvent),
     Dial(DialResult),
@@ -1015,13 +1105,38 @@ async fn work<Id, T>(work: &mut Option<(Id, Work<T>)>) -> T {
 
 async fn socket_turn(
     slot: &mut Option<Box<UdpAssociation>>,
+    core: &Agent,
     retry_payload_turn: Option<Generation>,
 ) -> Option<QuicEvent> {
     let Some(socket) = slot.as_mut() else {
         return pending().await;
     };
-    let retry = retry_payload_turn == Some(socket.generation());
-    let Ok(event) = socket.progress(retry).await else {
+    let generation = socket.generation();
+    let retry = retry_payload_turn == Some(generation);
+    let authorize = |binding| {
+        if let Some((_, ready)) = core.quic_data_receiver(generation, binding) {
+            return Some((ReceiveBinding::Data, ready));
+        }
+        [
+            (MediaKind::Audio, Profile::Opus),
+            (MediaKind::Video, Profile::H264),
+        ]
+        .into_iter()
+        .find_map(|(kind, profile)| {
+            let receiver = core
+                .quic_rtp_receiver_bindings(kind)
+                .find(|live| live.generation == generation && live.binding == binding)?;
+            Some((
+                ReceiveBinding::Media {
+                    profile,
+                    ssrc: receiver.ssrc,
+                    payload_type: receiver.payload_type,
+                },
+                receiver.ready,
+            ))
+        })
+    };
+    let Ok(event) = socket.progress(retry, authorize).await else {
         let event = socket.io_failure();
         *slot = None;
         return Some(event);

@@ -14,7 +14,7 @@ use super::{APPLICATION_DATAGRAM_BYTES, DatagramAdmission, PacketScheduler};
 
 const MAX_ACTIVE: usize = 4;
 const MAX_SLICES: usize = 16;
-const WHOLE_CAPACITY: usize = APPLICATION_DATAGRAM_BYTES - PacketFrame::WHOLE_HEADER_BYTES;
+pub const WHOLE_CAPACITY: usize = APPLICATION_DATAGRAM_BYTES - PacketFrame::WHOLE_HEADER_BYTES;
 const SLICE_CAPACITY: usize = APPLICATION_DATAGRAM_BYTES - PacketFrame::SLICE_HEADER_BYTES;
 const _: () = assert!(MAX_PACKET_BYTES.div_ceil(SLICE_CAPACITY) <= MAX_SLICES);
 const LIFETIME: Duration = Duration::from_millis(250);
@@ -31,7 +31,7 @@ pub enum SendError {
 #[derive(Debug, PartialEq, Eq)]
 pub enum SendProgress {
     Idle,
-    Deferred,
+    Deferred(DatagramAdmission),
     Partial,
     /// Every frame has entered the Noq queue. This is not a delivery receipt.
     Admitted,
@@ -67,6 +67,15 @@ impl Sender {
             last_transfer: 0,
             pending: None,
         }
+    }
+
+    pub fn is_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Abandon bytes without reusing any transfer ID already sent.
+    pub fn discard_pending(&mut self) {
+        self.pending = None;
     }
 
     pub fn start(&mut self, now: Instant, bytes: Box<[u8]>) -> Result<(), SendError> {
@@ -158,9 +167,9 @@ impl Sender {
                 }
             }
             Err(DatagramAdmission::Size) => Err(SendError::Size),
-            Err(DatagramAdmission::Full | DatagramAdmission::ControlTurn) => {
+            Err(error @ (DatagramAdmission::Full | DatagramAdmission::ControlTurn)) => {
                 self.pending = Some(pending);
-                Ok(SendProgress::Deferred)
+                Ok(SendProgress::Deferred(error))
             }
             Err(DatagramAdmission::Unsupported) => Err(SendError::Unsupported),
         }
@@ -235,6 +244,13 @@ impl Receiver {
                 false
             }
         });
+    }
+
+    /// Fence in-progress transfers without reopening their IDs.
+    pub fn discard_active(&mut self) {
+        for assembly in self.active.drain(..) {
+            self.terminal |= terminal_bit(self.high, assembly.id);
+        }
     }
 
     pub fn receive<'a>(

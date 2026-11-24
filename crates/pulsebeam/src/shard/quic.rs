@@ -7,6 +7,7 @@ use std::{
 };
 
 use pulsebeam_agent_quic::{
+    data_bindings::FabricOffer,
     frame::{Kind, Phase},
     records::{Denial, Lease, Renew, RenewResult, encode_admit_result},
     transport::{
@@ -67,6 +68,7 @@ pub(super) struct Installed {
     scope: crate::entity::ConnectionScope,
     publishers: data::Publishers,
     subscribers: receivers::Subscribers,
+    peer_fabric: Option<FabricOffer>,
     output: Option<SignalingOutput>,
     admissions: VecDeque<(u64, u64)>,
     data_control_staged: bool,
@@ -97,6 +99,7 @@ impl Installed {
             scope,
             publishers: data::Publishers::default(),
             subscribers: receivers::Subscribers::default(),
+            peer_fabric: None,
             output: None,
             admissions: VecDeque::new(),
             data_control_staged: false,
@@ -447,9 +450,9 @@ impl Session {
             }
             self.data_runnable = false;
             if installed.admissions.len() < MAX_PENDING_ADMISSIONS
-                && let Some(received) = pulsebeam_agent_quic::transport::read_datagram(
+                && let Some(received) = pulsebeam_agent_quic::transport::read_native_datagram(
                     &mut peer.connection,
-                    |datagram| installed.ingest_payload(self.serial, datagram, core, now),
+                    |datagram| installed.ingest_native_datagram(self.serial, datagram, core, now),
                 )
             {
                 self.data_runnable = true;
@@ -575,10 +578,12 @@ impl Session {
                 }
                 self.admitted = true;
                 self.installed.as_mut().is_some_and(|installed| {
-                    installed.handoff.opened(Opened {
-                        channel: CONTROL_CHANNEL,
-                        at: now,
-                    })
+                    installed.peer_fabric = peer.peer_fabric();
+                    installed.peer_fabric.is_some()
+                        && installed.handoff.opened(Opened {
+                            channel: CONTROL_CHANNEL,
+                            at: now,
+                        })
                 })
             }
             Ok(Write::Admitted {

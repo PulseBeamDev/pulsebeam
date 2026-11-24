@@ -185,6 +185,7 @@ impl ShardCore {
         publication: crate::entity::PublicationKey,
         installation: crate::participant::data_fabric::QuicInstallation,
         clock: Option<pulsebeam_proto::data_record::Clock<'_>>,
+        emission: Emission,
     ) -> Option<(FabricSourceHandle, std::num::NonZeroU64)> {
         let runtime = &mut self.execution.runtime;
         if runtime.track_handle(publication).is_some() {
@@ -192,8 +193,7 @@ impl ShardCore {
         }
         let track = runtime.install_track(publication, None, Some(publisher), None);
         let result = (|| {
-            let source =
-                runtime.install_fabric_source(track, publisher, Emission::DATA, None, None)?;
+            let source = runtime.install_fabric_source(track, publisher, emission, None, None)?;
             let incarnation = runtime.fabric_incarnation(source)?;
             runtime
                 .bind_quic_data_publisher(source, publisher, installation, clock)
@@ -271,28 +271,41 @@ impl ShardCore {
             .set_quic_media_binding(source, association, enabled)
     }
 
-    pub(super) fn ingest_quic_rtp(
+    pub(super) fn ingest_quic_media_packet(
         &mut self,
         source: FabricSourceHandle,
         publisher: ParticipantHandle,
         ingress: crate::rtp::fabric_ingress::QuicRtpIngress,
-        bytes: &[u8],
+        packet: &pulsebeam_core::fabric::BorrowedPacket<'_>,
         now: Instant,
     ) {
-        let execution = &mut self.execution;
-        if !execution.fabric_publisher_authorized(publisher, source) {
+        if !self
+            .execution
+            .fabric_publisher_authorized(publisher, source)
+        {
             return;
         }
-        let Ok(input) = ingress.prepare(now.into_std(), bytes) else {
+        let Ok(input) = ingress.prepare_packet(now.into_std(), packet) else {
             return;
         };
+        self.offer_quic_media(source, publisher, now, &input);
+    }
+
+    fn offer_quic_media(
+        &mut self,
+        source: FabricSourceHandle,
+        publisher: ParticipantHandle,
+        now: Instant,
+        input: &crate::rtp::fabric_ingress::MediaIngress,
+    ) {
+        let execution = &mut self.execution;
         let reference = execution
             .global_clock
             .as_mut()
             .and_then(|clock| clock.now(now));
         if execution
             .runtime
-            .offer_fabric_media(source, publisher, now, &input, reference.as_ref())
+            .offer_fabric_media(source, publisher, now, input, reference.as_ref())
             .is_ok()
         {
             execution.drain_fabric_rtp(source, now);
@@ -312,7 +325,7 @@ impl ShardCore {
         source: FabricSourceHandle,
         publisher: ParticipantHandle,
         installation: crate::participant::data_fabric::QuicInstallation,
-        bytes: &[u8],
+        input: crate::participant::data_fabric::QuicDataInput<'_>,
         now: Instant,
     ) -> Option<u64> {
         let execution = &mut self.execution;
@@ -327,7 +340,7 @@ impl ShardCore {
         );
         let position = execution
             .runtime
-            .admit_quic_data(source, publisher, installation, bytes, now, data_time)
+            .admit_quic_data(source, publisher, installation, input, now, data_time)
             .ok()?;
         if let Some(admission) = position.reliable {
             let unix_now = execution.fabric_unix_time();
@@ -449,9 +462,8 @@ impl ShardCore {
         &mut self,
         receiver: ParticipantHandle,
         publication: crate::entity::PublicationKey,
-        profile: pulsebeam_core::fabric::Profile,
+        emission: Emission,
     ) -> Option<FabricLocalBranch> {
-        use pulsebeam_core::fabric::{ExtensionKind, Profile};
         let execution = &mut self.execution;
         let track = execution.runtime.track_handle(publication)?;
         let source = execution.runtime.fabric_source_for_track(track)?;
@@ -462,13 +474,6 @@ impl ShardCore {
         } else if !execution.runtime.is_shard_fabric_source(source) {
             return None;
         }
-        // QUIC accepts Fabric's optional audio-level hint but emits extension-free RTP.
-        let extensions: &[_] = match profile {
-            Profile::Opus => &[ExtensionKind::AudioLevel],
-            Profile::H264 => &[],
-            _ => return None,
-        };
-        let emission = Emission::new(profile, extensions)?;
         execution.runtime.install_fabric_branch(
             track,
             source,
@@ -529,6 +534,7 @@ impl ShardCore {
         publication: crate::entity::PublicationKey,
         endpoint: pulsebeam_proto::data_control::SubscriberBinding,
         reliable_receiver: Option<(u64, u64)>,
+        emission: Emission,
     ) -> Option<FabricLocalBranch> {
         let execution = &mut self.execution;
         let track = execution.runtime.track_handle(publication)?;
@@ -544,7 +550,7 @@ impl ShardCore {
             track,
             source,
             receiver,
-            Emission::DATA,
+            emission,
             execution.plans.get(track)?,
             None,
         )?;
@@ -585,8 +591,9 @@ impl ShardCore {
         now: Instant,
         reliable: bool,
         write: impl FnOnce(
+            u64,
             crate::route::fabric::local::PacketView<'_>,
-            Option<crate::route::fabric::local::RepairFragment>,
+            Option<crate::route::fabric::local::RepairRequest>,
         ) -> crate::route::fabric::local::DataWrite,
     ) -> bool {
         use crate::{route::fabric::local::DataWrite, shard::router::FabricOwner};
@@ -628,12 +635,12 @@ impl ShardCore {
             receiver,
             now,
             current,
-            |_, packet, repair| {
+            |sequence, packet, repair| {
                 had_repair = repair.is_some();
                 if had_repair && !reliable {
                     DataWrite::Rejected
                 } else {
-                    write(packet, repair.map(|repair| repair.fragment))
+                    write(sequence, packet, repair)
                 }
             },
         ) else {

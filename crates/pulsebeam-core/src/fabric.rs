@@ -338,6 +338,15 @@ impl<P: AsRef<[u8]>, E: AsRef<[u8]>> FabricPacket<P, E> {
         self
     }
 
+    /// Project a media packet into a receiver-local sequence and clock domain.
+    #[must_use]
+    pub fn with_receiver_media_position(mut self, sequence: u32, timestamp: u32) -> Self {
+        debug_assert!(self.header.profile != Profile::Data);
+        self.header.sequence = sequence;
+        self.header.timestamp = timestamp;
+        self
+    }
+
     /// Associate the authenticated publisher primary size with this in-process copy.
     /// Neither Fabric wire codec carries this evidence.
     pub fn with_source_protected_bytes(mut self, bytes: NonZeroU16) -> Self {

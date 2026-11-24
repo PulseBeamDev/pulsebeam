@@ -287,6 +287,33 @@ pub fn read_datagram<T>(
     Some(Datagram::decode(&packet, usize::from(UDP_PAYLOAD_BYTES)).map(receive))
 }
 
+/// Dispatch an admitted association's DATAGRAM to the binding owner without
+/// copying its bytes. A frame prefix is not proof that the binding is live.
+pub enum NativeDatagram<'a> {
+    Packet {
+        binding: std::num::NonZeroU16,
+        wire: &'a [u8],
+    },
+    Endpoint(Datagram<'a>),
+}
+
+pub fn read_native_datagram<T>(
+    connection: &mut Connection,
+    receive: impl FnOnce(NativeDatagram<'_>) -> T,
+) -> Option<Result<T, crate::frame::Error>> {
+    let packet = connection.datagrams().recv()?;
+    if let Some(binding) = crate::records::PacketFrame::binding(&packet) {
+        return Some(Ok(receive(NativeDatagram::Packet {
+            binding,
+            wire: &packet,
+        })));
+    }
+    Some(
+        Datagram::decode(&packet, usize::from(UDP_PAYLOAD_BYTES))
+            .map(|datagram| receive(NativeDatagram::Endpoint(datagram))),
+    )
+}
+
 impl PacketScheduler {
     /// Call after resolving the binding in the sender's current association.
     pub fn offer_bound(

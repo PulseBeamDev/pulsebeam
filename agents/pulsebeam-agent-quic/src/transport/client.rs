@@ -64,6 +64,15 @@ impl ClientTransport {
         self.scheduler.offer_bound(&mut self.connection, datagram)
     }
 
+    /// Drive one frame on an already installed sender binding.
+    pub fn offer_packet(
+        &mut self,
+        sender: &mut super::framing::Sender,
+        now: Instant,
+    ) -> Result<super::framing::SendProgress, super::framing::SendError> {
+        sender.offer(&mut self.scheduler, &mut self.connection, now)
+    }
+
     /// Consume at most one received datagram. The callback must resolve the binding
     /// before inspecting its payload.
     pub fn read_datagram<T>(

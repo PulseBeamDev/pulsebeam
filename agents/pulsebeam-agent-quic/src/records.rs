@@ -4,7 +4,10 @@ use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 
 use pulsebeam_proto::state::{MAX_SUCCESSOR_RECEIPT_BYTES, validation::is_application_name};
 
-use crate::frame::{Error, MAX_TOKEN};
+use crate::{
+    data_bindings::FabricOffer,
+    frame::{Error, MAX_TOKEN},
+};
 
 const MAX_NAME: usize = 36;
 const MAX_PROOF: usize = 256;
@@ -14,6 +17,7 @@ pub(crate) const DATAGRAM_HEADER: usize = 3;
 // Do not derive Debug for types that borrow credentials.
 pub struct Admit<'a> {
     pub attempt: NonZeroU64,
+    pub fabric: FabricOffer,
     pub room: Option<&'a str>,
     pub owner: &'a str,
     pub token: &'a str,
@@ -23,6 +27,7 @@ pub struct Admit<'a> {
 impl<'a> Admit<'a> {
     pub fn decode(mut body: &'a [u8]) -> Result<Self, Error> {
         let attempt = revision(&mut body)?;
+        let fabric = FabricOffer::decode(take(&mut body)?);
         let room = field(&mut body, MAX_NAME)?;
         let room = (!room.is_empty()).then(|| name(room)).transpose()?;
         let owner = visible(field(&mut body, MAX_PROOF)?)?;
@@ -34,6 +39,7 @@ impl<'a> Admit<'a> {
         }
         Ok(Self {
             attempt,
+            fabric,
             room,
             owner,
             token,
@@ -54,6 +60,7 @@ impl<'a> Admit<'a> {
             return Err(Error::Body);
         }
         let mut out = self.attempt.get().to_be_bytes().to_vec();
+        out.extend_from_slice(&self.fabric.encode());
         append(&mut out, self.room.unwrap_or_default().as_bytes(), MAX_NAME)?;
         append(&mut out, self.owner.as_bytes(), MAX_PROOF)?;
         append(&mut out, self.token.as_bytes(), MAX_TOKEN)?;
@@ -101,6 +108,7 @@ pub enum Denial {
 #[derive(Debug, PartialEq, Eq)]
 pub struct Accepted<'a> {
     pub connection: [u8; 16],
+    pub fabric: FabricOffer,
     pub participant: &'a str,
     pub room: Option<&'a str>,
     pub capabilities: &'a [u8],
@@ -116,6 +124,7 @@ pub fn decode_admit_result(mut body: &[u8]) -> Result<Result<Accepted<'_>, Denia
         _ => return Err(Error::Body),
     }
     let connection = take(&mut body)?;
+    let fabric = FabricOffer::decode(take(&mut body)?);
     let participant = name(field(&mut body, MAX_NAME)?)?;
     let room = field(&mut body, MAX_NAME)?;
     let room = (!room.is_empty()).then(|| name(room)).transpose()?;
@@ -125,6 +134,7 @@ pub fn decode_admit_result(mut body: &[u8]) -> Result<Result<Accepted<'_>, Denia
     }
     Ok(Ok(Accepted {
         connection,
+        fabric,
         participant,
         room,
         capabilities,
@@ -142,6 +152,7 @@ pub fn encode_admit_result(result: Result<Accepted<'_>, Denial>) -> Result<Vec<u
     name(result.participant.as_bytes())?;
     let mut out = vec![0];
     out.extend_from_slice(&result.connection);
+    out.extend_from_slice(&result.fabric.encode());
     append(&mut out, result.participant.as_bytes(), MAX_NAME)?;
     append(
         &mut out,
@@ -199,8 +210,6 @@ impl RenewResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum DatagramKind {
-    Data = 1,
-    Rtp = 2,
     Rtcp = 3,
 }
 
@@ -220,8 +229,6 @@ impl<'a> Datagram<'a> {
         }
         let [kind, high, low] = take(&mut bytes)?;
         let kind = match kind {
-            1 => DatagramKind::Data,
-            2 => DatagramKind::Rtp,
             3 => DatagramKind::Rtcp,
             _ => return Err(Error::Kind),
         };
@@ -458,6 +465,7 @@ mod tests {
     #[test]
     fn bootstrap_is_exact_and_rejects_trailing_and_oversize_fields() {
         let original = Admit {
+            fabric: FabricOffer::CURRENT,
             attempt: NonZeroU64::MIN,
             room: Some("stage"),
             owner: "proof",
@@ -467,10 +475,11 @@ mod tests {
         let mut wire = original.encode().unwrap();
         assert_eq!(
             wire,
-            b"\0\0\0\0\0\0\0\x01\0\x05stage\0\x05proof\0\x05a.b.c\0\x01\xff"
+            b"\0\0\0\0\0\0\0\x01\x01\x01\0\x01\x03\xfc\0\x05stage\0\x05proof\0\x05a.b.c\0\x01\xff"
         );
         let decoded = Admit::decode(&wire).unwrap();
         assert_eq!(decoded.successor, original.successor);
+        assert_eq!(decoded.fabric, original.fabric);
         wire.push(0);
         assert_eq!(Admit::decode(&wire).err(), Some(Error::Body));
         let token = "x".repeat(MAX_TOKEN.saturating_add(1));
@@ -544,16 +553,8 @@ mod tests {
         let len = agreement.write(&packet, &mut output).unwrap();
         assert_eq!(len, 1186);
         let bytes = output.get(..len).unwrap();
-        let datagram = Datagram {
-            kind: DatagramKind::Data,
-            binding: NonZeroU16::new(0x0104).unwrap(),
-            payload: bytes,
-        };
-        assert_eq!(datagram.encode(1162), Err(Error::Length));
-        let image = datagram.encode(1189).unwrap();
-        // Independent wire fixture including the three-byte binding overhead.
         let mut expected = vec![
-            1, 1, 4, 99, 3, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0, 116, 2, 96,
+            99, 3, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0, 116, 2, 96,
         ];
         expected.extend([0xdb; 96]);
         expected.extend([3, 16]);
@@ -563,27 +564,33 @@ mod tests {
             0, 1, 0, 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe, 0x12, 0x34, 0x56, 0x78,
         ]);
         expected.extend([0x7b; 1024]);
-        assert_eq!(image, expected);
+        assert_eq!(bytes, expected);
         let decoded = agreement.decode(bytes).unwrap();
         assert_eq!(
             Record::decode_without_descriptor(decoded.payload(), Some(clock)).unwrap(),
             record
         );
-        assert!(decoded.same_content(&agreement.decode(expected.get(3..).unwrap()).unwrap()));
+        assert!(decoded.same_content(&packet.arrival_view(packet.remaining_hops()).unwrap()));
     }
 
     #[test]
     fn datagram_keeps_binding_and_rejects_zero_or_insufficient_budget() {
         let datagram = Datagram {
-            kind: DatagramKind::Rtp,
+            kind: DatagramKind::Rtcp,
             binding: NonZeroU16::new(0x104).unwrap(),
             payload: &[0x80, 0x60],
         };
         assert_eq!(datagram.encode(4), Err(Error::Length));
-        assert_eq!(datagram.encode(5).unwrap(), [2, 1, 4, 0x80, 0x60]);
-        assert_eq!(Datagram::decode(&[2, 1, 4, 0x80, 0x60], 5), Ok(datagram));
+        assert_eq!(datagram.encode(5).unwrap(), [3, 1, 4, 0x80, 0x60]);
+        assert_eq!(Datagram::decode(&[3, 1, 4, 0x80, 0x60], 5), Ok(datagram));
+        for retired in [1, 2] {
+            assert_eq!(
+                Datagram::decode(&[retired, 1, 4, 0x80, 0x60], 5),
+                Err(Error::Kind)
+            );
+        }
         assert_eq!(
-            Datagram::decode(&[2, 0, 0, 0x80, 0x60], 5),
+            Datagram::decode(&[3, 0, 0, 0x80, 0x60], 5),
             Err(Error::Body)
         );
     }

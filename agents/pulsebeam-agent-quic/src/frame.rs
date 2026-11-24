@@ -1,7 +1,7 @@
 //! Ordered application framing above the QUIC stream.
 
-pub const MAX_ADMIT_BODY: usize = 9_268;
-pub const MAX_ADMIT_RESULT_BODY: usize = 4_191;
+pub const MAX_ADMIT_BODY: usize = 9_274;
+pub const MAX_ADMIT_RESULT_BODY: usize = 4_197;
 pub const MAX_TOKEN: usize = 8_192;
 const MAX_LEN: usize = MAX_ADMIT_BODY + 1;
 const MAX_STATE: usize = pulsebeam_proto::state::codec::MAX_FRAME_SIZE;
@@ -51,7 +51,7 @@ impl Kind {
         use Kind::*;
         use Phase::{Admitted, Bootstrap};
         let limits = match (self, direction, phase) {
-            (Admit, Client, Bootstrap) => 18..=MAX_ADMIT_BODY,
+            (Admit, Client, Bootstrap) => 24..=MAX_ADMIT_BODY,
             (AdmitResult, Server, Bootstrap) => 1..=MAX_ADMIT_RESULT_BODY,
             (ClientState, Client, Admitted) | (ServerState, Server, Admitted) => 1..=MAX_STATE,
             (Renew, Client, Admitted) => 11..=MAX_TOKEN.saturating_add(10),
