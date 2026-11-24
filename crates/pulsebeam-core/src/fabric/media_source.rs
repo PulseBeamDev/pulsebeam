@@ -14,11 +14,11 @@ use std::{
 
 use arrayvec::ArrayVec;
 
+use crate::rtp_serial::{ExtensionError, extend_u16, extend_u32};
+
 use super::{Extension, ExtensionKind, ExtensionWidth, FabricPacket, Header, Profile, WireError};
 
 const MAX_POSITIONS: u16 = 4096;
-const SEQUENCE_CYCLE: u64 = 1 << 16;
-const TIMESTAMP_CYCLE: u64 = 1 << 32;
 
 pub struct Limits {
     /// Owner-reserved positions, at most 4096. Copy evidence retains at most
@@ -215,7 +215,7 @@ impl MediaIdentity {
     /// modifies the frozen wire timestamp or blocks whole-source admission.
     pub fn extended_timestamp(&self, raw: u32) -> Option<u64> {
         match self.clock {
-            Clock::Tracking(anchor) => unwrap(u64::from(raw), anchor, TIMESTAMP_CYCLE).ok(),
+            Clock::Tracking(anchor) => extend_u32(raw, anchor).ok(),
             Clock::Unanchored | Clock::Ambiguous => None,
         }
     }
@@ -266,16 +266,14 @@ impl MediaIdentity {
             Position::AuthenticatedPrimary(sequence) if !matches!(&input, Input::Media(copy) if copy.is_repair) => {
                 sequence
             }
-            Position::LowSequence(low) if !idle => {
-                let low = u64::from(low);
-                self.high
-                    .map_or(Ok(low), |high| unwrap(low, high, SEQUENCE_CYCLE))?
-            }
-            Position::CanonicalSequence(raw) if !idle => {
-                let low = u64::from(raw);
-                self.high
-                    .map_or(Ok(low), |high| unwrap(low, high, 1_u64 << 32))?
-            }
+            Position::LowSequence(low) if !idle => self
+                .high
+                .map_or_else(|| Ok(u64::from(low)), |high| extend_u16(low, high))
+                .map_err(serial_rejection)?,
+            Position::CanonicalSequence(raw) if !idle => self
+                .high
+                .map_or_else(|| Ok(u64::from(raw)), |high| extend_u32(raw, high))
+                .map_err(serial_rejection)?,
             Position::AuthenticatedPrimary(_)
             | Position::LowSequence(_)
             | Position::CanonicalSequence(_) => {
@@ -458,17 +456,11 @@ fn presence<'a>(extensions: impl Iterator<Item = Extension<'a>>) -> u16 {
     extensions.fold(0, |mask, ext| mask | (1 << ext.kind as u8))
 }
 
-fn unwrap(low: u64, anchor: u64, cycle: u64) -> Result<u64, Rejected> {
-    // Both callers use power-of-two RTP field widths.
-    let mask = cycle.saturating_sub(1);
-    let ahead = low.wrapping_sub(anchor & mask) & mask;
-    let half = cycle / 2;
-    match ahead.cmp(&half) {
-        std::cmp::Ordering::Equal => Err(Rejected::Ambiguous),
-        std::cmp::Ordering::Less => anchor.checked_add(ahead).ok_or(Rejected::Epoch),
-        std::cmp::Ordering::Greater => anchor
-            .checked_sub(cycle.saturating_sub(ahead))
-            .ok_or(Rejected::PreOrigin),
+fn serial_rejection(error: ExtensionError) -> Rejected {
+    match error {
+        ExtensionError::Ambiguous => Rejected::Ambiguous,
+        ExtensionError::BeforeOrigin => Rejected::PreOrigin,
+        ExtensionError::Overflow => Rejected::Epoch,
     }
 }
 

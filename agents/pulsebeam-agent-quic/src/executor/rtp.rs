@@ -1,12 +1,15 @@
 //! RTP packets at an installed native media binding, before codec processing.
 
-use std::{num::NonZeroU16, time::Instant};
+use std::{
+    num::{NonZeroU16, NonZeroUsize},
+    time::Instant,
+};
 
 use pulsebeam_agent_core::{Generation, MediaKind};
 use pulsebeam_core::fabric::{Extension, FabricPacket, WireError};
 
 pub use crate::media::SendPacket;
-use crate::transport::DatagramAdmission;
+use crate::{media::jitter, transport::DatagramAdmission};
 
 /// Opaque lifetime of one installed binding on this client.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
@@ -90,6 +93,23 @@ impl ReceivedPacket {
 
     pub fn payload(&self) -> &[u8] {
         self.packet.payload()
+    }
+}
+
+impl From<ReceivedPacket> for jitter::Input<Binding, ReceivedPacket> {
+    fn from(packet: ReceivedPacket) -> Self {
+        let bytes = packet
+            .packet
+            .retained_body_bytes()
+            .saturating_add(packet.publication_id.capacity());
+        Self {
+            source: packet.binding,
+            sequence: packet.extended_sequence(),
+            timestamp: packet.timestamp(),
+            arrived_at: packet.arrived_at,
+            retained_bytes: NonZeroUsize::new(bytes).unwrap_or(NonZeroUsize::MIN),
+            packet,
+        }
     }
 }
 

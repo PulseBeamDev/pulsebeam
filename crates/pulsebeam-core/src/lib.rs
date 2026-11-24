@@ -20,6 +20,7 @@ pub mod framing;
 pub mod h264;
 pub mod identity;
 pub mod net;
+pub mod rtp_serial;
 pub mod simulcast;
 pub mod vla;
 

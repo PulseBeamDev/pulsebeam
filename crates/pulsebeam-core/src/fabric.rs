@@ -366,6 +366,14 @@ impl<P: AsRef<[u8]>, E: AsRef<[u8]>> FabricPacket<P, E> {
         self.payload.as_ref()
     }
 
+    /// Bytes in the backing payload and extension blocks, not the fixed header.
+    pub fn retained_body_bytes(&self) -> usize {
+        self.payload
+            .as_ref()
+            .len()
+            .saturating_add(self.optional.as_ref().len())
+    }
+
     pub fn extensions(&self) -> impl Iterator<Item = Extension<'_>> {
         let mut rest = self.optional.as_ref();
         std::iter::from_fn(move || {
