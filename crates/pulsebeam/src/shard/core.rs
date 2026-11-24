@@ -1483,6 +1483,7 @@ impl ShardExecution {
         &mut self,
         destination: ParticipantHandle,
         feedback: crate::participant::event::FabricSubscriberFeedback,
+        now: Instant,
     ) {
         use crate::{
             participant::event::FabricFeedbackKind, route::fabric::local::ReceiptAcceptance,
@@ -1502,7 +1503,6 @@ impl ShardExecution {
         }) else {
             return;
         };
-        let now = Instant::now();
         match feedback.kind {
             FabricFeedbackKind::Propagation(unit, outcome) => {
                 self.runtime.settle_fabric_data_propagation(
@@ -2805,7 +2805,7 @@ impl ShardExecution {
                         destination,
                         feedback,
                     } => {
-                        self.observe_fabric_subscriber(destination, feedback);
+                        self.observe_fabric_subscriber(destination, feedback, now());
                     }
                     crate::shard::events::ShardInternalEvent::StageLocalRtpReceiver {
                         receiver,
