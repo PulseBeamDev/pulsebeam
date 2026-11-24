@@ -249,6 +249,125 @@ impl<'a> Datagram<'a> {
     }
 }
 
+/// Negotiated independently from the FabricPacket registry at binding install.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PacketFraming(());
+
+impl PacketFraming {
+    pub const VERSION: u8 = 1;
+
+    pub fn negotiate(peer_version: u8) -> Result<Self, Error> {
+        (peer_version == Self::VERSION)
+            .then_some(Self(()))
+            .ok_or(Error::Body)
+    }
+}
+
+/// An opaque range of a logical packet. Whole carries no transfer state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PacketFrame<'a> {
+    Whole(&'a [u8]),
+    Slice {
+        transfer: NonZeroU32,
+        total: u16,
+        offset: u16,
+        bytes: &'a [u8],
+    },
+}
+
+impl<'a> PacketFrame<'a> {
+    pub const WHOLE_HEADER_BYTES: usize = DATAGRAM_HEADER;
+    pub const SLICE_HEADER_BYTES: usize = DATAGRAM_HEADER + 8;
+    const WHOLE: u8 = 4;
+    const SLICE: u8 = 5;
+
+    /// Read only the routing prefix. The owner must resolve this binding,
+    /// including generation and direction, before invoking the reassembler.
+    pub fn binding(bytes: &[u8]) -> Option<NonZeroU16> {
+        match bytes {
+            [Self::WHOLE | Self::SLICE, a, b, ..] => NonZeroU16::new(u16::from_be_bytes([*a, *b])),
+            _ => None,
+        }
+    }
+
+    pub fn decode(_: PacketFraming, bytes: &'a [u8]) -> Result<Self, Error> {
+        Self::binding(bytes).ok_or(Error::Body)?;
+        let frame = match bytes {
+            [Self::WHOLE, _, _, bytes @ ..] => Self::Whole(bytes),
+            [Self::SLICE, _, _, a, b, c, d, e, f, g, h, bytes @ ..] => Self::Slice {
+                transfer: NonZeroU32::new(u32::from_be_bytes([*a, *b, *c, *d]))
+                    .ok_or(Error::Body)?,
+                total: u16::from_be_bytes([*e, *f]),
+                offset: u16::from_be_bytes([*g, *h]),
+                bytes,
+            },
+            _ => return Err(Error::Length),
+        };
+        frame.validate()?;
+        Ok(frame)
+    }
+
+    pub fn write(
+        self,
+        _: PacketFraming,
+        binding: NonZeroU16,
+        output: &mut [u8],
+    ) -> Result<usize, Error> {
+        self.validate()?;
+        let [a, b] = binding.get().to_be_bytes();
+        let (header, header_len, bytes) = match self {
+            Self::Whole(bytes) => (
+                [Self::WHOLE, a, b, 0, 0, 0, 0, 0, 0, 0, 0],
+                Self::WHOLE_HEADER_BYTES,
+                bytes,
+            ),
+            Self::Slice {
+                transfer,
+                total,
+                offset,
+                bytes,
+            } => {
+                let [c, d, e, f] = transfer.get().to_be_bytes();
+                let [g, h] = total.to_be_bytes();
+                let [i, j] = offset.to_be_bytes();
+                (
+                    [Self::SLICE, a, b, c, d, e, f, g, h, i, j],
+                    Self::SLICE_HEADER_BYTES,
+                    bytes,
+                )
+            }
+        };
+        let len = header_len.saturating_add(bytes.len());
+        let (prefix, data) = output
+            .get_mut(..len)
+            .and_then(|out| out.split_at_mut_checked(header_len))
+            .ok_or(Error::Length)?;
+        prefix.copy_from_slice(header.get(..header_len).ok_or(Error::Length)?);
+        data.copy_from_slice(bytes);
+        Ok(len)
+    }
+
+    fn validate(self) -> Result<(), Error> {
+        use pulsebeam_core::fabric::packet::MAX_PACKET_BYTES;
+        match self {
+            Self::Whole(bytes) if !bytes.is_empty() && bytes.len() <= MAX_PACKET_BYTES => Ok(()),
+            Self::Slice {
+                total,
+                offset,
+                bytes,
+                ..
+            } if usize::from(total) <= MAX_PACKET_BYTES
+                && !bytes.is_empty()
+                && bytes.len() < usize::from(total)
+                && usize::from(offset).saturating_add(bytes.len()) <= usize::from(total) =>
+            {
+                Ok(())
+            }
+            _ => Err(Error::Length),
+        }
+    }
+}
+
 /// Standalone RTCP Picture Loss Indication (RFC 4585). The QUIC envelope
 /// selects the media binding; the media SSRC must also match that binding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

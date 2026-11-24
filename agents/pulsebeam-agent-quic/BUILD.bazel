@@ -21,6 +21,7 @@ rust_library(
     lint_config = ":lints",
     aliases = aliases(),
     deps = _TRANSPORT_DEPS + [
+        "//crates/pulsebeam-core",
         "//crates/pulsebeam-proto:pulsebeam-proto-json",
         "//crates/pulsebeam-udp:pulsebeam-udp",
     ],
@@ -37,6 +38,7 @@ rust_library(
     lint_config = ":lints",
     aliases = aliases(),
     deps = _TRANSPORT_DEPS + [
+        "//crates/pulsebeam-core:pulsebeam-core-sim",
         "//crates/pulsebeam-proto:pulsebeam-proto-json",
         "//crates/pulsebeam-udp:pulsebeam-udp-sim",
     ],

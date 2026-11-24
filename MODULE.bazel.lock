@@ -2929,7 +2929,7 @@
           "FILE:@@//Cargo.lock 91ee92cb224ef84914cbcefd64fc0f1d190d0417e7bf1284a44052b4c1919111",
           "FILE:@@//Cargo.toml 1dddaf49112e8431a4664c4c1401d2e8a258738eab7803238ac20f644442d4bc",
           "FILE:@@//crates/pulsebeam/Cargo.toml d3bcac5b05af3fee4fc84d57c40d4ec5fc66da3b1da25544c564e1ef804d1e5e",
-          "FILE:@@//agents/pulsebeam-agent-quic/Cargo.toml 4faee97388d426d461e1388aa66d9b19da00a5f05f322578ac9531cd83204506",
+          "FILE:@@//agents/pulsebeam-agent-quic/Cargo.toml a1624861a381fb9de77ef4fa83960fc5e7df6e24dd97736ae7d103540c3aba7e",
           "FILE:@@//agents/pulsebeam-agent-core/Cargo.toml 56e53585740588609181383e7968c0ff9d90109456724ef5549bc9a5a965372c",
           "FILE:@@//crates/pulsebeam-proto/Cargo.toml fc9c43f7784f0032fd497520df7e0e52b786bb7370770e2aceeecd6281f12bd8",
           "FILE:@@//crates/pulsebeam-core/Cargo.toml 78ddc93f588ac4f32faa7752ab0c27ae808854a3d8e5469f4a2f47e10cf62eae",

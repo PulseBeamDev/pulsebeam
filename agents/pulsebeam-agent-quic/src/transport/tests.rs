@@ -39,6 +39,9 @@ struct Peer {
     out: Vec<u8>,
     scheduler: PacketScheduler,
     control_runnable: bool,
+    cid_bytes: usize,
+    last_short_dcid: Vec<u8>,
+    largest_delivered: usize,
 }
 
 impl Peer {
@@ -60,10 +63,20 @@ impl Peer {
                 break;
             };
             assert!(tx.segment_size.is_none());
-            assert!(tx.size + 48 <= 1280, "IPv6 packet exceeds minimum IP MTU");
+            assert!(
+                tx.size <= usize::from(UDP_PAYLOAD_BYTES),
+                "oversized UDP transmit: {}",
+                tx.size
+            );
             assert!(tx.src_ip.is_none_or(|ip| ip == self.address.ip()));
             if tx.destination != other.address {
                 continue;
+            }
+            self.largest_delivered = self.largest_delivered.max(tx.size);
+            if self.out.first().is_some_and(|flags| flags & 0x80 == 0) {
+                self.last_short_dcid.clear();
+                self.last_short_dcid
+                    .extend_from_slice(&self.out[1..=other.cid_bytes]);
             }
             let tuple = FourTuple::new(self.address, Some(other.address.ip()));
             other.out.clear();
@@ -104,9 +117,14 @@ impl Peer {
         }
     }
 
-    fn offer(&mut self, bytes: &[u8]) -> Result<(), DatagramAdmission> {
-        self.scheduler
-            .offer(&mut self.connection.as_mut().unwrap().1, bytes)
+    fn offer_frame(&mut self, now: Instant, sender: &mut framing::Sender) -> framing::SendProgress {
+        sender
+            .offer(
+                &mut self.scheduler,
+                &mut self.connection.as_mut().unwrap().1,
+                now,
+            )
+            .unwrap()
     }
 
     fn conn(&mut self) -> &mut Connection {
@@ -143,24 +161,41 @@ impl Pair {
     }
 
     fn profile(name: &str, trusted: bool, alpn: &[u8], datagrams: bool) -> Self {
+        Self::with_cid(
+            name,
+            trusted,
+            alpn,
+            CONNECTION_ID_BYTES,
+            datagrams.then_some(DATAGRAM_QUEUE_BYTES),
+        )
+    }
+
+    fn with_cid(
+        name: &str,
+        trusted: bool,
+        alpn: &[u8],
+        cid_bytes: usize,
+        receive_buffer: Option<usize>,
+    ) -> Self {
         let (roots, server_config) = credentials(trusted);
         let mut client_config = client_config_for_alpn(roots, Arc::new(Clock), alpn).unwrap();
-        if !datagrams {
-            let mut limits = limits();
-            limits.datagram_receive_buffer_size(None);
-            client_config.transport_config(Arc::new(limits));
-        }
+        let mut transport = limits();
+        transport.datagram_receive_buffer_size(receive_buffer);
+        client_config.transport_config(Arc::new(transport));
         let now = Instant::now();
         let server = Peer {
             address: "[2001:db8:1::1]:8443".parse().unwrap(),
-            endpoint: endpoint(Some(server_config)).unwrap(),
+            endpoint: endpoint_with_cid_bytes(Some(server_config), cid_bytes).unwrap(),
             connection: None,
             rejected: None,
             out: Vec::new(),
             scheduler: PacketScheduler::default(),
             control_runnable: false,
+            cid_bytes,
+            last_short_dcid: Vec::new(),
+            largest_delivered: 0,
         };
-        let mut client_endpoint = endpoint(None).unwrap();
+        let mut client_endpoint = endpoint_with_cid_bytes(None, cid_bytes).unwrap();
         let connection = client_endpoint
             .connect(now, client_config, server.address, name)
             .unwrap();
@@ -172,6 +207,9 @@ impl Pair {
             out: Vec::new(),
             scheduler: PacketScheduler::default(),
             control_runnable: false,
+            cid_bytes,
+            last_short_dcid: Vec::new(),
+            largest_delivered: 0,
         };
         Self {
             now,
@@ -189,30 +227,196 @@ impl Pair {
     }
 }
 
+const TEST_BINDING: std::num::NonZeroU16 = std::num::NonZeroU16::MIN;
+
+fn framing_pair() -> (framing::Sender, framing::Receiver) {
+    let version = crate::records::PacketFraming::negotiate(1).unwrap();
+    (
+        framing::Sender::new(version, TEST_BINDING),
+        framing::Receiver::new(version, TEST_BINDING),
+    )
+}
+
+fn canonical_fixture(profile: pulsebeam_core::fabric::Profile, len: usize) -> Box<[u8]> {
+    use pulsebeam_core::fabric::{
+        Extension, ExtensionKind, FabricPacket, Header, Profile,
+        packet::{Agreement, Offer},
+    };
+    use pulsebeam_proto::data_record::{Capture, Clock, Record};
+    let desc = [0xdb; 96];
+    let act = [0x24; 16];
+    let extensions = [
+        Extension {
+            kind: ExtensionKind::DependencyDescriptor,
+            value: &desc,
+        },
+        Extension {
+            kind: ExtensionKind::AbsoluteCaptureTime,
+            value: &act,
+        },
+    ];
+    let mut payload = vec![7; len - 12 - 116];
+    if profile == Profile::Data {
+        let fragment = vec![7; payload.len() - 34];
+        let clock = Clock {
+            id: "source",
+            epoch: 1,
+        };
+        let capture = Capture {
+            clock,
+            nanos: -3,
+            uncertainty_ns: Some(17),
+        };
+        let record = Record::new(
+            pulsebeam_proto::data_record::Header {
+                unit_seq: u64::MAX,
+                index: 0,
+                count: 1,
+                unit_len: fragment.len().try_into().unwrap(),
+                capture: Some(capture),
+            },
+            &fragment,
+            Some(clock),
+        )
+        .unwrap();
+        assert_eq!(record.write(&mut payload).unwrap(), payload.len());
+    }
+    let header = Header {
+        profile,
+        marker: true,
+        sequence: u32::MAX,
+        timestamp: 0xcafe_affe,
+    };
+    let packet = FabricPacket::new(header, &extensions, &payload).unwrap();
+    let offer = Offer::current(profile, 0x000c);
+    let mut bytes = vec![0; len];
+    assert_eq!(
+        Agreement::negotiate(profile, offer, offer)
+            .unwrap()
+            .write(&packet, &mut bytes)
+            .unwrap(),
+        len
+    );
+    bytes.into_boxed_slice()
+}
+
+impl Pair {
+    fn exchange_frame(
+        &mut self,
+        forward: bool,
+        sender: &mut framing::Sender,
+        receiver: &mut framing::Receiver,
+    ) -> (usize, Option<Box<[u8]>>, usize) {
+        let tx = if forward {
+            &mut self.client
+        } else {
+            &mut self.server
+        };
+        tx.largest_delivered = 0;
+        let mut progress = tx.offer_frame(self.now, sender);
+        if progress == framing::SendProgress::Deferred {
+            self.advance(1);
+            let tx = if forward {
+                &mut self.client
+            } else {
+                &mut self.server
+            };
+            progress = tx.offer_frame(self.now, sender);
+        }
+        assert!(matches!(
+            progress,
+            framing::SendProgress::Partial | framing::SendProgress::Admitted
+        ));
+        self.advance(10);
+        let (tx, rx) = if forward {
+            (&mut self.client, &mut self.server)
+        } else {
+            (&mut self.server, &mut self.client)
+        };
+        let wire = rx
+            .conn()
+            .datagrams()
+            .recv()
+            .expect("offered DATAGRAM was emitted by Noq");
+        let bytes = receiver
+            .receive(self.now, &wire)
+            .unwrap()
+            .map(|v| Box::from(v.as_ref()));
+        assert_eq!(progress == framing::SendProgress::Admitted, bytes.is_some());
+        (wire.len(), bytes, tx.largest_delivered)
+    }
+}
+
 #[test]
-fn ipv6_floor_accepts_full_data_record_before_and_after_rebind() {
-    let mut pair = Pair::new("edge.example", true);
+fn floor_budget_is_identical_through_rebind_and_cid_rotation() {
+    use pulsebeam_core::fabric::Profile;
+    let mut pair = Pair::with_cid(
+        "edge.example",
+        true,
+        ALPN,
+        MAX_V1_CID_BYTES,
+        Some(DATAGRAM_QUEUE_BYTES),
+    );
     assert_eq!(data_readiness(pair.client.conn()), Readiness::Handshaking);
     pair.advance(100);
-    assert_eq!(data_readiness(pair.client.conn()), Readiness::Ready);
-    assert_eq!(data_readiness(pair.server.conn()), Readiness::Ready);
     assert!(!pair.client.conn().has_0rtt());
     assert!(!pair.server.conn().is_multipath_negotiated());
+    assert_eq!(APPLICATION_DATAGRAM_BYTES, 1150);
 
-    let payload = [0x72; MAX_ENDPOINT_RECORD_BYTES + DATA_ENVELOPE_BYTES];
-    pair.client.offer(&payload).unwrap();
-    pair.advance(100);
-    assert_eq!(
-        pair.server.conn().datagrams().recv().unwrap().as_ref(),
-        payload
-    );
+    let before = pair.client.last_short_dcid.clone();
+    assert_eq!(before.len(), 20);
+    for stage in 0..2 {
+        for forward in [true, false] {
+            let connection = if forward {
+                pair.client.conn()
+            } else {
+                pair.server.conn()
+            };
+            assert_eq!(connection.current_mtu(), 1200);
+            assert_eq!(connection.datagrams().max_size(), Some(1150));
+            assert_eq!(data_readiness(connection), Readiness::Ready);
+            let (mut sender, mut receiver) = framing_pair();
+            for (profile, len) in [
+                (Profile::Data, 1147),
+                (Profile::Data, 1148),
+                (Profile::Data, 1186),
+                (Profile::Opus, 1147),
+                (Profile::Opus, 1148),
+                (Profile::H264, 1147),
+                (Profile::H264, 1148),
+                (Profile::H264, 1280),
+                (Profile::Av1, 1147),
+                (Profile::Av1, 1148),
+            ] {
+                let bytes = canonical_fixture(profile, len);
+                sender.start(pair.now, bytes.clone()).unwrap();
+                let (envelope, packet, udp) =
+                    pair.exchange_frame(forward, &mut sender, &mut receiver);
+                assert_eq!(envelope, 1150);
+                assert!((1188..=1200).contains(&udp), "UDP segment: {udp}");
+                if len == 1147 {
+                    assert_eq!(packet, Some(bytes));
+                } else {
+                    assert_eq!(packet, None);
+                    let (envelope, packet, udp) =
+                        pair.exchange_frame(forward, &mut sender, &mut receiver);
+                    assert_eq!(envelope, len - 1139 + 11);
+                    assert!(udp > envelope && udp <= 1200);
+                    assert_eq!(packet, Some(bytes));
+                }
+            }
+        }
+        if stage == 0 {
+            pair.client.address = "[2001:db8:3::1]:9002".parse().unwrap();
+            let now = pair.now;
+            pair.client.conn().handle_network_change(None, now);
+        }
+    }
 
-    pair.client.address.set_port(9001);
-    pair.client.offer(&payload).unwrap();
-    pair.advance(100);
-    assert_eq!(
-        pair.server.conn().datagrams().recv().unwrap().as_ref(),
-        payload
+    assert_eq!(pair.client.last_short_dcid.len(), 20);
+    assert_ne!(
+        pair.client.last_short_dcid, before,
+        "migration must exercise a rotated CID"
     );
     assert_eq!(
         pair.server
@@ -222,28 +426,38 @@ fn ipv6_floor_accepts_full_data_record_before_and_after_rebind() {
             .remote(),
         pair.client.address
     );
-    pair.client.address = "[2001:db8:3::1]:9002".parse().unwrap();
-    let now = pair.now;
-    pair.client.conn().handle_network_change(None, now);
-    pair.client.offer(&payload).unwrap();
+}
+
+#[test]
+fn peer_datagram_capacity_is_an_admission_check_not_a_sizing_input() {
+    let mut pair = Pair::new("edge.example", true);
     pair.advance(100);
+    assert_eq!(pair.server.conn().datagrams().max_size(), Some(1162));
+    let (mut sender, mut receiver) = framing_pair();
+    let payload: Box<[u8]> = vec![0x7b; 1148].into();
+    sender.start(pair.now, payload.clone()).unwrap();
     assert_eq!(
-        pair.server.conn().datagrams().recv().unwrap().as_ref(),
-        payload
+        pair.exchange_frame(false, &mut sender, &mut receiver).0,
+        1150
     );
-    assert_eq!(
-        pair.server
-            .conn()
-            .network_path(PathId::ZERO)
-            .unwrap()
-            .remote(),
-        pair.client.address
-    );
-    pair.server.offer(&payload).unwrap();
+    let (envelope, received, _) = pair.exchange_frame(false, &mut sender, &mut receiver);
+    assert_eq!(envelope, 20);
+    assert_eq!(received, Some(payload));
+
+    // Noq advertises its receive-buffer limit and accounts for its frame bound.
+    let mut pair = Pair::with_cid("edge.example", true, ALPN, CONNECTION_ID_BYTES, Some(1158));
     pair.advance(100);
+    assert_eq!(pair.server.conn().datagrams().max_size(), Some(1149));
     assert_eq!(
-        pair.client.conn().datagrams().recv().unwrap().as_ref(),
-        payload
+        data_readiness(pair.server.conn()),
+        Readiness::InsufficientDatagramBudget
+    );
+    let (mut sender, _) = framing_pair();
+    sender.start(pair.now, Box::from([7])).unwrap();
+    let (_, conn) = pair.server.connection.as_mut().unwrap();
+    assert_eq!(
+        sender.offer(&mut pair.server.scheduler, conn, pair.now),
+        Err(framing::SendError::Size)
     );
 }
 
@@ -283,7 +497,7 @@ fn control_progresses_between_full_payloads_without_displacing_admitted_data() {
     use crate::records::DatagramKind;
     use std::num::NonZeroU16;
 
-    let payload = [1; MAX_ENDPOINT_RECORD_BYTES];
+    let payload = [1; APPLICATION_DATAGRAM_BYTES - crate::records::DATAGRAM_HEADER];
     let offer = |peer: &mut Peer| {
         peer.scheduler.offer_bound(
             &mut peer.connection.as_mut().unwrap().1,

@@ -12,7 +12,6 @@ use noq_proto::{
     ClientConfig, Connection, ConnectionHandle, Endpoint, EndpointConfig, SendDatagramError,
     Transmit, TransportConfig,
 };
-use pulsebeam_proto::data_record::MAX_ENDPOINT_RECORD_BYTES;
 
 use crate::records::Datagram;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -20,8 +19,12 @@ use rustls::{RootCertStore, time_provider::TimeProvider};
 
 pub const ALPN: &[u8] = b"pulsebeam-rt-v1";
 pub const UDP_PAYLOAD_BYTES: u16 = 1200;
+const MAX_V1_CID_BYTES: usize = 20;
+// 1-RTT short header, maximum CID and packet number, AEAD tag, and Noq's
+// conservative DATAGRAM frame bound (one type byte and an eight-byte varint).
+const DATAGRAM_OVERHEAD: usize = 1 + MAX_V1_CID_BYTES + 4 + 16 + 9;
+pub const APPLICATION_DATAGRAM_BYTES: usize = (UDP_PAYLOAD_BYTES as usize) - DATAGRAM_OVERHEAD;
 const CONNECTION_ID_BYTES: usize = 8;
-const DATA_ENVELOPE_BYTES: usize = 3;
 const DATAGRAM_QUEUE_BYTES: usize = 8 * 1024;
 const CONTROL_WINDOW: u32 = 32 * 1024;
 
@@ -50,18 +53,23 @@ fn limits() -> TransportConfig {
     config
 }
 
+pub fn endpoint(server: Option<ServerConfig>) -> Result<Endpoint, noq_proto::ConfigError> {
+    endpoint_with_cid_bytes(server, CONNECTION_ID_BYTES)
+}
+
 #[allow(
     clippy::disallowed_types,
     reason = "Noq requires shared immutable endpoint configuration"
 )]
-pub fn endpoint(server: Option<ServerConfig>) -> Result<Endpoint, noq_proto::ConfigError> {
+fn endpoint_with_cid_bytes(
+    server: Option<ServerConfig>,
+    cid_bytes: usize,
+) -> Result<Endpoint, noq_proto::ConfigError> {
     let mut config = EndpointConfig::default();
     config
         .supported_versions(vec![1])
-        .cid_generator(Arc::new(|| {
-            Box::new(noq_proto::RandomConnectionIdGenerator::new(
-                CONNECTION_ID_BYTES,
-            ))
+        .cid_generator(Arc::new(move || {
+            Box::new(noq_proto::RandomConnectionIdGenerator::new(cid_bytes))
         }))
         .max_udp_payload_size(UDP_PAYLOAD_BYTES)?;
     Ok(Endpoint::new(Arc::new(config), server.map(Arc::new), true))
@@ -172,11 +180,7 @@ pub fn data_readiness(connection: &mut Connection) -> Readiness {
     if protocol.as_deref() != Some(ALPN) {
         return Readiness::WrongAlpn;
     }
-    if !connection
-        .datagrams()
-        .max_size()
-        .is_some_and(|size| size.saturating_sub(DATA_ENVELOPE_BYTES) >= MAX_ENDPOINT_RECORD_BYTES)
-    {
+    if datagram_capacity(connection.datagrams().max_size()).is_err() {
         return Readiness::InsufficientDatagramBudget;
     }
     Readiness::Ready
@@ -222,8 +226,8 @@ fn poll_packet(connection: &mut Connection, now: Instant, out: &mut Vec<u8>) -> 
 )]
 fn try_send_datagram(connection: &mut Connection, bytes: &[u8]) -> Result<(), DatagramAdmission> {
     let mut datagrams = connection.datagrams();
-    let limit = datagrams.max_size().ok_or(DatagramAdmission::Unsupported)?;
-    if bytes.is_empty() || bytes.len() > limit {
+    datagram_capacity(datagrams.max_size())?;
+    if bytes.is_empty() || bytes.len() > APPLICATION_DATAGRAM_BYTES {
         return Err(DatagramAdmission::Size);
     }
     if bytes.len() > datagrams.send_buffer_space() {
@@ -246,6 +250,14 @@ pub enum DatagramAdmission {
     Size,
     Full,
     ControlTurn,
+}
+
+fn datagram_capacity(capacity: Option<usize>) -> Result<(), DatagramAdmission> {
+    match capacity {
+        None => Err(DatagramAdmission::Unsupported),
+        Some(size) if size < APPLICATION_DATAGRAM_BYTES => Err(DatagramAdmission::Size),
+        Some(_) => Ok(()),
+    }
 }
 
 /// Noq serializes DATAGRAM frames before STREAM frames. Keep only one
@@ -287,12 +299,8 @@ impl PacketScheduler {
             Turn::Queued { .. } => return Err(DatagramAdmission::Full),
             Turn::Payload => {}
         }
-        let limit = connection
-            .datagrams()
-            .max_size()
-            .ok_or(DatagramAdmission::Unsupported)?;
         let bytes = datagram
-            .encode(limit)
+            .encode(APPLICATION_DATAGRAM_BYTES)
             .map_err(|_| DatagramAdmission::Size)?;
         self.offer(connection, &bytes)
     }
@@ -351,6 +359,7 @@ pub fn close(connection: &mut Connection, now: Instant) {
 
 pub mod client;
 pub mod control;
+pub mod framing;
 pub mod ingress;
 pub mod listener;
 pub mod socket;
