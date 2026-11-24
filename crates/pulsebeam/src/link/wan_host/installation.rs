@@ -127,7 +127,7 @@ pub(super) struct Pending {
 }
 
 enum Route {
-    Live(LiveReceive, Receipts<LiveNetworkChild>),
+    Live(Box<LiveReceive>, Receipts<LiveNetworkChild>),
     Repair(Box<PendingRepair>),
 }
 
@@ -286,7 +286,7 @@ impl WanHost {
                     .unzip();
                 let result = self
                     .stage_live_receive(now, expires, timing, destinations)
-                    .map(|route| Route::Live(route, receipts));
+                    .map(|route| Route::Live(Box::new(route), receipts));
                 (result, report)
             }
             ReceiveCommand::Repair {
@@ -396,7 +396,7 @@ impl WanHost {
             let ssrc = ticket.spec().ssrc;
             match route {
                 Route::Live(route, _) => {
-                    self.receives.insert(ssrc, route);
+                    self.receives.insert(ssrc, *route);
                 }
                 Route::Repair(repair) => {
                     self.repairs.insert(ssrc, repair.route);

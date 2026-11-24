@@ -575,7 +575,7 @@ fn exercise_native_data_v1(delivery: pulsebeam_proto::state::DataV1Delivery) {
         _ => None,
     };
     assert!(fabric_confirmation(&mut control, shard.publisher(), None, publication).is_none());
-    shard.flush_receiver_feedback();
+    shard.flush_receiver_feedback_with_clock(|| publisher.clock.monotonic);
     let live = fabric_confirmation(&mut control, shard.publisher(), None, publication)
         .expect("shard acknowledged the publisher route");
     assert_eq!(live.execution(), wire::ExecutionStatus::Installed);
@@ -619,6 +619,9 @@ fn exercise_native_data_v1(delivery: pulsebeam_proto::state::DataV1Delivery) {
         delivery,
     );
 
+    let now = publisher.clock.monotonic.max(subscriber.clock.monotonic);
+    publisher.clock.monotonic = now;
+    subscriber.clock.monotonic = now;
     let data = crate::participant::data_fabric::R4;
     assert!(
         publisher
@@ -702,10 +705,9 @@ fn exercise_native_data_v1(delivery: pulsebeam_proto::state::DataV1Delivery) {
             .find_map(|_| {
                 let (owner, mut sink) = shard.receiver_with_sink();
                 subscriber.step_with_sink(owner, None, &mut sink);
-                shard.flush_receiver_feedback();
-                shard.fire_fabric_control_timers(
-                    subscriber.clock.monotonic.max(publisher.clock.monotonic),
-                );
+                let now = subscriber.clock.monotonic.max(publisher.clock.monotonic);
+                shard.flush_receiver_feedback_with_clock(|| now);
+                shard.fire_fabric_control_timers(now);
                 let (owner, mut sink) = shard.publisher_with_sink();
                 publisher.step_with_sink(owner, None, &mut sink);
                 take_protected_original_request(&mut publisher, subscriber_endpoint.source)
@@ -775,10 +777,9 @@ fn exercise_native_data_v1(delivery: pulsebeam_proto::state::DataV1Delivery) {
         for _ in 0..32 {
             let (owner, mut sink) = shard.receiver_with_sink();
             subscriber.step_with_sink(owner, None, &mut sink);
-            shard.flush_receiver_feedback();
-            shard.fire_fabric_control_timers(
-                subscriber.clock.monotonic.max(publisher.clock.monotonic),
-            );
+            let now = subscriber.clock.monotonic.max(publisher.clock.monotonic);
+            shard.flush_receiver_feedback_with_clock(|| now);
+            shard.fire_fabric_control_timers(now);
             if let Some(next) = take_protected_repair_outcome(&mut subscriber, subscriber_endpoint)
             {
                 assert!(outcome.replace(next).is_none());
@@ -994,7 +995,7 @@ fn acknowledge_protected_expectation(
     for _ in 0..32 {
         let (owner, mut sink) = shard.receiver_with_sink();
         subscriber.step_with_sink(owner, None, &mut sink);
-        shard.flush_receiver_feedback();
+        shard.flush_receiver_feedback_with_clock(|| subscriber.clock.monotonic);
         shard.fire_fabric_control_timers(subscriber.clock.monotonic);
         if !shard.has_fabric_control_work() {
             break;
@@ -1057,7 +1058,7 @@ fn assert_protected_receipt_ack(
         for _ in 0..32 {
             let (owner, mut sink) = shard.receiver_with_sink();
             subscriber.step_with_sink(owner, None, &mut sink);
-            shard.flush_receiver_feedback();
+            shard.flush_receiver_feedback_with_clock(|| subscriber.clock.monotonic);
             if let Some(control) = take_protected_data_control(subscriber) {
                 ack = Some(control);
                 break;
@@ -3630,8 +3631,12 @@ fn installed_fabric_branch_projects_authenticated_rtp_without_waiting_for_holes(
         .slot_for_mid(publisher_leg)
         .unwrap();
     shard.use_negotiated_publication(publication, None);
-    let clock_origin = publisher.clock.monotonic;
-    let canonical_ns = 1_700_000_000_000_000_000_i64;
+    let clock_origin = publisher.clock.monotonic.max(pair.clock.monotonic);
+    publisher.clock.monotonic = clock_origin;
+    // Start this real admission/egress trace 400 Opus ticks before a canonical
+    // wrap, at a modern instant that remains inside the fixture's UTC policy.
+    let wrap_tick = (19_000_u128 << 32) - 400;
+    let canonical_ns = i64::try_from((wrap_tick * 1_000_000_000).div_ceil(48_000)).unwrap();
     assert!(shard.attach_publisher_ingress_with_clock(
         ingress.unwrap(),
         clock_origin,
@@ -3670,11 +3675,15 @@ fn installed_fabric_branch_projects_authenticated_rtp_without_waiting_for_holes(
             let ticks = (u128::try_from(canonical_ns).unwrap() + elapsed) * 48_000 / 1_000_000_000;
             u32::try_from(ticks % (1u128 << 32)).unwrap()
         });
-        assert_ne!(origin, 1000);
-        assert_eq!(
-            offer.packet.header().timestamp,
-            origin.wrapping_add(timestamp - 1000)
-        );
+        assert!(origin > u32::MAX - 600, "trace must start before wrap");
+        let expected_canonical = origin.wrapping_add(timestamp - 1000);
+        assert_eq!(offer.packet.header().timestamp, expected_canonical);
+        if index == 1 {
+            assert!(
+                expected_canonical < origin,
+                "trace must cross canonical wrap"
+            );
+        }
         assert_eq!(offer.packet.payload(), opaque);
         assert_eq!(offer.packet.remaining_hops(), 7);
         let now = publisher.clock.monotonic;

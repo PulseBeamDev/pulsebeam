@@ -1427,19 +1427,26 @@ impl ShardExecution {
         let Some(identity) = ingress.take_identity() else {
             return false;
         };
-        let reference = self.global_clock.as_mut()
+        let reference = self
+            .global_clock
+            .as_mut()
             .and_then(|clock| clock.now(now))
             .map(|estimate| (now, estimate));
         let primary = ingress.primary_ssrc();
-        let Some(mid) = ingress.mid() else { return false };
-        let Some(owner) = self.registry.resolve_mut(publisher) else { return false };
+        let Some(mid) = ingress.mid() else {
+            return false;
+        };
+        let Some(owner) = self.registry.resolve_mut(publisher) else {
+            return false;
+        };
         if !owner.attach_fabric_media_source(publication, ingress, source) {
             return false;
         }
         let report = owner.claim_fabric_sender_report(primary, mid);
-        if !self.runtime.bind_fabric_media_identity(
-            source, publisher, identity, primary, reference, report,
-        ) {
+        if !self
+            .runtime
+            .bind_fabric_media_identity(source, publisher, identity, primary, reference, report)
+        {
             owner.detach_fabric_media_source(source);
             return false;
         }
@@ -2649,10 +2656,13 @@ impl ShardExecution {
                     input,
                 } => {
                     if self.fabric_publisher_authorized(publisher, source) {
-                        match self
-                            .runtime
-                            .offer_fabric_media(source, publisher, now, &input, reference.as_ref())
-                        {
+                        match self.runtime.offer_fabric_media(
+                            source,
+                            publisher,
+                            now,
+                            &input,
+                            reference.as_ref(),
+                        ) {
                             Ok(report) => {
                                 use crate::route::fabric::local::DecodeTargetSample;
                                 if (report.dd_structure.is_some()

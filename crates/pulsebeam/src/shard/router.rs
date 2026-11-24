@@ -1888,12 +1888,22 @@ impl ShardRuntime {
         publisher: ParticipantHandle,
         identity: pulsebeam_core::fabric::media_source::MediaIdentity,
         primary_ssrc: u32,
-        reference: Option<(pulsebeam_runtime::time::Instant, crate::clock::reference::Estimate)>,
+        reference: Option<(
+            pulsebeam_runtime::time::Instant,
+            crate::clock::reference::Estimate,
+        )>,
         deferred: Option<pulsebeam_rtc::SenderReport>,
     ) -> bool {
         use pulsebeam_clock::time::{Binding, ClockRate, DomainId, Generation};
-        let Some(bound) = self.fabric_sources.get_mut(source) else { return false };
-        let FabricIngress::Publisher { participant, incarnation, .. } = bound.ingress else {
+        let Some(bound) = self.fabric_sources.get_mut(source) else {
+            return false;
+        };
+        let FabricIngress::Publisher {
+            participant,
+            incarnation,
+            ..
+        } = bound.ingress
+        else {
             return false;
         };
         if participant != publisher || !bound.fanout.bind_media_identity(identity) {
@@ -1907,7 +1917,10 @@ impl ShardRuntime {
         };
         if let Some((now, reference)) = reference
             && let Ok(clock) = crate::rtp::publisher_clock::PublisherClock::admit(
-                Binding { domain: DomainId(incarnation.get()), generation: Generation(0) },
+                Binding {
+                    domain: DomainId(incarnation.get()),
+                    generation: Generation(0),
+                },
                 primary_ssrc,
                 rate,
                 now,
@@ -1963,23 +1976,22 @@ impl ShardRuntime {
             .any(|hop| now < hop.route.expires_at && hop.route.tx.is_live());
         let clock = &mut bound.publisher_clock;
         let mut assigned = None;
-        let Some((sequence, hops, mut report)) = bound.fanout.offer_endpoint_media(
-            now,
-            input,
-            peer_repair,
-            |arrival, timestamp| {
-                if let Some(clock) = clock {
-                    clock.sync_host_reference(now, reference);
-                    let sample = clock.assign_sample(0, timestamp, arrival, now);
-                    assigned = Some(sample.projection);
-                    sample.timestamp
-                } else {
-                    // Standalone shard fixtures may omit the node clock.
-                    // Never export an endpoint RTP coordinate as canonical.
-                    0
-                }
-            },
-        )? else {
+        let Some((sequence, hops, mut report)) =
+            bound
+                .fanout
+                .offer_endpoint_media(now, input, peer_repair, |arrival, timestamp| {
+                    if let Some(clock) = clock {
+                        clock.sync_host_reference(now, reference);
+                        let sample = clock.assign_sample(0, timestamp, arrival, now);
+                        assigned = Some(sample.projection);
+                        sample.timestamp
+                    } else {
+                        // Standalone shard fixtures may omit the node clock.
+                        // Never export an endpoint RTP coordinate as canonical.
+                        0
+                    }
+                })?
+        else {
             return Ok(Offers::default());
         };
         if let Some(projection) = assigned

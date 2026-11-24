@@ -1575,11 +1575,10 @@ impl MediaEgress {
                 state.scope_retired = false;
                 state.media_scope = queued.scope;
                 state.canonical_offset = queued.clock.map(|clock| clock.canonical_offset);
-                state.latest_rtp = Some(
-                    queued
-                        .clock
-                        .map_or(u64::from(queued.media.timestamp), |clock| clock.timestamp),
-                );
+                state.latest_rtp = Some(queued.clock.map_or_else(
+                    || u64::from(queued.media.timestamp),
+                    |clock| clock.timestamp,
+                ));
                 state.highest_sequence = Some(
                     state
                         .highest_sequence

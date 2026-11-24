@@ -52,12 +52,16 @@ impl Session {
 
 fn native_capture_epoch(active: &Session, owned: u64) -> Option<u64> {
     let resource = active.state.resource_for_reference(owned)?;
-    let physical = active.payloads.get(active.payload_resources.get(resource)?)?;
+    let physical = active
+        .payloads
+        .get(active.payload_resources.get(resource)?)?;
     let live = active.state.eligible(resource)?;
     if !physical.current_data_v1_publisher(active.generation, live) {
         return None;
     }
-    let state::track::Kind::Data(track) = live.track.as_ref()?.kind.as_ref()? else { return None };
+    let state::track::Kind::Data(track) = live.track.as_ref()?.kind.as_ref()? else {
+        return None;
+    };
     let clock = track.capture_clock.as_ref()?;
     (clock.id == state::codec::NATIVE_CAPTURE_CLOCK_ID).then_some(clock.epoch)
 }
@@ -2090,26 +2094,56 @@ impl Agent {
     /// monotonic clock as its internal DATA capture provider.
     #[doc(hidden)]
     pub fn native_clock_probe(&mut self, now: core::time::Duration) {
-        use state::{NativeClockControl, NativeClockEnable, NativeClockExchange, codec::{ClockDirection, encode_clock_control}, native_clock_exchange::Message};
+        use state::{
+            NativeClockControl, NativeClockEnable, NativeClockExchange,
+            codec::{ClockDirection, encode_clock_control},
+            native_clock_exchange::Message,
+        };
         if self.pending_signal.is_some() || self.signal_retry.is_some() {
             return;
         }
-        let Some(active) = self.active.as_ref().filter(|active| !active.signaling_terminal) else { return };
-        let previous = self.native_probe.filter(|(generation, _, _)| *generation == active.generation);
-        if previous.is_some_and(|(_, _, at)| now.saturating_sub(at) < core::time::Duration::from_secs(1)) {
+        let Some(active) = self
+            .active
+            .as_ref()
+            .filter(|active| !active.signaling_terminal)
+        else {
+            return;
+        };
+        let previous = self
+            .native_probe
+            .filter(|(generation, _, _)| *generation == active.generation);
+        if previous
+            .is_some_and(|(_, _, at)| now.saturating_sub(at) < core::time::Duration::from_secs(1))
+        {
             return;
         }
-        let candidates = || active.payload_resources.keys().filter_map(|resource| {
-            let owned = active.state.reference(resource)?;
-            let epoch = native_capture_epoch(active, owned)?;
-            Some((owned, epoch))
-        });
+        let candidates = || {
+            active.payload_resources.keys().filter_map(|resource| {
+                let owned = active.state.reference(resource)?;
+                let epoch = native_capture_epoch(active, owned)?;
+                Some((owned, epoch))
+            })
+        };
         let cursor = previous.map_or(0, |(_, owned, _)| owned);
-        let Some((owned, clock_epoch)) = candidates().filter(|(owned, _)| *owned > cursor).min()
-            .or_else(|| candidates().min()) else { return };
-        let Ok(bytes) = encode_clock_control(&NativeClockControl {
-            exchange: Some(NativeClockExchange { owned, clock_epoch, message: Some(Message::Enable(NativeClockEnable {})) }),
-        }, ClockDirection::ClientToServer) else { return };
+        let Some((owned, clock_epoch)) = candidates()
+            .filter(|(owned, _)| *owned > cursor)
+            .min()
+            .or_else(|| candidates().min())
+        else {
+            return;
+        };
+        let Ok(bytes) = encode_clock_control(
+            &NativeClockControl {
+                exchange: Some(NativeClockExchange {
+                    owned,
+                    clock_epoch,
+                    message: Some(Message::Enable(NativeClockEnable {})),
+                }),
+            },
+            ClockDirection::ClientToServer,
+        ) else {
+            return;
+        };
         let (generation, channel) = (active.generation, active.signaling_channel);
         self.native_probe = Some((generation, owned, now));
         self.send_native_signal(generation, channel, bytes, false);
@@ -2125,23 +2159,50 @@ impl Agent {
         payload: &[u8],
         mut sample: impl FnMut() -> Option<i64>,
     ) -> bool {
-        use state::{NativeClockControl, NativeClockExchange, NativeClockReply, codec::{ClockDirection, decode_clock_control_frame, encode_clock_control}, native_clock_exchange::Message};
-        let Some(active) = self.active.as_ref().filter(|active| active.generation == generation && active.signaling_channel == channel && !active.signaling_terminal) else { return false };
-        let Some(result) = decode_clock_control_frame(payload, ClockDirection::ServerToClient) else { return false };
+        use state::{
+            NativeClockControl, NativeClockExchange, NativeClockReply,
+            codec::{ClockDirection, decode_clock_control_frame, encode_clock_control},
+            native_clock_exchange::Message,
+        };
+        let Some(active) = self.active.as_ref().filter(|active| {
+            active.generation == generation
+                && active.signaling_channel == channel
+                && !active.signaling_terminal
+        }) else {
+            return false;
+        };
+        let Some(result) = decode_clock_control_frame(payload, ClockDirection::ServerToClient)
+        else {
+            return false;
+        };
         if let Ok(frame) = result
-            && let Some(NativeClockExchange { owned, clock_epoch, message: Some(Message::Challenge(challenge)) }) = frame.exchange
-            && self.native_probe.is_some_and(|(current, probing, _)| current == generation && probing == owned)
+            && let Some(NativeClockExchange {
+                owned,
+                clock_epoch,
+                message: Some(Message::Challenge(challenge)),
+            }) = frame.exchange
+            && self
+                .native_probe
+                .is_some_and(|(current, probing, _)| current == generation && probing == owned)
             && native_capture_epoch(active, owned) == Some(clock_epoch)
             && self.pending_signal.is_none()
             && self.signal_retry.is_none()
             && let Some(received_nanos) = sample()
             && let Some(sent_nanos) = sample()
-            && let Ok(bytes) = encode_clock_control(&NativeClockControl {
-                exchange: Some(NativeClockExchange {
-                    owned, clock_epoch,
-                    message: Some(Message::Reply(NativeClockReply { nonce: challenge.nonce, received_nanos, sent_nanos })),
-                }),
-            }, ClockDirection::ClientToServer)
+            && let Ok(bytes) = encode_clock_control(
+                &NativeClockControl {
+                    exchange: Some(NativeClockExchange {
+                        owned,
+                        clock_epoch,
+                        message: Some(Message::Reply(NativeClockReply {
+                            nonce: challenge.nonce,
+                            received_nanos,
+                            sent_nanos,
+                        })),
+                    }),
+                },
+                ClockDirection::ClientToServer,
+            )
         {
             self.send_native_signal(generation, channel, bytes, false);
         }

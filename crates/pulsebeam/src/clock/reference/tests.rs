@@ -12,9 +12,16 @@ fn sample(
     error_ns: Option<u64>,
 ) -> Sample {
     Sample {
-        at: start + Duration::from_secs(elapsed_secs),
+        at: start
+            .checked_add(Duration::from_secs(elapsed_secs))
+            .unwrap(),
         global: GlobalInstant::from_nanos(
-            base + i64::try_from(elapsed_secs).unwrap() * NS_PER_SEC + step,
+            i64::try_from(elapsed_secs)
+                .unwrap()
+                .checked_mul(NS_PER_SEC)
+                .and_then(|elapsed| base.checked_add(elapsed))
+                .and_then(|nominal| nominal.checked_add(step))
+                .unwrap(),
         ),
         error_ns,
     }
@@ -38,7 +45,7 @@ fn linux_pair_is_qualified_only_when_attested_bounded_and_consistent() {
         qualified.global.as_nanos(),
         BASE_UTC + 11 * NS_PER_SEC - 8_000_082_000
     );
-    let ntp = policy.rules().encode(qualified.global).unwrap();
+    let ntp = policy.rules().unwrap().encode(qualified.global).unwrap();
     assert_eq!(ntp.era, Era(1));
     assert_eq!(ntp.timestamp.seconds, 123_010_304);
     assert_eq!(ntp.timestamp.fraction, 0);
@@ -171,17 +178,22 @@ fn leap_labels_and_policy_expiry_do_not_stop_continuous_time() {
     assert_eq!(
         policy
             .rules()
+            .unwrap()
             .decode_unix_nanos((transition - 1) * NS_PER_SEC),
         Err(Error::Ambiguous)
     );
     let after_leap = policy
         .rules()
+        .unwrap()
         .decode_unix_nanos(transition * NS_PER_SEC)
         .unwrap();
     let inserted = after_leap
         .checked_add(GlobalDuration::from_nanos(-500_000_000))
         .unwrap();
-    assert_eq!(policy.rules().encode(inserted), Err(Error::Ambiguous));
+    assert_eq!(
+        policy.rules().unwrap().encode(inserted),
+        Err(Error::Ambiguous)
+    );
 
     let start = Instant::now();
     let leap_clock = ShardClock::new(
@@ -212,7 +224,12 @@ fn leap_labels_and_policy_expiry_do_not_stop_continuous_time() {
     assert_eq!(at_expiry.uncertainty_ns, None);
     assert_eq!(at_expiry.evidence_generation, 1);
     assert_eq!(
-        authority.snapshot.policy.rules().encode(at_expiry.global),
+        authority
+            .snapshot
+            .policy
+            .rules()
+            .unwrap()
+            .encode(at_expiry.global),
         Err(Error::OutOfWindow)
     );
 

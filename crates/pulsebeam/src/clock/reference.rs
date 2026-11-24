@@ -1,7 +1,7 @@
 //! Node-local authority. The control runtime samples the host and publishes
 //! complete values; shards project them using their existing monotonic time.
 
-use std::{path::PathBuf, sync::Arc};
+use std::path::PathBuf;
 
 use pulsebeam_clock::{
     ntp::{LeapTransition, UtcRules, UtcSecond},
@@ -59,9 +59,8 @@ impl Policy {
         })
     }
 
-    fn rules(&self) -> UtcRules<'_> {
-        UtcRules::new(self.start, self.end, self.initial_offset, &self.transitions)
-            .expect("validated UTC policy")
+    fn rules(&self) -> Option<UtcRules<'_>> {
+        UtcRules::new(self.start, self.end, self.initial_offset, &self.transitions).ok()
     }
 
     fn parse(table: &str) -> anyhow::Result<Self> {
@@ -138,7 +137,7 @@ impl Sample {
     fn host(read: HostClockRead, policy: &Policy, unsmeared: bool) -> Option<Self> {
         let bracket = read.after.checked_duration_since(read.before)?;
         let at = read.before.checked_add(bracket.checked_div(2)?)?;
-        let global = policy.rules().decode_unix_nanos(read.unix_nanos).ok()?;
+        let global = policy.rules()?.decode_unix_nanos(read.unix_nanos).ok()?;
         let error_ns = read
             .kernel_max_error
             .filter(|error| unsmeared && bracket <= MAX_BRACKET && *error <= MAX_KERNEL_ERROR)
@@ -183,7 +182,7 @@ pub(crate) struct Snapshot {
         clippy::disallowed_types,
         reason = "immutable UTC policy, not shared packet state"
     )]
-    policy: Arc<Policy>,
+    policy: std::sync::Arc<Policy>,
     anchor: Sample,
     correction: i64,
     discipline: Discipline,
@@ -290,7 +289,7 @@ impl ShardClock {
             rate: ClockRate::OPUS,
             modular_offset: 0,
         }
-        .sender_report_pair(estimate.global, self.snapshot.policy.rules())
+        .sender_report_pair(estimate.global, self.snapshot.policy.rules()?)
         .ok()?;
         let video = OutgoingRtp {
             rate: ClockRate::VIDEO,
@@ -343,7 +342,7 @@ impl Authority {
                     clippy::disallowed_types,
                     reason = "one immutable UTC policy handed to shards"
                 )]
-                policy: Arc::new(policy),
+                policy: std::sync::Arc::new(policy),
                 anchor: sample,
                 correction: 0,
                 discipline,
@@ -410,7 +409,7 @@ impl Authority {
         }
         if policy_changed && let Some(policy) = replacement {
             #[allow(clippy::disallowed_types, reason = "immutable replacement UTC policy")]
-            let policy = Arc::new(policy);
+            let policy = std::sync::Arc::new(policy);
             self.snapshot.policy = policy;
             self.snapshot.policy_generation = self.snapshot.policy_generation.saturating_add(1);
         }
@@ -468,7 +467,7 @@ impl Source {
             #[cfg(any(test, feature = "sim"))]
             Self::Virtual { unix_nanos } => Some(Sample {
                 at: Instant::now(),
-                global: policy.rules().decode_unix_nanos(unix_nanos()).ok()?,
+                global: policy.rules()?.decode_unix_nanos(unix_nanos()).ok()?,
                 error_ns: Some(0),
             }),
         }

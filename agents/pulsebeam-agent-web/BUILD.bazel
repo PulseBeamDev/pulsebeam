@@ -20,6 +20,7 @@ package(default_visibility = ["//visibility:public"])
 filegroup(name = "workflow_inputs", srcs = glob(["*.md", "docs/**/*.md", "Justfile", "*.json", "*.yaml", "scripts/*.sh"], allow_empty = True))
 exports_files(["Cargo.toml", "package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"])
 filegroup(name = "destination_test_support", testonly = True, srcs = ["tests/support/destination.rs"])
+filegroup(name = "test_utc_policy", testonly = True, srcs = ["tests/support/leap-seconds.list"])
 
 npm_link_all_packages(name = "node_modules")
 typescript.tsc_binary(name = "tsc")
@@ -268,9 +269,10 @@ browser_test(
     source = "tests/browser.rs",
     features = ["browser-tests"],
     contracts = glob(["tests/contracts/*.js"]),
-    assets = [":browser_assets", "//agents/react:known_native_receiver", "//agents/react:generated_native_receiver", "//crates/pulsebeam-cli:native_foreign_smoke", "//agents/pulsebeam-agent-native:python_wheel"],
+    assets = [":browser_assets", ":test_utc_policy", "//agents/react:known_native_receiver", "//agents/react:generated_native_receiver", "//crates/pulsebeam-cli:native_foreign_smoke", "//agents/pulsebeam-agent-native:python_wheel"],
     env = {
         "PULSEBEAM_WEB_FIXTURE_ROOT": "$(rootpath :browser_assets)",
+        "PULSEBEAM_TEST_UTC_POLICY": "$(rootpath :test_utc_policy)",
         "PULSEBEAM_REACT_FIXTURE_ROOT": "$(rootpath //agents/react:known_native_receiver)",
         "PULSEBEAM_GENERATED_REACT_FIXTURE_ROOT": "$(rootpath //agents/react:generated_native_receiver)",
         "PULSEBEAM_FOREIGN_SMOKE": "$(rootpath //crates/pulsebeam-cli:native_foreign_smoke)",

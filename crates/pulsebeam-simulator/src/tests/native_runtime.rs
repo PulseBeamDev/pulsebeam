@@ -405,7 +405,7 @@ struct LatestData {
 impl LatestData {
     fn capture_clock() -> core_ffi::CaptureClock {
         core_ffi::CaptureClock {
-            id: "native-sensor".into(),
+            id: pulsebeam_proto::state::codec::NATIVE_CAPTURE_CLOCK_ID.into(),
             epoch: 1,
         }
     }
@@ -473,11 +473,12 @@ impl LatestData {
                         {
                             let witness = i64::from_be_bytes(witness.try_into()?);
                             anyhow::ensure!(
-                                captured_at == Some(core_ffi::CaptureTimestamp {
-                                    clock: clock.clone(),
-                                    nanos: witness,
-                                    uncertainty_ns: Some(1_000),
-                                }),
+                                captured_at
+                                    == Some(core_ffi::CaptureTimestamp {
+                                        clock: clock.clone(),
+                                        nanos: witness,
+                                        uncertainty_ns: Some(1_000),
+                                    }),
                                 "Native DATA capture metadata {captured_at:?} disagrees with sensor witness {witness} ns"
                             );
                             barrier.wait().await;
@@ -716,7 +717,14 @@ fn native_agents_prove_media_topics_reconnect_and_close() {
         Ok(())
     });
 
+    let exchanges_before =
+        pulsebeam::sim_metrics::routing_counter("native_capture_exchange_accepted");
     run_sim_or_timeout(&mut sim, Duration::from_secs(180)).expect("native vertical slice failed");
+    assert!(
+        pulsebeam::sim_metrics::routing_counter("native_capture_exchange_accepted")
+            > exchanges_before,
+        "sensor publisher must complete an authenticated Native clock exchange"
+    );
     let mut reports = reports.lock().unwrap();
     reports.sort_by(|left, right| left.participant.cmp(&right.participant));
     assert_eq!(reports.len(), 2);

@@ -1133,13 +1133,17 @@ where
 
     fn accept(&mut self, event: HostEvent) {
         if let HostEvent::DataChannel(agent_core::DataChannelEvent::Message {
-            generation, channel, binary: true, payload,
+            generation,
+            channel,
+            binary: true,
+            payload,
         }) = &event
             && payload.first() == Some(&0x32)
-            && self.core.external(|core| core.try_native_clock_frame(
-                *generation, *channel, payload,
-                || self.peer.as_ref()?.clock_evidence_nanos(),
-            ))
+            && self.core.external(|core| {
+                core.try_native_clock_frame(*generation, *channel, payload, || {
+                    self.peer.as_ref()?.clock_evidence_nanos()
+                })
+            })
         {
             return;
         }

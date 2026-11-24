@@ -89,6 +89,7 @@ impl Publisher {
 struct Errors {
     absolute_ns: Vec<u64>,
     relative_ns: Vec<u64>,
+    bounded_samples: usize,
 }
 
 impl Errors {
@@ -97,6 +98,7 @@ impl Errors {
         for estimate in estimates {
             let error = estimate.global.as_nanos().abs_diff(truth);
             if let Some(bound) = estimate.absolute_uncertainty_ns {
+                self.bounded_samples = self.bounded_samples.checked_add(1).unwrap();
                 assert!(
                     error <= bound,
                     "replay {replay:?}: {error} > {bound}: {estimate:?}"
@@ -123,7 +125,9 @@ impl Errors {
         let absolute = Self::percentiles(&mut self.absolute_ns);
         let relative = Self::percentiles(&mut self.relative_ns);
         println!(
-            "{label}: ns [p95, p99, p99.9, max], absolute {absolute:?}, relative {relative:?}; convergence step {convergence_step:?}"
+            "{label}: ns [p95, p99, p99.9, max], absolute {absolute:?}, relative {relative:?}; bounds covered {}/{} samples; convergence step {convergence_step:?}",
+            self.bounded_samples,
+            self.absolute_ns.len(),
         );
     }
 }

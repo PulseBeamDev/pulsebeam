@@ -47,6 +47,10 @@ impl DestinationServer {
             .transpose()?;
         let shutdown = tokio_util::sync::CancellationToken::new();
         let cancellation = shutdown.clone();
+        let utc_policy = std::env::var_os("PULSEBEAM_TEST_UTC_POLICY").map_or_else(
+            || std::path::Path::new(file!()).with_file_name("leap-seconds.list"),
+            std::path::PathBuf::from,
+        );
         let thread = std::thread::spawn(move || -> TestResult<()> {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -58,6 +62,7 @@ impl DestinationServer {
                     .work_stealing(1)
                     .local_addr("127.0.0.1:0".parse()?)
                     .advertise_bound_udp()
+                    .host_utc_policy(utc_policy, false)
                     .rng(pulsebeam_runtime::rand::os_rng())
                     .with_http_api_listener(listener)
                     .with_key_registry(KeyRegistry::new(

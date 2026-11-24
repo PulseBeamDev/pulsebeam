@@ -739,9 +739,10 @@ fn reject_incompatible_peer(role: Role, revision_zero: bool) {
     assert!(wan.take_control().is_none());
     if wan_is_client && !revision_zero {
         assert!(matches!(
-            wan.tick(now + CAPABILITY_TIMEOUT, &mut |_, _| panic!(
-                "expired WAN retried another carrier"
-            )),
+            wan.tick(
+                now.checked_add(CAPABILITY_TIMEOUT).unwrap(),
+                &mut |_, _| panic!("expired WAN retried another carrier")
+            ),
             Err(Error::Incompatible)
         ));
     } else {

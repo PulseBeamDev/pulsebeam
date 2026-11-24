@@ -1,10 +1,10 @@
 use std::num::NonZeroU64;
 
+use pulsebeam_clock::domain::{Projection, Provenance, Quality};
 use pulsebeam_core::fabric::{
     MAJOR, Profile, REGISTRY_REVISION,
     wan::{WINDOW_SPAN, Window},
 };
-use pulsebeam_clock::domain::{Projection, Provenance, Quality};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -190,31 +190,30 @@ impl WanSourceWindow {
     }
 
     pub(in crate::control) fn record_timing_quality(self) {
-        let (quality, provenance, bounded) = self.timing.map_or(
-            ("unknown", "unknown", "false"),
-            |point| {
-                let quality = match point.quality {
-                    0 => "acquiring",
-                    1 => "synchronized",
-                    2 => "degraded",
-                    3 => "holdover",
-                    4 => "recovering",
-                    _ => "unknown",
-                };
-                let provenance = match point.provenance {
-                    0 => "arrival",
-                    1 => "sender_report",
-                    2 => "data_capture",
-                    _ => "unknown",
-                };
-                let bounded = if point.uncertainty_ns.is_some() {
-                    "true"
-                } else {
-                    "false"
-                };
-                (quality, provenance, bounded)
-            },
-        );
+        let (quality, provenance, bounded) =
+            self.timing
+                .map_or(("unknown", "unknown", "false"), |point| {
+                    let quality = match point.quality {
+                        0 => "acquiring",
+                        1 => "synchronized",
+                        2 => "degraded",
+                        3 => "holdover",
+                        4 => "recovering",
+                        _ => "unknown",
+                    };
+                    let provenance = match point.provenance {
+                        0 => "arrival",
+                        1 => "sender_report",
+                        2 => "data_capture",
+                        _ => "unknown",
+                    };
+                    let bounded = if point.uncertainty_ns.is_some() {
+                        "true"
+                    } else {
+                        "false"
+                    };
+                    (quality, provenance, bounded)
+                });
         metrics::counter!(
             "wan_source_timing_observations",
             "quality" => quality,

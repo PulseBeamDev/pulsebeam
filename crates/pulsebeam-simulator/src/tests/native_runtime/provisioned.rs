@@ -643,6 +643,14 @@ async fn prove_payload(
         tokio::time::sleep(Duration::from_millis(150)).await;
         let before = branch_receipts();
         let upstream_before = upstream_receipts();
+        // The uncaptured unit must be timestamped between the scheduled send
+        // and observed delivery, using the known simulated UTC/TAI relation.
+        let canonical_tick = || {
+            let utc_ns = i128::from(crate::sim_clock::unix_nanos());
+            let elapsed_tai = utc_ns + 37_000_000_000 - 8_000_082_000;
+            u32::try_from((elapsed_tai * 90_000 / 1_000_000_000).rem_euclid(1 << 32)).unwrap()
+        };
+        let scheduled = canonical_tick();
         const PROBE: &[u8] = b"one publisher unit over both relay paths";
         publication.send(PROBE.to_vec(), None).await?;
         let mut delivered = 0;
@@ -676,6 +684,12 @@ async fn prove_payload(
         }
         let after = branch_receipts();
         let upstream_after = upstream_receipts();
+        let observed = canonical_tick();
+        anyhow::ensure!(
+            after[0].2.wrapping_sub(scheduled) <= observed.wrapping_sub(scheduled),
+            "canonical DATA timestamp {} is outside the scheduled send and delivery window {scheduled}..={observed}",
+            after[0].2
+        );
         anyhow::ensure!(
             delivered == 1,
             "diamond did not deliver the probe to the SDK"
@@ -717,6 +731,7 @@ async fn prove_payload(
         }
         let before_recovery = branch_receipts();
         let before_upstream = upstream_receipts();
+        let scheduled = canonical_tick();
         wait_payload(
             AFTER_REPAIR,
             Some(DURING_PARTITION),
@@ -729,11 +744,14 @@ async fn prove_payload(
                 feed.state(), publication.state(), upstream_receipts(), branch_receipts()
             )
         })??;
+        let observed = canonical_tick();
+        let resumed = branch_receipts();
         anyhow::ensure!(
-            branch_receipts()
-                .iter()
-                .zip(before_recovery)
-                .any(|(after, before)| after.0 > before.0)
+            resumed.iter().zip(before_recovery).any(|(after, before)| {
+                after.0 > before.0
+                    && after.2.wrapping_sub(scheduled) <= observed.wrapping_sub(scheduled)
+            }),
+            "no recovered branch delivered DATA in the scheduled canonical window {scheduled}..={observed}: {before_recovery:?} -> {resumed:?}"
         );
     }
     // The partition can trigger a transport reconnect. Renewal itself must preserve the

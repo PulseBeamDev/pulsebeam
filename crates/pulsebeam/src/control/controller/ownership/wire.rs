@@ -873,8 +873,12 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(decode_wan(&image).unwrap().wan.unwrap().sources, timed_windows);
-        let advanced = WanSourceWindow::from_sample(source.room, publisher, source.sequence_anchor + 1);
+        assert_eq!(
+            decode_wan(&image).unwrap().wan.unwrap().sources,
+            timed_windows
+        );
+        let advanced =
+            WanSourceWindow::from_sample(source.room, publisher, source.sequence_anchor + 1);
         let updated = plan_windows(vec![advanced], &timed_windows, 3);
         assert_eq!(updated[0].sequence_anchor, source.sequence_anchor);
         assert!(updated[0].timing.is_none());

@@ -1232,7 +1232,12 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
         if !self.has_clock_evidence() {
             return None;
         }
-        self.session.clock_timestamp().ok()?.microseconds().ok()?.checked_mul(1_000)
+        self.session
+            .clock_timestamp()
+            .ok()?
+            .microseconds()
+            .ok()?
+            .checked_mul(1_000)
     }
 
     pub fn capture_time_us(

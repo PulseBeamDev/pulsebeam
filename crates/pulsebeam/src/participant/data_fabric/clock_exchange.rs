@@ -41,7 +41,8 @@ impl PublisherSource {
         reference: crate::clock::reference::Estimate,
     ) -> Option<NativeClockExchange> {
         let (id, epoch) = self.ledger.clock.as_ref()?;
-        if self.ledger.fenced || *epoch != control.clock_epoch
+        if self.ledger.fenced
+            || *epoch != control.clock_epoch
             || id.as_ref() != pulsebeam_proto::state::codec::NATIVE_CAPTURE_CLOCK_ID
         {
             return None;
@@ -113,23 +114,28 @@ impl PublisherSource {
                     SourceTime::from_nanos(reply.received_nanos.midpoint(reply.sent_nanos));
                 let sent_at = elapsed(probe.origin, sent)?;
                 let at = elapsed(probe.origin, now)?;
-                let _ = probe.domain.observe_exchange(
-                    ActiveExchange {
-                        binding: probe.domain.binding(),
-                        source,
-                        sent_at,
-                        reference: ReferenceSample {
-                            at,
-                            global: reference.global,
-                            quality: ReferenceQuality::Qualified { uncertainty_ns },
+                probe
+                    .domain
+                    .observe_exchange(
+                        ActiveExchange {
+                            binding: probe.domain.binding(),
+                            source,
+                            sent_at,
+                            reference: ReferenceSample {
+                                at,
+                                global: reference.global,
+                                quality: ReferenceQuality::Qualified { uncertainty_ns },
+                            },
+                            asymmetry_bound_ns: None,
                         },
-                        asymmetry_bound_ns: None,
-                    },
-                    probe
-                        .assigned_frontier
-                        .map_or(source, |previous| previous.max(source)),
-                    at,
-                );
+                        probe
+                            .assigned_frontier
+                            .map_or(source, |previous| previous.max(source)),
+                        at,
+                    )
+                    .ok()?;
+                #[cfg(feature = "sim")]
+                crate::sim_metrics::record_routing_counter("native_capture_exchange_accepted");
                 None
             }
             Message::Challenge(_) => None,

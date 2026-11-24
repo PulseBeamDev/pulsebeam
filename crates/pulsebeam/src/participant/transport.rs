@@ -884,7 +884,7 @@ impl RtcDriver {
         {
             return;
         }
-        self.register_owned_encoding(info)
+        self.register_owned_encoding(info);
     }
 
     // Native callers have already reserved per-resource execution credit and
