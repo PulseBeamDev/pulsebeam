@@ -8,5 +8,6 @@ pub mod data_bindings;
 #[cfg(feature = "executor")]
 pub mod executor;
 pub mod frame;
+pub mod media;
 pub mod records;
 pub mod transport;

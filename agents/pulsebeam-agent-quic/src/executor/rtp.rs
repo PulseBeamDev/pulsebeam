@@ -5,6 +5,7 @@ use std::{num::NonZeroU16, time::Instant};
 use pulsebeam_agent_core::{Generation, MediaKind};
 use pulsebeam_core::fabric::{Extension, FabricPacket, WireError};
 
+pub use crate::media::SendPacket;
 use crate::transport::DatagramAdmission;
 
 /// Opaque lifetime of one installed binding on this client.
@@ -41,20 +42,6 @@ impl Publication {
     pub const fn payload_type(&self) -> u8 {
         self.payload_type
     }
-}
-
-/// Source packet coordinates. The installed publication, not the caller,
-/// supplies the SSRC, payload type and codec profile.
-pub struct SendPacket<'a> {
-    /// Extended RTP sequence within this publication; its low 16 bits are
-    /// the RTP sequence number. Supply a new sequence for each source packet.
-    pub sequence: u32,
-    pub timestamp: u32,
-    pub marker: bool,
-    /// Semantic extensions, not SDP numeric IDs. Unnegotiated advisory
-    /// metadata may be omitted; unnegotiated dependency/timing facts fail.
-    pub extensions: &'a [Extension<'a>],
-    pub payload: &'a [u8],
 }
 
 #[derive(Debug, PartialEq, Eq)]

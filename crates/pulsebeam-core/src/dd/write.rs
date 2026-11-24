@@ -119,6 +119,9 @@ fn validate(
     dd: &DependencyDescriptor,
     active: &TemplateDependencyStructure,
 ) -> Result<(), DdWriteError> {
+    if dd.template_id >= 64 || usize::from(active.decode_target_count) > MAX_DECODE_TARGETS {
+        return Err(DdWriteError::OutOfRange);
+    }
     if active.template(dd.template_id).is_none() {
         return Err(DdWriteError::UnknownTemplateId(dd.template_id));
     }
@@ -194,6 +197,14 @@ fn write_structure(w: &mut BitWriter, s: &TemplateDependencyStructure) -> Result
         return Err(DdWriteError::Inconsistent);
     }
 
+    if s.template_id_offset >= 64
+        || s.templates.iter().any(|template| {
+            usize::from(template.spatial_id) >= MAX_SPATIAL_IDS
+                || usize::from(template.temporal_id) >= MAX_TEMPORAL_IDS
+        })
+    {
+        return Err(DdWriteError::OutOfRange);
+    }
     w.write_bits(u32::from(s.template_id_offset), 6)?;
     debug_assert!(
         s.decode_target_count > 0,
@@ -232,7 +243,6 @@ fn write_template_layers(
         } else if next.spatial_id == prev.spatial_id.saturating_add(1) && next.temporal_id == 0 {
             NEXT_LAYER_SPATIAL
         } else {
-            debug_assert!(false, "templates not expressible as next_layer_idc");
             return Err(DdWriteError::Inconsistent);
         };
         w.write_bits(idc, 2)?;

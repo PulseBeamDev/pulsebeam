@@ -1494,6 +1494,7 @@ async fn opus_exchange(
     use pulsebeam_agent_quic::{
         executor::rtp::{Receive, SendPacket, SendPacketError},
         fabric::{Extension, ExtensionKind, WireError},
+        media::{Opus, PacketBudget},
     };
     let (mut publisher, publication_id) =
         prepare_agent_opus_publisher(address, edge, roots.clone(), publisher_token).await?;
@@ -1540,6 +1541,7 @@ async fn opus_exchange(
         .generation
         .context("admitted QUIC generation")?;
     let mut first = None;
+    let packetizer = Opus::new(PacketBudget::new(1280, 12).context("Opus RTP budget")?);
     let sliced = [0xf8; transport::framing::WHOLE_CAPACITY - BASE_BYTES + 1];
     for (offset, marker, payload) in [
         (0_u16, true, &[0xf8, 0xff, 0xfe][..]),
@@ -1555,17 +1557,11 @@ async fn opus_exchange(
             kind: ExtensionKind::DependencyDescriptor,
             value: &descriptor,
         }];
+        let packet = packetizer
+            .packetize(u32::from(offset), timestamp, marker, payload)
+            .map_err(|error| anyhow::anyhow!("Opus packetize: {error:?}"))?;
         loop {
-            match publisher.send_rtp(
-                &source,
-                SendPacket {
-                    sequence: u32::from(offset),
-                    timestamp,
-                    marker,
-                    extensions: &extensions,
-                    payload,
-                },
-            ) {
+            match publisher.send_rtp(&source, packet.as_send_packet(&extensions)) {
                 Ok(()) => break,
                 Err(SendPacketError::Datagram(
                     DatagramAdmission::Full | DatagramAdmission::ControlTurn,
