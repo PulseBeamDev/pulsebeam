@@ -727,7 +727,7 @@ fn executor_admits_and_renews_a_core_session() {
     let mut renewal_started = false;
     for step in 0..1_000 {
         let now = start + Duration::from_millis(step);
-        if let Some(event) = carrier.poll_event(now, |_| None) {
+        if let Some(crate::executor::Event::Core(event)) = carrier.poll_event(now, |_| None) {
             if matches!(event, pulsebeam_agent_core::QuicEvent::Accepted { .. }) {
                 assert_eq!(core.snapshot().connection, ConnectionState::Joining);
             }

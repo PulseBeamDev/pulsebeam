@@ -39,7 +39,26 @@ use crate::{
 
 pub mod host;
 pub mod recorder;
+pub mod rtp;
 pub mod udp;
+
+pub(crate) enum Event {
+    Core(QuicEvent),
+    Rtp {
+        generation: Generation,
+        binding: NonZeroU16,
+        arrived_at: Instant,
+        ssrc: u32,
+        payload_type: u8,
+        packet: FabricPacket<Box<[u8]>>,
+    },
+}
+
+impl From<QuicEvent> for Event {
+    fn from(event: QuicEvent) -> Self {
+        Self::Core(event)
+    }
+}
 
 const RENEW_TIMEOUT: Duration = Duration::from_secs(5);
 const CLOSE_GRACE: Duration = Duration::from_secs(1);
@@ -353,7 +372,7 @@ impl Association {
         &mut self,
         now: Instant,
         authorize: impl Fn(NonZeroU16) -> Option<(ReceiveBinding, bool)>,
-    ) -> Option<QuicEvent> {
+    ) -> Option<Event> {
         self.more_data_work = false;
         let generation = self.generation;
         let connection = self.transport.connection();
@@ -367,13 +386,13 @@ impl Association {
                         renewal: None,
                         peer_fabric: accepted.fabric,
                     };
-                    return Some(QuicEvent::Accepted {
+                    return Some(Event::Core(QuicEvent::Accepted {
                         generation,
                         connection_id: ConnectionId::from_bytes(accepted.connection).as_str(),
                         participant_id: accepted.participant,
                         room: accepted.room,
                         capabilities: accepted.capabilities,
-                    });
+                    }));
                 }
                 Err(error) => {
                     let failure = match error {
@@ -391,10 +410,10 @@ impl Association {
                         _ => protocol("invalid QUIC admission response"),
                     };
                     self.stage = Stage::Finished;
-                    return Some(QuicEvent::AdmissionFailed {
+                    return Some(Event::Core(QuicEvent::AdmissionFailed {
                         generation,
                         failure,
-                    });
+                    }));
                 }
             },
             Stage::Active {
@@ -403,10 +422,10 @@ impl Association {
                 renewal,
                 ..
             } => match poll_active(generation, connection, control, pending, renewal, now) {
-                Ok(Some(event)) => return Some(event),
+                Ok(Some(event)) => return Some(event.into()),
                 Ok(None) => {
                     if let Some(event) = self.poll_data_send(now) {
-                        return Some(event);
+                        return Some(event.into());
                     }
                     let offer = self.peer_fabric()?;
                     let connection = self.transport.connection();
@@ -438,10 +457,12 @@ impl Association {
                                     if datagram.kind == DatagramKind::Rtcp =>
                                 {
                                     PictureLossIndication::decode(datagram.payload).ok().map(
-                                        |pli| QuicEvent::PictureLoss {
-                                            generation,
-                                            binding: datagram.binding,
-                                            media_ssrc: pli.media_ssrc,
+                                        |pli| {
+                                            Event::Core(QuicEvent::PictureLoss {
+                                                generation,
+                                                binding: datagram.binding,
+                                                media_ssrc: pli.media_ssrc,
+                                            })
                                         },
                                     )
                                 }
@@ -459,17 +480,17 @@ impl Association {
             Stage::Closing(deadline) => {
                 if connection.is_drained() || now >= *deadline {
                     self.stage = Stage::Finished;
-                    return Some(QuicEvent::Closed { generation });
+                    return Some(Event::Core(QuicEvent::Closed { generation }));
                 }
                 return None;
             }
             Stage::Finished => return None,
         };
         self.stage = Stage::Finished;
-        Some(QuicEvent::TransportLost {
+        Some(Event::Core(QuicEvent::TransportLost {
             generation,
             failure,
-        })
+        }))
     }
     fn offer_media(&mut self, datagram: Datagram<'_>) -> Result<(), DatagramAdmission> {
         if !matches!(self.stage, Stage::Active { .. }) {
@@ -556,7 +577,7 @@ fn receive_packet(
     binding: ReceiveBinding,
     now: Instant,
     wire: &[u8],
-) -> Option<QuicEvent> {
+) -> Option<Event> {
     let room = receivers.len() < 64;
     let receiver = match receivers.entry(id) {
         std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
@@ -583,30 +604,24 @@ fn receive_packet(
     match binding {
         ReceiveBinding::Data => {
             let identity = pulsebeam_proto::data_record::wire_identity(packet.payload()).ok()?;
-            (header.marker == identity.final_fragment()).then(|| QuicEvent::Data {
-                generation,
-                binding: id,
-                payload: packet.payload().to_vec(),
+            (header.marker == identity.final_fragment()).then(|| {
+                Event::Core(QuicEvent::Data {
+                    generation,
+                    binding: id,
+                    payload: packet.payload().to_vec(),
+                })
             })
         }
         ReceiveBinding::Media {
             ssrc, payload_type, ..
-        } => {
-            // Reuse the Linux encoded depacketizer's RTP-shaped input locally.
-            // Packet authority and extensions are resolved before this adapter.
-            let mut payload = Vec::with_capacity(12_usize.saturating_add(packet.payload().len()));
-            payload.extend_from_slice(&[0x80, payload_type | (u8::from(header.marker) << 7)]);
-            let [.., a, b] = header.sequence.to_be_bytes();
-            payload.extend_from_slice(&[a, b]);
-            payload.extend_from_slice(&header.timestamp.to_be_bytes());
-            payload.extend_from_slice(&ssrc.to_be_bytes());
-            payload.extend_from_slice(packet.payload());
-            Some(QuicEvent::Rtp {
-                generation,
-                binding: id,
-                payload,
-            })
-        }
+        } => Some(Event::Rtp {
+            generation,
+            binding: id,
+            arrived_at: now,
+            ssrc,
+            payload_type,
+            packet: packet.into_owned(),
+        }),
     }
 }
 

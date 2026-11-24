@@ -11,7 +11,7 @@ use tokio::time;
 
 use crate::transport::socket::{self, Egress, Flush};
 
-use super::{Association, SubmitError};
+use super::{Association, Event, SubmitError};
 
 #[derive(Debug)]
 pub enum OpenError {
@@ -141,7 +141,7 @@ impl UdpAssociation {
         &mut self,
         retry_payload_turn: bool,
         authorize: impl Fn(std::num::NonZeroU16) -> Option<(super::ReceiveBinding, bool)>,
-    ) -> io::Result<Option<QuicEvent>> {
+    ) -> io::Result<Option<Event>> {
         let now = time::Instant::now().into_std();
         self.association.transport.service_timer(now);
         let event = self.association.poll_event(now, authorize);

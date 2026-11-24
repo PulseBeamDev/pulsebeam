@@ -1490,11 +1490,14 @@ async fn opus_exchange(
     receiver_token: &str,
     rebind: bool,
 ) -> Result<()> {
-    use pulsebeam_agent_core::{AgentCommand, AudioSubscription, DesiredState};
-    use pulsebeam_agent_quic::executor::host::OpusSendError;
+    use pulsebeam_agent_core::{AgentCommand, AudioSubscription, DesiredState, MediaKind};
+    use pulsebeam_agent_quic::{
+        executor::rtp::{Receive, SendPacket, SendPacketError},
+        fabric::{Extension, ExtensionKind, WireError},
+    };
     let (mut publisher, publication_id) =
         prepare_agent_opus_publisher(address, edge, roots.clone(), publisher_token).await?;
-    let mut receiver = sim_quic_agent(address, edge, roots, receiver_token)?;
+    let mut receiver = sim_quic_agent(address, edge, roots, receiver_token)?.with_raw_rtp();
     receiver.command(AgentCommand::ReplaceDesired(DesiredState {
         revision: 1,
         audio: AudioSubscription {
@@ -1515,30 +1518,59 @@ async fn opus_exchange(
             .await
             .map_err(|error| anyhow::anyhow!("Opus receiver readiness: {error:?}"))?;
     }
+    let source = publisher
+        .rtp_publication(MediaKind::Audio, "voice")
+        .context("ready RTP publication")?;
+    ensure!(source.publication_id() == publication_id && source.ssrc() != 0);
     ensure!(matches!(
-        publisher.send_opus("voice", 0, false, &vec![1; MAX_PACKET_BYTES]),
-        Err(OpusSendError::Datagram(DatagramAdmission::Size))
+        publisher.send_rtp(
+            &source,
+            SendPacket {
+                sequence: 0,
+                timestamp: 0,
+                marker: false,
+                extensions: &[],
+                payload: &vec![1; MAX_PACKET_BYTES],
+            }
+        ),
+        Err(SendPacketError::Invalid(WireError::Oversize))
     ));
     let generation = publisher
         .snapshot()
         .generation
         .context("admitted QUIC generation")?;
-    let mut previous: Option<(u16, u32)> = None;
+    let mut first = None;
     let sliced = [0xf8; transport::framing::WHOLE_CAPACITY - BASE_BYTES + 1];
-    for (timestamp, marker, payload) in [
-        (960, true, &[0xf8, 0xff, 0xfe][..]),
-        (1920, false, &sliced[..]),
+    for (offset, marker, payload) in [
+        (0_u16, true, &[0xf8, 0xff, 0xfe][..]),
+        (2, true, &sliced[..]),
+        (1, false, &[0xf8, 0xfe][..]),
     ] {
-        if rebind && previous.is_some() {
+        if rebind && offset == 2 {
             publisher.rebind(edge.ip()).await?;
         }
+        let timestamp = (1 + u32::from(offset)).saturating_mul(960);
+        let descriptor = [0xc0, 0, offset.to_le_bytes()[0]];
+        let extensions = [Extension {
+            kind: ExtensionKind::DependencyDescriptor,
+            value: &descriptor,
+        }];
         loop {
-            match publisher.send_opus("voice", timestamp, marker, payload) {
+            match publisher.send_rtp(
+                &source,
+                SendPacket {
+                    sequence: u32::from(offset),
+                    timestamp,
+                    marker,
+                    extensions: &extensions,
+                    payload,
+                },
+            ) {
                 Ok(()) => break,
-                Err(OpusSendError::Datagram(
+                Err(SendPacketError::Datagram(
                     DatagramAdmission::Full | DatagramAdmission::ControlTurn,
                 )) => {}
-                Err(error) => anyhow::bail!("Opus send: {error:?}"),
+                Err(error) => anyhow::bail!("raw RTP send: {error:?}"),
             }
             publisher
                 .turn()
@@ -1547,14 +1579,20 @@ async fn opus_exchange(
         }
         let receive = async {
             loop {
-                if let Some(packet) = receiver.next_opus() {
+                if let Some(event) = receiver.next_rtp() {
+                    let Receive::Packet(packet) = event else {
+                        anyhow::bail!("unexpected raw receive event: {event:?}");
+                    };
                     ensure!(
                         packet.publication_id == publication_id
-                            && packet.marker == marker
-                            && packet.payload == payload,
-                        "unexpected negotiated Opus packet: {packet:?}"
+                            && packet.kind == MediaKind::Audio
+                            && packet.ssrc != 0
+                            && packet.marker() == marker
+                            && packet.payload() == payload
+                            && packet.extensions().eq(extensions),
+                        "unexpected negotiated RTP packet: {packet:?}"
                     );
-                    return Ok((packet.sequence, packet.timestamp));
+                    return Ok((packet.sequence(), packet.timestamp(), packet.binding));
                 }
                 receiver
                     .turn()
@@ -1568,15 +1606,29 @@ async fn opus_exchange(
             error = async { loop { if let Err(error) = publisher.turn().await { break error; } } } =>
                 anyhow::bail!("Opus Agent drive: {error:?}"),
         };
-        if let Some((sequence, timestamp)) = previous {
-            ensure!(
-                timing.0 == sequence.wrapping_add(1) && timing.1 == timestamp.wrapping_add(960)
-            );
-        }
+        let (sequence, timestamp, binding) = *first.get_or_insert(timing);
+        ensure!(
+            timing.0 == sequence.wrapping_add(offset)
+                && timing.1 == timestamp.wrapping_add(u32::from(offset).saturating_mul(960))
+                && timing.2 == binding
+        );
         ensure!(publisher.snapshot().generation == Some(generation));
         ensure!(publisher.opus_publication_id("voice") == Some(publication_id.as_str()));
-        previous = Some(timing);
     }
+    publisher.command(AgentCommand::Disconnect)?;
+    ensure!(matches!(
+        publisher.send_rtp(
+            &source,
+            SendPacket {
+                sequence: 3,
+                timestamp: 3840,
+                marker: true,
+                extensions: &[],
+                payload: &[0xf8],
+            }
+        ),
+        Err(SendPacketError::NotReady)
+    ));
     Ok(())
 }
 

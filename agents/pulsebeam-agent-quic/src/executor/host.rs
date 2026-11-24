@@ -34,7 +34,8 @@ use crate::{
 };
 
 use super::{
-    ReceiveBinding,
+    Event, ReceiveBinding,
+    rtp::{Binding, Publication, Receive, ReceivedPacket, SendPacket, SendPacketError},
     udp::{OpenError, UdpAssociation},
 };
 
@@ -167,6 +168,7 @@ impl VideoAssembly {
     }
 }
 
+const MAX_QUEUED_RTP: usize = 32;
 const MAX_QUEUED_OPUS: usize = 32;
 const MAX_QUEUED_H264: usize = 2;
 const MAX_H264_ASSEMBLIES: usize = 8;
@@ -175,6 +177,7 @@ struct MediaSender {
     generation: Generation,
     binding: NonZeroU16,
     sequence: u32,
+    automatic_sequence: Option<bool>,
     agreement: Agreement,
     framer: Sender,
 }
@@ -196,9 +199,16 @@ pub struct Agent {
     video_assemblies: BTreeMap<(Generation, NonZeroU16), VideoAssembly>,
     received_h264: VecDeque<(Generation, NonZeroU16, ReceivedH264)>,
     received_opus: VecDeque<(Generation, NonZeroU16, ReceivedOpus)>,
+    raw_rtp: Option<RawRtp>,
     timers: BTreeMap<TimerId, Instant>,
     #[cfg(feature = "sim")]
     sim: Option<SimServices>,
+}
+
+#[derive(Default)]
+struct RawRtp {
+    packets: VecDeque<ReceivedPacket>,
+    dropped: u64,
 }
 
 impl Agent {
@@ -225,10 +235,43 @@ impl Agent {
             video_assemblies: BTreeMap::new(),
             received_h264: VecDeque::new(),
             received_opus: VecDeque::new(),
+            raw_rtp: None,
             timers: BTreeMap::new(),
             #[cfg(feature = "sim")]
             sim: None,
         })
+    }
+
+    /// Receive complete RTP packets instead of assembling Opus/H.264 frames.
+    /// Select this before connecting so no packets go through codec assembly.
+    #[must_use]
+    pub fn with_raw_rtp(mut self) -> Self {
+        self.raw_rtp.get_or_insert_with(RawRtp::default);
+        self.video_assemblies.clear();
+        self.received_h264.clear();
+        self.received_opus.clear();
+        self
+    }
+
+    /// Poll the raw receive queue in completion order, without a jitter wait.
+    /// Packets from retired or disabled bindings are not returned.
+    pub fn next_rtp(&mut self) -> Option<Receive> {
+        let raw = self.raw_rtp.as_mut()?;
+        if raw.dropped != 0 {
+            return Some(Receive::Overflow {
+                dropped: std::mem::take(&mut raw.dropped),
+            });
+        }
+        while let Some(packet) = raw.packets.pop_front() {
+            if self.core.quic_rtp_receivers(packet.kind).any(|live| {
+                live.generation == packet.binding.generation
+                    && live.binding == packet.binding.id
+                    && live.publication_id == packet.publication_id
+            }) {
+                return Some(Receive::Packet(packet));
+            }
+        }
+        None
     }
 
     fn placement_client() -> reqwest::ClientBuilder {
@@ -326,20 +369,93 @@ impl Agent {
         if payload.is_empty() {
             return Err(OpusSendError::Empty);
         }
-        if payload.len().saturating_add(BASE_BYTES) > MAX_PACKET_BYTES {
-            return Err(OpusSendError::Datagram(DatagramAdmission::Size));
+        self.send_rtp_inner(
+            kind,
+            track_id,
+            SendPacket {
+                sequence: 0,
+                timestamp,
+                marker,
+                extensions: &[],
+                payload,
+            },
+            None,
+        )
+        .map_err(|error| match error {
+            SendPacketError::NotReady | SendPacketError::SequenceOwner => OpusSendError::NotReady,
+            SendPacketError::Invalid(_) => OpusSendError::Datagram(DatagramAdmission::Size),
+            SendPacketError::Datagram(reason) => OpusSendError::Datagram(reason),
+        })
+    }
+
+    pub fn rtp_publication(&self, kind: MediaKind, track_id: &str) -> Option<Publication> {
+        let live = self
+            .core
+            .quic_rtp_publication(kind, track_id)
+            .filter(|live| live.ready)?;
+        Some(Publication {
+            binding: Binding {
+                generation: live.generation,
+                id: live.binding,
+            },
+            kind,
+            track_id: track_id.to_owned(),
+            publication_id: live.publication_id.to_owned(),
+            ssrc: live.ssrc,
+            payload_type: live.payload_type,
+        })
+    }
+
+    /// Submit one already packetized RTP payload to this installed publication.
+    /// If the binding was replaced, resolve a new publication and reset source state.
+    /// On backpressure no part was accepted; retry the same packet later.
+    /// Success transfers the packet to bounded staging, not delivery to the peer.
+    pub fn send_rtp(
+        &mut self,
+        publication: &Publication,
+        packet: SendPacket<'_>,
+    ) -> Result<(), SendPacketError> {
+        self.send_rtp_inner(
+            publication.kind,
+            &publication.track_id,
+            packet,
+            Some(publication),
+        )
+    }
+
+    fn send_rtp_inner(
+        &mut self,
+        kind: MediaKind,
+        track_id: &str,
+        input: SendPacket<'_>,
+        expected: Option<&Publication>,
+    ) -> Result<(), SendPacketError> {
+        use pulsebeam_core::fabric::WireError;
+
+        if input.payload.len().saturating_add(BASE_BYTES) > MAX_PACKET_BYTES {
+            return Err(SendPacketError::Invalid(WireError::Oversize));
         }
         let live = self
             .core
             .quic_rtp_publication(kind, track_id)
             .filter(|publication| publication.ready)
-            .ok_or(OpusSendError::NotReady)?;
+            .ok_or(SendPacketError::NotReady)?;
         let (generation, binding) = (live.generation, live.binding);
+        if expected.is_some_and(|source| {
+            source.binding.generation != generation
+                || source.binding.id != binding
+                || source.publication_id != live.publication_id
+                || source.ssrc != live.ssrc
+                || source.payload_type != live.payload_type
+        }) {
+            return Err(SendPacketError::NotReady);
+        }
+        let generate_sequence = expected.is_none();
         let key = (kind, track_id.to_owned());
         if !self.media_senders.contains_key(&key) && self.media_senders.len() >= 64 {
             self.retain_media_senders();
             if self.media_senders.len() >= 64 {
-                return Err(OpusSendError::NotReady);
+                return Err(SendPacketError::NotReady);
             }
         }
         let socket = self
@@ -347,7 +463,7 @@ impl Agent {
             .iter_mut()
             .flatten()
             .find(|socket| socket.generation() == generation)
-            .ok_or(OpusSendError::NotReady)?;
+            .ok_or(SendPacketError::NotReady)?;
         let profile = match kind {
             MediaKind::Audio => Profile::Opus,
             MediaKind::Video => Profile::H264,
@@ -357,16 +473,17 @@ impl Agent {
             .get(&key)
             .is_some_and(|sender| sender.generation == generation && sender.binding == binding)
         {
-            let offer = socket.peer_fabric().ok_or(OpusSendError::NotReady)?;
+            let offer = socket.peer_fabric().ok_or(SendPacketError::NotReady)?;
             let selected = FabricOffer::CURRENT
                 .bind(offer, profile, 0)
-                .map_err(|_| OpusSendError::NotReady)?;
+                .map_err(SendPacketError::Invalid)?;
             self.media_senders.insert(
                 key.clone(),
                 MediaSender {
                     generation,
                     binding,
                     sequence: 0,
+                    automatic_sequence: None,
                     agreement: selected.agreement,
                     framer: Sender::new(selected.framing, binding),
                 },
@@ -375,27 +492,37 @@ impl Agent {
         let sender = self
             .media_senders
             .get_mut(&key)
-            .ok_or(OpusSendError::NotReady)?;
+            .ok_or(SendPacketError::NotReady)?;
+        if sender
+            .automatic_sequence
+            .is_some_and(|automatic| automatic != generate_sequence)
+        {
+            return Err(SendPacketError::SequenceOwner);
+        }
         if sender.framer.is_pending() {
-            return Err(OpusSendError::Datagram(DatagramAdmission::Full));
+            return Err(SendPacketError::Datagram(DatagramAdmission::Full));
         }
         let header = Header {
             profile,
-            marker,
-            sequence: sender.sequence,
-            timestamp,
+            marker: input.marker,
+            sequence: if generate_sequence {
+                sender.sequence
+            } else {
+                input.sequence
+            },
+            timestamp: input.timestamp,
         };
-        let packet = FabricPacket::new(header, &[], payload)
-            .map_err(|_| OpusSendError::Datagram(DatagramAdmission::Size))?;
+        let packet = FabricPacket::new(header, input.extensions, input.payload)
+            .map_err(SendPacketError::Invalid)?;
         let mut wire = [0; MAX_PACKET_BYTES];
         let size = sender
             .agreement
             .write(&packet, &mut wire)
-            .map_err(|_| OpusSendError::Datagram(DatagramAdmission::Size))?;
+            .map_err(SendPacketError::Invalid)?;
         let now = Instant::now().into_std();
         let bytes = wire
             .get(..size)
-            .ok_or(OpusSendError::Datagram(DatagramAdmission::Size))?;
+            .ok_or(SendPacketError::Invalid(WireError::Oversize))?;
         sender
             .framer
             .start(now, Box::from(bytes))
@@ -405,14 +532,17 @@ impl Agent {
             .map_err(media_send_error)?
         {
             SendProgress::Admitted | SendProgress::Partial => {
-                sender.sequence = sender.sequence.wrapping_add(1);
+                sender.automatic_sequence = Some(generate_sequence);
+                if generate_sequence {
+                    sender.sequence = sender.sequence.wrapping_add(1);
+                }
                 Ok(())
             }
             SendProgress::Deferred(reason) => {
                 sender.framer.discard_pending();
-                Err(OpusSendError::Datagram(reason))
+                Err(SendPacketError::Datagram(reason))
             }
-            SendProgress::Idle => Err(OpusSendError::NotReady),
+            SendProgress::Idle => Err(SendPacketError::NotReady),
         }
     }
 
@@ -812,17 +942,67 @@ impl Agent {
         Ok(())
     }
 
-    fn accept(&mut self, event: HostEvent) -> Result<(), Error> {
-        if let HostEvent::Quic(QuicEvent::Rtp {
-            generation,
-            binding,
-            payload,
-        }) = event
-        {
-            self.receive_opus(generation, binding, &payload);
-            self.receive_h264(generation, binding, &payload);
-            return Ok(());
+    fn accept_socket(&mut self, event: Event) -> Result<(), Error> {
+        let (generation, binding, arrived_at, ssrc, payload_type, packet) = match event {
+            Event::Core(event) => return self.accept(HostEvent::Quic(event)),
+            Event::Rtp {
+                generation,
+                binding,
+                arrived_at,
+                ssrc,
+                payload_type,
+                packet,
+            } => (generation, binding, arrived_at, ssrc, payload_type, packet),
+        };
+        let header = packet.header();
+        let kind = match header.profile {
+            Profile::Opus => MediaKind::Audio,
+            Profile::H264 => MediaKind::Video,
+            _ => return Ok(()),
+        };
+        if let Some(raw) = &mut self.raw_rtp {
+            let Some(live) = self
+                .core
+                .quic_rtp_receivers(kind)
+                .find(|live| live.generation == generation && live.binding == binding)
+            else {
+                return Ok(());
+            };
+            if raw.packets.len() >= MAX_QUEUED_RTP {
+                raw.dropped = raw.dropped.saturating_add(1);
+            } else {
+                raw.packets.push_back(ReceivedPacket {
+                    binding: Binding {
+                        generation,
+                        id: binding,
+                    },
+                    publication_id: live.publication_id.to_owned(),
+                    kind,
+                    arrived_at,
+                    ssrc,
+                    payload_type,
+                    packet,
+                });
+            }
+        } else {
+            // The compatibility frame adapters consume minimal RTP. Only the
+            // raw boundary exposes negotiated extensions to the application.
+            let mut bytes = Vec::with_capacity(RTP_HEADER.saturating_add(packet.payload().len()));
+            bytes.extend_from_slice(&[0x80, payload_type | (u8::from(header.marker) << 7)]);
+            let [.., a, b] = header.sequence.to_be_bytes();
+            bytes.extend_from_slice(&[a, b]);
+            bytes.extend_from_slice(&header.timestamp.to_be_bytes());
+            bytes.extend_from_slice(&ssrc.to_be_bytes());
+            bytes.extend_from_slice(packet.payload());
+            match kind {
+                MediaKind::Audio => self.receive_opus(generation, binding, &bytes),
+                MediaKind::Video => self.receive_h264(generation, binding, &bytes),
+            }
         }
+        Ok(())
+    }
+
+    fn accept(&mut self, event: HostEvent) -> Result<(), Error> {
         if let HostEvent::Quic(QuicEvent::PictureLoss {
             generation,
             binding,
@@ -1070,15 +1250,15 @@ impl Agent {
                 self.timers.remove(&timer);
                 self.accept(HostEvent::Timer(TimerEvent::Fired { timer }))?;
             }
-            Input::Socket(Some(event)) => self.accept(HostEvent::Quic(event))?,
+            Input::Socket(Some(event)) => self.accept_socket(event)?,
             Input::Socket(None) => {}
         }
         Ok(())
     }
 }
 
-fn media_send_error(error: SendError) -> OpusSendError {
-    OpusSendError::Datagram(match error {
+fn media_send_error(error: SendError) -> SendPacketError {
+    SendPacketError::Datagram(match error {
         SendError::Size => DatagramAdmission::Size,
         SendError::Busy => DatagramAdmission::Full,
         _ => DatagramAdmission::Unsupported,
@@ -1089,7 +1269,7 @@ enum Input {
     Http(HttpEvent),
     Dial(DialResult),
     Timer(TimerId),
-    Socket(Option<QuicEvent>),
+    Socket(Option<Event>),
 }
 
 async fn work<Id, T>(work: &mut Option<(Id, Work<T>)>) -> T {
@@ -1103,7 +1283,7 @@ async fn socket_turn(
     slot: &mut Option<Box<UdpAssociation>>,
     core: &CoreAgent,
     retry_payload_turn: Option<Generation>,
-) -> Option<QuicEvent> {
+) -> Option<Event> {
     let Some(socket) = slot.as_mut() else {
         return pending().await;
     };
@@ -1135,9 +1315,9 @@ async fn socket_turn(
     let Ok(event) = socket.progress(retry, authorize).await else {
         let event = socket.io_failure();
         *slot = None;
-        return Some(event);
+        return Some(event.into());
     };
-    if matches!(event, Some(QuicEvent::Closed { .. })) {
+    if matches!(event, Some(Event::Core(QuicEvent::Closed { .. }))) {
         *slot = None;
     }
     event

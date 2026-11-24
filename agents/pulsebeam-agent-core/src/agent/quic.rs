@@ -466,7 +466,7 @@ impl Agent {
                     return Err(error);
                 }
             }
-            QuicEvent::Rtp { .. } | QuicEvent::PictureLoss { .. } => {}
+            QuicEvent::PictureLoss { .. } => {}
             QuicEvent::Data {
                 generation,
                 binding,

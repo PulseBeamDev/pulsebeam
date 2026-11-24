@@ -33,11 +33,6 @@ pub enum QuicEvent {
         binding: core::num::NonZeroU16,
         payload: Vec<u8>,
     },
-    Rtp {
-        generation: Generation,
-        binding: core::num::NonZeroU16,
-        payload: Vec<u8>,
-    },
     PictureLoss {
         generation: Generation,
         binding: core::num::NonZeroU16,
