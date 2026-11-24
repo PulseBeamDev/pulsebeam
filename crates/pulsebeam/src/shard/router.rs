@@ -126,6 +126,11 @@ struct FabricSource {
     fanout: SourceFanout,
     reliable_installation: Option<pulsebeam_rtc::DataChannelInstallation>,
     publisher_clock: Option<Box<crate::rtp::publisher_clock::PublisherClock>>,
+    publisher_timing: Option<(
+        u64,
+        pulsebeam_runtime::time::Instant,
+        pulsebeam_clock::domain::Projection,
+    )>,
 }
 
 impl FabricSource {
@@ -545,6 +550,7 @@ impl ShardRuntime {
             fanout: SourceFanout::new(emission),
             reliable_installation: None,
             publisher_clock: None,
+            publisher_timing: None,
         });
         bound.media.insert_fabric(source);
         Some(source)
@@ -702,6 +708,7 @@ impl ShardRuntime {
             fanout: SourceFanout::new(emission),
             reliable_installation: None,
             publisher_clock: None,
+            publisher_timing: None,
         });
         bound.media.insert_fabric(source);
         Some(source)
@@ -864,6 +871,7 @@ impl ShardRuntime {
                 fanout,
                 reliable_installation: None,
                 publisher_clock: None,
+                publisher_timing: None,
             });
             track.media.insert_fabric(source);
         }
@@ -1249,6 +1257,7 @@ impl ShardRuntime {
             window,
             position,
             packet,
+            ..
         } = image;
         let source = self.network_fabric_source(address)?;
         let FabricIngress::Network {
@@ -1278,6 +1287,7 @@ impl ShardRuntime {
                 window: parent.window?,
                 position,
                 packet,
+                capture: None,
             },
         ))
     }
@@ -1353,6 +1363,7 @@ impl ShardRuntime {
             window,
             position,
             packet,
+            capture,
         } = image;
         if input.window != Some(window) || !window.contains(position) {
             return Err(Rejection::Binding);
@@ -1375,6 +1386,11 @@ impl ShardRuntime {
                 return Err(error);
             }
         };
+        if let Some(capture) = capture {
+            bound
+                .fanout
+                .attach_network_capture(sequence, child.ingress, arrival, capture);
+        }
         media_repairs.retain(|repair| {
             repair.child.position != sequence
                 && now < repair.child.expires
@@ -1531,11 +1547,16 @@ impl ShardRuntime {
         &self,
         source: FabricSourceHandle,
         now: pulsebeam_runtime::time::Instant,
-    ) -> Option<u64> {
-        self.fabric_sources
-            .get(source)?
-            .fanout
-            .live_sequence_anchor(now)
+    ) -> Option<crate::shard_update::PublisherPosition> {
+        let source = self.fabric_sources.get(source)?;
+        let sequence = source.fanout.live_sequence_anchor(now)?;
+        let timing = source.publisher_timing.and_then(|(position, at, timing)| {
+            (position == sequence
+                && now.checked_duration_since(at)?
+                    < crate::route::fabric::network_repair::MAX_REPAIR_LIFETIME)
+                .then_some(timing)
+        });
+        Some(crate::shard_update::PublisherPosition { sequence, timing })
     }
 
     pub(super) fn fabric_emission(&self, source: FabricSourceHandle) -> Option<Emission> {
@@ -1941,6 +1962,7 @@ impl ShardRuntime {
             .iter()
             .any(|hop| now < hop.route.expires_at && hop.route.tx.is_live());
         let clock = &mut bound.publisher_clock;
+        let mut assigned = None;
         let Some((sequence, hops, mut report)) = bound.fanout.offer_endpoint_media(
             now,
             input,
@@ -1948,7 +1970,9 @@ impl ShardRuntime {
             |arrival, timestamp| {
                 if let Some(clock) = clock {
                     clock.sync_host_reference(now, reference);
-                    clock.assign(0, timestamp, arrival, now)
+                    let sample = clock.assign_sample(0, timestamp, arrival, now);
+                    assigned = Some(sample.projection);
+                    sample.timestamp
                 } else {
                     // Standalone shard fixtures may omit the node clock.
                     // Never export an endpoint RTP coordinate as canonical.
@@ -1958,6 +1982,11 @@ impl ShardRuntime {
         )? else {
             return Ok(Offers::default());
         };
+        if let Some(projection) = assigned
+            && bound.fanout.live_sequence_anchor(now) == Some(sequence)
+        {
+            bound.publisher_timing = projection.map(|(at, projection)| (sequence, at, projection));
+        }
         Self::forward_publisher_branches(bound, now, sequence, hops, None, &mut report);
         Ok(report)
     }

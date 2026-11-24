@@ -56,6 +56,28 @@ pub struct DeadlineEvidence {
     pub expiry: Expiry,
 }
 
+/// Conservative capture age at the observation instant. Missing bounds stay unknown.
+pub fn capture_age(capture: Timing, now: Timing) -> Result<Option<Interval>, Error> {
+    age_terms(capture, now)?
+        .map(|(center, radius)| Interval::around(center, radius))
+        .transpose()
+}
+
+fn age_terms(capture: Timing, now: Timing) -> Result<Option<(i128, i128)>, Error> {
+    let (Some(capture_radius), Some(now_radius)) =
+        (capture.absolute_uncertainty_ns, now.absolute_uncertainty_ns)
+    else {
+        return Ok(None);
+    };
+    let radius = i128::from(capture_radius)
+        .checked_add(i128::from(now_radius))
+        .ok_or(Error::Overflow)?;
+    let center = i128::from(now.instant.as_nanos())
+        .checked_sub(i128::from(capture.instant.as_nanos()))
+        .ok_or(Error::Overflow)?;
+    Ok(Some((center, radius)))
+}
+
 /// Evaluate one subscription's nonnegative target without changing capture
 /// time. Endpoints are inclusive; even exact equality is not definite expiry.
 pub fn evaluate(
@@ -66,21 +88,13 @@ pub fn evaluate(
     if target.as_nanos() < 0 {
         return Err(Error::Invalid);
     }
-    let (Some(capture_radius), Some(now_radius)) =
-        (capture.absolute_uncertainty_ns, now.absolute_uncertainty_ns)
-    else {
+    let Some((center, radius)) = age_terms(capture, now)? else {
         return Ok(DeadlineEvidence {
             age: None,
             remaining: None,
             expiry: Expiry::Inconclusive,
         });
     };
-    let radius = i128::from(capture_radius)
-        .checked_add(i128::from(now_radius))
-        .ok_or(Error::Overflow)?;
-    let center = i128::from(now.instant.as_nanos())
-        .checked_sub(i128::from(capture.instant.as_nanos()))
-        .ok_or(Error::Overflow)?;
     let age = Interval::around(center, radius)?;
     let remaining = Interval::around(
         i128::from(target.as_nanos())

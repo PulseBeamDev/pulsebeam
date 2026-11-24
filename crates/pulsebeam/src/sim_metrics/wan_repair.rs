@@ -27,6 +27,8 @@ struct Target {
 pub struct Report {
     pub position: u64,
     pub live: NonZeroU32,
+    pub live_wire_timestamp: u32,
+    pub repaired_timestamp: Option<u32>,
     pub dropped_repair: Option<NonZeroU32>,
     pub opened_repair: Option<NonZeroU32>,
     pub late_original_matches: Option<bool>,
@@ -63,6 +65,7 @@ pub(crate) fn filter(
     ecn: Option<Ecn>,
     window: Window,
     position: u64,
+    wire_timestamp: u32,
     repair: bool,
 ) -> Option<Box<[u8]>> {
     let label = window.ssrc();
@@ -78,6 +81,8 @@ pub(crate) fn filter(
                 report: Report {
                     position,
                     live: label,
+                    live_wire_timestamp: wire_timestamp,
+                    repaired_timestamp: None,
                     dropped_repair: None,
                     opened_repair: None,
                     late_original_matches: None,
@@ -125,6 +130,7 @@ pub(crate) fn authenticated(
             .is_some_and(|dropped| dropped != window.ssrc())
         {
             target.report.opened_repair = Some(window.ssrc());
+            target.report.repaired_timestamp = Some(packet.header().timestamp);
             target.repaired_packet = Some(packet.clone());
         }
     });

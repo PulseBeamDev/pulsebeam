@@ -830,6 +830,55 @@ mod tests {
         )
         .unwrap();
         assert_eq!(decode_wan(&wan).unwrap().wan.unwrap().sources, rollover);
+
+        use pulsebeam_clock::{
+            domain::{Projection, Provenance, Quality},
+            time::{Binding, DomainId, Generation, GlobalInstant, RtpTimestamp},
+        };
+        let timed = source.with_projection(Some(Projection {
+            global: GlobalInstant::from_nanos(100_000_000),
+            rtp: RtpTimestamp(4_800),
+            binding: Binding {
+                domain: DomainId(publisher.incarnation.get()),
+                generation: Generation(3),
+            },
+            provenance: Provenance::SenderReport,
+            source: None,
+            absolute_uncertainty_ns: None,
+            quality: Quality::Degraded,
+            calibration: None,
+        }));
+        assert!(timed.timing.is_some());
+        assert_ne!(timed, source);
+        assert!(timed.same_window(source));
+        assert!(!timed.same_window(WanSourceWindow::from_sample(
+            source.room,
+            PublisherAnchor {
+                incarnation: NonZeroU64::MAX,
+                ..publisher
+            },
+            source.sequence_anchor,
+        )));
+        let timed_windows = plan_windows(vec![timed], &[], 3);
+        assert_eq!(timed_windows[0], timed);
+        assert!(timed_windows[1].timing.is_none());
+        let image = encode(
+            NonZeroU64::MIN,
+            authority(),
+            &audio,
+            RouteImage::Wan {
+                offers: Box::default(),
+                sources: timed_windows.clone(),
+                retired: Vec::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(decode_wan(&image).unwrap().wan.unwrap().sources, timed_windows);
+        let advanced = WanSourceWindow::from_sample(source.room, publisher, source.sequence_anchor + 1);
+        let updated = plan_windows(vec![advanced], &timed_windows, 3);
+        assert_eq!(updated[0].sequence_anchor, source.sequence_anchor);
+        assert!(updated[0].timing.is_none());
+
         assert!(matches!(
             encode(
                 NonZeroU64::MIN,

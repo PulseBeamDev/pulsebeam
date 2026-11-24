@@ -52,7 +52,7 @@ struct Samples {
     routing_counters: HashMap<String, u64>,
     fabric_udp_submission_peak: usize,
     wan_opus_wire_peak: usize,
-    wan_live_data: HashMap<(IpAddr, IpAddr), (u64, u64)>,
+    wan_live_data: HashMap<(IpAddr, IpAddr), (u64, u64, u32)>,
     wan_data_loss: Option<WanDataLoss>,
     shard_data: Option<ShardDataTrace>,
     wan_data_sends: HashMap<String, pulsebeam_link::BindingCutoff>,
@@ -289,15 +289,15 @@ pub(crate) fn record_wan_data_repair(edge: (IpAddr, IpAddr), position: u64) {
     });
 }
 
-pub(crate) fn record_wan_live_data(from: IpAddr, to: IpAddr, position: u64) {
+pub(crate) fn record_wan_live_data(from: IpAddr, to: IpAddr, position: u64, timestamp: u32) {
     SAMPLES.with_borrow_mut(|samples| {
         let entry = samples.wan_live_data.entry((from, to)).or_default();
-        *entry = (entry.0.saturating_add(1), position);
+        *entry = (entry.0.saturating_add(1), position, timestamp);
     });
 }
 
-/// Count and newest observed position on one authenticated WAN ingress.
-pub fn wan_live_data(from: IpAddr, to: IpAddr) -> (u64, u64) {
+/// Count, newest observed position and its timestamp on one authenticated WAN ingress.
+pub fn wan_live_data(from: IpAddr, to: IpAddr) -> (u64, u64, u32) {
     SAMPLES.with_borrow(|samples| {
         samples
             .wan_live_data

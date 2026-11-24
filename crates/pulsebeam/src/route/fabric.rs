@@ -90,11 +90,36 @@ pub(crate) struct LiveNetworkChild {
     pub window: Option<pulsebeam_core::fabric::wan::Window>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WindowTiming {
+    pub position: u64,
+    pub capture: pulsebeam_clock::deadline::Timing,
+}
+
+impl WindowTiming {
+    pub(crate) fn capture_for(
+        self,
+        image: &NetworkPacket,
+    ) -> Option<pulsebeam_clock::deadline::Timing> {
+        use pulsebeam_clock::time::ClockRate;
+        use pulsebeam_core::fabric::Profile;
+        let rate = match image.window.profile() {
+            Profile::Opus => ClockRate::OPUS,
+            Profile::Av1 | Profile::H264 => ClockRate::VIDEO,
+            Profile::Data => return None,
+        };
+        (self.position == image.position
+            && rate.timestamp(self.capture.instant).ok()?.0 == image.packet.header().timestamp)
+            .then_some(self.capture)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct NetworkPacket {
     pub(crate) window: pulsebeam_core::fabric::wan::Window,
     pub(crate) position: u64,
     pub(crate) packet: local::OwnedPacket,
+    pub(crate) capture: Option<pulsebeam_clock::deadline::Timing>,
 }
 
 impl From<pulsebeam_link::wan::Received<local::OwnedPacket, pulsebeam_core::fabric::wan::Window>>
@@ -110,6 +135,7 @@ impl From<pulsebeam_link::wan::Received<local::OwnedPacket, pulsebeam_core::fabr
             window: input.route.descriptor(),
             position: input.position,
             packet: input.packet,
+            capture: None,
         }
     }
 }

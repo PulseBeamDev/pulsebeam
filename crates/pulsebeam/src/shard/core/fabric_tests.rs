@@ -136,7 +136,6 @@ fn wan_child_receipt_requires_the_installed_plan_and_exact_window() {
                 marker: false,
                 sequence: 0x7fff,
                 timestamp: 0,
-                ingress_ntp32: 0,
             },
             &[],
             Box::<[u8]>::from([1]),
@@ -147,11 +146,37 @@ fn wan_child_receipt_requires_the_installed_plan_and_exact_window() {
     let image = || NetworkPacket {
         window,
         position,
+        capture: None,
         packet: packet(),
     };
+    let timing = crate::route::fabric::WindowTiming {
+        position,
+        capture: pulsebeam_clock::deadline::Timing {
+            instant: pulsebeam_clock::time::GlobalInstant::from_nanos(0),
+            absolute_uncertainty_ns: None,
+            quality: pulsebeam_clock::domain::Quality::Degraded,
+        },
+    };
+    assert_eq!(timing.capture_for(&image()), Some(timing.capture));
+    assert_eq!(
+        timing.capture_for(&NetworkPacket {
+            position: 1,
+            ..image()
+        }),
+        None
+    );
+    let inconsistent = crate::route::fabric::WindowTiming {
+        capture: pulsebeam_clock::deadline::Timing {
+            instant: pulsebeam_clock::time::GlobalInstant::from_nanos(1_000_000_000),
+            ..timing.capture
+        },
+        ..timing
+    };
+    assert_eq!(inconsistent.capture_for(&image()), None);
     for wrong in [NetworkPacket {
         window,
         position: 1,
+        capture: None,
         packet: packet(),
     }] {
         assert_eq!(
@@ -173,7 +198,10 @@ fn wan_child_receipt_requires_the_installed_plan_and_exact_window() {
         .unwrap();
     assert_eq!(
         execution.runtime.fabric_sequence_anchor(source, now),
-        Some(position)
+        Some(crate::shard_update::PublisherPosition {
+            sequence: position,
+            timing: None,
+        })
     );
     assert_eq!(
         execution
@@ -197,6 +225,7 @@ fn wan_child_receipt_requires_the_installed_plan_and_exact_window() {
     let next_image = |position, sequence| NetworkPacket {
         window: next_window,
         position,
+        capture: None,
         packet: FabricPacket::new(
             Header {
                 sequence,
@@ -236,7 +265,10 @@ fn wan_child_receipt_requires_the_installed_plan_and_exact_window() {
     );
     assert_eq!(
         execution.runtime.fabric_sequence_anchor(source, now),
-        Some(next_start)
+        Some(crate::shard_update::PublisherPosition {
+            sequence: next_start,
+            timing: None,
+        })
     );
     lifetime().fence();
     assert!(
@@ -640,7 +672,7 @@ impl FabricRtpFixture {
         writer.publish().unwrap();
         let mut updates = crate::shard::updates::ShardUpdateApplication::new(shard, reader);
         assert_eq!(updates.apply(&mut self.execution, 1), 1);
-        receipt.try_recv().unwrap()
+        receipt.try_recv().unwrap().map(|sample| sample.sequence)
     }
 
     #[cfg(feature = "transport-conformance")]
@@ -1130,7 +1162,6 @@ fn packet(sequence: u32) -> OwnedPacket {
             marker: false,
             sequence,
             timestamp: 24,
-            ingress_ntp32: 64,
         },
         &[],
         Box::from(&b"opaque"[..]),
@@ -1173,7 +1204,9 @@ fn opus_anchor_samples_only_the_exact_live_publisher_emission() {
         .offer_fabric(source, publisher, now, now, sequence, packet(1))
         .unwrap();
     assert_eq!(
-        execution.sample_publisher_anchor(query(), now),
+        execution
+            .sample_publisher_anchor(query(), now)
+            .map(|sample| sample.sequence),
         Some(sequence)
     );
     assert_eq!(
@@ -1394,7 +1427,6 @@ fn shard_data_notice_admits_only_current_exact_receivers() {
             marker: true,
             sequence: 0,
             timestamp: 3,
-            ingress_ntp32: 0,
         },
         &[],
         Box::<[u8]>::from(crate::participant::data_fabric::R4.as_slice()),
@@ -1544,7 +1576,6 @@ fn shard_mailbox_preserves_fabric_image_and_fences_rebound_sources() {
                 marker: sequence == 2,
                 sequence,
                 timestamp: 24,
-                ingress_ntp32: 64,
             },
             &[],
             payload,
@@ -1609,17 +1640,12 @@ fn shard_mailbox_preserves_fabric_image_and_fences_rebound_sources() {
     producer.apply_lifecycle_op(&ShardUpdateOp::BindShardFabricDestination { binding });
     let first = packet(1);
     let value = first.arrival_view(0).unwrap();
-    let expected = {
-        let mut bytes = [0; pulsebeam_core::fabric::MAX_PACKET_BYTES];
-        let len = value.write_local(&mut bytes).unwrap();
-        bytes[..len].to_vec()
-    };
     let offer = ShardOffer {
         binding,
         arrival: now,
         ready_at: None,
         sequence: 1,
-        packet: value.into_owned(),
+        packet: value.clone().into_owned(),
     };
     let mut full = false;
     for _ in 0..2048 {
@@ -1665,9 +1691,7 @@ fn shard_mailbox_preserves_fabric_image_and_fences_rebound_sources() {
     execution.on_shard_frames([received.packet], now, &Local);
     assert_eq!(
         execution.admit_fabric(original, receiver, now, |_, _, packet, _| {
-            let mut bytes = [0; pulsebeam_core::fabric::MAX_PACKET_BYTES];
-            let len = packet.write_local(&mut bytes).unwrap();
-            assert_eq!(bytes[..len], expected);
+            assert!(packet.same_content(&value));
             assert_eq!(packet.remaining_hops(), 0);
             Ok::<_, ()>(())
         }),
@@ -1676,10 +1700,6 @@ fn shard_mailbox_preserves_fabric_image_and_fences_rebound_sources() {
 
     let large = packet(2);
     assert_eq!(large.wan_plaintext_len(), 1200);
-    assert_eq!(
-        large.legacy_wire_len(),
-        Err(pulsebeam_core::fabric::WireError::Oversize)
-    );
     {
         use crate::participant::event::{FabricPublication, ParticipantSink};
         let owner = producer.registry.resolve_mut(publisher).unwrap();

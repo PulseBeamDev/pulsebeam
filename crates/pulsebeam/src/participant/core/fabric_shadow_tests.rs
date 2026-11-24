@@ -1395,7 +1395,6 @@ fn authenticated_opus_observes_the_source_clock_and_fences_retired_media() {
             .sdp_fabric_receive_binding(mid)
             .is_none()
     );
-    let wall = pair.clock.wall;
     let write = |pair: &mut Pair, timestamp, bytes: &'static [u8]| {
         pair.peer
             .writer(peer_mid)
@@ -1410,7 +1409,7 @@ fn authenticated_opus_observes_the_source_clock_and_fences_retired_media() {
     };
     write(&mut pair, 20, &[0xf8, 0xff, 0xfe]);
     let mut ingress = None;
-    let mut observe = |packet: AuthenticatedRtp<'_>, _| {
+    let mut observe = |packet: AuthenticatedRtp<'_>| {
         ingress = Some(
             RtpIngressShadow::bind_whole(
                 pulsebeam_core::fabric::Profile::Opus,
@@ -1467,11 +1466,7 @@ fn authenticated_opus_observes_the_source_clock_and_fences_retired_media() {
         }
     }
     let shadow = connection.media_ingress.values().next().unwrap();
-    let (stamp, observation) = shadow.observation.unwrap();
-    assert_eq!(
-        stamp,
-        crate::clock::NtpTime::from_system_time(wall).middle32()
-    );
+    let observation = shadow.observation.unwrap();
     assert!(matches!(
         observation,
         Observation::Media {
@@ -1551,7 +1546,7 @@ fn authenticated_large_primary_and_rtx_fan_out_and_receiver_refresh_reaches_the_
     for _ in 0..200 {
         tx.step(
             shard.publisher(),
-            Some(&mut |packet: AuthenticatedRtp<'_>, _| {
+            Some(&mut |packet: AuthenticatedRtp<'_>| {
                 assert_eq!(packet.primary_ssrc, *ssrc);
                 let mut shadow = RtpIngressShadow::bind_whole(
                     Profile::H264,
@@ -1567,7 +1562,7 @@ fn authenticated_large_primary_and_rtx_fan_out_and_receiver_refresh_reaches_the_
                 )
                 .unwrap();
                 assert_eq!(
-                    shadow.observe(packet.arrival.into(), 0, packet),
+                    shadow.observe(packet.arrival.into(), packet),
                     Ok(Observation::Media {
                         sequence: 99,
                         first: true,
@@ -1678,7 +1673,6 @@ fn authenticated_large_primary_and_rtx_fan_out_and_receiver_refresh_reaches_the_
         };
         large_positions.push(offer.sequence);
         assert_eq!(offer.packet.payload(), expected);
-        assert_eq!(offer.packet.legacy_wire_len(), Err(WireError::Oversize));
         assert_eq!(offer.packet.remaining_hops(), 7);
         let mut image = [0; 1162];
         assert_eq!(
@@ -1787,7 +1781,7 @@ async fn native_maximum_encoded_opus_reaches_authenticated_rtp() {
                 endpoint.now,
                 endpoint.shard.publisher(),
                 &mut MockParticipantSink::new(),
-                Some(&mut |packet: AuthenticatedRtp<'_>, _| {
+                Some(&mut |packet: AuthenticatedRtp<'_>| {
                     assert_eq!(packet.primary_ssrc, primary.get());
                     assert_eq!(packet.wire_payload(), opus);
                     assert_eq!(packet.protected_bytes(), Some(1_236));
@@ -1868,7 +1862,7 @@ async fn stock_opus_decodes_across_capped_whip_and_whep_udp() {
                 endpoint.now,
                 endpoint.shard.publisher(),
                 &mut MockParticipantSink::new(),
-                Some(&mut |packet: AuthenticatedRtp<'_>, _| {
+                Some(&mut |packet: AuthenticatedRtp<'_>| {
                     assert_eq!(packet.primary_ssrc, primary.get());
                     let negotiated = packet.binding();
                     let form = if negotiated.allow_mixed_extensions {
@@ -2069,7 +2063,7 @@ async fn prove_stock_video_on_capped_udp(
                 endpoint.now,
                 endpoint.shard.publisher(),
                 &mut MockParticipantSink::new(),
-                Some(&mut |packet: AuthenticatedRtp<'_>, _| {
+                Some(&mut |packet: AuthenticatedRtp<'_>| {
                     probe_auth_rtp += 1;
                     assert_eq!(packet.primary_ssrc, primary.get());
                     let repair = packet
@@ -2130,7 +2124,11 @@ async fn prove_stock_video_on_capped_udp(
     endpoint
         .shard
         .use_negotiated_publication(publication, Some(primary));
-    assert!(endpoint.shard.attach_publisher_ingress(binding.unwrap()));
+    assert!(endpoint.shard.attach_publisher_ingress_with_clock(
+        binding.unwrap(),
+        endpoint.now,
+        pulsebeam_clock::time::GlobalInstant::from_nanos(10_000_000_000),
+    ));
     let fid = [endpoint.udp.primary, endpoint.udp.repair.unwrap()];
     assert!(
         endpoint.shard.bind_output(
@@ -3149,7 +3147,6 @@ async fn decode_stock_h264_on_participant_udp(filtered: bool) {
                     marker: *marker,
                     sequence,
                     timestamp,
-                    ingress_ntp32: 0,
                 },
                 dd.as_slice(),
                 payload.clone(),
@@ -3278,7 +3275,6 @@ fn prove_filtered_dd_switch(
                 marker,
                 sequence,
                 timestamp,
-                ingress_ntp32: 0,
             },
             &[Extension {
                 kind: ExtensionKind::DependencyDescriptor,
@@ -3578,7 +3574,6 @@ fn installed_fabric_branch_projects_authenticated_rtp_without_waiting_for_holes(
                 marker,
                 sequence,
                 timestamp,
-                ingress_ntp32: 0x1234,
             },
             &[],
             Box::from(opaque.as_slice()),
@@ -3607,7 +3602,7 @@ fn installed_fabric_branch_projects_authenticated_rtp_without_waiting_for_holes(
     for _ in 0..200 {
         publisher.step(
             shard.publisher(),
-            Some(&mut |rtp: AuthenticatedRtp<'_>, _| {
+            Some(&mut |rtp: AuthenticatedRtp<'_>| {
                 ingress = Some(
                     RtpIngressShadow::bind_whole(
                         Profile::Opus,
@@ -3676,7 +3671,10 @@ fn installed_fabric_branch_projects_authenticated_rtp_without_waiting_for_holes(
             u32::try_from(ticks % (1u128 << 32)).unwrap()
         });
         assert_ne!(origin, 1000);
-        assert_eq!(offer.packet.header().timestamp, origin.wrapping_add(timestamp - 1000));
+        assert_eq!(
+            offer.packet.header().timestamp,
+            origin.wrapping_add(timestamp - 1000)
+        );
         assert_eq!(offer.packet.payload(), opaque);
         assert_eq!(offer.packet.remaining_hops(), 7);
         let now = publisher.clock.monotonic;
@@ -3722,7 +3720,12 @@ fn installed_fabric_branch_projects_authenticated_rtp_without_waiting_for_holes(
     // The old epoch reserves a future timestamp. Revoke the branch after
     // protection and batching, but before the socket sees the datagram.
     let now = pair.clock.monotonic;
-    shard.offer(now, now, 104, packet(104, origin.wrapping_add(199_000), false));
+    shard.offer(
+        now,
+        now,
+        104,
+        packet(104, origin.wrapping_add(199_000), false),
+    );
     shard.write(now, &mut leg, source);
     pair.stage_receiver_handoff(&mut shard);
     let replacement = shard.replace_source();
@@ -3762,13 +3765,21 @@ fn installed_fabric_branch_projects_authenticated_rtp_without_waiting_for_holes(
     assert_eq!(new_report.sender_packet_count, 4);
     assert_eq!(old_report.ssrc, new_report.ssrc);
     let check_report = |rtp: u64, wall: SystemTime, anchor_rtp: u32, canonical: u32| {
-        let utc = wall.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
+        let utc = wall
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let elapsed_tai = utc + 37_000_000_000 - 8_000_082_000;
         let ticks = u32::try_from((elapsed_tai * 48_000 / 1_000_000_000) % (1u128 << 32)).unwrap();
         let expected = ticks.wrapping_add(anchor_rtp.wrapping_sub(canonical));
         assert!(u32::try_from(rtp).unwrap().abs_diff(expected) <= 1);
     };
-    check_report(old_report.rtp_time.numer(), old_report.ntp_time, 1500, origin);
+    check_report(
+        old_report.rtp_time.numer(),
+        old_report.ntp_time,
+        1500,
+        origin,
+    );
     check_report(
         new_report.rtp_time.numer(),
         new_report.ntp_time,

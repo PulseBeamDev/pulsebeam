@@ -193,7 +193,7 @@ struct PendingIngress {
     source_shard: crate::id::ShardId,
 }
 pub(super) type AuthenticatedIngressObserver<'a> =
-    dyn for<'packet> FnMut(pulsebeam_rtc::AuthenticatedRtp<'packet>, std::time::SystemTime) + 'a;
+    dyn for<'packet> FnMut(pulsebeam_rtc::AuthenticatedRtp<'packet>) + 'a;
 
 struct ScopedMedia {
     id: u64,
@@ -205,7 +205,6 @@ struct ScopedMedia {
 
 struct InputObservation {
     path: AuthenticatedPath,
-    wall: std::time::SystemTime,
     source_shard: crate::id::ShardId,
     tcp_flow: Option<TcpFlowId>,
 }
@@ -255,7 +254,6 @@ pub(crate) struct RtcDriver {
     session: SessionInfo,
     senders: HashMap<Mid, Sender>,
     encodings: HashMap<Ssrc, Encoding>,
-    pending_reports: indexmap::IndexMap<u32, pulsebeam_rtc::SenderReport>,
     input_observation: Option<InputObservation>,
     udp_packets: OwnedPacketQueue,
     scoped_media: Option<ScopedMedia>,
@@ -310,7 +308,6 @@ impl RtcDriver {
             session: accepted.session,
             senders,
             encodings: HashMap::new(),
-            pending_reports: Default::default(),
             input_observation: None,
             udp_packets: OwnedPacketQueue::with_capacity(udp_gso_size),
             scoped_media: None,
@@ -538,7 +535,8 @@ impl RtcDriver {
     pub(super) fn set_sender_report_time(&mut self, clock: &crate::clock::reference::ShardClock) {
         let at = self.rtc_clock.into_std();
         if self.rtc.sender_report_due(at) {
-            self.rtc.set_sender_report_time(at, clock.sender_report_time(self.rtc_clock));
+            self.rtc
+                .set_sender_report_time(at, clock.sender_report_time(self.rtc_clock));
         }
     }
 
@@ -555,7 +553,7 @@ impl RtcDriver {
                 now,
                 &mut |packet: pulsebeam_rtc::AuthenticatedRtp<'_>| {
                     if packet.arrival == input.path.arrival {
-                        observer(packet, input.wall);
+                        observer(packet);
                     }
                 },
             ),
@@ -881,25 +879,23 @@ impl RtcDriver {
             .filter(|observation| observation.path == path)
             .map(|observation| observation.source_shard)
     }
-    pub(crate) fn register_encoding(
-        &mut self,
-        info: pulsebeam_rtc::EncodingInfo,
-    ) -> Option<pulsebeam_rtc::SenderReport> {
+    pub(crate) fn register_encoding(&mut self, info: pulsebeam_rtc::EncodingInfo) {
         if self.encodings.len() >= MAX_ENCODINGS && !self.encodings.contains_key(&info.ssrc.into())
         {
-            return None;
+            return;
         }
         self.register_owned_encoding(info)
     }
 
     // Native callers have already reserved per-resource execution credit and
     // checked this SSRC against the admitted source's index.
-    pub(crate) fn register_owned_encoding(
-        &mut self,
-        info: pulsebeam_rtc::EncodingInfo,
-    ) -> Option<pulsebeam_rtc::SenderReport> {
-        let mid = Mid::new(&info.mid).ok()?;
-        let rid = info.rid.as_deref().map(Rid::new).transpose().ok()?;
+    pub(crate) fn register_owned_encoding(&mut self, info: pulsebeam_rtc::EncodingInfo) {
+        let (Ok(mid), Ok(rid)) = (
+            Mid::new(&info.mid),
+            info.rid.as_deref().map(Rid::new).transpose(),
+        ) else {
+            return;
+        };
         let payloads: Box<[_]> = info
             .payloads
             .iter()
@@ -919,7 +915,7 @@ impl RtcDriver {
             })
             .collect();
         if payloads.is_empty() {
-            return None;
+            return;
         }
         self.encodings.entry(info.ssrc.into()).or_insert(Encoding {
             mid,
@@ -930,7 +926,6 @@ impl RtcDriver {
             pending_fabric_report: None,
             fabric_claimed: false,
         });
-        self.pending_reports.shift_remove(&info.ssrc)
     }
     pub(super) fn rtp_receive_binding(
         &self,
@@ -1060,7 +1055,6 @@ impl RtcDriver {
 
     pub(crate) fn retire_encoding(&mut self, ssrc: u32) {
         self.encodings.remove(&ssrc.into());
-        self.pending_reports.shift_remove(&ssrc);
     }
     pub(crate) fn convert_rtp(
         &mut self,
@@ -1091,7 +1085,9 @@ impl RtcDriver {
     pub(super) fn defer_fabric_sender_report(&mut self, report: pulsebeam_rtc::SenderReport) {
         if let Some(encoding) = self.encodings.get_mut(&report.ssrc.into())
             && !encoding.fabric_claimed
-            && encoding.pending_fabric_report.is_none_or(|old| old.arrival < report.arrival)
+            && encoding
+                .pending_fabric_report
+                .is_none_or(|old| old.arrival < report.arrival)
         {
             encoding.pending_fabric_report = Some(report);
         }
@@ -1109,33 +1105,6 @@ impl RtcDriver {
         encoding.pending_fabric_report.take()
     }
 
-    pub(crate) fn sender_report(
-        &mut self,
-        report: pulsebeam_rtc::SenderReport,
-    ) -> Option<(Mid, crate::rtp::sync::SenderInfo)> {
-        let Some(encoding) = self.encodings.get_mut(&report.ssrc.into()) else {
-            if self.pending_reports.len() >= MAX_ENCODINGS
-                && !self.pending_reports.contains_key(&report.ssrc)
-            {
-                self.pending_reports.shift_remove_index(0);
-            }
-            self.pending_reports.insert(report.ssrc, report);
-            return None;
-        };
-        let frequency = encoding.payloads.first()?.frequency;
-        let timestamp = extend_serial(encoding.timestamp, u64::from(report.rtp_timestamp), 32);
-        encoding.timestamp = Some(encoding.timestamp.unwrap_or(timestamp).max(timestamp));
-        Some((
-            encoding.mid,
-            crate::rtp::sync::SenderInfo {
-                ssrc: report.ssrc.into(),
-                rtp_time: MediaTime::new(timestamp, frequency),
-                ntp_time: crate::clock::NtpTime::from_raw(
-                    u64::from(report.ntp_seconds).wrapping_shl(32) | u64::from(report.ntp_fraction),
-                ),
-            },
-        ))
-    }
     pub(crate) fn keyframe_request(&self, ssrc: u32) -> Option<KeyframeRequest> {
         let (&mid, _) = self
             .senders
@@ -1272,7 +1241,6 @@ impl RtcDriver {
         let packet = RtpWrite {
             sequence: index,
             timestamp: u32::try_from(timestamp & u64::from(u32::MAX)).unwrap_or_default(),
-            wallclock: command.now.into(),
             marker,
             payload: rtc_bytes(&command.pkt.payload),
             extensions,
@@ -1360,7 +1328,6 @@ impl RtcDriver {
             };
         let arrival = received_at.monotonic;
         self.input_observation = Some(InputObservation {
-            wall: received_at.wall,
             path: AuthenticatedPath {
                 protocol,
                 local,
@@ -1514,25 +1481,25 @@ mod tests {
             ntp_fraction: 0,
             rtp_timestamp: 2000,
         };
-        assert!(transport.sender_report(report).is_none());
+        transport.defer_fabric_sender_report(report);
+        transport.register_encoding(info(0, 111, "opus", MediaKind::Audio));
+        // SSRC-only reports from before registration do not enter Fabric.
+        assert!(
+            transport
+                .encodings
+                .get(&0.into())
+                .unwrap()
+                .pending_fabric_report
+                .is_none()
+        );
         transport.defer_fabric_sender_report(report);
         assert_eq!(
-            transport.register_encoding(info(0, 111, "opus", MediaKind::Audio)),
-            Some(report)
+            transport.claim_fabric_sender_report(0, Mid::from("other")),
+            None
         );
-        // SSRC-only reports from before registration do not enter Fabric.
-        assert!(transport.encodings.get(&0.into()).unwrap().pending_fabric_report.is_none());
-        transport.defer_fabric_sender_report(report);
-        assert_eq!(transport.claim_fabric_sender_report(0, Mid::from("other")), None);
         assert_eq!(transport.claim_fabric_sender_report(0, mid), Some(report));
         transport.defer_fabric_sender_report(report);
         assert_eq!(transport.claim_fabric_sender_report(0, mid), None);
-        let (report_mid, sender) = transport.sender_report(report).unwrap();
-        assert_eq!(report_mid, mid);
-        assert_eq!(
-            sender.rtp_time,
-            MediaTime::new((1u64 << 32) + 2000, Frequency::FORTY_EIGHT_KHZ)
-        );
         let packet = pulsebeam_rtc::RtpPacket {
             arrival: report.arrival,
             header: pulsebeam_rtc::RtpHeader {

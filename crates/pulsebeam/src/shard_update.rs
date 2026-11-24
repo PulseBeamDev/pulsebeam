@@ -214,10 +214,16 @@ impl From<crate::route::fabric::DataPublisher> for PublisherAnchor {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PublisherPosition {
+    pub sequence: u64,
+    pub timing: Option<pulsebeam_clock::domain::Projection>,
+}
+
 #[derive(Debug)]
 pub(crate) struct SamplePublisherAnchor {
     pub publisher: PublisherAnchor,
-    pub result: oneshot::Sender<Option<u64>>,
+    pub result: oneshot::Sender<Option<PublisherPosition>>,
 }
 
 #[derive(Debug)]
@@ -470,7 +476,7 @@ impl ShardUpdateWriter {
         &mut self,
         generation: u64,
         publisher: PublisherAnchor,
-    ) -> oneshot::Receiver<Option<u64>> {
+    ) -> oneshot::Receiver<Option<PublisherPosition>> {
         let commit = self
             .staged
             .get_or_insert_with(|| Box::new(ShardUpdate::new(self.shard, generation)));

@@ -31,6 +31,7 @@ pub(in crate::control) struct WanLiveReceiveSpec {
     pub start: u64,
     pub forms: u8,
     pub expires: Instant,
+    pub timing: Option<crate::route::fabric::WindowTiming>,
 }
 
 pub(in crate::control) struct RepairSendPermit {
@@ -516,6 +517,7 @@ impl Links {
         };
         if let Err(error) = peer.commands.try_send(ReceiveCommand::Live {
             expires: spec.expires,
+            timing: spec.timing,
             children,
             report,
         }) {

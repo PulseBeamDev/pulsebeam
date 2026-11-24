@@ -529,7 +529,6 @@ impl StreamCache {
         for (i, p) in prefix.iter_mut().enumerate() {
             p.rtp_ts = MediaTime::new(segment_ts, p.rtp_ts.frequency());
             p.arrival_ts = anchor.arrival_ts;
-            p.playout_time = anchor.playout_time;
             p.marker = false;
             // Keep the prefix ahead of the segment once it is sorted by seq.
             p.seq_no = (*anchor.seq_no)

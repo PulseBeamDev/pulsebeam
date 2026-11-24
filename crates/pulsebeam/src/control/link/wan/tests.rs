@@ -121,6 +121,7 @@ async fn wan_host_receives_only_controller_scoped_commits_and_fences_on_peer_clo
         start,
         forms: 0,
         expires: now + Duration::from_secs(2),
+        timing: None,
     };
     assert!(matches!(
         links.stage_wan_live_receive(now, spec(), |_, _| panic!("uncommitted route")),
@@ -224,6 +225,7 @@ async fn wan_host_receives_only_controller_scoped_commits_and_fences_on_peer_clo
         },
         sequence_anchor: 0,
         window_start: start,
+        timing: None,
     };
     let ack = offers[0];
     let deadline = now + Duration::from_secs(2);
@@ -263,7 +265,6 @@ async fn wan_host_receives_only_controller_scoped_commits_and_fences_on_peer_clo
             marker: true,
             sequence: 0x18000,
             timestamp: 0,
-            ingress_ntp32: 0,
         },
         &[],
         vec![0; 64].into_boxed_slice(),
@@ -279,7 +280,7 @@ async fn wan_host_receives_only_controller_scoped_commits_and_fences_on_peer_clo
     let mut frames = Vec::new();
     assert_eq!(mailbox.try_recv_batch(&mut frames, 1), 1);
     assert!(
-        matches!(frames.pop().unwrap().packet, ShardFrame::FabricWanImage { ingress, image: NetworkPacket { window, position, packet: received } }
+        matches!(frames.pop().unwrap().packet, ShardFrame::FabricWanImage { ingress, image: NetworkPacket { window, position, packet: received, .. } }
         if ingress == child.ingress && window == live_window && position == start && received.same_content(&packet))
     );
 
@@ -393,7 +394,7 @@ async fn wan_host_receives_only_controller_scoped_commits_and_fences_on_peer_clo
     );
     assert_eq!(mailbox.try_recv_batch(&mut frames, 1), 1);
     assert!(
-        matches!(frames.pop().unwrap().packet, ShardFrame::FabricWanImage { ingress, image: NetworkPacket { window, position: full, packet } }
+        matches!(frames.pop().unwrap().packet, ShardFrame::FabricWanImage { ingress, image: NetworkPacket { window, position: full, packet, .. } }
         if ingress == repair.route.ingress && window == repair_window && full == position && packet.same_content(&repaired))
     );
     assert_ne!(live_window.ssrc(), repair_window.ssrc());

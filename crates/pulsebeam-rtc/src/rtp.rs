@@ -26,13 +26,11 @@ pub struct RtpExtension {
 ///
 /// Gaps, wraps and late holes are valid. An accepted original index must never be
 /// reused under the same sender/key, including after pending packets are discarded.
-/// Rejected writes do not consume an index. `wallclock` relates `timestamp` to the
-/// connection's fixed protocol clock anchor for RTCP Sender Reports.
+/// Rejected writes do not consume an index.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RtpWrite {
     pub sequence: u64,
     pub timestamp: u32,
-    pub wallclock: Instant,
     pub marker: bool,
     pub payload: Bytes,
     pub extensions: Vec<RtpExtension>,
@@ -95,7 +93,6 @@ impl MediaScope {
 pub struct RtpClockAnchor {
     /// Extended output timestamp at the start of the output epoch.
     pub timestamp: u64,
-    pub wallclock: Instant,
     /// Fixed offset from canonical RTP to this output epoch.
     pub canonical_offset: u32,
 }

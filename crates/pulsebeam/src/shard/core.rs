@@ -195,6 +195,7 @@ impl ShardCore {
         #[cfg(feature = "sim")]
         let wan_protected_bytes = image.packet.wan_received_bytes();
         let position = image.position;
+        let capture = image.capture;
         let result = self
             .execution
             .runtime
@@ -203,6 +204,16 @@ impl ShardCore {
             && let Some(source) = self.execution.runtime.network_fabric_source(address)
         {
             if !data {
+                if let Some(capture) = capture
+                    && report.enqueued != 0
+                {
+                    Self::record_wan_capture_age(
+                        self.execution.global_clock.as_ref(),
+                        capture,
+                        arrival,
+                        "ingress",
+                    );
+                }
                 #[cfg(feature = "sim")]
                 if profile == pulsebeam_core::fabric::Profile::Opus && report.enqueued != 0 {
                     crate::sim_metrics::record_routing_counter("fabric_network_opus_receive");
@@ -239,6 +250,35 @@ impl ShardCore {
         router: &impl IngressTransport,
     ) {
         self.execution.on_udp_batch_routed(batch, router);
+    }
+
+    fn record_wan_capture_age(
+        clock: Option<&crate::clock::reference::ShardClock>,
+        capture: pulsebeam_clock::deadline::Timing,
+        observed_at: Instant,
+        stage: &'static str,
+    ) {
+        use pulsebeam_clock::{deadline, domain::Quality};
+        let age = clock.and_then(|clock| {
+            let reference = clock.estimate_at(observed_at)?;
+            let uncertainty_ns = reference.uncertainty_ns?;
+            let now = deadline::Timing {
+                instant: reference.global,
+                absolute_uncertainty_ns: Some(uncertainty_ns),
+                quality: Quality::Synchronized,
+            };
+            deadline::capture_age(capture, now).ok().flatten()
+        });
+        let limit = crate::route::fabric::network_repair::MAX_REPAIR_LIFETIME;
+        if let Some(age) = age
+            && let Ok(latest) = u64::try_from(age.latest.as_nanos())
+            && std::time::Duration::from_nanos(latest) < limit
+        {
+            metrics::histogram!("wan_capture_age_upper_seconds", "stage" => stage)
+                .record(std::time::Duration::from_nanos(latest).as_secs_f64());
+        } else {
+            metrics::counter!("wan_capture_age_inconclusive", "stage" => stage).increment(1);
+        }
     }
 
     pub(crate) fn on_tcp_ingress(&mut self, event: crate::ice_tcp::TcpIngress) {
@@ -559,9 +599,12 @@ impl ShardExecution {
         &mut self,
         publisher: crate::shard_update::PublisherAnchor,
         now: Instant,
-    ) -> Option<u64> {
+    ) -> Option<crate::shard_update::PublisherPosition> {
         if let Some(data) = publisher.data_publisher() {
-            return self.data_publisher_anchor(data);
+            return Some(crate::shard_update::PublisherPosition {
+                sequence: self.data_publisher_anchor(data)?,
+                timing: None,
+            });
         }
         if publisher.emission.profile() != pulsebeam_core::fabric::Profile::Opus {
             return None;
@@ -2471,9 +2514,15 @@ impl ShardExecution {
         let Some(receiver) = self.registry.resolve_mut(destination) else {
             return Ok(None);
         };
+        let clock = self.global_clock.as_ref();
         self.runtime
             .admit_fabric(handle, destination, now, |sequence, packet, evidence| {
-                write(receiver, sequence, packet, evidence)
+                let capture = evidence.capture;
+                let result = write(receiver, sequence, packet, evidence)?;
+                if let Some(capture) = capture {
+                    ShardCore::record_wan_capture_age(clock, capture, now, "handoff");
+                }
+                Ok(result)
             })
     }
 

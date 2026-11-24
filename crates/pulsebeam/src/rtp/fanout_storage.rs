@@ -26,5 +26,4 @@ fn transit_shares_immutable_storage_without_copying_recipient_payloads() {
         second.ext_vals.opaque.as_ptr()
     );
     assert_eq!(packet.arrival_ts, first.arrival_ts);
-    assert_eq!(packet.playout_time, second.playout_time);
 }

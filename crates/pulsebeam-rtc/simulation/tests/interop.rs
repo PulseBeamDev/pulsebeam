@@ -223,7 +223,6 @@ fn exercise(seed: u64, start: Instant) -> (u64, u64, usize) {
                     pending.push_back(RtpWrite {
                         sequence: inbound,
                         timestamp: packet.header.timestamp,
-                        wallclock: packet.arrival,
                         marker: packet.header.marker,
                         payload: packet.payload,
                         extensions: Vec::new(),

@@ -871,7 +871,7 @@ impl BitrateEstimate {
     }
 
     pub fn record(&mut self, pkt: &RtpPacket) {
-        self.advance_time(pkt.playout_time);
+        self.advance_time(pkt.arrival_ts);
         self.accumulated_bytes = self.accumulated_bytes.saturating_add(pkt.payload.len());
     }
 
@@ -930,7 +930,6 @@ mod test {
             seq_no: seq.into(),
             rtp_ts: MediaTime::new(seq * 3000, Frequency::NINETY_KHZ),
             arrival_ts,
-            playout_time: arrival_ts,
             ..Default::default()
         }
     }
@@ -1440,7 +1439,6 @@ mod test {
     fn make_packet(now: Instant, size_bytes: usize) -> RtpPacket {
         let mut pkt = RtpPacket {
             arrival_ts: now,
-            playout_time: now,
             ..Default::default()
         };
         let payload_len = size_bytes;

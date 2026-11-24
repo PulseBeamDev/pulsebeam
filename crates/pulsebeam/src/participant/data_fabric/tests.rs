@@ -30,7 +30,6 @@ impl Fixture {
             &mut self.fanout,
             bytes,
             now,
-            stamp,
             DataTime {
                 fallback: stamp ^ 0x0070_0000,
                 reference: None,
@@ -43,14 +42,12 @@ impl Fixture {
         &mut self,
         bytes: &[u8],
         now: Instant,
-        stamp: u32,
         timestamp: u32,
     ) -> Result<Admission<'_>, Error> {
         self.ledger.admit_record(
             &mut self.fanout,
             bytes,
             now,
-            stamp,
             DataTime {
                 fallback: timestamp,
                 reference: None,
@@ -69,7 +66,6 @@ impl Fixture {
             &mut self.fanout,
             bytes,
             now,
-            stamp,
             DataTime {
                 fallback: stamp ^ 0x0070_0000,
                 reference: None,
@@ -108,13 +104,6 @@ pub(crate) const R4: [u8; 23] = [
 const R3_HEADER: [u8; 22] = [
     0x50, 0x44, 1, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 2, 4, 0, 0, 0, 4, 1,
 ];
-const IMAGE_0: [u8; 24] = [
-    0x90, 0xe3, 0, 0, 1, 0x72, 3, 4, 0, 0, 0, 0, 0xbe, 0xde, 0, 2, 0x16, 1, 2, 3, 4, 0, 0, 0xe0,
-];
-const IMAGE_1: [u8; 24] = [
-    0x90, 0x63, 0, 1, 1, 0x72, 3, 4, 0, 0, 0, 0, 0xbe, 0xde, 0, 2, 0x16, 1, 2, 3, 4, 0, 0, 0xe0,
-];
-
 pub(crate) fn r3_record() -> Vec<u8> {
     [R3_HEADER.as_slice(), &[b'a'; 1_024]].concat()
 }
@@ -242,7 +231,6 @@ fn data_admission_uses_only_current_qualified_capture_calibration() {
                 &mut source.fanout,
                 &bytes,
                 now,
-                0,
                 DataTime::from_reference(Some(estimate)),
                 false,
             )
@@ -284,10 +272,6 @@ fn optional_descriptor_round_trips_through_bound_wan_live_and_repair() {
     let first = source.admit(&CLIENT, now, 42).unwrap();
     assert_eq!(first.sequence, 0);
     assert_eq!(first.packet.payload(), BARE);
-    assert_eq!(
-        first.packet.legacy_wire_len(),
-        Err(WireError::ExtensionProfile)
-    );
     assert_eq!(project(first.packet, None), Err(Error::Projection));
     let mut tuple = [3, 1, 1, 4, 0, 0, 0, 0, 0, 0, 0, 0, 1, 5, 6, 7, 10];
     for (ssrc_end, repair) in [
@@ -483,20 +467,21 @@ fn appendix_b_index_one_first_freezes_canonical_identity_and_projects_unchanged(
     assert_eq!(retry.packet, &frozen);
     let r3 = r3_record();
     let second = source
-        .admit_record_with_timestamp(&r3, now + Duration::from_secs(1), 0x0102_0304, 0xaaaa_bbbb)
+        .admit_record_with_timestamp(&r3, now + Duration::from_secs(1), 0xaaaa_bbbb)
         .unwrap();
     assert!(second.new_fragment && !second.new_unit);
     assert_eq!(second.first_unit(), None);
     assert_eq!(second.source_ack(binding), Some(ack));
     assert_eq!(second.sequence, 1);
-    for (packet, prefix, original) in [
-        (&frozen, IMAGE_0, R4.as_slice()),
-        (second.packet, IMAGE_1, r3.as_slice()),
+    for (packet, sequence, marker, original) in [
+        (&frozen, 0, true, R4.as_slice()),
+        (second.packet, 1, false, r3.as_slice()),
     ] {
-        let mut wire = [0; 1_152];
-        let len = packet.write_local(&mut wire).unwrap();
-        assert_eq!(wire.get(..24), Some(prefix.as_slice()));
-        assert_eq!(wire.get(24..len), Some(original));
+        assert_eq!(packet.header().profile, Profile::Data);
+        assert_eq!(packet.header().sequence, sequence);
+        assert_eq!(packet.header().marker, marker);
+        assert_eq!(packet.header().timestamp, 0x0172_0304);
+        assert_eq!(packet.payload(), original);
         assert_eq!(project(packet, None), Ok(original));
     }
     let invalid_marker = FabricPacket::new(
@@ -591,7 +576,6 @@ fn original_only_positions_survive_live_window_without_becoming_live() {
     assert!(source.fanout.live_sequence_anchor(now).is_none());
     let retry = source.admit(&R4, now, 9).unwrap();
     assert_eq!(retry.sequence, position);
-    assert_eq!(retry.packet.header().ingress_ntp32, 7);
     assert_eq!(retry.packet.payload().as_ptr(), bytes);
 
     let fresh = fixture(4, 0, 1, 1, b"x");

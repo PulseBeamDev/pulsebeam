@@ -115,7 +115,7 @@ fn stock_native_whole_source_h264_and_rtx_fit_without_dd() {
 )]
 fn stock_native_keyframe_and_rtx_report_fabric_size_with_negotiated_dd() {
     use pulsebeam_core::fabric::{
-        Extension, ExtensionKind, FabricPacket, Header, MAX_PACKET_BYTES, Profile, WireError,
+        Extension, ExtensionKind, FabricPacket, Header, MAX_WAN_RTP_BYTES, Profile, WireError,
     };
 
     let mut fixture = PeerFixture::connected_bounded_video_dd(PROTECTED_UDP_CEILING);
@@ -155,28 +155,26 @@ fn stock_native_keyframe_and_rtx_report_fabric_size_with_negotiated_dd() {
         });
         let length = packet.descriptor.as_ref().map_or(0, Vec::len);
         let element_header = if length > 16 { 2 } else { 1 };
-        let extension_block =
-            element_header + 7 + extensions.map_or(0, |_| element_header + length);
-        let expected = 16 + extension_block.next_multiple_of(4) + packet.codec_bytes;
+        let expected = 12
+            + extensions.map_or(0, |_| 4 + (element_header + length).next_multiple_of(4))
+            + packet.codec_bytes;
         let payload = vec![0; packet.codec_bytes];
-        let legacy_len = FabricPacket::new(
+        let fabric_len = FabricPacket::new(
             Header {
                 profile: Profile::H264,
                 marker: packet.marker,
                 sequence: u32::from(packet.sequence),
                 timestamp: packet.timestamp,
-                ingress_ntp32: 0,
             },
             extensions.as_slice(),
             payload,
         )
-        .unwrap()
-        .legacy_wire_len();
-        if expected > MAX_PACKET_BYTES {
-            assert_eq!(legacy_len, Err(WireError::Oversize));
+        .map(|packet| packet.wan_plaintext_len());
+        if expected > MAX_WAN_RTP_BYTES {
+            assert_eq!(fabric_len, Err(WireError::Oversize));
             oversize += 1;
         } else {
-            assert_eq!(legacy_len, Ok(expected));
+            assert_eq!(fabric_len, Ok(expected));
         }
         if packet.is_repair {
             repair = repair.max(expected);

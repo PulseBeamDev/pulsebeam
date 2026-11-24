@@ -1,7 +1,4 @@
-use pulsebeam_core::{
-    dd::DependencyDescriptorWriter,
-    fabric::{Header, MAX_PACKET_BYTES},
-};
+use pulsebeam_core::{dd::DependencyDescriptorWriter, fabric::Header};
 
 use super::*;
 
@@ -16,7 +13,6 @@ fn packet(sequence: u32, bytes: &[u8]) -> OwnedPacket {
             marker: false,
             sequence,
             timestamp: 90,
-            ingress_ntp32: 500,
         },
         &[],
         bytes.into(),
@@ -45,7 +41,6 @@ fn reliable_expectation_snapshots_at_first_acceptance_and_rechecks_at_handoff() 
             marker: true,
             sequence: 0,
             timestamp: 3,
-            ingress_ntp32: 0,
         },
         &[],
         Box::<[u8]>::from(crate::participant::data_fabric::R4.as_slice()),
@@ -370,7 +365,6 @@ fn fresh_data_receive_anchor_advances_without_reopening_the_old_window() {
                 sequence,
                 marker: true,
                 timestamp: 3,
-                ingress_ntp32: 0,
             },
             &[],
             Box::<[u8]>::from(crate::participant::data_fabric::R4.as_slice()),
@@ -491,7 +485,6 @@ fn cached_data_location_requires_an_unambiguous_live_original() {
                 sequence,
                 timestamp: 0x2876_1234,
                 marker,
-                ingress_ntp32: 7,
             },
             &[],
             Box::<[u8]>::from(fragment.as_slice()),
@@ -543,7 +536,6 @@ fn live_and_repair_race_through_one_branch_queue_and_keep_original_content() {
                 marker: true,
                 sequence: 0,
                 timestamp: 3,
-                ingress_ntp32: 7,
             },
             &[],
             Box::<[u8]>::from(crate::participant::data_fabric::R4.as_slice()),
@@ -683,13 +675,7 @@ fn live_and_repair_race_through_one_branch_queue_and_keep_original_content() {
                 )
                 .unwrap();
                 assert_eq!(
-                    fanout.enqueue_network_repair(
-                        now,
-                        target,
-                        demand,
-                        wrong_unit,
-                        NonZeroU64::MIN
-                    ),
+                    fanout.enqueue_network_repair(now, target, demand, wrong_unit, NonZeroU64::MIN),
                     RepairQueue::Unavailable
                 );
                 assert!(!fanout.fates.contains_key(&0));
@@ -858,7 +844,6 @@ fn ordered_handoff_requires_membership_in_the_original_cohort() {
             marker: true,
             sequence: 0,
             timestamp: 3,
-            ingress_ntp32: 0,
         },
         &[],
         Box::<[u8]>::from(crate::participant::data_fabric::R4.as_slice()),
@@ -1410,7 +1395,6 @@ fn dd_test_packet(
             marker: true,
             sequence,
             timestamp: 9000,
-            ingress_ntp32: 0,
         },
         &[Extension {
             kind: ExtensionKind::DependencyDescriptor,
@@ -1690,12 +1674,7 @@ fn local_zero_hop_retains_the_actual_arrival_budget() {
     let original = packet(1, b"opaque");
     fanout.offer(now, now, 1, original.clone()).unwrap();
     let branch = fanout.install_branch(receiver, emission()).unwrap();
-    let mut image = [0; MAX_PACKET_BYTES];
-    let zero = original.arrival_view(0).unwrap();
-    let len = zero.write_local(&mut image).unwrap();
-    let attempt = FabricPacket::decode_local(image.get(..len).unwrap())
-        .unwrap()
-        .into_owned();
+    let attempt = original.arrival_view(0).unwrap().into_owned();
     assert_eq!(attempt.remaining_hops(), 0);
     assert_eq!(fanout.offer(now, now, 1, attempt).unwrap().enqueued, 1);
     let received = fanout.take(now, branch, receiver).unwrap();

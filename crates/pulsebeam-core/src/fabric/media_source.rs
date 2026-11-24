@@ -146,7 +146,6 @@ impl MediaSource {
         &mut self,
         now: Instant,
         arrival: Instant,
-        ingress_ntp32: u32,
         low_sequence: u16,
         input: Input<'_>,
     ) -> Result<Admission<'_>, Rejected> {
@@ -154,7 +153,6 @@ impl MediaSource {
         let accepted = self.identity.admit(
             now,
             arrival,
-            ingress_ntp32,
             Position::LowSequence(low_sequence),
             input,
             |sequence| originals.get(&sequence),
@@ -245,7 +243,6 @@ impl MediaIdentity {
         &mut self,
         now: Instant,
         arrival: Instant,
-        ingress_ntp32: u32,
         position: Position,
         input: Input<'_>,
         original: impl FnOnce(u64) -> Option<&'a FabricPacket<Box<[u8]>>>,
@@ -308,7 +305,6 @@ impl MediaIdentity {
                         marker: copy.marker,
                         sequence: wire_sequence,
                         timestamp: copy.timestamp,
-                        ingress_ntp32,
                     },
                     copy.extensions,
                     copy.payload,

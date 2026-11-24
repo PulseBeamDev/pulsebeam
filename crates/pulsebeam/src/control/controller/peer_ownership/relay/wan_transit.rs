@@ -102,7 +102,9 @@ impl Sends {
                 if let Some(export) = exports.iter().find(|export| {
                     now < export.expires
                         && export.source.matches_ack(ack)
-                        && advertised.contains(&export.source)
+                        && advertised
+                            .iter()
+                            .any(|source| source.same_window(export.source))
                 }) {
                     desired.insert(
                         ack.window.ssrc(),

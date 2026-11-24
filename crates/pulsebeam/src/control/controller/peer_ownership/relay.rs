@@ -235,6 +235,7 @@ pub(super) fn reconcile_wan_receives(
                 start: source.window_start,
                 forms: source.forms(),
                 expires,
+                timing: source.window_timing(),
             },
         );
     }

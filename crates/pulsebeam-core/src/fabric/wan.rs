@@ -42,7 +42,26 @@ pub struct Window {
 
 impl Window {
     pub fn from_tuple(tuple: [u8; WINDOW_TUPLE_BYTES], emission: u16) -> Result<Self, WireError> {
-        let [3, 1, TIMING_REVISION, profile, a, b, c, d, e, f, g, h, forms, i, j, k, l] = tuple else {
+        let [
+            3,
+            1,
+            TIMING_REVISION,
+            profile,
+            a,
+            b,
+            c,
+            d,
+            e,
+            f,
+            g,
+            h,
+            forms,
+            i,
+            j,
+            k,
+            l,
+        ] = tuple
+        else {
             return Err(WireError::Window);
         };
         let profile = match profile {
@@ -105,7 +124,23 @@ impl Window {
         let [a, b, c, d, e, f, g, h] = self.start.to_be_bytes();
         let [i, j, k, l] = self.ssrc.get().to_be_bytes();
         [
-            3, 1, TIMING_REVISION, profile, a, b, c, d, e, f, g, h, self.forms, i, j, k, l,
+            3,
+            1,
+            TIMING_REVISION,
+            profile,
+            a,
+            b,
+            c,
+            d,
+            e,
+            f,
+            g,
+            h,
+            self.forms,
+            i,
+            j,
+            k,
+            l,
         ]
     }
 
@@ -217,7 +252,6 @@ impl Window {
                     marker: pt & 0x80 != 0,
                     sequence: low32(position),
                     timestamp: u32::from_be_bytes([*c, *d, *e, *f]),
-                    ingress_ntp32: 0,
                 },
                 hops,
                 form,

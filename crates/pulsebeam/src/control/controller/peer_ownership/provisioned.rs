@@ -359,7 +359,7 @@ impl RepairInterest {
 
 type WanSample = (
     (crate::entity::ProjectRoomKey, PublisherAnchor),
-    oneshot::Receiver<Option<u64>>,
+    oneshot::Receiver<Option<crate::shard_update::PublisherPosition>>,
 );
 
 struct PendingImage {
@@ -659,12 +659,11 @@ impl Association {
             pending
                 .wan_samples
                 .retain_mut(|((room, publisher), receipt)| match receipt.try_recv() {
-                    Ok(Some(sequence_anchor)) => {
-                        pending.wan_sources.push(WanSourceWindow::from_sample(
-                            *room,
-                            *publisher,
-                            sequence_anchor,
-                        ));
+                    Ok(Some(sample)) => {
+                        pending.wan_sources.push(
+                            WanSourceWindow::from_sample(*room, *publisher, sample.sequence)
+                                .with_projection(sample.timing),
+                        );
                         false
                     }
                     Err(oneshot::error::TryRecvError::Empty) => true,
@@ -722,7 +721,10 @@ impl Association {
             } else {
                 snapshot.push(export.endpoint.clone());
             }
-            if !wan_sources.contains(&export.source) {
+            if !wan_sources
+                .iter()
+                .any(|source| source.same_window(export.source))
+            {
                 wan_sources.push(export.source);
             }
         }
@@ -1294,6 +1296,11 @@ impl Association {
                                 revision = image.revision,
                                 "WAN ownership image installed"
                             );
+                            if now < deadline {
+                                for source in &wan.sources {
+                                    source.record_timing_quality();
+                                }
+                            }
                             self.remote_wan = Some((deadline, wan));
                         } else {
                             self.relays.install(image.routes, deadline);
@@ -1449,7 +1456,7 @@ impl ControllerActor {
                 .and_then(|peer| peer.association.as_mut())
             {
                 let same = |old: &wan_transit::Export, new: &wan_transit::Export| {
-                    old.source == new.source
+                    old.source.same_window(new.source)
                         && old.input == new.input
                         && old.endpoint == new.endpoint
                 };

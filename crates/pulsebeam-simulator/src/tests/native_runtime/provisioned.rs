@@ -624,8 +624,10 @@ async fn prove_payload(
     if let Some(relays) = relays {
         let branch_receipts =
             || relays.map(|relay| pulsebeam::sim_metrics::wan_live_data(relay, viewer_ip));
+        let upstream_receipts =
+            || relays.map(|relay| pulsebeam::sim_metrics::wan_live_data(publisher_ip, relay));
         tokio::time::timeout(Duration::from_secs(5), async {
-            while branch_receipts().iter().any(|&(count, _)| count == 0) {
+            while branch_receipts().iter().any(|&(count, _, _)| count == 0) {
                 wait_payload(PAYLOAD, None, Duration::from_secs(2)).await??;
             }
             anyhow::Ok(())
@@ -640,6 +642,7 @@ async fn prove_payload(
         // Let earlier publications age out before offering a single known unit.
         tokio::time::sleep(Duration::from_millis(150)).await;
         let before = branch_receipts();
+        let upstream_before = upstream_receipts();
         const PROBE: &[u8] = b"one publisher unit over both relay paths";
         publication.send(PROBE.to_vec(), None).await?;
         let mut delivered = 0;
@@ -672,6 +675,7 @@ async fn prove_payload(
             result?;
         }
         let after = branch_receipts();
+        let upstream_after = upstream_receipts();
         anyhow::ensure!(
             delivered == 1,
             "diamond did not deliver the probe to the SDK"
@@ -679,9 +683,20 @@ async fn prove_payload(
         anyhow::ensure!(
             after[0].0 == before[0].0 + 1
                 && after[1].0 == before[1].0 + 1
-                && after[0].1 == after[1].1,
-            "expected one copy on each WAN branch at the same source position: {before:?} -> {after:?}"
+                && after[0].1 == after[1].1
+                && after[0].2 == after[1].2,
+            "expected one copy on each WAN branch at the same position and timestamp: {before:?} -> {after:?}"
         );
+        for ((prior, upstream), downstream) in
+            upstream_before.into_iter().zip(upstream_after).zip(after)
+        {
+            anyhow::ensure!(
+                upstream.0 == prior.0 + 1
+                    && upstream.1 == downstream.1
+                    && upstream.2 == downstream.2,
+                "WAN relay changed the DATA position or canonical timestamp: {upstream:?} -> {downstream:?}"
+            );
+        }
 
         const DURING_PARTITION: &[u8] = b"must not cross the retired WAN paths";
         const AFTER_REPAIR: &[u8] = b"fresh payload after WAN path recovery";
@@ -701,8 +716,6 @@ async fn prove_payload(
             turmoil::repair(relay, viewer_ip);
         }
         let before_recovery = branch_receipts();
-        let upstream_receipts =
-            || relays.map(|relay| pulsebeam::sim_metrics::wan_live_data(publisher_ip, relay));
         let before_upstream = upstream_receipts();
         wait_payload(
             AFTER_REPAIR,
@@ -1533,6 +1546,10 @@ async fn prove_wan_opus_repair(
                         let replacement = report.opened_repair.ok_or_else(|| anyhow::anyhow!("replacement repair did not authenticate"))?;
                         anyhow::ensure!(replacement != first && replacement != report.live, "repair must use fresh SSRC: {report:?}");
                         anyhow::ensure!(report.late_original_matches == Some(true), "repair changed the source image: {report:?}");
+                        anyhow::ensure!(
+                            report.repaired_timestamp == Some(report.live_wire_timestamp),
+                            "replacement repair changed canonical RTP timestamp: {report:?}"
+                        );
                         anyhow::ensure!(report.repair_offers == 1 && late_offers == 0, "exact repair must queue once without delivering a late duplicate at {armed:?}: {report:?}");
                         let Some(edge) = edges.next() else { return anyhow::Ok(()); };
                         // The upstream repair itself can still be in flight on this leg.

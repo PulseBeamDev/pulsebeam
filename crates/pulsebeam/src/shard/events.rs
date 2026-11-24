@@ -239,7 +239,10 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
         control: pulsebeam_proto::state::NativeClockExchange,
     ) -> Option<pulsebeam_proto::state::NativeClockExchange> {
         let reference = self.media_clock?.estimate_at(now)?;
-        let (publisher, _) = self.runtime.as_deref_mut()?.data_publisher_mut(source, self.key, installation)?;
+        let (publisher, _) =
+            self.runtime
+                .as_deref_mut()?
+                .data_publisher_mut(source, self.key, installation)?;
         publisher.clock_control(control, now, reference)
     }
 
@@ -412,14 +415,13 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
         installation: pulsebeam_rtc::DataChannelInstallation,
         bytes: &[u8],
         now: pulsebeam_runtime::time::Instant,
-        stamp: u32,
     ) -> Result<(), crate::participant::data_fabric::Error> {
         let (publisher, fanout) = self
             .runtime
             .as_deref_mut()
             .and_then(|runtime| runtime.data_publisher_mut(source, self.key, installation))
             .ok_or(crate::participant::data_fabric::Error::Fenced)?;
-        let publication = publisher.publish(fanout, bytes, now, stamp, self.data_time)?;
+        let publication = publisher.publish(fanout, bytes, now, self.data_time)?;
         self.pipeline.push_packet(QueuedPublication::FabricData {
             publisher: self.key,
             publication,
@@ -549,7 +551,6 @@ mod tests {
                     marker: false,
                     sequence,
                     timestamp: 480,
-                    ingress_ntp32: 0,
                 },
                 &[],
                 Box::<[u8]>::from([0xf8, 0xff, 0xfe]),

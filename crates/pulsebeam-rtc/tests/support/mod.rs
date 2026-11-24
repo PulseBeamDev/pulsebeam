@@ -2664,7 +2664,7 @@ pub fn assert_native_rtp_pacing(
 
 pub fn rtp_write(packet: RtpPacket, sequence: u64) -> RtpWrite {
     RtpWrite {
-        sequence, timestamp: packet.header.timestamp, wallclock: packet.arrival,
+        sequence, timestamp: packet.header.timestamp,
         marker: packet.header.marker, payload: packet.payload,
         extensions: packet.extensions.into_iter().filter(|value| !matches!(value.uri.as_ref(),
             "urn:ietf:params:rtp-hdrext:sdes:mid"
@@ -2683,7 +2683,6 @@ pub fn sample(at: Instant, sequence: u64, payload_bytes: usize, clock_rate: u32)
         timestamp: u32::try_from(sequence)
             .expect("short sample trace")
             .wrapping_mul(clock_rate / 50),
-        wallclock: at,
         marker: true,
         payload: Bytes::from(vec![0x55; payload_bytes]),
         extensions: Vec::new(),

@@ -349,10 +349,9 @@ impl RtpIngressShadow {
     pub fn observe(
         &mut self,
         now: Instant,
-        ingress_ntp32: u32,
         packet: AuthenticatedRtp<'_>,
     ) -> Result<Observation, DropReason> {
-        Ok(match self.admit(now, ingress_ntp32, packet)? {
+        Ok(match self.admit(now, packet)? {
             Admission::Padding => Observation::Padding,
             Admission::Media {
                 sequence,
@@ -370,7 +369,6 @@ impl RtpIngressShadow {
     fn admit(
         &mut self,
         now: Instant,
-        ingress_ntp32: u32,
         packet: AuthenticatedRtp<'_>,
     ) -> Result<Admission<'_>, DropReason> {
         let arrival = packet.arrival;
@@ -380,7 +378,7 @@ impl RtpIngressShadow {
         self.observer
             .as_mut()
             .ok_or(DropReason::Binding)?
-            .admit(now, arrival, ingress_ntp32, sequence, input.as_input())
+            .admit(now, arrival, sequence, input.as_input())
             .map_err(DropReason::Admission)
     }
 
@@ -390,7 +388,6 @@ impl RtpIngressShadow {
 
     pub(crate) fn prepare(
         &self,
-        ingress_ntp32: u32,
         packet: AuthenticatedRtp<'_>,
     ) -> Result<Option<MediaIngress>, DropReason> {
         // The receiver may omit all extensions and use a full SRTP tag even
@@ -411,7 +408,6 @@ impl RtpIngressShadow {
             .map(|(sequence, input)| MediaIngress {
                 arrival,
                 ready_at,
-                ingress_ntp32,
                 position: primary_index.map_or(
                     Position::LowSequence(sequence),
                     Position::AuthenticatedPrimary,
@@ -493,7 +489,6 @@ impl RtpIngressShadow {
 pub(crate) struct MediaIngress {
     pub arrival: Instant,
     pub ready_at: Instant,
-    pub ingress_ntp32: u32,
     pub position: Position,
     pub protected_bytes: Option<NonZeroU16>,
     media: Option<OwnedCopy>,

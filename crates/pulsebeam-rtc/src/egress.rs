@@ -20,7 +20,6 @@ use crate::{
     negotiation::EgressSenderFacts,
     packet::RtpPacket,
     scheduler::SenderScheduler,
-    time::ProtocolClock,
     transport::{
         DatagramKind, PathEpoch, PreparedRtpIdentity, PreparedTransmit, RtpAdmission, RtpService,
         Transport, TransportError,
@@ -75,7 +74,6 @@ pub(crate) struct MediaEgress {
     path_available: bool,
     bandwidth_estimate: u64,
     desired_bitrate: u64,
-    clock: ProtocolClock,
     sender_report_time: Option<(Instant, Option<crate::SenderReportTime>)>,
     estimate_changed: Option<MediaPayloadBitrate>,
     next_rtcp: Instant,
@@ -114,7 +112,7 @@ struct Sender {
     ssrc: u32,
     rtx_ssrc: u32,
     next_rtx_sequence: u64,
-    latest_rtp: Option<(u64, Instant)>,
+    latest_rtp: Option<u64>,
     canonical_offset: Option<u32>,
     media_scope: Option<crate::MediaScope>,
     scope_retired: bool,
@@ -239,7 +237,6 @@ impl MediaEgress {
         max_retransmission_bytes: usize,
         max_runtime_bytes: usize,
         accepted_at: Instant,
-        clock: ProtocolClock,
     ) -> Result<Self, crate::AcceptError> {
         let mut senders: BTreeMap<_, _> = facts
             .into_vec()
@@ -348,7 +345,6 @@ impl MediaEgress {
             path_available: false,
             bandwidth_estimate: 0,
             desired_bitrate: 0,
-            clock,
             sender_report_time: None,
             estimate_changed: None,
             next_rtcp: accepted_at
@@ -1579,10 +1575,11 @@ impl MediaEgress {
                 state.scope_retired = false;
                 state.media_scope = queued.scope;
                 state.canonical_offset = queued.clock.map(|clock| clock.canonical_offset);
-                state.latest_rtp = Some(queued.clock.map_or_else(
-                    || (u64::from(queued.media.timestamp), queued.media.wallclock),
-                    |clock| (clock.timestamp, clock.wallclock),
-                ));
+                state.latest_rtp = Some(
+                    queued
+                        .clock
+                        .map_or(u64::from(queued.media.timestamp), |clock| clock.timestamp),
+                );
                 state.highest_sequence = Some(
                     state
                         .highest_sequence
@@ -2289,7 +2286,11 @@ impl MediaEgress {
         at >= self.next_rtcp && !self.rtcp_senders.is_empty()
     }
 
-    pub(crate) fn set_sender_report_time(&mut self, at: Instant, time: Option<crate::SenderReportTime>) {
+    pub(crate) fn set_sender_report_time(
+        &mut self,
+        at: Instant,
+        time: Option<crate::SenderReportTime>,
+    ) {
         self.sender_report_time = Some((at, time));
     }
 
@@ -2305,8 +2306,7 @@ impl MediaEgress {
         let sender = self.senders.get(&sender_index)?;
         let projected = match self.sender_report_time {
             Some((observed, Some(time))) if observed == at => canonical_report(sender, time),
-            Some(_) => None,
-            None => sender_report(sender, at, &self.clock),
+            _ => None,
         };
         let Some((timestamp, packet)) = projected else {
             self.rtcp_cursor = sender_index;
@@ -2371,7 +2371,7 @@ impl MediaEgress {
             .facts
             .twcc_extension_id
             .map(|_| wire_u16(self.next_twcc));
-        let timestamp = sender.latest_rtp.map_or(0, |(rtp, _)| wire_u32(rtp));
+        let timestamp = sender.latest_rtp.map_or(0, wire_u32);
         let Some(mut packet) = build_rtp(
             sender,
             false,
@@ -2752,20 +2752,8 @@ fn write_extensions<'a>(
     true
 }
 
-fn sender_report(sender: &Sender, at: Instant, clock: &ProtocolClock) -> Option<(u64, Vec<u8>)> {
-    let (rtp, wallclock) = sender.latest_rtp?;
-    let ticks = at
-        .saturating_duration_since(wallclock)
-        .as_nanos()
-        .saturating_mul(u128::from(sender.facts.clock_rate))
-        / 1_000_000_000;
-    let timestamp = rtp.checked_add(u64::try_from(ticks).ok()?)?;
-    let (seconds, fraction) = clock.ntp(at);
-    encode_sender_report(sender, timestamp, seconds, fraction)
-}
-
 fn canonical_report(sender: &Sender, time: crate::SenderReportTime) -> Option<(u64, Vec<u8>)> {
-    let (epoch_rtp, _) = sender.latest_rtp?;
+    let epoch_rtp = sender.latest_rtp?;
     let offset = sender.canonical_offset?;
     let canonical = match sender.facts.clock_rate {
         48_000 => time.opus_rtp,
@@ -2773,14 +2761,20 @@ fn canonical_report(sender: &Sender, time: crate::SenderReportTime) -> Option<(u
         _ => return None,
     };
     let wire = canonical.wrapping_add(offset);
-    let floor = sender.highest_sender_report.unwrap_or(epoch_rtp).max(epoch_rtp);
+    let floor = sender
+        .highest_sender_report
+        .unwrap_or(epoch_rtp)
+        .max(epoch_rtp);
     let delta = wire.wrapping_sub(wire_u32(floor));
     if delta == 1 << 31 {
         return None;
     }
     let delta = i32::from_ne_bytes(delta.to_ne_bytes());
     let timestamp = floor.checked_add_signed(i64::from(delta))?;
-    if sender.highest_sender_report.is_some_and(|previous| timestamp < previous) {
+    if sender
+        .highest_sender_report
+        .is_some_and(|previous| timestamp < previous)
+    {
         return None;
     }
     encode_sender_report(sender, timestamp, time.ntp_seconds, time.ntp_fraction)
@@ -2821,7 +2815,6 @@ mod tests {
     use super::*;
 
     mod cc;
-    use std::time::UNIX_EPOCH;
 
     fn audio_egress(start: Instant) -> MediaEgress {
         let facts = EgressSenderFacts {
@@ -2849,7 +2842,6 @@ mod tests {
             1_024,
             crate::ConnectionLimits::DEFAULT_MAX_SEND_RUNTIME_BYTES,
             start,
-            ProtocolClock::new(start, UNIX_EPOCH + Duration::from_secs(17)),
         )
         .unwrap()
     }
@@ -2867,7 +2859,6 @@ mod tests {
             retransmission_bytes,
             crate::ConnectionLimits::DEFAULT_MAX_SEND_RUNTIME_BYTES,
             start,
-            ProtocolClock::new(start, UNIX_EPOCH),
         )
         .unwrap()
     }
@@ -3050,7 +3041,6 @@ mod tests {
             let media = RtpWrite {
                 sequence: 0,
                 timestamp: 0,
-                wallclock: start,
                 marker: false,
                 payload: vec![7; 3].into(),
                 extensions: vec![crate::RtpExtension {
@@ -3116,7 +3106,6 @@ mod tests {
         let write = |sequence, bytes| RtpWrite {
             sequence,
             timestamp: 0,
-            wallclock: now,
             marker: false,
             payload: vec![7; bytes].into(),
             extensions: vec![],
@@ -3234,7 +3223,6 @@ mod tests {
                     RtpWrite {
                         sequence,
                         timestamp: 9000,
-                        wallclock: now,
                         marker: true,
                         payload: vec![7, 8].into(),
                         extensions: vec![],
@@ -3299,7 +3287,6 @@ mod tests {
             1024,
             crate::ConnectionLimits::DEFAULT_MAX_SEND_RUNTIME_BYTES,
             start,
-            ProtocolClock::new(start, UNIX_EPOCH),
         )
         .unwrap();
         assert_eq!(egress.runtime_bytes, unnamed.checked_add(capacity).unwrap());
@@ -3307,7 +3294,6 @@ mod tests {
         let write = |sequence, extensions| RtpWrite {
             sequence,
             timestamp: 0,
-            wallclock: start,
             marker: false,
             payload: vec![7].into(),
             extensions: Vec::with_capacity(extensions),
@@ -3430,7 +3416,6 @@ mod tests {
             1024,
             crate::ConnectionLimits::DEFAULT_MAX_SEND_RUNTIME_BYTES,
             start,
-            ProtocolClock::new(start, UNIX_EPOCH),
         )
         .unwrap();
         let sibling_ssrc = egress.senders[&2].ssrc;
@@ -3442,7 +3427,6 @@ mod tests {
                 RtpWrite {
                     sequence: 0,
                     timestamp: 0,
-                    wallclock: start,
                     marker: false,
                     payload: vec![7].into(),
                     extensions: Vec::new(),
@@ -3487,7 +3471,6 @@ mod tests {
                 RtpWrite {
                     sequence: 0,
                     timestamp: 0,
-                    wallclock: start,
                     marker: false,
                     payload: vec![7].into(),
                     extensions: Vec::new(),
@@ -3570,7 +3553,6 @@ mod tests {
                 128,
                 initial.checked_sub(1).unwrap(),
                 start,
-                ProtocolClock::new(start, UNIX_EPOCH),
             ),
             Err(crate::AcceptError::SessionLimitExceeded)
         ));
@@ -3583,7 +3565,6 @@ mod tests {
         let write = |sequence| RtpWrite {
             sequence,
             timestamp: 0,
-            wallclock: start,
             marker: false,
             payload: vec![7].into(),
             extensions: Vec::with_capacity(2),
@@ -4010,7 +3991,6 @@ mod tests {
         let write = |sequence, payload| RtpWrite {
             sequence,
             timestamp: 0,
-            wallclock: start,
             marker: false,
             payload: vec![payload].into(),
             extensions: Vec::new(),
@@ -4076,7 +4056,6 @@ mod tests {
                     RtpWrite {
                         sequence: 900,
                         timestamp: 0,
-                        wallclock: start,
                         marker: false,
                         payload: vec![7].into(),
                         extensions: Vec::new(),
@@ -4136,7 +4115,6 @@ mod tests {
                     RtpWrite {
                         sequence,
                         timestamp: 0,
-                        wallclock: start,
                         marker: false,
                         payload: vec![8].into(),
                         extensions: Vec::new(),
@@ -4164,7 +4142,6 @@ mod tests {
                 RtpWrite {
                     sequence: 358,
                     timestamp: 0,
-                    wallclock: start,
                     marker: false,
                     payload: vec![9].into(),
                     extensions: Vec::new(),
@@ -4239,7 +4216,6 @@ mod tests {
                     RtpWrite {
                         sequence,
                         timestamp: 0,
-                        wallclock: start,
                         marker: false,
                         payload: vec![0; 128].into(),
                         extensions: Vec::new(),
@@ -4281,7 +4257,6 @@ mod tests {
         let write = |sequence, at| RtpWrite {
             sequence,
             timestamp: 0,
-            wallclock: at,
             marker: false,
             payload: vec![0; 128].into(),
             extensions: Vec::new(),
@@ -4415,7 +4390,7 @@ mod tests {
         let start = Instant::now();
         let mut egress = audio_egress(start);
         let sender = egress.senders.values_mut().next().unwrap();
-        sender.latest_rtp = Some((u64::from(u32::MAX) - 5, start));
+        sender.latest_rtp = Some(u64::from(u32::MAX) - 5);
         sender.canonical_offset = Some(u32::MAX - 8);
         sender.highest_sender_report = Some(u64::from(u32::MAX) - 5);
         let time = crate::SenderReportTime {
@@ -4432,18 +4407,24 @@ mod tests {
     }
 
     #[test]
-    fn sender_report_correspondence_and_incoming_wire_facts_use_the_fixed_anchor() {
+    fn sender_report_correspondence_preserves_wire_facts() {
         let start = Instant::now();
         let mut egress = audio_egress(start);
         let sender = egress.senders.get_mut(&1).unwrap();
-        sender.latest_rtp = Some((
-            u64::from(u32::MAX) - 11_999,
-            start + Duration::from_millis(250),
-        ));
+        sender.latest_rtp = Some(u64::from(u32::MAX) - 11_999);
+        sender.canonical_offset = Some(0);
         sender.committed_packets = 2;
         sender.committed_payload_bytes = 777;
-        let (timestamp, packet) =
-            sender_report(sender, start + Duration::from_millis(750), &egress.clock).unwrap();
+        let (timestamp, packet) = canonical_report(
+            sender,
+            crate::SenderReportTime {
+                opus_rtp: 12_000,
+                video_rtp: 0,
+                ntp_seconds: 2_208_988_817,
+                ntp_fraction: 3 << 30,
+            },
+        )
+        .unwrap();
         assert_eq!(timestamp, u64::from(u32::MAX) + 12_001);
         assert_eq!(u32::from_be_bytes(packet[20..24].try_into().unwrap()), 2);
         assert_eq!(u32::from_be_bytes(packet[24..28].try_into().unwrap()), 777);

@@ -52,13 +52,19 @@ pub(crate) struct PublisherClock {
     reference: Option<(u64, ReferenceState)>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct AssignedSample {
+    pub timestamp: u32,
+    pub projection: Option<(Instant, Projection)>,
+}
+
 struct EncodingClock {
     track: RtpBinding,
     primary_ssrc: u32,
     frontier: Option<TimedTick>,
     pending_report: Option<pulsebeam_rtc::SenderReport>,
     last_report: Option<(MonotonicTime, SourceTime)>,
-    assigned: HashMap<u32, u32>,
+    assigned: HashMap<u32, AssignedSample>,
     assigned_order: VecDeque<(Instant, u32)>,
     latest_assignment: Option<(Instant, u32, u32)>,
 }
@@ -193,9 +199,19 @@ impl PublisherClock {
 
     /// Assign once per source sample. The bounded sample cache is independent
     /// of sequence identity: several packets and repairs can name one sample.
-    pub(crate) fn assign(&mut self, slot: usize, raw: u32, arrival: Instant, now: Instant) -> u32 {
+    pub(crate) fn assign_sample(
+        &mut self,
+        slot: usize,
+        raw: u32,
+        arrival: Instant,
+        now: Instant,
+    ) -> AssignedSample {
+        let fallback = AssignedSample {
+            timestamp: 0,
+            projection: None,
+        };
         let Some(track) = self.encodings.get_mut(slot) else {
-            return 0;
+            return fallback;
         };
         let retention = pulsebeam_runtime::time::Duration::from_nanos(REORDER_NS);
         while let Some(&(assigned_at, oldest)) = track.assigned_order.front() {
@@ -205,17 +221,14 @@ impl PublisherClock {
             track.assigned_order.pop_front();
             track.assigned.remove(&oldest);
         }
-        if let Some(timestamp) = track.assigned.get(&raw) {
-            return *timestamp;
+        if let Some(sample) = track.assigned.get(&raw) {
+            return *sample;
         }
-        let recovered = self
-            .media(slot, raw, arrival, now)
-            .ok()
-            .map(|time| time.rtp.0);
+        let projection = self.media(slot, raw, arrival, now).ok();
         let Some(track) = self.encodings.get_mut(slot) else {
-            return 0;
+            return fallback;
         };
-        let timestamp = recovered.unwrap_or_else(|| {
+        let timestamp = projection.map(|time| time.rtp.0).unwrap_or_else(|| {
             if let Some((previous_at, previous_raw, previous_timestamp)) = track.latest_assignment {
                 // An ambiguous or physically implausible source jump cannot
                 // move the admitted cadence by half an RTP wrap.
@@ -259,15 +272,19 @@ impl PublisherClock {
         {
             track.assigned.remove(&oldest);
         }
+        let sample = AssignedSample {
+            timestamp,
+            projection: projection.map(|projection| (now, projection)),
+        };
         track.assigned_order.push_back((now, raw));
-        track.assigned.insert(raw, timestamp);
+        track.assigned.insert(raw, sample);
         if track
             .latest_assignment
             .is_none_or(|(previous, _, _)| arrival >= previous)
         {
             track.latest_assignment = Some((arrival, raw, timestamp));
         }
-        timestamp
+        sample
     }
 
     fn media(

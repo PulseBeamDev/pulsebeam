@@ -36,15 +36,10 @@ const NTP_UNITS_PER_SEC: u64 = 1 << 32;
 /// The envelope carries bits 47..16 of an [`NtpTime`], so one middle-32 step is
 /// 2^-16 s and the field repeats every 2^16 s.
 const MID_SHIFT: u32 = 16;
-pub const MID_RESOLUTION_NANOS: u64 = 15_259;
-pub const MID_WRAP: Duration = Duration::from_secs(1 << 16);
-
-/// Largest gap [`NtpExpander`] will bridge, as a signed middle-32 distance.
-///
-/// The theoretical limit is half a wrap (2^31 steps, ~9.1h) — beyond it the
-/// nearest-candidate choice is no longer unique. This sits an octave below that
-/// so expansion refuses well before it would silently pick the wrong era.
-const MAX_EXPANSION_GAP: i64 = 1 << 30;
+#[cfg(test)]
+const MID_RESOLUTION_NANOS: u64 = 15_259;
+#[cfg(test)]
+const MID_WRAP: Duration = Duration::from_secs(1 << 16);
 
 /// An instant on the NTP timeline, 32.32 fixed point: the upper 32 bits are
 /// seconds since 1900, the lower 32 a binary fraction of a second.
@@ -297,60 +292,6 @@ impl WallAnchor {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExpandError {
-    /// The route has been idle long enough that the middle-32 value no longer
-    /// identifies a unique instant. The caller must re-establish a full NTP
-    /// reference or tear the route down — it must not guess.
-    Ambiguous { gap: i64 },
-}
-
-/// Recovers full [`NtpTime`] values from the envelope's middle-32 field.
-///
-/// The reference chains: the first expansion resolves against the full NTP64
-/// delivered at route installation, and every one after that against the
-/// previously expanded value. The receiving host's own wall clock is
-/// consulted exactly once — at route installation, via `wall.ntp()`, to seed
-/// that initial reference — and never again: every later expansion chains off
-/// the previous expanded value instead of a fresh clock read, so it stays
-/// correct under clock skew that develops after installation.
-#[derive(Debug, Clone, Copy)]
-pub struct NtpExpander {
-    reference: NtpTime,
-}
-
-impl NtpExpander {
-    pub fn new(reference: NtpTime) -> Self {
-        Self { reference }
-    }
-
-    pub fn reference(&self) -> NtpTime {
-        self.reference
-    }
-
-    pub fn expand(&mut self, mid: u32) -> Result<NtpTime, ExpandError> {
-        // An era boundary must read as a negative gap, not a huge positive one.
-        let gap = i64::from(mid.wrapping_sub(self.reference.middle32()).cast_signed());
-        if gap.abs() >= MAX_EXPANSION_GAP {
-            return Err(ExpandError::Ambiguous { gap });
-        }
-
-        let steps = (self.reference.as_raw() >> MID_SHIFT)
-            .cast_signed()
-            .saturating_add(gap);
-        debug_assert!(steps >= 0, "expansion underflowed the NTP epoch: {steps}");
-        let expanded = NtpTime::from_raw((steps as u64) << MID_SHIFT);
-        debug_assert_eq!(
-            expanded.middle32(),
-            mid,
-            "expansion must preserve the transmitted middle-32"
-        );
-
-        self.reference = expanded;
-        Ok(expanded)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     // Tests assert by panicking; the process ending is the mechanism.
@@ -427,36 +368,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn expansion_chains_from_the_route_reference() {
-        let reference = ntp(3_900_000_000, 0);
-        let mut exp = NtpExpander::new(reference);
-        let mut expected = reference;
-        for _ in 0..1_000 {
-            expected = expected.wrapping_add(Duration::from_millis(20));
-            let got = exp.expand(expected.middle32()).unwrap();
-            assert!(
-                got.saturating_duration_since(expected)
-                    < Duration::from_nanos(MID_RESOLUTION_NANOS)
-                    || expected.saturating_duration_since(got)
-                        < Duration::from_nanos(MID_RESOLUTION_NANOS)
-            );
-        }
-    }
-
-    #[test]
-    fn expansion_crosses_the_wrap_boundary() {
-        // Start just under a middle-32 wrap so the next step rolls it over.
-        let reference =
-            NtpTime::from_raw(((1u64 << 48) - (1 << MID_SHIFT)) | (3_900_000_000 << 32));
-        let mut exp = NtpExpander::new(reference);
-        let target = NtpTime::from_raw(reference.as_raw() + (4 << MID_SHIFT));
-        assert!(target.middle32() < reference.middle32(), "test must wrap");
-
-        let got = exp.expand(target.middle32()).unwrap();
-        assert_eq!(got.as_raw() >> MID_SHIFT, target.as_raw() >> MID_SHIFT);
-    }
-
     /// Everything that compares two `NtpTime`s must be modular. The seconds
     /// field wraps in 2036, and a raw comparison there reads a fresh timestamp
     /// as 136 years old — which turns a millisecond interval into an enormous
@@ -500,49 +411,6 @@ mod tests {
             mono - Duration::from_secs(2),
             "a pre-rollover timestamp must map behind it"
         );
-    }
-
-    #[test]
-    fn expansion_handles_reordering_backwards() {
-        let reference = ntp(3_900_000_000, 0);
-        let mut exp = NtpExpander::new(reference);
-        let ahead = reference.wrapping_add(Duration::from_millis(100));
-        exp.expand(ahead.middle32()).unwrap();
-
-        let reordered = reference.wrapping_add(Duration::from_millis(80));
-        let got = exp.expand(reordered.middle32()).unwrap();
-        assert!(
-            got.units_since(ahead) < 0,
-            "a reordered packet must expand to an earlier instant"
-        );
-    }
-
-    #[test]
-    fn expansion_refuses_an_ambiguous_gap_instead_of_guessing() {
-        let reference = ntp(3_900_000_000, 0);
-        let mut exp = NtpExpander::new(reference);
-        // Half a wrap away: the nearest candidate is no longer unique.
-        let far = reference.wrapping_add(MID_WRAP / 2);
-        assert!(matches!(
-            exp.expand(far.middle32()),
-            Err(ExpandError::Ambiguous { .. })
-        ));
-        assert_eq!(
-            exp.reference(),
-            reference,
-            "a refused expansion must not advance the chain"
-        );
-    }
-
-    #[test]
-    fn expansion_ignores_receiver_wall_clock_skew() {
-        // Two expanders on the same route reference agree regardless of what
-        // their hosts think the time is — the reference is the only input.
-        let reference = ntp(3_900_000_000, 0);
-        let target = reference.wrapping_add(Duration::from_millis(40));
-        let mut a = NtpExpander::new(reference);
-        let mut b = NtpExpander::new(reference);
-        assert_eq!(a.expand(target.middle32()), b.expand(target.middle32()));
     }
 
     #[test]

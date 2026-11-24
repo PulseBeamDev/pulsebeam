@@ -14,7 +14,6 @@ fn live_packet_matches_literal_layout_and_uses_installed_position() {
         marker: true,
         sequence: 0x18000,
         timestamp: 0x0102_0304,
-        ingress_ntp32: 42,
     };
     let packet = FabricPacket::new(header, &[], [0x65, 0x88]).unwrap();
     let mut bytes = [0xff; 14];
@@ -32,6 +31,16 @@ fn live_packet_matches_literal_layout_and_uses_installed_position() {
     let next = Window::from_tuple(next, 0).unwrap();
     assert_eq!(next.position(0), Ok(0x20000));
     assert_eq!(next.decode(&LIVE), Err(WireError::RouteKey));
+}
+
+#[test]
+fn historical_core_extension_is_not_admitted() {
+    let window = Window::from_tuple(H264, 1 << 2).unwrap();
+    let legacy = [
+        0x90, 0xe6, 0x80, 0, 1, 2, 3, 4, 5, 6, 7, 8, 0xbe, 0xde, 0, 2, 0x16, 1, 2, 3, 4, 0, 1,
+        0xc0, 0x65, 0x88,
+    ];
+    assert!(window.decode(&legacy).is_err());
 }
 
 #[test]
@@ -58,14 +67,6 @@ fn media_keeps_both_extension_forms_and_minimum_padding() {
         )
         .unwrap();
         assert!(decoded.same_content(&fresh.arrival_view(6).unwrap()));
-        let mut legacy = [0; 32];
-        let legacy_len = fresh.write_local(&mut legacy).unwrap();
-        assert_eq!(legacy[12..14], [0xbe, 0xde]);
-        assert!(
-            BorrowedPacket::decode_local(&legacy[..legacy_len])
-                .unwrap()
-                .same_content(&decoded)
-        );
         assert!(decoded.extensions().eq([Extension {
             kind: ExtensionKind::DependencyDescriptor,
             value: &[0xc0, 0, 0],
@@ -88,7 +89,6 @@ fn protected_wan_primary_can_grow_within_the_path_envelope() {
             marker: false,
             sequence: 1,
             timestamp: 960,
-            ingress_ntp32: 0,
         },
         &[],
         [0xf8, 0xff, 0xfe],
@@ -128,7 +128,6 @@ fn accepts_through_envelope_and_rejects_next_byte() {
                 profile: Profile::H264,
                 marker: false,
                 timestamp: 0,
-                ingress_ntp32: 0,
             };
             let packet = FabricPacket::new(header, &[], &image[12..]).unwrap();
             let mut out = [0; MAX_WAN_RTP_BYTES + 1];
@@ -139,7 +138,6 @@ fn accepts_through_envelope_and_rejects_next_byte() {
         } else {
             let (position, packet) = window.decode(&image).unwrap();
             assert_eq!(packet.wan_plaintext_len(), len);
-            assert_eq!(packet.legacy_wire_len(), Err(WireError::Oversize));
             let mut out = [0; MAX_WAN_RTP_BYTES];
             assert_eq!(window.write(position, &packet, &mut out), Ok(len));
             let repair_label = NonZeroU32::new(12).unwrap();

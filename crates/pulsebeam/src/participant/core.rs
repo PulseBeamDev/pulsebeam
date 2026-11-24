@@ -171,7 +171,7 @@ struct BoundFabricIngress {
     geometry_refresh_at: Option<Instant>,
     loss_measurement: FabricLossMeasurement,
     #[cfg(test)]
-    observation: Option<(u32, Observation)>,
+    observation: Option<Observation>,
 }
 
 #[derive(Default)]
@@ -217,35 +217,27 @@ impl BoundFabricIngress {
     fn input(
         &mut self,
         now: Instant,
-        wall: std::time::SystemTime,
         rtp: pulsebeam_rtc::AuthenticatedRtp<'_>,
         events: &mut impl ParticipantSink,
     ) {
         let Some(source) = self.publisher_source else {
-            self.observe(now, wall, rtp);
+            self.observe(now, rtp);
             return;
         };
         if !rtp.is_repair && !rtp.wire_payload().is_empty() {
             self.loss_measurement
                 .observe_primary(rtp.wire_header().sequence);
         }
-        let stamp = crate::clock::NtpTime::from_system_time(wall).middle32();
-        if let Ok(Some(input)) = self.ingress.prepare(stamp, rtp) {
+        if let Ok(Some(input)) = self.ingress.prepare(rtp) {
             events.publish_fabric_media(source, input);
         }
     }
 
-    fn observe(
-        &mut self,
-        now: Instant,
-        wall: std::time::SystemTime,
-        rtp: pulsebeam_rtc::AuthenticatedRtp<'_>,
-    ) {
-        let stamp = crate::clock::NtpTime::from_system_time(wall).middle32();
-        let outcome = self.ingress.observe(now.into(), stamp, rtp);
+    fn observe(&mut self, now: Instant, rtp: pulsebeam_rtc::AuthenticatedRtp<'_>) {
+        let outcome = self.ingress.observe(now.into(), rtp);
         #[cfg(test)]
         if let Ok(observation) = outcome {
-            self.observation = Some((stamp, observation));
+            self.observation = Some(observation);
         }
         match outcome {
             Ok(Observation::Media {
@@ -1454,9 +1446,7 @@ impl Connection {
             if input.reliable_endpoint.is_some() && !self.native_data.can_write(cid) {
                 return true;
             }
-            let stamp =
-                crate::clock::NtpTime::from_system_time(net::ReceiveTime::now().wall).middle32();
-            match events.publish_fabric_data(input.source, input.installation, bytes, now, stamp) {
+            match events.publish_fabric_data(input.source, input.installation, bytes, now) {
                 Ok(()) => (),
                 Err(data_fabric::Error::SourceConflict) => {
                     self.retire_fabric_data(cid, events);
@@ -1774,18 +1764,33 @@ impl Connection {
         now: Instant,
         events: &mut impl ParticipantSink,
     ) {
-        use pulsebeam_proto::state::{NativeClockControl, codec::{ClockDirection, encode_clock_control}};
+        use pulsebeam_proto::state::{
+            NativeClockControl,
+            codec::{ClockDirection, encode_clock_control},
+        };
         if !self.fabric_io_authorized() || self.native_handoff.is_none() {
             return;
         }
-        let Some(control) = frame.exchange else { return };
-        let Some(FabricDataLease::Input(input)) = self.native_data.publication_channel(control.owned)
+        let Some(control) = frame.exchange else {
+            return;
+        };
+        let Some(FabricDataLease::Input(input)) = self
+            .native_data
+            .publication_channel(control.owned)
             .and_then(|cid| self.fabric_data.get(&cid))
-        else { return };
-        if let Some(response) = events.native_clock_control(input.source, input.installation, now, control)
+        else {
+            return;
+        };
+        if let Some(response) =
+            events.native_clock_control(input.source, input.installation, now, control)
             && let Some(channel) = self.native_channel_id()
             && !self.transport.signaling_pending()
-            && let Ok(bytes) = encode_clock_control(&NativeClockControl { exchange: Some(response) }, ClockDirection::ServerToClient)
+            && let Ok(bytes) = encode_clock_control(
+                &NativeClockControl {
+                    exchange: Some(response),
+                },
+                ClockDirection::ServerToClient,
+            )
         {
             let _ = self.transport.write_channel(channel, true, &bytes);
         }
@@ -2020,7 +2025,7 @@ impl Connection {
         let native_authorized = self.authorization_expiry.is_some();
         let ingress = &mut self.media_ingress;
         let fenced = &self.fenced_fabric_sources;
-        let mut observer = |rtp: pulsebeam_rtc::AuthenticatedRtp<'_>, wall| {
+        let mut observer = |rtp: pulsebeam_rtc::AuthenticatedRtp<'_>| {
             let Some(shadow) = ingress.get_mut(&rtp.primary_ssrc) else {
                 return;
             };
@@ -2056,7 +2061,7 @@ impl Connection {
                         .is_some_and(|(_, publication)| publication == shadow.publication)
             };
             if authorized {
-                shadow.input(now, wall, rtp, events);
+                shadow.input(now, rtp, events);
             }
         };
         self.transport.poll_output(Some(&mut observer))
@@ -2121,13 +2126,9 @@ impl Connection {
                     return;
                 };
                 if self.native_rtp.owns_encoding(info.ssrc) {
-                    if let Some(report) = self.transport.register_owned_encoding(info) {
-                        self.handle_legacy_sender_report(report);
-                    }
+                    self.transport.register_owned_encoding(info);
                 } else if self.activate_sdp_sender(mid) {
-                    if let Some(report) = self.transport.register_encoding(info) {
-                        self.handle_legacy_sender_report(report);
-                    }
+                    self.transport.register_encoding(info);
                     self.handle_stream_paused(mid, false, events);
                 }
             }
@@ -2246,8 +2247,12 @@ impl Connection {
                     return;
                 };
                 if Some(cid) == self.native_channel_id() {
-                    use pulsebeam_proto::state::codec::{ClockDirection, decode_clock_control_frame};
-                    if let Some(control) = decode_clock_control_frame(&bytes, ClockDirection::ClientToServer) {
+                    use pulsebeam_proto::state::codec::{
+                        ClockDirection, decode_clock_control_frame,
+                    };
+                    if let Some(control) =
+                        decode_clock_control_frame(&bytes, ClockDirection::ClientToServer)
+                    {
                         if let Ok(control) = control {
                             self.receive_native_clock_control(control, now, events);
                         }
@@ -2499,39 +2504,16 @@ impl Connection {
         events: &mut impl ParticipantSink,
     ) {
         if self.fabric_io_authorized() {
-            match self.media_ingress.get(&report.ssrc).and_then(|ingress| ingress.publisher_source) {
+            match self
+                .media_ingress
+                .get(&report.ssrc)
+                .and_then(|ingress| ingress.publisher_source)
+            {
                 Some(source) if !self.fenced_fabric_sources.contains(&source) => {
                     events.observe_fabric_sender_report(source, now, report);
                 }
                 None => self.transport.defer_fabric_sender_report(report),
                 _ => (),
-            }
-        }
-        self.handle_legacy_sender_report(report);
-    }
-
-    fn handle_legacy_sender_report(&mut self, report: pulsebeam_rtc::SenderReport) {
-        let owned = self.native_rtp.owns_encoding(report.ssrc);
-        if !owned
-            && self.sdp_senders.is_empty()
-            && !self
-                .negotiated
-                .media_sections()
-                .iter()
-                .any(|media| self.upstream.slot_for_mid(media.mid).is_some())
-        {
-            return;
-        }
-        let arrival = report.arrival.into();
-        if let Some((mid, report)) = self.transport.sender_report(report) {
-            if owned {
-                if let Some(slot) = self.native_rtp.slot_for_mid(mid)
-                    && let Some(track) = self.upstream.track_mut(slot)
-                {
-                    track.sender_report(report, arrival);
-                }
-            } else {
-                self.upstream.sender_report(mid, report, arrival);
             }
         }
     }

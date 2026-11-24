@@ -13,7 +13,6 @@ pub mod monitor;
 pub mod normalize;
 pub(crate) mod publisher_clock;
 pub mod switcher;
-pub mod sync;
 pub mod time;
 pub mod timeline;
 
@@ -71,10 +70,6 @@ pub struct RtpPacket {
     pub rtp_ts: MediaTime,
     pub arrival_ts: Instant,
 
-    /// Scheduled playout time for the packet, in the server's monotonic clock domain.
-    /// Since all streams in this process share the same monotonic clock, this time can
-    /// be compared directly between unrelated streams for scheduling or synchronization.
-    pub playout_time: Instant,
     /// Whether this packet begins a frame that can be decoded without any
     /// preceding frame (an H.264 IDR, or any Opus packet).
     pub is_keyframe: bool,
@@ -109,7 +104,6 @@ impl Default for RtpPacket {
             seq_no: SeqNo::from(1u64),
             rtp_ts: MediaTime::new(0, VIDEO_FREQUENCY),
             arrival_ts: Instant::now(),
-            playout_time: Instant::now(),
             is_keyframe: false,
             is_frame_start: true,
             nal: h264::NalFlags::empty(),
@@ -179,7 +173,6 @@ impl RtpPacket {
             seq_no: sequence.into(),
             rtp_ts: MediaTime::new(timestamp, frequency),
             arrival_ts: rtp.arrival.into(),
-            playout_time: rtp.arrival.into(),
             is_keyframe: matches!(codec, Codec::Opus) || nal.idr(),
             is_frame_start: true,
             nal,
@@ -218,15 +211,14 @@ pub mod test_utils {
 
             // Assuming 30fps video for test purposes.
             let rtp_ts_delta = 90_000 / 30; // 3000 ticks per frame
-            let playout_time_delta = Duration::from_millis(1000 / 30);
+            let frame_interval = Duration::from_millis(1000 / 30);
 
             new_packet.rtp_ts = MediaTime::new(
                 new_packet.rtp_ts.numer().wrapping_add(rtp_ts_delta),
                 new_packet.rtp_ts.frequency(),
             );
 
-            new_packet.playout_time += playout_time_delta;
-            if let Some(at) = new_packet.arrival_ts.checked_add(playout_time_delta) {
+            if let Some(at) = new_packet.arrival_ts.checked_add(frame_interval) {
                 new_packet.arrival_ts = at;
             }
 
@@ -363,7 +355,6 @@ pub mod test_utils {
                 seq_no: SeqNo::from(self.seq),
                 rtp_ts: MediaTime::new(self.rtp_ts, VIDEO_FREQUENCY),
                 arrival_ts: at,
-                playout_time: at,
                 is_keyframe: nal.idr(),
                 is_frame_start: true,
                 nal,

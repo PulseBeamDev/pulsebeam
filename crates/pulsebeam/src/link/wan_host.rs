@@ -74,6 +74,7 @@ struct Destination {
 
 struct LiveReceive {
     window: Staged<Window>,
+    timing: Option<crate::route::fabric::WindowTiming>,
     destinations: Vec<Destination>,
 }
 
@@ -184,6 +185,7 @@ impl WanHost {
         &mut self,
         now: Instant,
         expires: Instant,
+        timing: Option<crate::route::fabric::WindowTiming>,
         destinations: Vec<Destination>,
     ) -> Result<LiveReceive, Error> {
         let first = destinations.first().ok_or(Error::Binding)?.child;
@@ -228,6 +230,7 @@ impl WanHost {
             .stage(now.into_std(), self.binding(), spec, window)?;
         Ok(LiveReceive {
             window: staged,
+            timing: timing.filter(|point| point.position == first.sequence_anchor),
             destinations,
         })
     }
@@ -518,7 +521,7 @@ impl WanHost {
         if !media_probe && !sim_metrics::wan_data_loss_armed(edge) {
             return Some(bytes);
         }
-        let [0x80 | 0x90, pt, hi, lo, _, _, _, _, a, b, c, d, ..] = bytes.as_ref() else {
+        let [0x80 | 0x90, pt, hi, lo, t0, t1, t2, t3, a, b, c, d, ..] = bytes.as_ref() else {
             return Some(bytes);
         };
         if !(96..=103).contains(&(pt & 0x7f)) {
@@ -541,7 +544,8 @@ impl WanHost {
         };
         match window.profile() {
             Profile::Opus if media_probe => {
-                wan_repair::filter(self.id, bytes, ecn, window, position, repair)
+                let timestamp = u32::from_be_bytes([*t0, *t1, *t2, *t3]);
+                wan_repair::filter(self.id, bytes, ecn, window, position, timestamp, repair)
             }
             Profile::Data if !repair && sim_metrics::drop_wan_live_data(edge, position) => None,
             _ => Some(bytes),
@@ -690,9 +694,11 @@ impl WanHost {
                         self.binding().peer.ip(),
                         self.socket.local_addr().ip(),
                         image.position,
+                        image.packet.header().timestamp,
                     );
                 }
-                let frame: crate::route::fabric::NetworkPacket = image.into();
+                let mut frame: crate::route::fabric::NetworkPacket = image.into();
+                frame.capture = route.timing.and_then(|timing| timing.capture_for(&frame));
                 for destination in &route.destinations {
                     handoff(&destination.tx, destination.child.ingress, frame.clone());
                 }

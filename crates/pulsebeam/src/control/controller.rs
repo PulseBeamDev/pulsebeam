@@ -3064,7 +3064,7 @@ impl ControllerActor {
         snapshot: &ownership::observations::Snapshot,
     ) -> Vec<(
         (ProjectRoomKey, crate::shard_update::PublisherAnchor),
-        oneshot::Receiver<Option<u64>>,
+        oneshot::Receiver<Option<crate::shard_update::PublisherPosition>>,
     )> {
         let candidates = snapshot
             .iter()
@@ -3098,7 +3098,7 @@ impl ControllerActor {
     fn stage_anchor_samples<T>(
         &mut self,
         candidates: Vec<(ShardId, crate::shard_update::PublisherAnchor, T)>,
-    ) -> Vec<(T, oneshot::Receiver<Option<u64>>)> {
+    ) -> Vec<(T, oneshot::Receiver<Option<crate::shard_update::PublisherPosition>>)> {
         let generation = self.lifecycle.next_generation();
         let mut receipts = Vec::new();
         for (shard, anchor, publisher) in candidates {

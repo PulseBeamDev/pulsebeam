@@ -511,8 +511,8 @@ impl RtcConnection {
     /// Admit only when both primary and negotiated RTX fit the current leg.
     /// The byte budget is at the selected UDP or ICE-TCP handoff, after SRTP
     /// and any RFC 4571 framing. Rejection leaves the RTP index unconsumed.
-    /// When supplied, the output clock anchor replaces the packet's individual
-    /// RTP timestamp and wallclock for Sender Report correlation only.
+    /// When supplied, the output clock anchor identifies the committed output
+    /// epoch for canonical Sender Report projection.
     #[allow(
         clippy::result_large_err,
         reason = "return the original packet on rejection"
@@ -1582,7 +1582,7 @@ impl RtcConnection {
         config: ConnectionConfig,
         offer: SdpOffer,
         at: Instant,
-        wallclock: SystemTime,
+        _wallclock: SystemTime,
         entropy: ConnectionEntropy,
     ) -> Result<AcceptedConnection, AcceptError> {
         let config = config.validate()?;
@@ -1615,7 +1615,6 @@ impl RtcConnection {
             config.limits.max_retransmission_bytes,
             config.limits.max_send_runtime_bytes,
             at,
-            crate::time::ProtocolClock::new(at, wallclock),
         )?;
         let mut installation_context = Sha256::new();
         installation_context.update(b"pulsebeam.rtc.channel-installation.v1");
@@ -2096,7 +2095,6 @@ mod tests {
                     RtpWrite {
                         sequence,
                         timestamp: 0,
-                        wallclock: now,
                         marker: false,
                         payload: vec![7].into(),
                         extensions: vec![],

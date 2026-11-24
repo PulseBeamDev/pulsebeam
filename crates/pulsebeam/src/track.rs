@@ -13,11 +13,9 @@ use crate::entity::PublicationKey;
 use crate::entity::{ParticipantId, TrackId, TrackKind};
 use crate::media::{Mid, Pt, Rid, SimulcastLayer, Ssrc};
 use crate::rtp::normalize::{Normalization, StreamFacts, StreamNormalizer};
-use crate::rtp::sync::SenderInfo;
 use crate::rtp::{
     self, RtpPacket,
     monitor::{StreamMonitor, StreamStats},
-    sync::TrackSynchronizer,
 };
 pub use data_track::*;
 pub use pulsebeam_core::simulcast::LayerQuality;
@@ -474,10 +472,6 @@ impl UpstreamStats {
 
 pub struct UpstreamTrack {
     pub meta: TrackMeta,
-    /// One clock for the whole track. Every encoding is the same source over the
-    /// same connection, so their `playout_time`s are reconciled onto a single
-    /// timeline rather than each encoding running an independent clock.
-    synchronizer: TrackSynchronizer,
     /// One monitor for the whole track. It owns every simulcast encoding's
     /// ingest state and all cross-encoding reasoning (VLA fan-out, sibling
     /// activity, aggregate demand), while each encoding keeps its own
@@ -495,22 +489,6 @@ impl PartialEq for UpstreamTrack {
 impl Eq for UpstreamTrack {}
 
 impl UpstreamTrack {
-    pub(crate) fn sender_report(&mut self, report: SenderInfo, arrival: Instant) {
-        self.synchronizer.sender_report(report, arrival);
-    }
-
-    pub fn process(
-        &mut self,
-        rid: Option<&Rid>,
-        mut packet: RtpPacket,
-        sr: Option<SenderInfo>,
-    ) -> ProcessedRtp {
-        // Stamp playout_time on the track's shared clock before the encoding's
-        // monitor and the switcher downstream see it.
-        self.synchronizer.process(&mut packet, sr);
-        self.monitor.process(rid, packet)
-    }
-
     pub fn by_rid_mut(&mut self, rid: &Option<Rid>) -> Option<&mut UpstreamTrackLayer> {
         self.monitor.by_rid_mut(rid)
     }
@@ -1058,7 +1036,6 @@ pub fn new_audio(mid: Mid, meta: TrackMeta) -> (UpstreamTrack, Track) {
 
     let sender = UpstreamTrack {
         meta: meta.clone(),
-        synchronizer: TrackSynchronizer::new(rtp::AUDIO_FREQUENCY),
         monitor: TrackMonitor::new(vec![UpstreamTrackLayer {
             mid,
             rid: None,
@@ -1170,7 +1147,6 @@ fn new_video_encodings(
     (
         UpstreamTrack {
             meta,
-            synchronizer: TrackSynchronizer::new(rtp::VIDEO_FREQUENCY),
             monitor: TrackMonitor::new(senders),
             stats: UpstreamStats::Video(stats),
         },

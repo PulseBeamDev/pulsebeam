@@ -66,6 +66,7 @@ impl From<ReceiveCommand> for Command {
 pub(crate) enum ReceiveCommand {
     Live {
         expires: Instant,
+        timing: Option<crate::route::fabric::WindowTiming>,
         children: Vec<ChildInstall<LiveNetworkChild>>,
         report: Report,
     },
@@ -273,6 +274,7 @@ impl WanHost {
         let (result, report) = match command {
             ReceiveCommand::Live {
                 expires,
+                timing,
                 children,
                 report,
             } => {
@@ -283,7 +285,7 @@ impl WanHost {
                     })
                     .unzip();
                 let result = self
-                    .stage_live_receive(now, expires, destinations)
+                    .stage_live_receive(now, expires, timing, destinations)
                     .map(|route| Route::Live(route, receipts));
                 (result, report)
             }

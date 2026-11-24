@@ -157,7 +157,7 @@ impl Timeline {
             // Nothing forwarded yet: keep the source's own timestamps.
             None => 0,
             Some((epoch_at, epoch_ts)) => {
-                let elapsed = packet.playout_time.saturating_duration_since(epoch_at);
+                let elapsed = packet.arrival_ts.saturating_duration_since(epoch_at);
                 let raw_target = epoch_ts.wrapping_add(self.ticks(elapsed));
                 let target = self.switch_target(raw_target);
                 debug_assert!(
@@ -283,7 +283,7 @@ impl Timeline {
         pkt.rtp_ts = MediaTime::new(output_ts, self.clock_rate);
 
         if self.epoch.is_none() {
-            self.epoch = Some((pkt.playout_time, output_ts));
+            self.epoch = Some((pkt.arrival_ts, output_ts));
             self.max_output = output_seq;
             self.max_output_ts = output_ts;
             return;
@@ -315,7 +315,6 @@ mod test {
         RtpPacket {
             seq_no: seq.into(),
             rtp_ts: MediaTime::new(ts, Frequency::NINETY_KHZ),
-            playout_time: at,
             arrival_ts: at,
             ..Default::default()
         }
@@ -529,8 +528,8 @@ mod test {
         let last = last.unwrap();
         let ts_elapsed = last.rtp_ts.numer() - first.rtp_ts.numer();
         let wall_ticks = crate::bitrate::saturating_bps(
-            last.playout_time
-                .duration_since(first.playout_time)
+            last.arrival_ts
+                .duration_since(first.arrival_ts)
                 .as_secs_f64()
                 * 90_000.0,
         );

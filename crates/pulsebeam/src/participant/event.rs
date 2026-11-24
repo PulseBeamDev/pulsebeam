@@ -71,7 +71,6 @@ pub(crate) trait ParticipantSink {
         installation: pulsebeam_rtc::DataChannelInstallation,
         bytes: &[u8],
         now: pulsebeam_runtime::time::Instant,
-        stamp: u32,
     ) -> Result<(), super::data_fabric::Error>;
     fn settle_fabric_original_unavailable(
         &mut self,
@@ -219,7 +218,6 @@ pub mod test_utils {
             _installation: pulsebeam_rtc::DataChannelInstallation,
             _bytes: &[u8],
             _now: pulsebeam_runtime::time::Instant,
-            _stamp: u32,
         ) -> Result<(), super::super::data_fabric::Error> {
             panic!("Fabric DATA requires the shard publication sink");
         }

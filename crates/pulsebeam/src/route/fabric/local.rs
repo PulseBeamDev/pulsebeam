@@ -71,6 +71,7 @@ pub struct OutputEvidence {
     pub dd: Option<(u64, Qualified)>,
     pub(crate) output_position: u64,
     pub(crate) ingress: Option<NonZeroU64>,
+    pub(crate) capture: Option<pulsebeam_clock::deadline::Timing>,
 }
 
 #[derive(Clone, Copy)]
@@ -303,6 +304,7 @@ fn dd_structure(
 
 struct Frozen {
     packet: OwnedPacket,
+    capture: Option<pulsebeam_clock::deadline::Timing>,
     live_arrival: Option<Instant>,
     ready_at: Option<std::time::Instant>,
     live_ingress: Option<NonZeroU64>,
@@ -1055,6 +1057,7 @@ impl SourceFanout {
                 sequence,
                 Frozen {
                     packet,
+                    capture: None,
                     live_arrival: None,
                     ready_at: None,
                     live_ingress: None,
@@ -1410,7 +1413,6 @@ impl SourceFanout {
             identity.admit(
                 now.into(),
                 input.arrival,
-                input.ingress_ntp32,
                 input.position,
                 media,
                 |sequence| originals.get(&sequence).map(|frozen| &frozen.packet),
@@ -1483,6 +1485,7 @@ impl SourceFanout {
             sequence,
             Frozen {
                 packet,
+                capture: None,
                 live_arrival: None,
                 ready_at: None,
                 live_ingress: None,
@@ -1627,6 +1630,7 @@ impl SourceFanout {
                     sequence,
                     Frozen {
                         packet: packet.ok_or(Rejection::Stale)?,
+                        capture: None,
                         live_arrival: Some(arrival),
                         ready_at,
                         live_ingress: ingress,
@@ -1737,6 +1741,22 @@ impl SourceFanout {
     ) -> Result<(u64, Offers), Rejection> {
         self.offer_from(now, arrival, sequence, Some(packet), Some(ingress), None)
             .map(|offers| (sequence, offers))
+    }
+
+    pub(crate) fn attach_network_capture(
+        &mut self,
+        sequence: u64,
+        ingress: NonZeroU64,
+        arrival: Instant,
+        capture: pulsebeam_clock::deadline::Timing,
+    ) {
+        if let Some(frozen) = self.fates.get_mut(&sequence)
+            && frozen.live_ingress == Some(ingress)
+            && frozen.live_arrival == Some(arrival)
+            && frozen.capture.is_none()
+        {
+            frozen.capture = Some(capture);
+        }
     }
 
     #[cfg(test)]
@@ -1853,6 +1873,9 @@ impl SourceFanout {
             (qualified.structure_sequence == frame.structure_sequence)
                 .then_some((frame.number, qualified))
         });
+        let capture = frozen
+            .capture
+            .filter(|_| frozen.live_ingress == queued.ingress);
         let projected = OutputEvidence {
             mode: queued.selection,
             entry: queued.entry,
@@ -1860,8 +1883,19 @@ impl SourceFanout {
             dd,
             output_position: queued.output_position,
             ingress: queued.ingress,
+            capture,
         };
         let result = write(queued.sequence, packet, projected)?;
+        if capture.is_some()
+            && let Some(arrival) = frozen.live_arrival
+        {
+            let residence = now.saturating_duration_since(queued.queued_at);
+            let remaining = MAX_AGE.saturating_sub(now.saturating_duration_since(arrival));
+            metrics::histogram!("fabric_rtp_branch_queue_residence_seconds")
+                .record(residence.as_secs_f64());
+            metrics::histogram!("fabric_rtp_branch_handoff_remaining_seconds")
+                .record(remaining.as_secs_f64());
+        }
         if let Some(ready_at) = frozen.ready_at {
             let enqueued = Instant::now();
             metrics::histogram!("fabric_rtp_local_enqueue_delay_us").record(

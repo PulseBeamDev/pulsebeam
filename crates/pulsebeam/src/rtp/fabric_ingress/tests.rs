@@ -361,7 +361,7 @@ fn av1_binding_uses_av1_wire_profile_or_rejects_unbounded_level() {
         .unwrap();
     let now = Instant::now();
     assert!(matches!(
-        shadow.observer.as_mut().unwrap().admit(now, now, 1, sequence, media.as_input()),
+        shadow.observer.as_mut().unwrap().admit(now, now, sequence, media.as_input()),
         Ok(Admission::Media { packet, .. }) if packet.header().profile == Profile::Av1 && packet.payload() == b"opaque AV1"
     ));
 }
@@ -437,13 +437,12 @@ fn co_occurring_metadata_is_not_stripped_to_fit() {
         .observer
         .as_mut()
         .unwrap()
-        .admit(now, now, 1, sequence, media.as_input())
+        .admit(now, now, sequence, media.as_input())
         .unwrap()
     else {
         panic!("the logical packet must retain all authenticated media");
     };
     assert_eq!(packet.wan_plaintext_len(), MAX_WAN_RTP_BYTES + 1);
-    assert_eq!(packet.legacy_wire_len(), Err(WireError::Oversize));
     assert_eq!(packet.extensions().count(), hints.len());
 }
 
@@ -480,7 +479,6 @@ fn prove_endpoint_identity(peer_repair: bool) {
         |arrival: ShardInstant, sequence, bytes: Option<&[u8]>, protected_bytes| MediaIngress {
             arrival: arrival.into(),
             ready_at: arrival.into(),
-            ingress_ntp32: 1,
             position: Position::LowSequence(sequence),
             protected_bytes: NonZeroU16::new(protected_bytes),
             media: bytes.map(|payload| OwnedCopy {

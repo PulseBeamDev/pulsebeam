@@ -334,13 +334,10 @@ impl PublisherSource {
         fanout: &mut SourceFanout,
         bytes: &[u8],
         now: Instant,
-        stamp: u32,
         time: DataTime,
     ) -> Result<super::event::FabricDataPosition, Error> {
         // Protected SCTP DD is not qualified for this binding.
-        let admission = self
-            .ledger
-            .admit_record(fanout, bytes, now, stamp, time, false)?;
+        let admission = self.ledger.admit_record(fanout, bytes, now, time, false)?;
         #[cfg(feature = "sim")]
         if let Some(endpoint) = self.reliable_endpoint {
             crate::sim_metrics::record_wan_data_sctp(
@@ -741,7 +738,6 @@ impl Source {
         fanout: &'a mut SourceFanout,
         bytes: &[u8],
         now: Instant,
-        ingress_ntp32: u32,
         time: DataTime,
         allow_descriptor: bool,
     ) -> Result<Admission<'a>, Error> {
@@ -863,7 +859,6 @@ impl Source {
                 sequence: low32(sequence),
                 timestamp,
                 marker,
-                ingress_ntp32,
             },
             extension.as_slice(),
             Box::from(payload),

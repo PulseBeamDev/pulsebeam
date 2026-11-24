@@ -308,7 +308,6 @@ impl Pump<'_> {
                                     RtpWrite {
                                         sequence,
                                         timestamp: packet.header.timestamp,
-                                        wallclock: packet.arrival,
                                         marker: packet.header.marker,
                                         payload: self
                                             .output_sources

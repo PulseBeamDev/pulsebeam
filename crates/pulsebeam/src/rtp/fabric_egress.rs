@@ -481,13 +481,11 @@ impl EndpointHints {
         }
         let clock = RtpClockAnchor {
             timestamp: output.anchor_timestamp,
-            wallclock: output.wallclock,
             canonical_offset: output.canonical_offset,
         };
         let write = RtpWrite {
             sequence: output.sequence,
             timestamp: output.timestamp,
-            wallclock: output.wallclock,
             marker: packet.header().marker,
             payload: bytes::Bytes::copy_from_slice(packet.payload()),
             extensions,

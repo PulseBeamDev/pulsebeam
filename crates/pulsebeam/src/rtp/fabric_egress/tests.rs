@@ -8,7 +8,6 @@ fn packet<'a>(profile: Profile, extensions: &[Extension<'a>]) -> FabricPacket<&'
             marker: true,
             sequence: 6,
             timestamp: 7,
-            ingress_ntp32: 8,
         },
         extensions,
         &b"opaque"[..],

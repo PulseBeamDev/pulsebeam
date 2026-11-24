@@ -20,7 +20,6 @@
 use pulsebeam_runtime::time::{Duration, Instant};
 use std::collections::VecDeque;
 
-use crate::clock::{NtpExpander, NtpTime};
 use crate::id::ShardId;
 
 pub mod fabric;
@@ -300,15 +299,12 @@ pub(crate) enum RouteAction {
     },
 }
 
-/// Destination-owned semantic dispatch and media timeline state. Link owns
+/// Destination-owned semantic dispatch. Link owns
 /// transport receipt, loss and transmission identity.
 #[derive(Debug)]
 pub(crate) struct RouteRuntimeEntry {
     pub epoch: u16,
     pub action: RouteAction,
-    /// Expands the envelope's middle-32 against this route's own reference.
-    pub expander: NtpExpander,
-    timing_initialized: bool,
 }
 
 /// Hands out `(slot, epoch)` pairs within one shard's slot namespace.
@@ -478,61 +474,6 @@ impl RouteRuntime {
         debug_assert_eq!(self.slots.len(), self.reverse_dedup.len());
     }
 
-    /// The accounting behind a route, created on first use.
-    ///
-    /// Nothing tells the shard a route exists: the published view is the
-    /// announcement, and this materialises when a packet actually arrives on
-    /// it. A stale entry for a slot the view has since reused is harmless —
-    /// it is epoch-checked, and the next install overwrites it — so there is
-    /// no retirement message either.
-    pub fn accounting_mut(
-        &mut self,
-        address: NodeRouteAddress,
-        ntp_ref: NtpTime,
-    ) -> &mut RouteRuntimeEntry {
-        let idx = address.route.index();
-        self.ensure_slot(idx);
-        let stale = self
-            .slots
-            .get(idx)
-            .and_then(Option::as_ref)
-            .is_none_or(|entry| entry.epoch != address.epoch);
-        if stale {
-            self.install(address, ntp_ref);
-        }
-        let Some(Some(entry)) = self.slots.get_mut(idx) else {
-            pulsebeam_runtime::fatal!("route accounting must exist after installing it")
-        };
-        if !entry.timing_initialized {
-            entry.expander = NtpExpander::new(ntp_ref);
-            entry.timing_initialized = true;
-        }
-        entry
-    }
-
-    /// Build the accounting behind an address the control plane granted.
-    pub fn install(&mut self, address: NodeRouteAddress, ntp_ref: NtpTime) {
-        debug_assert_eq!(
-            address.shard(),
-            self.shard_id,
-            "a route's accounting only exists at the shard that owns it"
-        );
-        let idx = address.route.index();
-        self.ensure_slot(idx);
-        let Some(slot) = self.slots.get_mut(idx) else {
-            debug_assert!(false, "the resize above guarantees this slot exists");
-            return;
-        };
-        *slot = Some(RouteRuntimeEntry {
-            epoch: address.epoch,
-            action: RouteAction::Forward {
-                target: crate::keys::TrackHandle::default(),
-            },
-            expander: NtpExpander::new(ntp_ref),
-            timing_initialized: false,
-        });
-    }
-
     pub fn install_action(&mut self, address: NodeRouteAddress, action: RouteAction) {
         debug_assert_eq!(
             address.shard(),
@@ -562,8 +503,6 @@ impl RouteRuntime {
         *slot = Some(RouteRuntimeEntry {
             epoch: address.epoch,
             action,
-            expander: NtpExpander::new(NtpTime::ZERO),
-            timing_initialized: false,
         });
     }
 
@@ -798,7 +737,12 @@ mod tests {
     #[pulsebeam_runtime::test(start_paused = true, crate = "pulsebeam_runtime::__harness")]
     async fn accounting_is_scoped_to_one_incarnation() {
         let mut runtime = RouteRuntime::new(ShardId::new(0));
-        runtime.install(address(0, 0, 1), NtpTime::ZERO);
+        runtime.install_action(
+            address(0, 0, 1),
+            RouteAction::Forward {
+                target: crate::keys::TrackHandle::default(),
+            },
+        );
 
         assert!(runtime.entry_mut(address(0, 0, 1)).is_some());
         assert!(
@@ -812,7 +756,7 @@ mod tests {
     }
 
     #[pulsebeam_runtime::test(start_paused = true, crate = "pulsebeam_runtime::__harness")]
-    async fn same_epoch_action_updates_preserve_media_timing() {
+    async fn same_epoch_action_updates_dispatch() {
         let mut runtime = RouteRuntime::new(ShardId::new(0));
         let route = address(0, 0, 7);
         runtime.install_action(
@@ -821,8 +765,6 @@ mod tests {
                 target: crate::keys::TrackHandle::default(),
             },
         );
-        runtime.accounting_mut(route, NtpTime::ZERO);
-        let expander_before = runtime.entry(route).unwrap().expander;
         runtime.install_action(
             route,
             RouteAction::Reverse {
@@ -837,8 +779,6 @@ mod tests {
                 target: crate::keys::TrackHandle::default()
             }
         );
-        assert!(entry.timing_initialized);
-        assert_eq!(entry.expander.reference(), expander_before.reference());
     }
 
     #[pulsebeam_runtime::test(start_paused = true, crate = "pulsebeam_runtime::__harness")]
@@ -909,7 +849,7 @@ mod tests {
     }
 
     #[pulsebeam_runtime::test(start_paused = true, crate = "pulsebeam_runtime::__harness")]
-    async fn a_new_epoch_restarts_media_timing() {
+    async fn a_new_epoch_hides_superseded_dispatch() {
         let mut runtime = RouteRuntime::new(ShardId::new(0));
         let old = address(0, 0, 7);
         runtime.install_action(
@@ -918,7 +858,6 @@ mod tests {
                 target: crate::keys::TrackHandle::default(),
             },
         );
-        runtime.accounting_mut(old, NtpTime::ZERO);
 
         let replacement = address(0, 0, 8);
         runtime.install_action(
@@ -928,15 +867,19 @@ mod tests {
             },
         );
 
-        let entry = runtime.entry(replacement).unwrap();
-        assert!(!entry.timing_initialized);
+        assert!(runtime.entry(replacement).is_some());
         assert!(runtime.entry(old).is_none());
     }
 
     #[pulsebeam_runtime::test(start_paused = true, crate = "pulsebeam_runtime::__harness")]
     async fn retiring_accounting_is_idempotent_and_epoch_checked() {
         let mut runtime = RouteRuntime::new(ShardId::new(0));
-        runtime.install(address(0, 0, 4), NtpTime::ZERO);
+        runtime.install_action(
+            address(0, 0, 4),
+            RouteAction::Forward {
+                target: crate::keys::TrackHandle::default(),
+            },
+        );
 
         assert!(
             !runtime.retire(address(0, 0, 3)),

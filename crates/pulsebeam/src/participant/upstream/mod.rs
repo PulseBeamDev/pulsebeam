@@ -3,7 +3,6 @@ mod binding_tests;
 
 use crate::keys::TrackHandle;
 use crate::media::{Mid, Ssrc};
-use crate::rtp::sync::SenderInfo;
 use crate::{
     entity::{PublicationKey, TrackKind},
     log::{LogCtx, plog_warn},
@@ -174,23 +173,12 @@ impl UpstreamMedia {
             (slot.mid == mid).then_some((index, slot.track.meta.id))
         })
     }
-    fn sender_report(&mut self, mid: Mid, report: SenderInfo, arrival: Instant) {
-        if let Some(slot) = self
-            .published_tracks
-            .values_mut()
-            .find(|slot| slot.media_index.is_some() && slot.mid == mid)
-        {
-            slot.track.sender_report(report, arrival);
-        }
-    }
-
     fn handle_incoming_rtp(
         &mut self,
         index: usize,
         mid: Mid,
         rid: Option<&crate::media::Rid>,
         rtp: RtpPacket,
-        sr: Option<SenderInfo>,
     ) -> crate::track::ProcessedRtp {
         let Some(slot) = self.published_tracks.get_mut(&index) else {
             debug_assert!(false, "cached upstream slot index is out of bounds");
@@ -213,7 +201,7 @@ impl UpstreamMedia {
         }
         let mut rtp = rtp;
         rtp.ext_vals.rid = rid.cloned();
-        slot.track.process(rid, rtp, sr)
+        slot.track.monitor.process(rid, rtp)
     }
     fn announce_state_mut(&mut self, mid: Mid) -> Option<(&crate::track::Track, &mut bool)> {
         let slot = self
@@ -291,26 +279,16 @@ impl Upstream {
                     .map(|(index, id)| (UpstreamSlotKey::Video(index), id))
             })
     }
-    pub(crate) fn sender_report(&mut self, mid: Mid, report: SenderInfo, arrival: Instant) {
-        self.audio.sender_report(mid, report, arrival);
-        self.video.sender_report(mid, report, arrival);
-    }
-
     pub fn handle_incoming_rtp(
         &mut self,
         slot: UpstreamSlotKey,
         mid: Mid,
         rid: Option<&crate::media::Rid>,
         rtp: RtpPacket,
-        sr: Option<SenderInfo>,
     ) -> crate::track::ProcessedRtp {
         match slot {
-            UpstreamSlotKey::Audio(index) => {
-                self.audio.handle_incoming_rtp(index, mid, rid, rtp, sr)
-            }
-            UpstreamSlotKey::Video(index) => {
-                self.video.handle_incoming_rtp(index, mid, rid, rtp, sr)
-            }
+            UpstreamSlotKey::Audio(index) => self.audio.handle_incoming_rtp(index, mid, rid, rtp),
+            UpstreamSlotKey::Video(index) => self.video.handle_incoming_rtp(index, mid, rid, rtp),
         }
     }
     pub fn announce_state_mut(&mut self, mid: Mid) -> Option<(&crate::track::Track, &mut bool)> {

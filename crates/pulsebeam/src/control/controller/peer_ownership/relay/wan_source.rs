@@ -4,6 +4,7 @@ use pulsebeam_core::fabric::{
     MAJOR, Profile, REGISTRY_REVISION,
     wan::{WINDOW_SPAN, Window},
 };
+use pulsebeam_clock::domain::{Projection, Provenance, Quality};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -39,7 +40,12 @@ pub(in crate::control) fn plan_windows(
             .copied()
     };
     for source in &mut current {
-        *source = stable(*source).unwrap_or(*source);
+        if let Some(previous) = stable(*source) {
+            let timing = (previous.sequence_anchor == source.sequence_anchor)
+                .then_some(source.timing)
+                .flatten();
+            *source = WanSourceWindow { timing, ..previous };
+        }
     }
     let sources = current.len();
     for index in 0..sources {
@@ -53,7 +59,10 @@ pub(in crate::control) fn plan_windows(
                 ..source
             })
         {
-            current.push(predecessor);
+            current.push(WanSourceWindow {
+                timing: None,
+                ..predecessor
+            });
         }
     }
     for index in 0..sources {
@@ -67,11 +76,53 @@ pub(in crate::control) fn plan_windows(
                 window_start,
                 ..source
             };
-            current.push(stable(successor).unwrap_or(successor));
+            current.push(WanSourceWindow {
+                timing: None,
+                ..stable(successor).unwrap_or(successor)
+            });
         }
     }
     current.sort_unstable_by_key(|source| (source.scope(), source.window_start));
     current.into_boxed_slice()
+}
+
+/// Evidence for the exact sequence anchor, not a bound for other samples in its window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::control) struct WanTimingPoint {
+    generation: u64,
+    global_ns: i64,
+    uncertainty_ns: Option<u32>,
+    provenance: u8,
+    quality: u8,
+}
+
+impl WanTimingPoint {
+    fn from_projection(projection: Projection) -> Self {
+        Self {
+            generation: projection.binding.generation.0,
+            global_ns: projection.global.as_nanos(),
+            uncertainty_ns: projection
+                .absolute_uncertainty_ns
+                .and_then(|ns| u32::try_from(ns).ok()),
+            provenance: match projection.provenance {
+                Provenance::ArrivalEstimate => 0,
+                Provenance::SenderReport => 1,
+                Provenance::DataCapture => 2,
+            },
+            quality: match projection.quality {
+                Quality::Acquiring => 0,
+                Quality::Synchronized => 1,
+                Quality::Degraded => 2,
+                Quality::Holdover => 3,
+                Quality::Recovering => 4,
+            },
+        }
+    }
+
+    fn valid(self) -> bool {
+        self.provenance <= 2 && self.quality <= 4
+    }
 }
 
 /// One publisher-owned position window, before the receiver allocates its SSRC.
@@ -81,6 +132,7 @@ pub(in crate::control) struct WanSourceWindow {
     pub publisher: PublisherAnchor,
     pub sequence_anchor: u64,
     pub window_start: u64,
+    pub timing: Option<WanTimingPoint>,
 }
 
 impl WanSourceWindow {
@@ -94,7 +146,15 @@ impl WanSourceWindow {
             publisher,
             sequence_anchor,
             window_start: Window::start_for(sequence_anchor),
+            timing: None,
         }
+    }
+
+    pub(in crate::control) fn with_projection(mut self, projection: Option<Projection>) -> Self {
+        self.timing = projection
+            .filter(|value| value.binding.domain.0 == self.publisher.incarnation.get())
+            .map(WanTimingPoint::from_projection);
+        self
     }
 
     pub(in crate::control) fn scope(self) -> super::Key {
@@ -107,6 +167,68 @@ impl WanSourceWindow {
         } else {
             3
         }
+    }
+
+    pub(in crate::control) fn window_timing(self) -> Option<crate::route::fabric::WindowTiming> {
+        let point = self.timing?;
+        let quality = match point.quality {
+            0 => Quality::Acquiring,
+            1 => Quality::Synchronized,
+            2 => Quality::Degraded,
+            3 => Quality::Holdover,
+            4 => Quality::Recovering,
+            _ => return None,
+        };
+        Some(crate::route::fabric::WindowTiming {
+            position: self.sequence_anchor,
+            capture: pulsebeam_clock::deadline::Timing {
+                instant: pulsebeam_clock::time::GlobalInstant::from_nanos(point.global_ns),
+                absolute_uncertainty_ns: point.uncertainty_ns.map(u64::from),
+                quality,
+            },
+        })
+    }
+
+    pub(in crate::control) fn record_timing_quality(self) {
+        let (quality, provenance, bounded) = self.timing.map_or(
+            ("unknown", "unknown", "false"),
+            |point| {
+                let quality = match point.quality {
+                    0 => "acquiring",
+                    1 => "synchronized",
+                    2 => "degraded",
+                    3 => "holdover",
+                    4 => "recovering",
+                    _ => "unknown",
+                };
+                let provenance = match point.provenance {
+                    0 => "arrival",
+                    1 => "sender_report",
+                    2 => "data_capture",
+                    _ => "unknown",
+                };
+                let bounded = if point.uncertainty_ns.is_some() {
+                    "true"
+                } else {
+                    "false"
+                };
+                (quality, provenance, bounded)
+            },
+        );
+        metrics::counter!(
+            "wan_source_timing_observations",
+            "quality" => quality,
+            "provenance" => provenance,
+            "reported_bound" => bounded,
+        )
+        .increment(1);
+    }
+
+    pub(in crate::control) fn same_window(self, other: Self) -> bool {
+        self.room == other.room
+            && self.publisher == other.publisher
+            && self.sequence_anchor == other.sequence_anchor
+            && self.window_start == other.window_start
     }
 
     pub(in crate::control) fn matches_ack(self, ack: WanLiveRouteAck) -> bool {
@@ -159,6 +281,8 @@ pub(in crate::control) struct WireWanSourceWindow {
     profile: u8,
     extensions: u16,
     forms: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    timing: Option<WanTimingPoint>,
 }
 
 impl From<WanSourceWindow> for WireWanSourceWindow {
@@ -175,6 +299,7 @@ impl From<WanSourceWindow> for WireWanSourceWindow {
             profile,
             extensions,
             forms: source.forms(),
+            timing: source.timing,
         }
     }
 }
@@ -201,6 +326,9 @@ impl WireWanSourceWindow {
             },
             sequence_anchor: self.sequence_anchor,
             window_start: self.window_start,
+            timing: self.timing.filter(|point| {
+                Window::start_for(self.sequence_anchor) == self.window_start && point.valid()
+            }),
         };
         (Window::start_for(self.window_start) == self.window_start && source.forms() == self.forms)
             .then_some(source)

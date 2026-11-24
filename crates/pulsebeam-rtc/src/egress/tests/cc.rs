@@ -21,7 +21,6 @@ fn positive_insufficient_window_slack_has_no_immediate_data_or_padding_wake() {
             RtpWrite {
                 sequence: 0,
                 timestamp: 0,
-                wallclock: start,
                 marker: false,
                 payload: vec![0; 128].into(),
                 extensions: Vec::new(),
@@ -165,7 +164,6 @@ fn encoder_budget_churn_and_same_epoch_pause_cannot_refund_an_accepted_burst() {
                 RtpWrite {
                     sequence: u64::try_from(sequence).unwrap(),
                     timestamp: 0,
-                    wallclock: start,
                     marker: true,
                     payload: vec![0; 320].into(),
                     extensions: Vec::new(),

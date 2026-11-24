@@ -29,11 +29,17 @@ pub(in crate::control) struct PublisherSends {
     used: BTreeSet<NonZeroU32>,
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy)]
 struct Permit {
     source: WanSourceWindow,
     ack: WanLiveRouteAck,
     shard: ShardId,
+}
+
+impl Permit {
+    fn same_route(self, other: Self) -> bool {
+        self.shard == other.shard && self.ack == other.ack && self.source.same_window(other.source)
+    }
 }
 
 struct Entry {
@@ -205,7 +211,9 @@ impl PublisherSends {
             }
         }
         self.entries.retain(|ssrc, entry| {
-            let retained = desired.remove(ssrc) == Some(entry.permit)
+            let retained = desired
+                .remove(ssrc)
+                .is_some_and(|permit| permit.same_route(entry.permit))
                 && now < entry.expires
                 && entry.cutoff.is_live()
                 && entry.advance(actor, peer);

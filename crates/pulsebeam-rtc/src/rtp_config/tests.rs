@@ -1674,7 +1674,6 @@ fn maximum_typed_namespaces_are_included_before_original_write_admission() {
         65536,
         crate::ConnectionLimits::DEFAULT_MAX_SEND_RUNTIME_BYTES,
         now,
-        crate::time::ProtocolClock::new(now, std::time::UNIX_EPOCH),
     )
     .unwrap();
     let update = egress
@@ -1695,7 +1694,6 @@ fn maximum_typed_namespaces_are_included_before_original_write_admission() {
     let write = |bytes| crate::RtpWrite {
         sequence: 0,
         timestamp: 0,
-        wallclock: now,
         marker: false,
         payload: vec![7; bytes].into(),
         extensions: vec![],
@@ -1733,7 +1731,6 @@ fn pause_preserves_egress_but_terminal_omission_requires_a_fresh_identity() {
         65536,
         crate::ConnectionLimits::DEFAULT_MAX_SEND_RUNTIME_BYTES,
         now,
-        crate::time::ProtocolClock::new(now, std::time::UNIX_EPOCH),
     )
     .unwrap();
     let physical = PhysicalBinding {
@@ -1778,7 +1775,6 @@ fn pause_preserves_egress_but_terminal_omission_requires_a_fresh_identity() {
         65536,
         crate::ConnectionLimits::DEFAULT_MAX_SEND_RUNTIME_BYTES,
         now,
-        crate::time::ProtocolClock::new(now, std::time::UNIX_EPOCH),
     )
     .unwrap();
     assert_eq!(
@@ -1808,7 +1804,6 @@ fn pause_preserves_egress_but_terminal_omission_requires_a_fresh_identity() {
     let packet = || crate::RtpWrite {
         sequence: 65536,
         timestamp: 90000,
-        wallclock: now,
         marker: true,
         payload: bytes::Bytes::from_static(b"opaque-source"),
         extensions: vec![],
@@ -1834,7 +1829,6 @@ fn pause_preserves_egress_but_terminal_omission_requires_a_fresh_identity() {
         65536,
         replacement_budget,
         now,
-        crate::time::ProtocolClock::new(now, std::time::UNIX_EPOCH),
     )
     .unwrap();
     let update = constrained

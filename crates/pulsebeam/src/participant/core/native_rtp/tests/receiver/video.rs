@@ -71,7 +71,7 @@ fn feed(
                 });
         }
         last_arrival = raw.arrival_ts;
-        let processed = tx.process(Some(&rid), raw, None);
+        let processed = tx.monitor.process(Some(&rid), raw);
         for packet in processed.first.into_iter().chain(processed.remaining) {
             assert!(cache.push(packet.clone()).is_none());
             participant.on_track_packet(handle, &packet, Some(cache));
