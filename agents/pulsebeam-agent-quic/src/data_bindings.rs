@@ -77,16 +77,20 @@ impl FabricOffer {
         publishes_h264_dd: bool,
     ) -> Result<FabricBinding, WireError> {
         let dd = ExtensionKind::DependencyDescriptor.bit();
-        let required = if publishes_h264_dd {
-            if profile != Profile::H264 {
-                return Err(WireError::ExtensionProfile);
-            }
-            dd
-        } else {
-            if profile == Profile::H264 {
+        let required = match (profile, publishes_h264_dd) {
+            (Profile::H264, true) => dd,
+            (_, true) => return Err(WireError::ExtensionProfile),
+            (Profile::H264, false) => {
                 self.supported &= !dd;
+                0
             }
-            0
+            (Profile::Data, false) => {
+                // Logical DATA publications promise the SCTP-compatible record
+                // shape. Capture time within the record is not an extension.
+                self.supported = 0;
+                0
+            }
+            _ => 0,
         };
         self.bind(peer, profile, required)
     }
@@ -252,6 +256,10 @@ mod tests {
         assert_eq!(old_data.agreement.revision(), 0);
         assert_eq!(old_data.agreement.extension_mask(), 0x000c);
         assert_eq!(old.bind(current, Profile::Data, 0x000c), Ok(old_data));
+        for peer in [old, current] {
+            let logical_data = current.bind_publisher(peer, Profile::Data, false).unwrap();
+            assert_eq!(logical_data.agreement.extension_mask(), 0);
+        }
         assert_eq!(
             current.bind(old, Profile::H264, 0x0100),
             Err(WireError::RequiredFeature)

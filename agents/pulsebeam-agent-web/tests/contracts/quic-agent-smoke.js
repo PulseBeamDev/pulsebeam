@@ -45,7 +45,9 @@
   analyser.connect(muted).connect(context.destination);
   let monitor;
   let failure;
-  const fail = (error) => (failure = error);
+  const fail = (lane) => (error) => {
+    failure ??= new Error(`${lane}: ${error?.inner?.info?.message ?? error}`);
+  };
   const native = agent.room(room).participant("linux-quic");
   const videoSubscription = native.video("camera").subscribe({
     visible: true,
@@ -53,10 +55,14 @@
     priority: 1,
   });
   const audioSubscription = native.audio("voice").subscribe();
-  const incoming = native.data("bytes").subscribe();
-  const outgoing = agent.data("bytes").publish();
-  const videoPublication = agent.video("camera").publish({ enabled: true });
-  const audioPublication = agent.audio("voice").publish({ enabled: true });
+  const incoming = native.data("native-bytes").subscribe();
+  const outgoing = agent.data("browser-bytes").publish();
+  const videoPublication = agent
+    .video("browser-camera")
+    .publish({ enabled: true });
+  const audioPublication = agent
+    .audio("browser-voice")
+    .publish({ enabled: true });
   const videoPipe =
     VideoSource.fromTrack(outgoingVideo).pipeTo(videoPublication);
   const audioPipe =
@@ -66,23 +72,24 @@
     "video",
     video,
     true,
-    fail,
-    fail,
+    fail("video attachment"),
+    fail("video playback"),
   );
   const audioView = attachMedia(
     audioSubscription,
     "audio",
     audio,
     true,
-    fail,
-    fail,
+    fail("audio attachment"),
+    fail("audio playback"),
   );
   let decodedFrame = false;
+  let receivedData = false;
+  let heard = false;
   video.requestVideoFrameCallback(() => (decodedFrame = true));
   try {
     await context.resume();
     agent.join(room);
-    let receivedData = false;
     const receive = (async () => {
       const event = await incoming.next();
       if (!event || !DataEvent.Message.instanceOf(event)) {
@@ -91,12 +98,10 @@
       const data = Array.from(event.inner.data).join(",");
       if (data !== "0,255,9") throw new Error(`unexpected QUIC DATA ${data}`);
       receivedData = true;
-    })().catch(fail);
+    })().catch(fail("DATA receive"));
     const until = Date.now() + 12000;
     let nextData = 0;
-    let heard = false;
     while (Date.now() < until) {
-      if (failure) throw failure;
       if (!monitor && audio.srcObject?.getAudioTracks().length) {
         monitor = context.createMediaStreamSource(audio.srcObject);
         monitor.connect(analyser);
@@ -115,6 +120,7 @@
       }
       if (receivedData && decodedFrame && heard) {
         await receive;
+        if (failure) throw failure;
         return true;
       }
       await new Promise((resolve) => setTimeout(resolve, 20));
@@ -137,7 +143,7 @@
       }
     }
     throw new Error(
-      `QUIC browser proof missing: data=${receivedData} video=${decodedFrame} audio=${heard}; bound=${JSON.stringify({ video: videoSubscription.state().execution, audio: audioSubscription.state().execution, videoSource: videoPublication.state().execution, audioSource: audioPublication.state().execution })}; rtp=${JSON.stringify(rtp)}`,
+      `QUIC browser proof missing: data=${receivedData} video=${decodedFrame} audio=${heard}; error=${failure}; rtp=${JSON.stringify(rtp)}`,
     );
   } finally {
     RTCPeerConnection.prototype.setLocalDescription = setLocalDescription;

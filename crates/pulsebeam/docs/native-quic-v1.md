@@ -33,7 +33,7 @@ Each frame is `length:u32be | kind:u8 | body`. Length includes the kind, not the
 
 ## Datagram bindings
 
-DATA, Opus and H.264 all carry a canonical Fabric packet. Admission exchanges the packet registry revision range, extension capabilities and framing version. Each installed binding selects a profile and agreement. Resolve the association, direction and exact binding incarnation before reassembly, then decode the complete packet under that agreement.
+DATA, Opus and H.264 all carry a canonical Fabric packet. Admission exchanges the packet registry revision range, extension capabilities and framing version. Each installed binding selects a profile and agreement. Logical DATA publications use the SCTP-compatible record shape and do not negotiate packet extensions. Capture timestamps and uncertainty in the DATA record are unchanged. Resolve the association, direction and exact binding incarnation before reassembly, then decode the complete packet under that agreement.
 
 | Kind | Fields after the one-byte kind and two-byte big-endian binding ID |
 | --- | --- |

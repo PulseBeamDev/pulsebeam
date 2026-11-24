@@ -152,7 +152,7 @@ pub async fn witness(
 async fn drive(agent: &mut Agent, browser_done: &Cell<bool>) -> TestResult<()> {
     use pulsebeam_agent_quic::executor::host::{H264SendError, OpusSendError};
     let spec = TrackSpec::Data {
-        track_id: "bytes".into(),
+        track_id: "native-bytes".into(),
         delivery: TopicMode::Ordered,
     };
     let publications = [
@@ -179,11 +179,14 @@ async fn drive(agent: &mut Agent, browser_done: &Cell<bool>) -> TestResult<()> {
         capture_clock: None,
     })?;
     let ResourceResult::Owned { owner } = agent.resource(ResourceCommand::ReceiveData {
-        spec: spec.clone(),
+        spec: TrackSpec::Data {
+            track_id: "browser-bytes".into(),
+            delivery: TopicMode::Ordered,
+        },
         source: TrackSelector {
             room: ROOM.into(),
             participant_id: BROWSER.into(),
-            track_id: "bytes".into(),
+            track_id: "browser-bytes".into(),
         },
     })?
     else {
@@ -245,7 +248,8 @@ async fn drive(agent: &mut Agent, browser_done: &Cell<bool>) -> TestResult<()> {
                     .find(|entry| entry.track_id == track)
                     .map(|entry| entry.id.clone())
             };
-            if let (Some(voice), Some(camera)) = (remote("voice"), remote("camera")) {
+            if let (Some(voice), Some(camera)) = (remote("browser-voice"), remote("browser-camera"))
+            {
                 let revision = snapshot
                     .desired_revision
                     .checked_add(1)

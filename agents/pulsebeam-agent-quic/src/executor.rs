@@ -294,7 +294,7 @@ impl Association {
                         return Err(SubmitError::Data(DatagramAdmission::Full));
                     }
                     let selected = FabricOffer::CURRENT
-                        .bind(peer, Profile::Data, 0)
+                        .bind_publisher(peer, Profile::Data, false)
                         .map_err(|_| SubmitError::Data(DatagramAdmission::Unsupported))?;
                     self.data_senders.insert(
                         send.binding,
