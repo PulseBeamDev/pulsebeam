@@ -85,6 +85,10 @@ pub(crate) trait ParticipantSink {
         source: crate::shard::router::FabricSourceHandle,
         input: crate::rtp::fabric_ingress::MediaIngress,
     );
+    fn media_clock(&self) -> Option<&crate::clock::reference::ShardClock> {
+        None
+    }
+
     fn observe_fabric_sender_report(
         &mut self,
         _source: crate::shard::router::FabricSourceHandle,

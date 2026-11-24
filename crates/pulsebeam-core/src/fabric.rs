@@ -473,6 +473,15 @@ impl<P: AsRef<[u8]>, E: AsRef<[u8]>> FabricPacket<P, E> {
 
     /// Associate the authenticated publisher primary size with this in-process copy.
     /// Neither Fabric wire codec carries this evidence.
+    /// Set the canonical timestamp on a newly admitted endpoint media image,
+    /// before it becomes visible to any branch or repair store.
+    #[must_use]
+    pub fn with_admitted_media_timestamp(mut self, timestamp: u32) -> Self {
+        debug_assert!(self.header.profile != Profile::Data);
+        self.header.timestamp = timestamp;
+        self
+    }
+
     pub fn with_source_protected_bytes(mut self, bytes: NonZeroU16) -> Self {
         self.source_protected_bytes = Some(bytes);
         self

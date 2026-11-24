@@ -3,15 +3,19 @@
 //! [FabricPacket #275 §5.4][rfc]: authenticated binary SCTP messages map 1:1
 //! to logical DATA packets. The WAN projection carries optional DATA v1 DD
 //! as a packet extension rather than in the payload. The Fabric sequence is
-//! assigned on first fragment admission; the timestamp is the low 32 bits of
-//! the unit ID, and M marks only the final fragment. No RTP sampling clock or
-//! ACT is inferred from the unit label, arrival time, or an unqualified clock.
+//! assigned on first fragment admission. Every fragment of a unit keeps the
+//! first admitted 90 kHz time; M marks only the final fragment. Unit identity
+//! and capture metadata remain in the record and do not qualify ACT.
 //!
 //! [rfc]: https://github.com/PulseBeamDev/pulsebeam/issues/275
 
 use core::mem::size_of;
 use std::{collections::BTreeMap, time::Duration};
 
+use pulsebeam_clock::{
+    domain::{ClockDomain, DataCapture, DataReceipt, Provenance, Quality},
+    time::{ClockRate, GlobalDuration, MonotonicTime, SourceTime},
+};
 use pulsebeam_core::fabric::{Extension, ExtensionKind, FabricPacket, Header, Profile, WireError};
 use pulsebeam_proto::{
     data_control::{OriginalDemand, PublisherBinding, SourceUnit},
@@ -305,15 +309,29 @@ impl PublisherSource {
         self.ledger.original_unavailable(fanout, demand, now)
     }
 
+    pub(crate) fn install_capture_reference(
+        &mut self,
+        clock: Clock<'_>,
+        domain: ClockDomain,
+        origin: Instant,
+        host_generation: u64,
+    ) -> bool {
+        self.ledger
+            .install_capture_reference(clock, domain, origin, host_generation)
+    }
+
     pub(crate) fn publish(
         &mut self,
         fanout: &mut SourceFanout,
         bytes: &[u8],
         now: Instant,
         stamp: u32,
+        time: DataTime,
     ) -> Result<super::event::FabricDataPosition, Error> {
         // Protected SCTP DD is not qualified for this binding.
-        let admission = self.ledger.admit_record(fanout, bytes, now, stamp, false)?;
+        let admission = self
+            .ledger
+            .admit_record(fanout, bytes, now, stamp, time, false)?;
         #[cfg(feature = "sim")]
         if let Some(endpoint) = self.reliable_endpoint {
             crate::sim_metrics::record_wan_data_sctp(
@@ -401,6 +419,7 @@ struct PendingOriginal {
 struct OpenUnit {
     id: u64,
     shape: UnitShape,
+    timestamp: u32,
     expires: Instant,
     charge: usize,
     fragments: Box<[Option<u64>]>,
@@ -457,10 +476,73 @@ impl Admission<'_> {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+pub(crate) struct DataTime {
+    fallback: u32,
+    reference: Option<crate::clock::reference::Estimate>,
+}
+
+impl DataTime {
+    pub(crate) fn from_reference(reference: Option<crate::clock::reference::Estimate>) -> Self {
+        let fallback = reference
+            .and_then(|value| ClockRate::DATA.timestamp(value.global).ok())
+            .map_or(0, |tick| tick.0);
+        Self {
+            fallback,
+            reference,
+        }
+    }
+}
+
+/// Calibration belongs to this source incarnation and the record clock bound
+/// at publication. It is installed only from verified source evidence, never
+/// from capture stamps or from sharing an SCTP association.
+struct CaptureReference {
+    domain: ClockDomain,
+    origin: Instant,
+    host_generation: u64,
+}
+
+impl CaptureReference {
+    fn timestamp(&self, capture: (i64, u32), now: Instant, time: DataTime) -> Option<u32> {
+        let reference = time.reference?;
+        if reference.evidence_generation != self.host_generation {
+            return None;
+        }
+        let uncertainty = i64::try_from(reference.uncertainty_ns?).ok()?;
+        let latest = reference
+            .global
+            .checked_add(GlobalDuration::from_nanos(uncertainty))
+            .ok()?;
+        let at = now.checked_duration_since(self.origin)?;
+        let at = MonotonicTime::from_nanos(u64::try_from(at.as_nanos()).ok()?);
+        let projected = self
+            .domain
+            .project_data(
+                Some(DataCapture {
+                    binding: self.domain.binding(),
+                    source: SourceTime::from_nanos(capture.0),
+                    uncertainty_ns: u64::from(capture.1),
+                }),
+                DataReceipt {
+                    at,
+                    latest_global: Some(latest),
+                },
+                at,
+            )
+            .ok()?;
+        (projected.provenance == Provenance::DataCapture
+            && projected.quality == Quality::Synchronized
+            && projected.absolute_uncertainty_ns.is_some())
+        .then_some(projected.rtp.0)
+    }
+}
+
 /// One admitted source incarnation. The binding owner must match the exact
 /// authenticated publish channel before admitting a fragment.
 pub(super) struct Source {
     clock: Option<(Box<str>, u64)>,
+    capture_reference: Option<Box<CaptureReference>>,
     slots: Box<[Slot; WINDOW]>,
     max_seen: Option<u64>,
     next_sequence: u64,
@@ -472,6 +554,29 @@ pub(super) struct Source {
 }
 
 impl Source {
+    fn install_capture_reference(
+        &mut self,
+        clock: Clock<'_>,
+        domain: ClockDomain,
+        origin: Instant,
+        host_generation: u64,
+    ) -> bool {
+        if self.fenced
+            || !self
+                .clock
+                .as_ref()
+                .is_some_and(|(id, epoch)| id.as_ref() == clock.id && *epoch == clock.epoch)
+        {
+            return false;
+        }
+        self.capture_reference = Some(Box::new(CaptureReference {
+            domain,
+            origin,
+            host_generation,
+        }));
+        true
+    }
+
     fn new(clock: Option<Clock<'_>>) -> Self {
         let clock: Option<(Box<str>, u64)> = clock.map(|value| (Box::from(value.id), value.epoch));
         let charged = size_of::<Self>()
@@ -479,6 +584,7 @@ impl Source {
             .saturating_add(clock.as_ref().map_or(0, |(id, _)| id.len()));
         Self {
             clock,
+            capture_reference: None,
             slots: Box::new(core::array::from_fn(|_| Slot::Empty)),
             max_seen: None,
             next_sequence: 0,
@@ -625,6 +731,7 @@ impl Source {
         bytes: &[u8],
         now: Instant,
         ingress_ntp32: u32,
+        time: DataTime,
         allow_descriptor: bool,
     ) -> Result<Admission<'a>, Error> {
         if self.fenced {
@@ -654,6 +761,9 @@ impl Source {
         };
         let header = record.header();
         let shape = UnitShape::from(header);
+        let capture = header
+            .capture
+            .and_then(|capture| Some((capture.nanos, capture.uncertainty_ns?)));
         let marker = record.final_fragment();
         let unit_id = header.unit_seq;
         let fragment_index = header.index;
@@ -667,7 +777,7 @@ impl Source {
         }
         let slot = slot_index(unit_id)?;
         let current = self.slots.get(slot).ok_or(Error::Sequence)?;
-        let is_new = match current {
+        let (is_new, timestamp) = match current {
             Slot::Closed(id) if *id == unit_id => return Err(Error::Expired),
             Slot::Open(unit) if unit.id == unit_id => {
                 if let Some(sequence) = unit.fragments.get(index).and_then(Option::as_ref) {
@@ -682,9 +792,18 @@ impl Source {
                     self.close(fanout, slot);
                     return Err(Error::UnitConflict);
                 }
-                false
+                (false, unit.timestamp)
             }
-            _ => true,
+            _ => (
+                true,
+                capture
+                    .and_then(|capture| {
+                        self.capture_reference
+                            .as_ref()?
+                            .timestamp(capture, now, time)
+                    })
+                    .unwrap_or(time.fallback),
+            ),
         };
 
         let (old_floor, new_floor) = self.floors(unit_id);
@@ -727,7 +846,7 @@ impl Source {
             Header {
                 profile: Profile::Data,
                 sequence: low32(sequence),
-                timestamp: low32(unit_id),
+                timestamp,
                 marker,
                 ingress_ntp32,
             },
@@ -748,6 +867,7 @@ impl Source {
             *entry = Slot::Open(Box::new(OpenUnit {
                 id: unit_id,
                 shape,
+                timestamp,
                 expires,
                 charge: unit_charge,
                 fragments: (0..shape.fragments).map(|_| None).collect(),
@@ -899,8 +1019,7 @@ fn project_record<'data, 'clock>(
     }
     let record =
         Record::decode_without_descriptor(packet.payload(), clock).map_err(Error::Record)?;
-    if header.timestamp != low32(record.header().unit_seq)
-        || header.marker != record.final_fragment()
+    if header.marker != record.final_fragment()
         || repair.is_some_and(|repair| {
             repair.unit_seq != record.header().unit_seq || repair.index != record.header().index
         })

@@ -1,6 +1,8 @@
 //! Clock evidence scoped to authenticated publisher admission. An SR describes
 //! the publisher's NTP coordinate, not the receiver's global reference.
 
+use std::collections::{HashMap, VecDeque};
+
 use pulsebeam_clock::{
     Error,
     domain::{
@@ -15,6 +17,7 @@ const NTP_ERA_SECONDS: i128 = 4_294_967_296;
 const NTP_TO_UNIX_SECONDS: i128 = 2_208_988_800;
 const EVIDENCE_AGE_NS: u64 = 10_000_000_000;
 const REORDER_NS: u64 = 2_000_000_000;
+const ASSIGNED_SAMPLES: usize = 256;
 // A report clock can be offset from UTC, but a far-off epoch doesn't qualify
 // an initial era. Forward using arrival cadence if it cannot be unfolded.
 const ERA_BOOTSTRAP_WINDOW_SECONDS: u128 = 86_400 * 365;
@@ -55,6 +58,9 @@ struct EncodingClock {
     frontier: Option<TimedTick>,
     pending_report: Option<pulsebeam_rtc::SenderReport>,
     last_report: Option<(MonotonicTime, SourceTime)>,
+    assigned: HashMap<u32, u32>,
+    assigned_order: VecDeque<(Instant, u32)>,
+    latest_assignment: Option<(Instant, u32, u32)>,
 }
 
 impl PublisherClock {
@@ -82,8 +88,13 @@ impl PublisherClock {
                     .ok()?;
                 Some((report, at, global))
             });
+        // The first packet can already be in the receive queue when discovery
+        // completes. Reserve only the admission/repair window, not an old era.
+        let slack = pulsebeam_runtime::time::Duration::from_millis(120);
         let (origin, global) =
             earlier.map_or((now, reference.global), |(_, at, global)| (at, global));
+        let origin = origin.checked_sub(slack).ok_or(Error::Overflow)?;
+        let global = global.checked_add(GlobalDuration::from_nanos(-120_000_000))?;
         let mut clock =
             Self::with_verified_members(binding, &[(primary_ssrc, rate)], origin, global)?;
         clock.sync_host_reference(now, Some(reference));
@@ -128,6 +139,9 @@ impl PublisherClock {
                 frontier: None,
                 pending_report: None,
                 last_report: None,
+                assigned: HashMap::with_capacity(ASSIGNED_SAMPLES),
+                assigned_order: VecDeque::with_capacity(ASSIGNED_SAMPLES),
+                latest_assignment: None,
             });
         }
         Ok(Self {
@@ -177,7 +191,86 @@ impl PublisherClock {
         Ok(())
     }
 
-    pub(crate) fn media(
+    /// Assign once per source sample. The bounded sample cache is independent
+    /// of sequence identity: several packets and repairs can name one sample.
+    pub(crate) fn assign(&mut self, slot: usize, raw: u32, arrival: Instant, now: Instant) -> u32 {
+        let Some(track) = self.encodings.get_mut(slot) else {
+            return 0;
+        };
+        let retention = pulsebeam_runtime::time::Duration::from_nanos(REORDER_NS);
+        while let Some(&(assigned_at, oldest)) = track.assigned_order.front() {
+            if now.saturating_duration_since(assigned_at) <= retention {
+                break;
+            }
+            track.assigned_order.pop_front();
+            track.assigned.remove(&oldest);
+        }
+        if let Some(timestamp) = track.assigned.get(&raw) {
+            return *timestamp;
+        }
+        let recovered = self
+            .media(slot, raw, arrival, now)
+            .ok()
+            .map(|time| time.rtp.0);
+        let Some(track) = self.encodings.get_mut(slot) else {
+            return 0;
+        };
+        let timestamp = recovered.unwrap_or_else(|| {
+            if let Some((previous_at, previous_raw, previous_timestamp)) = track.latest_assignment {
+                // An ambiguous or physically implausible source jump cannot
+                // move the admitted cadence by half an RTP wrap.
+                let delta = raw.wrapping_sub(previous_raw);
+                let age = arrival.saturating_duration_since(previous_at).as_nanos();
+                let expected = age
+                    .saturating_mul(u128::from(track.track.rate.hz()))
+                    .div_euclid(1_000_000_000);
+                let tolerance = u128::from(REORDER_NS)
+                    .saturating_mul(u128::from(track.track.rate.hz()))
+                    .div_euclid(1_000_000_000);
+                if u128::from(delta).abs_diff(expected) <= tolerance {
+                    previous_timestamp.wrapping_add(delta)
+                } else {
+                    let cadence =
+                        u32::try_from(expected.rem_euclid(1u128 << 32)).unwrap_or_default();
+                    previous_timestamp.wrapping_add(cadence)
+                }
+            } else {
+                use pulsebeam_clock::time::GlobalDuration;
+                let signed_age = if let Some(age) = arrival.checked_duration_since(self.origin) {
+                    i64::try_from(age.as_nanos()).unwrap_or(i64::MAX)
+                } else {
+                    i64::try_from(self.origin.saturating_duration_since(arrival).as_nanos())
+                        .unwrap_or(i64::MAX)
+                        .saturating_neg()
+                };
+                let arrival_time = self
+                    .global_origin
+                    .checked_add(GlobalDuration::from_nanos(signed_age))
+                    .unwrap_or(self.global_origin);
+                track
+                    .track
+                    .rate
+                    .timestamp(arrival_time)
+                    .map_or(0, |timestamp| timestamp.0)
+            }
+        });
+        if track.assigned_order.len() == ASSIGNED_SAMPLES
+            && let Some((_, oldest)) = track.assigned_order.pop_front()
+        {
+            track.assigned.remove(&oldest);
+        }
+        track.assigned_order.push_back((now, raw));
+        track.assigned.insert(raw, timestamp);
+        if track
+            .latest_assignment
+            .is_none_or(|(previous, _, _)| arrival >= previous)
+        {
+            track.latest_assignment = Some((arrival, raw, timestamp));
+        }
+        timestamp
+    }
+
+    fn media(
         &mut self,
         slot: usize,
         residue: u32,

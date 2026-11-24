@@ -1366,7 +1366,17 @@ impl ShardExecution {
         &mut self,
         source: FabricSourceHandle,
         publisher: ParticipantHandle,
+        ingress: crate::rtp::fabric_ingress::RtpIngressShadow,
+    ) -> bool {
+        self.attach_fabric_ingress_at(source, publisher, ingress, Instant::now())
+    }
+
+    fn attach_fabric_ingress_at(
+        &mut self,
+        source: FabricSourceHandle,
+        publisher: ParticipantHandle,
         mut ingress: crate::rtp::fabric_ingress::RtpIngressShadow,
+        now: Instant,
     ) -> bool {
         let Some(publication) = self.runtime.local_fabric_publication(source, publisher) else {
             return false;
@@ -1374,7 +1384,6 @@ impl ShardExecution {
         let Some(identity) = ingress.take_identity() else {
             return false;
         };
-        let now = Instant::now();
         let reference = self.global_clock.as_mut()
             .and_then(|clock| clock.now(now))
             .map(|estimate| (now, estimate));
@@ -3535,6 +3544,9 @@ impl ShardExecution {
         debug_assert!(budget > 0);
         debug_assert!(self.udp_send_batch.is_empty());
         self.dirty.begin_phase();
+        let data_time = crate::participant::data_fabric::DataTime::from_reference(
+            self.global_clock.as_mut().and_then(|clock| clock.now(now)),
+        );
         let mut processed = 0;
         while processed < budget {
             let Some(key) = self.dirty.next() else {
@@ -3551,6 +3563,8 @@ impl ShardExecution {
                 handle: key,
             };
             let mut sink = self.pipeline.polling_sink(who, &mut self.runtime);
+            sink.data_time = data_time;
+            sink.media_clock = self.global_clock.as_ref();
             if let Some(deadline) = participant.poll(now, &mut sink) {
                 self.timers.schedule(key, deadline);
             }

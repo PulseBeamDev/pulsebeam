@@ -535,6 +535,13 @@ impl RtcDriver {
             }
         }
     }
+    pub(super) fn set_sender_report_time(&mut self, clock: &crate::clock::reference::ShardClock) {
+        let at = self.rtc_clock.into_std();
+        if self.rtc.sender_report_due(at) {
+            self.rtc.set_sender_report_time(at, clock.sender_report_time(self.rtc_clock));
+        }
+    }
+
     pub(super) fn poll_output(
         &mut self,
         observer: Option<&mut AuthenticatedIngressObserver<'_>>,

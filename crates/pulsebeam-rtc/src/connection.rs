@@ -1034,6 +1034,16 @@ impl RtcConnection {
             })
     }
 
+    pub fn sender_report_due(&self, at: Instant) -> bool {
+        self.egress.sender_report_due(at)
+    }
+
+    /// Supply the caller's authoritative report instant for the next poll at `at`.
+    /// An unrepresentable UTC label (`None`) defers RTCP without deferring RTP.
+    pub fn set_sender_report_time(&mut self, at: Instant, time: Option<crate::SenderReportTime>) {
+        self.egress.set_sender_report_time(at, time);
+    }
+
     /// Performs one bounded service turn and returns an owned value.
     /// Callers may collect a bounded batch, then must service it promptly before
     /// requesting more finalized work. Budget exhaustion needs an immediate

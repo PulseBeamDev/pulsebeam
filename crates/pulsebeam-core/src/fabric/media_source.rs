@@ -105,6 +105,7 @@ struct Entry {
 }
 
 struct CopyEvidence {
+    source_timestamp: u32,
     primary_presence: Option<u16>,
     additional_values: Vec<(ExtensionKind, Box<[u8]>)>,
 }
@@ -377,6 +378,7 @@ impl MediaIdentity {
             Entry {
                 admitted_at: arrival,
                 media: packet.as_ref().map(|packet| CopyEvidence {
+                    source_timestamp: packet.header().timestamp,
                     primary_presence: primary.then(|| presence(packet.extensions())),
                     additional_values: Vec::new(),
                 }),
@@ -402,7 +404,7 @@ impl CopyEvidence {
         let original = retained.header();
         let header = copy.header();
         if original.profile != header.profile
-            || original.timestamp != header.timestamp
+            || self.source_timestamp != header.timestamp
             || original.marker != header.marker
             || retained.payload() != copy.payload()
         {

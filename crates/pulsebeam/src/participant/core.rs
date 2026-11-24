@@ -1986,6 +1986,9 @@ impl Connection {
         now: Instant,
         events: &mut impl ParticipantSink,
     ) -> TransportPollOutput {
+        if let Some(clock) = events.media_clock() {
+            self.transport.set_sender_report_time(clock);
+        }
         if self.media_ingress.is_empty() || !self.media_ingress_authorized() {
             return self.transport.poll_output(None);
         }

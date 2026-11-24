@@ -374,6 +374,18 @@ impl FabricRtpFixture {
         }
     }
 
+    pub(crate) fn attach_publisher_ingress_with_clock(
+        &mut self,
+        ingress: crate::rtp::fabric_ingress::RtpIngressShadow,
+        at: Instant,
+        global: pulsebeam_clock::time::GlobalInstant,
+    ) -> bool {
+        let (source, publisher) = (self.binding().source, self.publisher);
+        let execution = self.publisher_execution();
+        execution.global_clock = Some(crate::clock::reference::ShardClock::fixture(at, global));
+        execution.attach_fabric_ingress_at(source, publisher, ingress, at)
+    }
+
     fn binding(&self) -> FixtureRtpBinding {
         self.binding.expect("fixture publication is routed")
     }
@@ -851,7 +863,7 @@ impl FabricRtpFixture {
         crate::shard::events::PipelineSinkRef<'_>,
     ) {
         let receiver = execution.registry.resolve_mut(handle).unwrap();
-        let sink = execution.pipeline.polling_sink(
+        let mut sink = execution.pipeline.polling_sink(
             crate::shard::events::ParticipantBinding {
                 participant_id: receiver.participant_id,
                 connection_id: receiver.connection_id,
@@ -859,6 +871,7 @@ impl FabricRtpFixture {
             },
             &mut execution.runtime,
         );
+        sink.media_clock = execution.global_clock.as_ref();
         (receiver, sink)
     }
 

@@ -1948,7 +1948,11 @@ impl ShardRuntime {
             |arrival, timestamp| {
                 if let Some(clock) = clock {
                     clock.sync_host_reference(now, reference);
-                    let _ = clock.media(0, timestamp, arrival, now);
+                    clock.assign(0, timestamp, arrival, now)
+                } else {
+                    // Standalone shard fixtures may omit the node clock.
+                    // Never export an endpoint RTP coordinate as canonical.
+                    0
                 }
             },
         )? else {

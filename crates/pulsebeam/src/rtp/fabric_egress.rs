@@ -482,6 +482,7 @@ impl EndpointHints {
         let clock = RtpClockAnchor {
             timestamp: output.anchor_timestamp,
             wallclock: output.wallclock,
+            canonical_offset: output.canonical_offset,
         };
         let write = RtpWrite {
             sequence: output.sequence,

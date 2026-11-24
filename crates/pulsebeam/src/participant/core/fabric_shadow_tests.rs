@@ -80,7 +80,6 @@ struct Pair {
     refresh: Vec<str0m::media::KeyframeRequest>,
     output_form: Option<pulsebeam_rtc::RtpExtensionForm>,
     rtp_loss: Option<RtpLoss>,
-    protocol_clock: net::ReceiveTime,
     #[cfg(feature = "transport-conformance")]
     udp: Option<ScopedTestUdp>,
 }
@@ -472,7 +471,6 @@ fn endpoint_pair_at(
         refresh: Vec::new(),
         output_form,
         rtp_loss: None,
-        protocol_clock: clock,
         #[cfg(feature = "transport-conformance")]
         udp: None,
     };
@@ -3637,11 +3635,17 @@ fn installed_fabric_branch_projects_authenticated_rtp_without_waiting_for_holes(
         .slot_for_mid(publisher_leg)
         .unwrap();
     shard.use_negotiated_publication(publication, None);
-    assert!(shard.attach_publisher_ingress(ingress.unwrap()));
+    let clock_origin = publisher.clock.monotonic;
+    let canonical_ns = 1_700_000_000_000_000_000_i64;
+    assert!(shard.attach_publisher_ingress_with_clock(
+        ingress.unwrap(),
+        clock_origin,
+        pulsebeam_clock::time::GlobalInstant::from_nanos(canonical_ns),
+    ));
     assert!(shard.bind_output(leg, source));
     let (mailbox_control, mut mailbox) = shard.bind_publisher_mailbox(publisher.clock.monotonic);
     let mut frames = Vec::new();
-    let mut first_anchor = None;
+    let mut first_timestamp = None;
     for (index, (sequence, timestamp, marker, output_sequence, output_timestamp)) in [
         (100_u32, 1000_u32, false, 500_u16, 1500_u32),
         (102, 1600, true, 502, 2100),
@@ -3666,12 +3670,17 @@ fn installed_fabric_branch_projects_authenticated_rtp_without_waiting_for_holes(
         };
         assert_eq!(offer.sequence, u64::from(sequence));
         assert_eq!(offer.packet.header().marker, marker);
-        assert_eq!(offer.packet.header().timestamp, timestamp);
+        let origin = *first_timestamp.get_or_insert_with(|| {
+            let elapsed = offer.arrival.duration_since(clock_origin).as_nanos();
+            let ticks = (u128::try_from(canonical_ns).unwrap() + elapsed) * 48_000 / 1_000_000_000;
+            u32::try_from(ticks % (1u128 << 32)).unwrap()
+        });
+        assert_ne!(origin, 1000);
+        assert_eq!(offer.packet.header().timestamp, origin.wrapping_add(timestamp - 1000));
         assert_eq!(offer.packet.payload(), opaque);
         assert_eq!(offer.packet.remaining_hops(), 7);
         let now = publisher.clock.monotonic;
         pair.clock.monotonic = now;
-        first_anchor.get_or_insert(now);
         for _ in 0..200 {
             pair.step_receiver(&mut shard);
             if pair.received.len() > index {
@@ -3697,7 +3706,8 @@ fn installed_fabric_branch_projects_authenticated_rtp_without_waiting_for_holes(
         pair.step_receiver(&mut shard);
     }
     let now = pair.clock.monotonic;
-    shard.offer(now, now, 103, packet(103, 1900, false));
+    let origin = first_timestamp.unwrap();
+    shard.offer(now, now, 103, packet(103, origin.wrapping_add(900), false));
     shard.write(now, &mut leg, source);
     pair.stage_receiver_handoff(&mut shard);
     shard.submit_receiver(|offered| {
@@ -3712,7 +3722,7 @@ fn installed_fabric_branch_projects_authenticated_rtp_without_waiting_for_holes(
     // The old epoch reserves a future timestamp. Revoke the branch after
     // protection and batching, but before the socket sees the datagram.
     let now = pair.clock.monotonic;
-    shard.offer(now, now, 104, packet(104, 200_000, false));
+    shard.offer(now, now, 104, packet(104, origin.wrapping_add(199_000), false));
     shard.write(now, &mut leg, source);
     pair.stage_receiver_handoff(&mut shard);
     let replacement = shard.replace_source();
@@ -3723,7 +3733,7 @@ fn installed_fabric_branch_projects_authenticated_rtp_without_waiting_for_holes(
     );
     let cut_at = pair.clock.monotonic;
     leg.stage_branch(replacement);
-    shard.offer(cut_at, cut_at, 4, packet(4, 800, true));
+    shard.offer(cut_at, cut_at, 4, packet(4, origin.wrapping_add(800), true));
     shard.write(cut_at, &mut leg, source);
     for _ in 0..1100 {
         pair.step_receiver(&mut shard);
@@ -3738,7 +3748,7 @@ fn installed_fabric_branch_projects_authenticated_rtp_without_waiting_for_holes(
     assert_eq!(old_report.sender_packet_count, 3);
 
     let now = pair.clock.monotonic;
-    shard.offer(now, now, 5, packet(5, 1280, false));
+    shard.offer(now, now, 5, packet(5, origin.wrapping_add(1280), false));
     shard.write(now, &mut leg, source);
     for _ in 0..200 {
         pair.step_receiver(&mut shard);
@@ -3751,23 +3761,18 @@ fn installed_fabric_branch_projects_authenticated_rtp_without_waiting_for_holes(
     let new_report = probe.last_sender_info.expect("report after cut");
     assert_eq!(new_report.sender_packet_count, 4);
     assert_eq!(old_report.ssrc, new_report.ssrc);
-    let check_report = |rtp: u64, wall: SystemTime, anchor_rtp, anchor_at: Instant| {
-        let clock = pair.protocol_clock;
-        let wall_at_anchor = clock.wall + anchor_at.duration_since(clock.monotonic);
-        let elapsed = wall.duration_since(wall_at_anchor).unwrap();
-        let ticks = u64::try_from(elapsed.as_nanos() * 48_000 / 1_000_000_000).unwrap();
-        assert!(rtp.abs_diff(anchor_rtp + ticks) <= 1);
+    let check_report = |rtp: u64, wall: SystemTime, anchor_rtp: u32, canonical: u32| {
+        let utc = wall.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
+        let elapsed_tai = utc + 37_000_000_000 - 8_000_082_000;
+        let ticks = u32::try_from((elapsed_tai * 48_000 / 1_000_000_000) % (1u128 << 32)).unwrap();
+        let expected = ticks.wrapping_add(anchor_rtp.wrapping_sub(canonical));
+        assert!(u32::try_from(rtp).unwrap().abs_diff(expected) <= 1);
     };
-    check_report(
-        old_report.rtp_time.numer(),
-        old_report.ntp_time,
-        1500,
-        first_anchor.unwrap(),
-    );
+    check_report(old_report.rtp_time.numer(), old_report.ntp_time, 1500, origin);
     check_report(
         new_report.rtp_time.numer(),
         new_report.ntp_time,
-        cut_timestamp,
-        cut_at,
+        u32::try_from(cut_timestamp).unwrap(),
+        origin.wrapping_add(800),
     );
 }

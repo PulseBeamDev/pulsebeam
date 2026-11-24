@@ -75,6 +75,26 @@ fn unqualified_arrival_cadence_crosses_rtp_wrap_without_source_evidence() {
 }
 
 #[test]
+fn assigned_samples_survive_reorder_and_holdover_without_exporting_sender_ticks() {
+    let at = Instant::now();
+    let mut clock = clock(at, 2, 1);
+    let a = clock.assign(0, 200, at, at);
+    let next = at + Duration::from_millis(20);
+    let b = clock.assign(0, 2_000, next, next);
+    assert_ne!(a, 200);
+    assert_eq!(b.wrapping_sub(a), 1_800);
+    clock.host_reference(next, 1, false).unwrap();
+    let later = next + Duration::from_millis(15);
+    assert_eq!(clock.assign(0, 200, later, later), a);
+    assert_eq!(clock.assign(0, 2_000, later, later), b);
+    let unknown = 0x8000_07d0;
+    assert_eq!(
+        clock.assign(0, unknown, later, later),
+        b.wrapping_add(1_350)
+    );
+}
+
+#[test]
 fn verified_members_share_a_domain_but_keep_independent_rtp_coordinates() {
     let at = Instant::now();
     let binding = Binding {

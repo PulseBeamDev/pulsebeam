@@ -29,6 +29,7 @@ pub struct Input {
 pub struct Projected {
     pub sequence: u64,
     pub timestamp: u32,
+    pub canonical_offset: u32,
     pub anchor_timestamp: u64,
     pub wallclock: Instant,
 }
@@ -108,25 +109,30 @@ impl<B: Copy + Eq> Timeline<B> {
                     .sequence_high
                     .checked_add(2)
                     .ok_or(Rejected::IndexExhausted)?;
-                let duration = now
-                    .checked_duration_since(previous.wallclock)
-                    .ok_or(Rejected::Clock)?;
-                let ticks = duration
-                    .as_nanos()
-                    .saturating_mul(u128::from(self.clock_rate))
-                    / 1_000_000_000;
-                let extrapolated = previous
-                    .anchor_timestamp
-                    .checked_add(u64::try_from(ticks).map_err(|_| Rejected::Clock)?)
-                    .ok_or(Rejected::Clock)?;
-                let sr_floor = transmitted
-                    .sender_report
-                    .map_or(extrapolated, |sr| sr.max(extrapolated));
+                if now < previous.wallclock {
+                    return Err(Rejected::Clock);
+                }
                 let media_floor = self
                     .timestamp_high
                     .checked_add(self.sample_interval)
                     .ok_or(Rejected::Clock)?;
-                start_epoch(source, input, reserved_gap, sr_floor.max(media_floor), now)
+                let floor = transmitted
+                    .sender_report
+                    .map_or(media_floor, |sr| sr.max(media_floor));
+                // The input is already in the global sample coordinate. If
+                // the old offset puts it behind a committed floor, splice at
+                // that floor instead of restarting an arrival-based mapper.
+                let continuous = unwrap_timestamp(
+                    input.timestamp.wrapping_add(previous.timestamp_offset),
+                    floor,
+                );
+                start_epoch(
+                    source,
+                    input,
+                    reserved_gap,
+                    continuous.map_or(floor, |time| time.max(floor)),
+                    now,
+                )
             }
             None if !cut => {
                 start_epoch(source, input, self.sequence_high, self.timestamp_high, now)
@@ -167,6 +173,7 @@ impl<B: Copy + Eq> Timeline<B> {
             Projected {
                 sequence,
                 timestamp,
+                canonical_offset: epoch.timestamp_offset,
                 anchor_timestamp: epoch.anchor_timestamp,
                 wallclock: epoch.wallclock,
             },

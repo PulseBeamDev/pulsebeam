@@ -76,6 +76,7 @@ pub(crate) struct MediaEgress {
     bandwidth_estimate: u64,
     desired_bitrate: u64,
     clock: ProtocolClock,
+    sender_report_time: Option<(Instant, Option<crate::SenderReportTime>)>,
     estimate_changed: Option<MediaPayloadBitrate>,
     next_rtcp: Instant,
     rtcp_cursor: u64,
@@ -114,6 +115,7 @@ struct Sender {
     rtx_ssrc: u32,
     next_rtx_sequence: u64,
     latest_rtp: Option<(u64, Instant)>,
+    canonical_offset: Option<u32>,
     media_scope: Option<crate::MediaScope>,
     scope_retired: bool,
     highest_sequence: Option<u64>,
@@ -259,6 +261,7 @@ impl MediaEgress {
                         rtx_ssrc,
                         next_rtx_sequence: u64::from(rtx_sequence),
                         latest_rtp: None,
+                        canonical_offset: None,
                         media_scope: None,
                         scope_retired: false,
                         highest_sequence: None,
@@ -346,6 +349,7 @@ impl MediaEgress {
             bandwidth_estimate: 0,
             desired_bitrate: 0,
             clock,
+            sender_report_time: None,
             estimate_changed: None,
             next_rtcp: accepted_at
                 .checked_add(Duration::from_secs(1))
@@ -774,6 +778,7 @@ impl MediaEgress {
                     rtx_ssrc: encoding.repair.unwrap_or(fallback_repair),
                     next_rtx_sequence: u64::from(rtx_sequence),
                     latest_rtp: None,
+                    canonical_offset: None,
                     media_scope: None,
                     scope_retired: false,
                     highest_sequence: None,
@@ -1573,6 +1578,7 @@ impl MediaEgress {
                 }
                 state.scope_retired = false;
                 state.media_scope = queued.scope;
+                state.canonical_offset = queued.clock.map(|clock| clock.canonical_offset);
                 state.latest_rtp = Some(queued.clock.map_or_else(
                     || (u64::from(queued.media.timestamp), queued.media.wallclock),
                     |clock| (clock.timestamp, clock.wallclock),
@@ -2279,6 +2285,14 @@ impl MediaEgress {
         Some(result)
     }
 
+    pub(crate) fn sender_report_due(&self, at: Instant) -> bool {
+        at >= self.next_rtcp && !self.rtcp_senders.is_empty()
+    }
+
+    pub(crate) fn set_sender_report_time(&mut self, at: Instant, time: Option<crate::SenderReportTime>) {
+        self.sender_report_time = Some((at, time));
+    }
+
     fn prepare_rtcp(&mut self, at: Instant, transport: &mut Transport) -> Option<PrepareResult> {
         let &sender_index = self
             .rtcp_senders
@@ -2289,7 +2303,16 @@ impl MediaEgress {
             .next()
             .or_else(|| self.rtcp_senders.first())?;
         let sender = self.senders.get(&sender_index)?;
-        let (timestamp, packet) = sender_report(sender, at, &self.clock)?;
+        let projected = match self.sender_report_time {
+            Some((observed, Some(time))) if observed == at => canonical_report(sender, time),
+            Some(_) => None,
+            None => sender_report(sender, at, &self.clock),
+        };
+        let Some((timestamp, packet)) = projected else {
+            self.rtcp_cursor = sender_index;
+            self.next_rtcp = at.checked_add(Duration::from_secs(1)).unwrap_or(at);
+            return None;
+        };
         match transport.send_rtcp(&packet) {
             Ok(()) => {
                 self.rtcp_cursor = sender_index;
@@ -2738,6 +2761,37 @@ fn sender_report(sender: &Sender, at: Instant, clock: &ProtocolClock) -> Option<
         / 1_000_000_000;
     let timestamp = rtp.checked_add(u64::try_from(ticks).ok()?)?;
     let (seconds, fraction) = clock.ntp(at);
+    encode_sender_report(sender, timestamp, seconds, fraction)
+}
+
+fn canonical_report(sender: &Sender, time: crate::SenderReportTime) -> Option<(u64, Vec<u8>)> {
+    let (epoch_rtp, _) = sender.latest_rtp?;
+    let offset = sender.canonical_offset?;
+    let canonical = match sender.facts.clock_rate {
+        48_000 => time.opus_rtp,
+        90_000 => time.video_rtp,
+        _ => return None,
+    };
+    let wire = canonical.wrapping_add(offset);
+    let floor = sender.highest_sender_report.unwrap_or(epoch_rtp).max(epoch_rtp);
+    let delta = wire.wrapping_sub(wire_u32(floor));
+    if delta == 1 << 31 {
+        return None;
+    }
+    let delta = i32::from_ne_bytes(delta.to_ne_bytes());
+    let timestamp = floor.checked_add_signed(i64::from(delta))?;
+    if sender.highest_sender_report.is_some_and(|previous| timestamp < previous) {
+        return None;
+    }
+    encode_sender_report(sender, timestamp, time.ntp_seconds, time.ntp_fraction)
+}
+
+fn encode_sender_report(
+    sender: &Sender,
+    timestamp: u64,
+    seconds: u32,
+    fraction: u32,
+) -> Option<(u64, Vec<u8>)> {
     let mut packet = vec![0x80, 200, 0, 6];
     packet.extend_from_slice(&sender.ssrc.to_be_bytes());
     packet.extend_from_slice(&seconds.to_be_bytes());
@@ -4354,6 +4408,27 @@ mod tests {
             egress.poll_event().is_none(),
             "a delayed old report cannot reverse progress"
         );
+    }
+
+    #[test]
+    fn canonical_sender_report_projects_the_committed_offset_across_wrap() {
+        let start = Instant::now();
+        let mut egress = audio_egress(start);
+        let sender = egress.senders.values_mut().next().unwrap();
+        sender.latest_rtp = Some((u64::from(u32::MAX) - 5, start));
+        sender.canonical_offset = Some(u32::MAX - 8);
+        sender.highest_sender_report = Some(u64::from(u32::MAX) - 5);
+        let time = crate::SenderReportTime {
+            opus_rtp: 12,
+            video_rtp: 22,
+            ntp_seconds: 0,
+            ntp_fraction: 0x8000_0000,
+        };
+        let (extended, wire) = canonical_report(sender, time).unwrap();
+        assert_eq!(extended, (1u64 << 32) + 3);
+        assert_eq!(&wire[8..20], &[0, 0, 0, 0, 128, 0, 0, 0, 0, 0, 0, 3]);
+        sender.highest_sender_report = Some(extended + 1);
+        assert!(canonical_report(sender, time).is_none());
     }
 
     #[test]

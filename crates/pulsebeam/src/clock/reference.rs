@@ -191,7 +191,7 @@ pub(crate) struct Snapshot {
     policy_generation: u64,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Estimate {
     pub(crate) global: GlobalInstant,
     pub(crate) uncertainty_ns: Option<u64>,
@@ -248,6 +248,23 @@ pub(crate) struct ShardClock {
 }
 
 impl ShardClock {
+    #[cfg(test)]
+    pub(crate) fn fixture(at: Instant, global: GlobalInstant) -> Self {
+        let policy = Policy::new(
+            UtcSecond(1_483_228_800),
+            UtcSecond(4_102_444_800),
+            37,
+            Vec::new(),
+        )
+        .unwrap();
+        let sample = Sample {
+            at,
+            global,
+            error_ns: None,
+        };
+        Self::new(Authority::start(policy, sample).snapshot)
+    }
+
     pub(crate) fn new(snapshot: Snapshot) -> Self {
         Self {
             snapshot,
@@ -257,6 +274,32 @@ impl ShardClock {
 
     pub(crate) fn update(&mut self, snapshot: Snapshot) {
         self.snapshot = snapshot;
+    }
+
+    pub(crate) fn sender_report_time(
+        &self,
+        at: Instant,
+    ) -> Option<pulsebeam_rtc::SenderReportTime> {
+        let estimate = self.snapshot.at(at)?;
+        use pulsebeam_clock::{ntp::OutgoingRtp, time::ClockRate};
+        let opus = OutgoingRtp {
+            rate: ClockRate::OPUS,
+            modular_offset: 0,
+        }
+        .sender_report_pair(estimate.global, self.snapshot.policy.rules())
+        .ok()?;
+        let video = OutgoingRtp {
+            rate: ClockRate::VIDEO,
+            modular_offset: 0,
+        }
+        .timestamp(estimate.global)
+        .ok()?;
+        Some(pulsebeam_rtc::SenderReportTime {
+            opus_rtp: opus.rtp.0,
+            video_rtp: video.0,
+            ntp_seconds: opus.ntp.timestamp.seconds,
+            ntp_fraction: opus.ntp.timestamp.fraction,
+        })
     }
 
     pub(crate) fn now(&mut self, now: Instant) -> Option<Estimate> {

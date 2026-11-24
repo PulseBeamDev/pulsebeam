@@ -1403,7 +1403,7 @@ impl SourceFanout {
         now: Instant,
         input: &crate::rtp::fabric_ingress::MediaIngress,
         peer_repair: bool,
-        observe_sample: impl FnOnce(Instant, u32),
+        assign_timestamp: impl FnOnce(Instant, u32) -> u32,
     ) -> Result<Option<(u64, u8, Offers)>, Rejection> {
         if self.fenced {
             return Err(Rejection::Fenced);
@@ -1449,12 +1449,13 @@ impl SourceFanout {
         else {
             return Ok(None);
         };
-        if let Some(packet) = &original {
-            observe_sample(Instant::from_std(arrival), packet.header().timestamp);
-        }
-        let original = original.map(|packet| match input.protected_bytes {
-            Some(bytes) => packet.with_source_protected_bytes(bytes),
-            None => packet,
+        let original = original.map(|packet| {
+            let timestamp = assign_timestamp(Instant::from_std(arrival), packet.header().timestamp);
+            let packet = packet.with_admitted_media_timestamp(timestamp);
+            match input.protected_bytes {
+                Some(bytes) => packet.with_source_protected_bytes(bytes),
+                None => packet,
+            }
         });
         let report = self.offer_from(
             now,

@@ -160,6 +160,8 @@ fn identity_retries_require_the_owners_exact_retained_original() {
         panic!("first admission did not transfer an original");
     };
     assert_eq!(sequence, 5);
+    let original = original.with_admitted_media_timestamp(0x8675_3090);
+    assert_eq!(original.header().timestamp, 0x8675_3090);
     let later = now + Duration::from_millis(1);
     assert!(matches!(
         identity.admit(
@@ -179,7 +181,7 @@ fn identity_retries_require_the_owners_exact_retained_original() {
         }),
         Ok(IdentityAdmission::Media { sequence: 5, arrival, original: None }) if arrival == now
     ));
-    let changed = media(false, 31, &[]);
+    let changed = media(false, 0x8675_3090, &[]);
     let result = identity.admit(later, later, 12, Position::LowSequence(5), changed, |_| {
         Some(&original)
     });

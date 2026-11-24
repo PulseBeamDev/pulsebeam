@@ -26,8 +26,37 @@ impl Fixture {
     }
 
     fn admit(&mut self, bytes: &[u8], now: Instant, stamp: u32) -> Result<Admission<'_>, Error> {
-        self.ledger
-            .admit_record(&mut self.fanout, bytes, now, stamp, true)
+        self.ledger.admit_record(
+            &mut self.fanout,
+            bytes,
+            now,
+            stamp,
+            DataTime {
+                fallback: stamp ^ 0x0070_0000,
+                reference: None,
+            },
+            true,
+        )
+    }
+
+    fn admit_record_with_timestamp(
+        &mut self,
+        bytes: &[u8],
+        now: Instant,
+        stamp: u32,
+        timestamp: u32,
+    ) -> Result<Admission<'_>, Error> {
+        self.ledger.admit_record(
+            &mut self.fanout,
+            bytes,
+            now,
+            stamp,
+            DataTime {
+                fallback: timestamp,
+                reference: None,
+            },
+            true,
+        )
     }
 
     fn admit_sctp(
@@ -36,8 +65,17 @@ impl Fixture {
         now: Instant,
         stamp: u32,
     ) -> Result<Admission<'_>, Error> {
-        self.ledger
-            .admit_record(&mut self.fanout, bytes, now, stamp, false)
+        self.ledger.admit_record(
+            &mut self.fanout,
+            bytes,
+            now,
+            stamp,
+            DataTime {
+                fallback: stamp ^ 0x0070_0000,
+                reference: None,
+            },
+            false,
+        )
     }
 
     fn original(&self, unit_seq: u64, index: u16, now: Instant) -> Original<'_> {
@@ -71,10 +109,10 @@ const R3_HEADER: [u8; 22] = [
     0x50, 0x44, 1, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 2, 4, 0, 0, 0, 4, 1,
 ];
 const IMAGE_0: [u8; 24] = [
-    0x90, 0xe3, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0xbe, 0xde, 0, 2, 0x16, 1, 2, 3, 4, 0, 0, 0xe0,
+    0x90, 0xe3, 0, 0, 1, 0x72, 3, 4, 0, 0, 0, 0, 0xbe, 0xde, 0, 2, 0x16, 1, 2, 3, 4, 0, 0, 0xe0,
 ];
 const IMAGE_1: [u8; 24] = [
-    0x90, 0x63, 0, 1, 0, 0, 0, 3, 0, 0, 0, 0, 0xbe, 0xde, 0, 2, 0x16, 1, 2, 3, 4, 0, 0, 0xe0,
+    0x90, 0x63, 0, 1, 1, 0x72, 3, 4, 0, 0, 0, 0, 0xbe, 0xde, 0, 2, 0x16, 1, 2, 3, 4, 0, 0, 0xe0,
 ];
 
 pub(crate) fn r3_record() -> Vec<u8> {
@@ -100,6 +138,121 @@ fn fixture(unit_seq: u64, index: u16, count: u16, len: u32, bytes: &[u8]) -> Vec
 }
 
 #[test]
+fn data_admission_uses_only_current_qualified_capture_calibration() {
+    use pulsebeam_clock::{
+        domain::{ActiveExchange, Config, LocalOrigin, ReferenceQuality, ReferenceSample},
+        time::{Binding, DomainId, Generation, GlobalInstant},
+    };
+    let origin = Instant::now();
+    let mut source = Fixture::new(Some(CLOCK));
+    let binding = Binding {
+        domain: DomainId(1),
+        generation: Generation(1),
+    };
+    let mut domain = ClockDomain::new(
+        Config {
+            track_capacity: 1,
+            nominal_delay_ns: 0,
+            max_past_ns: 10_000_000_000,
+            max_future_ns: 1_000_000_000,
+            observation_max_age_ns: 2_000_000_000,
+            max_drift_ppm: 2_000,
+            max_exchange_rtt_ns: 100_000_000,
+            min_fit_span_ns: 100_000_000,
+            lock_uncertainty_ns: 5_000_000,
+            reorder_ns: 100_000_000,
+            history_capacity: 4,
+            slew_ppm: 1_000,
+            max_phase_error_ns: 1_000_000_000,
+        },
+        binding,
+        LocalOrigin {
+            at: MonotonicTime::from_nanos(0),
+            global: GlobalInstant::from_nanos(100_000_000_000),
+        },
+    )
+    .unwrap();
+    for tick in [1_000_000_000, 2_000_000_000] {
+        let source = SourceTime::from_nanos(i64::try_from(tick).unwrap());
+        let at = MonotonicTime::from_nanos(tick + 10_000_000);
+        domain
+            .observe_exchange(
+                ActiveExchange {
+                    binding,
+                    source,
+                    sent_at: MonotonicTime::from_nanos(tick - 10_000_000),
+                    reference: ReferenceSample {
+                        at,
+                        global: GlobalInstant::from_nanos(
+                            100_010_000_000 + i64::try_from(tick).unwrap(),
+                        ),
+                        quality: ReferenceQuality::Qualified {
+                            uncertainty_ns: 100,
+                        },
+                    },
+                    asymmetry_bound_ns: Some(0),
+                },
+                source,
+                at,
+            )
+            .unwrap();
+    }
+    assert!(
+        source
+            .ledger
+            .install_capture_reference(CLOCK, domain, origin, 3)
+    );
+    let now = origin + Duration::from_millis(2_200);
+    let mut estimate = crate::clock::reference::Estimate {
+        global: GlobalInstant::from_nanos(102_200_000_000),
+        uncertainty_ns: Some(100),
+        discipline: crate::clock::reference::Discipline::Locked,
+        evidence_generation: 3,
+        policy_generation: 0,
+    };
+    for (unit_seq, nanos, expected) in [
+        (1, 2_100_000_000, 9_189_000),
+        (2, 2_300_000_000, 9_198_000),
+        (3, 2_100_000_000, 9_198_000),
+    ] {
+        if unit_seq == 3 {
+            estimate.evidence_generation = 4;
+        }
+        let record = Record::new(
+            data_record::Header {
+                unit_seq,
+                index: 0,
+                count: 1,
+                unit_len: 1,
+                capture: Some(Capture {
+                    clock: CLOCK,
+                    nanos,
+                    uncertainty_ns: Some(50),
+                }),
+            },
+            b"x",
+            Some(CLOCK),
+        )
+        .unwrap();
+        let mut bytes = vec![0; record.encoded_len()];
+        record.write(&mut bytes).unwrap();
+        let admitted = source
+            .ledger
+            .admit_record(
+                &mut source.fanout,
+                &bytes,
+                now,
+                0,
+                DataTime::from_reference(Some(estimate)),
+                false,
+            )
+            .unwrap();
+        assert_eq!(admitted.packet.header().timestamp, expected);
+        assert_eq!(admitted.packet.payload(), bytes);
+    }
+}
+
+#[test]
 fn optional_descriptor_round_trips_through_bound_wan_live_and_repair() {
     use crate::route::fabric::local::RepairFragment;
     use pulsebeam_core::fabric::wan::Window;
@@ -111,8 +264,8 @@ fn optional_descriptor_round_trips_through_bound_wan_live_and_repair() {
         0x50, 0x44, 1, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 3, 0xc0, 0, 0,
     ];
     const RTP: [u8; 42] = [
-        0x90, 0xe6, 0, 0, 0, 0, 0, 0, 5, 6, 7, 10, 0xbe, 0xde, 0, 1, 0x22, 0xc0, 0, 0, 0x50, 0x44,
-        1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
+        0x90, 0xe6, 0, 0, 0, 0x70, 0, 42, 5, 6, 7, 10, 0xbe, 0xde, 0, 1, 0x22, 0xc0, 0, 0, 0x50,
+        0x44, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
     ];
     let now = Instant::now();
     let mut unqualified = Fixture::new(None);
@@ -330,7 +483,7 @@ fn appendix_b_index_one_first_freezes_canonical_identity_and_projects_unchanged(
     assert_eq!(retry.packet, &frozen);
     let r3 = r3_record();
     let second = source
-        .admit(&r3, now + Duration::from_secs(1), 0x0102_0304)
+        .admit_record_with_timestamp(&r3, now + Duration::from_secs(1), 0x0102_0304, 0xaaaa_bbbb)
         .unwrap();
     assert!(second.new_fragment && !second.new_unit);
     assert_eq!(second.first_unit(), None);
@@ -355,7 +508,7 @@ fn appendix_b_index_one_first_freezes_canonical_identity_and_projects_unchanged(
         frozen.payload(),
     )
     .unwrap();
-    let invalid_label = FabricPacket::new(
+    let unrelated_timestamp = FabricPacket::new(
         Header {
             timestamp: 4,
             ..frozen.header()
@@ -365,7 +518,7 @@ fn appendix_b_index_one_first_freezes_canonical_identity_and_projects_unchanged(
     )
     .unwrap();
     assert_eq!(project(&invalid_marker, None), Err(Error::Projection));
-    assert_eq!(project(&invalid_label, None), Err(Error::Projection));
+    assert_eq!(project(&unrelated_timestamp, None), Ok(R4.as_slice()));
     assert!(
         matches!(source.original(3, 0, now + Duration::from_secs(1)), Original::Cached { sequence: 1, packet, expires } if packet.payload() == r3 && expires == now + LIFETIME)
     );

@@ -184,6 +184,24 @@ fn leap_labels_and_policy_expiry_do_not_stop_continuous_time() {
     assert_eq!(policy.rules().encode(inserted), Err(Error::Ambiguous));
 
     let start = Instant::now();
+    let leap_clock = ShardClock::new(
+        Authority::start(
+            Policy::parse(TABLE).unwrap(),
+            Sample {
+                at: start,
+                global: inserted,
+                error_ns: Some(0),
+            },
+        )
+        .snapshot,
+    );
+    assert!(leap_clock.sender_report_time(start).is_none());
+    assert!(
+        leap_clock
+            .sender_report_time(start + Duration::from_millis(500))
+            .is_some()
+    );
+
     let base = policy.expires.as_nanos() - NS_PER_SEC;
     let mut authority = Authority::start(policy, sample(start, 0, base, 0, Some(0)));
     let at_expiry = authority

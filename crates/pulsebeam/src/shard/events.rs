@@ -128,6 +128,8 @@ impl EventPipeline {
             key: who.handle,
             pipeline: self,
             runtime: None,
+            data_time: Default::default(),
+            media_clock: None,
         }
     }
 
@@ -224,9 +226,15 @@ pub struct PipelineSinkRef<'a> {
     key: ParticipantHandle,
     pipeline: &'a mut EventPipeline,
     runtime: Option<&'a mut super::router::ShardRuntime>,
+    pub(super) data_time: crate::participant::data_fabric::DataTime,
+    pub(super) media_clock: Option<&'a crate::clock::reference::ShardClock>,
 }
 
 impl<'a> ParticipantSink for PipelineSinkRef<'a> {
+    fn media_clock(&self) -> Option<&crate::clock::reference::ShardClock> {
+        self.media_clock
+    }
+
     #[inline]
     fn connected(
         &mut self,
@@ -399,7 +407,7 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
             .as_deref_mut()
             .and_then(|runtime| runtime.data_publisher_mut(source, self.key, installation))
             .ok_or(crate::participant::data_fabric::Error::Fenced)?;
-        let publication = publisher.publish(fanout, bytes, now, stamp)?;
+        let publication = publisher.publish(fanout, bytes, now, stamp, self.data_time)?;
         self.pipeline.push_packet(QueuedPublication::FabricData {
             publisher: self.key,
             publication,

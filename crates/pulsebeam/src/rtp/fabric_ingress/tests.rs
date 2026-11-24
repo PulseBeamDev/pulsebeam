@@ -497,7 +497,10 @@ fn prove_endpoint_identity(peer_repair: bool) {
             now,
             &input(now, u16::MAX, Some(b"original"), 100),
             peer_repair,
-            |arrival, _| assert_eq!(arrival, now),
+            |arrival, _| {
+                assert_eq!(arrival, now);
+                0x7123_4567
+            },
         )
         .unwrap()
         .unwrap();
@@ -522,6 +525,7 @@ fn prove_endpoint_identity(peer_repair: bool) {
     assert_eq!(report.duplicates, 1);
     let transit = fanout.transit(position, hops).unwrap();
     assert_eq!(transit.work.arrival(), now);
+    assert_eq!(transit.packet.header().timestamp, 0x7123_4567);
     assert_eq!(transit.packet.payload().as_ptr(), first);
     assert_eq!(
         transit.packet.source_protected_bytes(),
@@ -563,7 +567,10 @@ fn prove_endpoint_identity(peer_repair: bool) {
             retry,
             &input(retry, 4, Some(b"new"), 120),
             peer_repair,
-            |arrival, _| assert_eq!(arrival, retry),
+            |arrival, _| {
+                assert_eq!(arrival, retry);
+                0x7123_4568
+            },
         )
         .unwrap()
         .unwrap();

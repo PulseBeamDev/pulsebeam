@@ -93,9 +93,22 @@ impl MediaScope {
 /// Output RTP clock correlation independent of an individual media timestamp.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RtpClockAnchor {
-    /// Extended output timestamp. Only its low 32 bits are sent on the wire.
+    /// Extended output timestamp at the start of the output epoch.
     pub timestamp: u64,
     pub wallclock: Instant,
+    /// Fixed offset from canonical RTP to this output epoch.
+    pub canonical_offset: u32,
+}
+
+/// Caller projection of one monotonic instant into continuous global time
+/// and its representable UTC label. The UTC label already includes the era
+/// conversion; only its wire fields are needed here.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SenderReportTime {
+    pub opus_rtp: u32,
+    pub video_rtp: u32,
+    pub ntp_seconds: u32,
+    pub ntp_fraction: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
