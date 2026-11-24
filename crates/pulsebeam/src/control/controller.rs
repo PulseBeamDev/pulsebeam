@@ -1428,7 +1428,10 @@ impl ControllerActor {
         continuation: Option<QuicContinuation>,
         wall_now: SystemTime,
     ) -> Result<QuicAdmission, ControllerError> {
-        let (host, port) = self.quic_authority.clone().ok_or(ControllerError::ServiceUnavailable)?;
+        let (host, port) = self
+            .quic_authority
+            .clone()
+            .ok_or(ControllerError::ServiceUnavailable)?;
         let verified = principal
             .clone()
             .authorize_presence(room)
@@ -1438,7 +1441,8 @@ impl ControllerActor {
             room,
         };
         let (partition, shard) = self.select_placement(scope, verified.participant_id)?;
-        let route = u16::try_from(shard.index()).map_err(|_| ControllerError::ServiceUnavailable)?;
+        let route =
+            u16::try_from(shard.index()).map_err(|_| ControllerError::ServiceUnavailable)?;
         let now = pulsebeam_runtime::time::Instant::now();
         let connection = ConnectionId::new();
         let (proof, successor) = if let Some(QuicContinuation { proof, successor }) = continuation {

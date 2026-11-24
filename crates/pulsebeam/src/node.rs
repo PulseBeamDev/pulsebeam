@@ -293,7 +293,11 @@ impl NodeBuilder {
     }
 
     /// Serve authenticated native QUIC on the RTC UDP port using this DNS authority and TLS identity.
-    pub fn with_native_quic(mut self, host: String, tls: pulsebeam_agent_quic::transport::ServerConfig) -> Self {
+    pub fn with_native_quic(
+        mut self,
+        host: String,
+        tls: pulsebeam_agent_quic::transport::ServerConfig,
+    ) -> Self {
         self.native_quic = Some(NativeQuic { host, tls });
         self
     }
@@ -616,8 +620,14 @@ impl NodeBuilder {
                 pulsebeam_proto::valid_native_quic_host(&host),
                 "invalid QUIC advertised DNS authority"
             );
-            let port = advertised_addrs.first().copied()
-                .or_else(|| udp_sockets.first().map(pulsebeam_udp::BoundUdpSocket::local_addr))
+            let port = advertised_addrs
+                .first()
+                .copied()
+                .or_else(|| {
+                    udp_sockets
+                        .first()
+                        .map(pulsebeam_udp::BoundUdpSocket::local_addr)
+                })
                 .map_or(0, |addr| addr.port());
             anyhow::ensure!(
                 port != 0 && advertised_addrs.iter().all(|addr| addr.port() == port),

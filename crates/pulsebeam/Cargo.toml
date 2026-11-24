@@ -83,6 +83,7 @@ tempfile = "3.24"
 pulsebeam-agent-native = { path = "../../agents/pulsebeam-agent-native", features = ["transport-conformance"] }
 pulsebeam-rtc-simulation = { path = "../pulsebeam-rtc/simulation" }
 reqwest = "0.13.4"
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["aws_lc_rs"] }
 str0m = { workspace = true }
 pulsebeam-server = { path = "../../server/rust" }
 pulsebeam-core = { path = "../pulsebeam-core", features = [
@@ -110,5 +111,5 @@ default = []
 unpace = []
 parking_lot = ["pulsebeam-runtime/parking_lot"]
 sim = ["pulsebeam-core/sim", "pulsebeam-runtime/sim", "pulsebeam-udp/sim", "pulsebeam-membership/sim", "pulsebeam-agent-quic/sim"]
-transport-conformance = []
+transport-conformance = ["pulsebeam-agent-quic/executor"]
 cluster-tests = []

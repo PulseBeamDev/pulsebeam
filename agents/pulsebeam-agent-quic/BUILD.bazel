@@ -1,11 +1,11 @@
 load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
 load("@rules_rust//cargo:defs.bzl", "extract_cargo_lints")
-load("@rules_rust//rust:defs.bzl", "rust_clippy_test", "rust_library", "rust_test", "rustfmt_test")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_clippy_test", "rust_library", "rust_test", "rustfmt_test")
 
 package(default_visibility = ["//visibility:public"])
 
 exports_files(["Cargo.toml"])
-filegroup(name = "cargo_metadata_inputs", srcs = ["Cargo.toml"] + glob(["src/**/*.rs"]))
+filegroup(name = "cargo_metadata_inputs", srcs = ["Cargo.toml"] + glob(["src/**/*.rs", "examples/**/*.rs"]))
 filegroup(name = "workflow_inputs", srcs = glob(["*.md", "docs/**/*.md", "Justfile", "*.json", "*.yaml", "scripts/*.sh"], allow_empty = True))
 
 extract_cargo_lints(name = "lints", manifest = "Cargo.toml", workspace = "//:Cargo.toml")
@@ -58,12 +58,18 @@ rust_library(
         "@crates//:reqwest",
         "@crates//:tokio",
         "//agents/pulsebeam-agent-core:pulsebeam-agent-core" + ("-sim" if suffix == "-sim" else ""),
-        "//crates/pulsebeam-core:pulsebeam-core-http" + ("-sim" if suffix == "-sim" else ""),
-        "//crates/pulsebeam-proto:pulsebeam-proto",
-        "//crates/pulsebeam-udp:pulsebeam-udp" + suffix,
+        core,
+        proto,
+        "//crates/pulsebeam-udp:pulsebeam-udp" + udp_suffix,
     ],
     target_compatible_with = ["@platforms//os:linux"],
-) for suffix, features in [("", []), ("-sim", ["sim"]), ("-portable", ["portable-scalar"])]]
+) for suffix, features, core, proto, udp_suffix in [
+    ("", [], "//crates/pulsebeam-core:pulsebeam-core-http", "//crates/pulsebeam-proto", ""),
+    ("-sim", ["sim"], "//crates/pulsebeam-core:pulsebeam-core-http-sim", "//crates/pulsebeam-proto", "-sim"),
+    ("-portable", ["portable-scalar"], "//crates/pulsebeam-core:pulsebeam-core-http", "//crates/pulsebeam-proto", "-portable"),
+    # In-process conformance shares the server's Fabric and wire type identities.
+    ("-edge-test", [], "//crates/pulsebeam-core", "//crates/pulsebeam-proto:pulsebeam-proto-json", ""),
+]]
 
 rust_test(
     name = "unit_tests",
@@ -84,6 +90,19 @@ rust_test(
     target_compatible_with = ["@platforms//os:linux"],
 )
 
-rust_clippy_test(name = "clippy", targets = [":pulsebeam-agent-quic", ":executor", ":executor-sim", ":unit_tests"])
+rust_binary(
+    name = "encoded_worker",
+    srcs = ["examples/encoded_worker.rs"],
+    edition = crate_edition(),
+    lint_config = ":lints",
+    deps = [
+        ":executor",
+        "//agents/pulsebeam-agent-core",
+        "@crates//:rustls",
+        "@crates//:tokio",
+    ],
+)
+
+rust_clippy_test(name = "clippy", targets = [":pulsebeam-agent-quic", ":executor", ":executor-sim", ":unit_tests", ":encoded_worker"])
 rust_clippy_test(name = "portable_clippy", targets = [":executor-portable", ":portable_conformance"])
-rustfmt_test(name = "format", targets = [":pulsebeam-agent-quic", ":executor", ":unit_tests"])
+rustfmt_test(name = "format", targets = [":pulsebeam-agent-quic", ":executor", ":unit_tests", ":encoded_worker"])

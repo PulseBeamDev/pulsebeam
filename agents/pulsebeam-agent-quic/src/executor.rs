@@ -785,7 +785,7 @@ mod tests {
         Agent, AgentCommand, AgentConfig, Effect, HostEvent, HttpEffect, HttpEvent, HttpResponse,
     };
 
-    fn dial_effect() -> QuicAdmit {
+    pub(super) fn dial_effect() -> QuicAdmit {
         let mut agent = Agent::new_quic(AgentConfig {
             endpoint: "https://api.example".into(),
             token: "token".into(),

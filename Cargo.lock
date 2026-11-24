@@ -3790,6 +3790,7 @@ dependencies = [
  "str0m 0.22.0",
  "tempfile",
  "thiserror 2.0.20",
+ "tokio-rustls",
  "toml",
  "tower",
  "tower-http 0.7.0",

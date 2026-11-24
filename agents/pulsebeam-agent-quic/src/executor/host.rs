@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, VecDeque},
     future::{Future, pending},
     io,
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     num::{NonZeroU16, NonZeroU32},
     pin::Pin,
     time::Duration,
@@ -1053,6 +1053,20 @@ impl Agent {
         owner: pulsebeam_agent_core::TrackOwner,
     ) -> Option<pulsebeam_agent_core::ffi::WatchState> {
         self.core.close_catalog_watch(owner)
+    }
+
+    /// Remote UDP endpoint selected from authenticated QUIC placement.
+    pub fn quic_peer(&self) -> Option<SocketAddr> {
+        let snapshot = self.core.snapshot();
+        if snapshot.connection != pulsebeam_agent_core::ConnectionState::Connected {
+            return None;
+        }
+        let generation = snapshot.generation?;
+        self.sockets
+            .iter()
+            .flatten()
+            .find(|socket| socket.generation() == generation)
+            .map(|socket| socket.peer())
     }
 
     pub fn snapshot(&self) -> &Snapshot {

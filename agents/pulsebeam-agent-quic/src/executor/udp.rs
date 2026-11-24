@@ -23,6 +23,7 @@ pub enum OpenError {
 /// across backpressure and cancellation of an in-progress wait.
 pub struct UdpAssociation {
     socket: UdpSocket,
+    peer: SocketAddr,
     association: Association,
     egress: Egress,
 }
@@ -57,6 +58,7 @@ impl UdpAssociation {
         .map_err(OpenError::Admission)?;
         Ok(Self {
             socket,
+            peer: resolved,
             association,
             egress: Egress::default(),
         })
@@ -84,6 +86,10 @@ impl UdpAssociation {
             .connection()
             .handle_network_change(None, time::Instant::now().into_std());
         Ok(())
+    }
+
+    pub(super) fn peer(&self) -> SocketAddr {
+        self.peer
     }
 
     pub fn generation(&self) -> Generation {

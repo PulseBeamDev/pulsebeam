@@ -15,6 +15,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[path = "transport_conformance/quic.rs"]
 mod quic;
+#[path = "transport_conformance/worker.rs"]
+mod worker;
 
 const CONNECT: Duration = Duration::from_secs(30);
 const DELIVERY: Duration = Duration::from_secs(30);
@@ -506,6 +508,7 @@ async fn witness(
     port: u16,
     candidate: DataWitness,
     migration: Option<&pulsebeam_runtime::rt::MigrationHandle>,
+    native_worker: Option<(&str, noq_proto::rustls::pki_types::CertificateDer<'static>)>,
 ) -> Result<()> {
     let protocol = candidate.protocol();
     let mode = candidate.topic_mode();
@@ -561,6 +564,9 @@ async fn witness(
             received(&data_a.receiver, &sender_b, B_TO_A)
         )?;
         tracing::info!("EXERCISED both recipient application payloads");
+        if let Some((endpoint, certificate)) = native_worker {
+            worker::witness(endpoint, port, certificate).await?;
+        }
         let lossy = if matches!(candidate, DataWitness::LiveUdp { .. }) {
             const LOSSY_TOPIC: &str = "dual-stack-lossy";
             let leg_a = DataLeg::open(a, &sender_b, LOSSY_TOPIC, TopicMode::Lossy)?;
@@ -708,7 +714,8 @@ async fn run(candidate: DataWitness) -> Result<()> {
         );
     }
     let http = TcpListener::bind("127.0.0.1:0").await?;
-    let endpoint = format!("http://{}", http.local_addr()?);
+    let http_addr = http.local_addr()?;
+    let endpoint = format!("http://{http_addr}");
     let (control, runtime_control) = pulsebeam_runtime::sync::oneshot::channel();
     let mut builder = NodeBuilder::new()
         .data_threads(if candidate.crosses_shards() {
@@ -746,8 +753,20 @@ async fn run(candidate: DataWitness) -> Result<()> {
         Protocol::Udp => builder.udp_only(),
         Protocol::Tcp => builder.tcp_only(),
     };
-    let advertised = builder.advertised_udp_addrs()?;
     let shutdown = CancellationToken::new();
+    let (builder, placement) = if matches!(candidate, DataWitness::LiveUdp { cross_shard: false }) {
+        let tls = worker::tls()?;
+        let https = TcpListener::bind("127.0.0.1:0").await?;
+        let origin = format!("https://{}", https.local_addr()?);
+        let placement = worker::placement_https(https, tls.https, http_addr, shutdown.clone());
+        (
+            builder.with_native_quic(worker::AUTHORITY.into(), tls.quic),
+            Some((origin, tls.certificate, placement)),
+        )
+    } else {
+        (builder, None)
+    };
+    let advertised = builder.advertised_udp_addrs()?;
     let mut node = pulsebeam_runtime::task::spawn_local(builder.run_bound(
         sockets,
         advertised,
@@ -786,8 +805,17 @@ async fn run(candidate: DataWitness) -> Result<()> {
         .context("FAILED: 30s owned SDK/node startup deadline")??;
         let a = agents.first().context("IPv4 agent missing")?;
         let b = agents.get(1).context("IPv6 agent missing")?;
+        let clients = async {
+            match placement {
+                Some((origin, certificate, proxy)) => pulsebeam_runtime::select! {
+                    result = witness(a, b, port, candidate, migration.as_ref(), Some((&origin, certificate))) => result,
+                    result = proxy => result.and_then(|()| Err(anyhow::anyhow!("placement proxy stopped before the witness"))),
+                },
+                None => witness(a, b, port, candidate, migration.as_ref(), None).await,
+            }
+        };
         pulsebeam_runtime::select! {
-            result = witness(a, b, port, candidate, migration.as_ref()) => result?,
+            result = clients => result?,
             result = &mut node => {
                 node_observed = true;
                 bail!("production node exited before qualification: {result:?}");
