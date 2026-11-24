@@ -108,13 +108,23 @@ impl Association {
 
 impl Listener {
     pub fn new(config: ServerConfig) -> Result<Self, noq_proto::ConfigError> {
-        Ok(Self {
-            endpoint: endpoint(Some(config))?,
+        Ok(Self::with_endpoint(endpoint(Some(config))?))
+    }
+
+    pub fn on_shard(config: ServerConfig, shard: u16) -> Result<Self, noq_proto::ConfigError> {
+        Ok(Self::with_endpoint(super::endpoint_on_shard(
+            config, shard,
+        )?))
+    }
+
+    fn with_endpoint(endpoint: Endpoint) -> Self {
+        Self {
+            endpoint,
             peers: HashMap::new(),
             ready: VecDeque::new(),
             pre_admission: 0,
             remaining: 0,
-        })
+        }
     }
 
     pub fn association_count(&self) -> usize {
@@ -162,10 +172,6 @@ impl Listener {
 
     /// Process one UDP packet. If Noq returns an immediate transmit, its
     /// bytes are in `out`; use the same bounded egress slot as normal output.
-    #[allow(
-        clippy::disallowed_types,
-        reason = "Noq owns packet bytes after the UDP receive buffer advances"
-    )]
     pub fn receive(
         &mut self,
         now: Instant,
@@ -173,6 +179,22 @@ impl Listener {
         ecn: Option<EcnCodepoint>,
         packet: &[u8],
         out: &mut Vec<u8>,
+    ) -> Option<Transmit> {
+        self.receive_then(now, path, ecn, packet, out, |_, _| {})
+    }
+
+    #[allow(
+        clippy::disallowed_types,
+        reason = "Noq owns packet bytes after the UDP receive buffer advances"
+    )]
+    pub(super) fn receive_then(
+        &mut self,
+        now: Instant,
+        path: FourTuple,
+        ecn: Option<EcnCodepoint>,
+        packet: &[u8],
+        out: &mut Vec<u8>,
+        service: impl FnOnce(ConnectionHandle, &mut Association),
     ) -> Option<Transmit> {
         out.clear();
         if packet.is_empty() || packet.len() > usize::from(UDP_PAYLOAD_BYTES) {
@@ -185,6 +207,9 @@ impl Listener {
             DatagramEvent::ConnectionEvent(handle, event) => {
                 if let Some(peer) = self.peers.get_mut(&handle) {
                     peer.connection.handle_event(event);
+                    if !peer.pre_admission && !peer.connection.is_closed() {
+                        service(handle, peer);
+                    }
                 }
                 None
             }

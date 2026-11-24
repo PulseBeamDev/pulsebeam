@@ -3832,7 +3832,7 @@ impl ShardExecution {
                     crate::sim_metrics::record_routing_counter("fabric_rtp_shard_refresh");
                 }
             }
-            ShardFrame::FabricWanImage { .. } => {}
+            ShardFrame::QuicIngress { .. } | ShardFrame::FabricWanImage { .. } => {}
             ShardFrame::Reverse { address, packet } => self.on_reverse_frame(address, packet, now),
         }
     }

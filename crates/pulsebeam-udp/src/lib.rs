@@ -4,7 +4,12 @@ mod simulation_tests;
 #[cfg(test)]
 mod tests;
 use std::task::{Context, Poll};
-use std::{io, net::SocketAddr, num::NonZeroU16, time::SystemTime};
+use std::{
+    io,
+    net::{IpAddr, SocketAddr},
+    num::NonZeroU16,
+    time::SystemTime,
+};
 use tokio::time::Instant;
 
 #[cfg(all(target_os = "linux", not(feature = "sim")))]
@@ -395,7 +400,7 @@ impl UdpSocket {
 
     /// Validate the entire input first, then submit a bounded contiguous prefix.
     pub fn try_send_batch(&mut self, datagrams: &[SendDatagram<'_>]) -> SendReport {
-        self.try_send(datagrams, false)
+        self.try_send(datagrams, None)
     }
 
     pub const fn supports_ect0(&self) -> bool {
@@ -404,44 +409,53 @@ impl UdpSocket {
 
     /// Submit exactly one ECT(0) datagram using per-packet IP metadata.
     pub fn try_send_ect0(&mut self, destination: SocketAddr, payload: &[u8]) -> SendReport {
+        self.try_send_one(destination, payload, None, true)
+    }
+
+    /// Submit one datagram with an optional local source IP. A concrete bound
+    /// address needs no ancillary data. Unsupported source selection is an error.
+    pub fn try_send_one(
+        &mut self,
+        destination: SocketAddr,
+        payload: &[u8],
+        source_ip: Option<IpAddr>,
+        ect0: bool,
+    ) -> SendReport {
+        let source_ip = source_ip
+            .map(|ip| ip.to_canonical())
+            .filter(|ip| *ip != self.local_addr().ip().to_canonical());
         self.try_send(
             &[SendDatagram {
                 destination,
                 payload,
                 gso_segment_size: None,
             }],
-            true,
+            (source_ip.is_some() || ect0).then_some((source_ip, ect0)),
         )
     }
 
-    fn try_send(&mut self, datagrams: &[SendDatagram<'_>], ect0: bool) -> SendReport {
+    fn try_send(
+        &mut self,
+        datagrams: &[SendDatagram<'_>],
+        controls: Option<(Option<IpAddr>, bool)>,
+    ) -> SendReport {
         let max_datagram = self
             .nonfragmenting_max_datagram_bytes
             .map_or(MAX_DATAGRAM_BYTES, |cap| usize::from(cap.get()));
-        let report = match validate_send(datagrams, self.capabilities(), max_datagram) {
-            Ok(()) if ect0 => {
-                #[cfg(all(target_os = "linux", not(feature = "sim")))]
-                {
-                    match datagrams {
-                        [datagram] => self.inner.send_ect0(datagram),
-                        _ => SendReport {
-                            accepted: 0,
-                            stop: Some(SendStop::Error(io::ErrorKind::InvalidInput.into())),
-                        },
-                    }
-                }
-                #[cfg(any(not(target_os = "linux"), feature = "sim"))]
-                {
-                    SendReport {
-                        accepted: 0,
-                        stop: Some(SendStop::Error(io::ErrorKind::Unsupported.into())),
-                    }
-                }
-            }
-            Ok(()) => self.inner.send(datagrams),
-            Err(error) => SendReport {
+        let report = match (
+            validate_send(datagrams, self.capabilities(), max_datagram),
+            controls,
+            datagrams,
+        ) {
+            (Ok(()), None, _) => self.inner.send(datagrams),
+            (Ok(()), Some((source, ect0)), [entry]) => self.inner.send_one(entry, source, ect0),
+            (result, _, _) => SendReport {
                 accepted: 0,
-                stop: Some(SendStop::Error(error)),
+                stop: Some(SendStop::Error(
+                    result
+                        .err()
+                        .unwrap_or_else(|| io::ErrorKind::InvalidInput.into()),
+                )),
             },
         };
         for entry in datagrams.iter().take(report.accepted) {

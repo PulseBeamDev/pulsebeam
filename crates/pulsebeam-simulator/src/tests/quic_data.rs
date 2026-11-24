@@ -14,7 +14,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, ensure};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use noq_proto::rustls;
-use pulsebeam::node::{IceTcpConfig, NodeBuilder, QuicListener};
+use pulsebeam::node::{IceTcpConfig, NodeBuilder};
 use pulsebeam_agent_quic::{
     data_bindings::{FabricBinding, FabricOffer},
     fabric::{
@@ -62,12 +62,18 @@ impl Client {
         clippy::disallowed_types,
         reason = "rustls requires a shared immutable time provider"
     )]
-    async fn new(edge: SocketAddr, roots: RootCertStore) -> Result<Self> {
+    async fn new(
+        edge: SocketAddr,
+        roots: RootCertStore,
+        placement: &pulsebeam_agent_core::placement::Placement,
+    ) -> Result<Self> {
+        ensure!(placement.port.get() == edge.port(), "placement did not advertise the RTC UDP port");
         let socket = transport::socket::bind(SocketAddr::new(edge.ip(), 0))
             .await?
             .activate()?;
-        let config = transport::client_config(roots, Arc::new(DefaultTimeProvider))
+        let mut config = transport::client_config(roots, Arc::new(DefaultTimeProvider))
             .map_err(|e| anyhow::anyhow!("client configuration: {e:?}"))?;
+        transport::routing::set_initial_destination(&mut config, placement.initial_dcid);
         let transport =
             ClientTransport::connect(Instant::now().into_std(), config, edge, "edge.example")
                 .map_err(|e| anyhow::anyhow!("client start: {e:?}"))?;
@@ -298,7 +304,7 @@ async fn issue(
     address: SocketAddr,
     token: &str,
     continuation: Option<(&str, &[u8])>,
-) -> Result<String> {
+) -> Result<pulsebeam_agent_core::placement::Placement> {
     let mut socket = TcpStream::connect(address).await?;
     let body = match continuation {
         Some((owner, successor)) => {
@@ -322,19 +328,13 @@ async fn issue(
         "admission HTTP status: {}",
         head.lines().next().unwrap_or_default()
     );
-    let result: serde_json::Value = serde_json::from_str(body)?;
-    ensure!(
-        result.get("profile").and_then(serde_json::Value::as_str) == Some("pulsebeam-rt-v1")
-            && result
-                .pointer("/authority/host")
-                .and_then(serde_json::Value::as_str)
-                == Some("edge.example")
-    );
-    Ok(result
-        .get("owner")
-        .and_then(serde_json::Value::as_str)
-        .context("ownership proof")?
-        .to_owned())
+    let result = pulsebeam_agent_core::placement::Placement::decode(&pulsebeam_agent_core::HttpResponse {
+        status: 200,
+        headers: vec![],
+        body: body.as_bytes().to_vec(),
+    }).map_err(|error| anyhow::anyhow!("invalid placement: {error:?}"))?;
+    ensure!(result.host == "edge.example");
+    Ok(result)
 }
 
 #[test]
@@ -343,7 +343,7 @@ async fn issue(
     clippy::disallowed_types,
     reason = "fixture owns one node, bounded I/O and immutable TLS providers"
 )]
-fn dedicated_quic_listener_redeems_renews_and_closes() {
+fn shared_quic_endpoint_redeems_renews_and_closes() {
     replay(DataV1Delivery::Unreliable);
 }
 
@@ -893,8 +893,9 @@ async fn open_subscriber(
     ControlStream,
     (u64, pulsebeam_proto::state::DataV1ReceiverOffer),
 )> {
-    let owner = issue(address, credential, None).await?;
-    let mut client = Client::new(edge, roots).await?;
+    let placement = issue(address, credential, None).await?;
+    let mut client = Client::new(edge, roots, &placement).await?;
+    let owner = placement.owner;
     let (_, mut control) = client
         .admit(Admit {
             fabric: pulsebeam_agent_quic::data_bindings::FabricOffer::CURRENT,
@@ -1714,6 +1715,7 @@ async fn mixed_opus_exchange(
         }))?;
         bulk_payload = Some(payload);
     }
+    let enqueued_before = pulsebeam::sim_metrics::routing_counter("fabric_rtp_opus_shard_enqueued");
     let media_start = Instant::now();
     loop {
         match quic.send_opus("voice", opus.timestamp, true, &opus.payload) {
@@ -1741,7 +1743,7 @@ async fn mixed_opus_exchange(
                     );
                     ensure!(
                         pulsebeam::sim_metrics::routing_counter("fabric_rtp_opus_shard_enqueued")
-                            > 0,
+                            > enqueued_before,
                         "mixed Opus must cross shard owners"
                     );
                     return Ok(());
@@ -1752,7 +1754,11 @@ async fn mixed_opus_exchange(
     };
     pulsebeam_runtime::select! {
         result = pulsebeam_runtime::time::timeout(Duration::from_secs(2), receive) =>
-            result.map_err(|_| anyhow::anyhow!("WebRTC encoded receiver did not observe QUIC Opus"))??,
+            result.map_err(|_| {
+                let enqueued = pulsebeam::sim_metrics::routing_counter("fabric_rtp_opus_shard_enqueued")
+                    .saturating_sub(enqueued_before);
+                anyhow::anyhow!("WebRTC encoded receiver did not observe QUIC Opus ({enqueued} new cross-shard offers)")
+            })??,
         error = async { loop { if let Err(error) = quic.turn().await { break error; } } } =>
             anyhow::bail!("mixed Opus Agent drive: {error:?}"),
     }
@@ -2351,7 +2357,7 @@ async fn witness(scenario: Scenario) -> Result<()> {
     let builder = NodeBuilder::new()
         .sim_utc_clock(crate::sim_clock::unix_nanos)
         .with_current_runtime()
-        .local_addr(SocketAddr::new(host, 0))
+        .local_addr(edge)
         .advertise_bound_udp()
         .ice_tcp(IceTcpConfig::Disabled)
         .rng(rand::Rng::seed_from_u64(19))
@@ -2377,19 +2383,7 @@ async fn witness(scenario: Scenario) -> Result<()> {
         .workers(shards)
         .room_partition_size(1)
         .round_robin_rooms()
-        .quic_listeners(
-            (0..shards)
-                .map(|index| {
-                    let port = if index == 0 { edge.port() } else { 8444 };
-                    QuicListener {
-                        bind: SocketAddr::new(host, port),
-                        host: "edge.example".to_owned(),
-                        port,
-                        tls: tls.clone(),
-                    }
-                })
-                .collect(),
-        );
+        .with_native_quic("edge.example".to_owned(), tls);
     let mut node = pulsebeam_runtime::task::spawn_local(builder.run(shutdown.clone()));
     pulsebeam_runtime::select! {
         notification = ready.recv() => ensure!(notification.is_some(), "node stopped before startup"),
@@ -2454,8 +2448,9 @@ async fn witness(scenario: Scenario) -> Result<()> {
             )
             .await;
         };
-        let owner = issue(address, &credential, None).await?;
-        let mut client = Client::new(edge, roots.clone()).await?;
+        let placement = issue(address, &credential, None).await?;
+        let mut client = Client::new(edge, roots.clone(), &placement).await?;
+        let owner = placement.owner;
         let (accepted, mut control) = client
             .admit(Admit {
                 fabric: pulsebeam_agent_quic::data_bindings::FabricOffer::CURRENT,
@@ -2673,10 +2668,10 @@ async fn witness(scenario: Scenario) -> Result<()> {
         }
         let issued = issue(address, &renewal, Some((&owner, &successor))).await?;
         ensure!(
-            issued == owner,
+            issued.owner == owner,
             "continuation must not mint a fresh owner proof"
         );
-        let mut next = Client::new(edge, roots).await?;
+        let mut next = Client::new(edge, roots, &issued).await?;
         let (accepted, mut control) = next
             .admit(Admit {
                 fabric: pulsebeam_agent_quic::data_bindings::FabricOffer::CURRENT,

@@ -109,6 +109,18 @@ impl Socket {
         }
         Ok(())
     }
+    pub(crate) fn send_one(
+        &mut self,
+        _: &SendDatagram<'_>,
+        _: Option<IpAddr>,
+        _: bool,
+    ) -> SendReport {
+        SendReport {
+            accepted: 0,
+            stop: Some(SendStop::Error(io::ErrorKind::Unsupported.into())),
+        }
+    }
+
     pub(crate) fn send(&mut self, entries: &[SendDatagram<'_>]) -> SendReport {
         submit_prefix(entries, 1, |group| {
             let Some(entry) = group.first() else {

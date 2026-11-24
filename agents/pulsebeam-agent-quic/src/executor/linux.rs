@@ -418,16 +418,14 @@ impl LinuxAgent {
 
     fn retain_media_senders(&mut self) {
         self.media_senders.retain(|(kind, track), sender| {
-            let current = self
-                .core
+            self.core
                 .quic_rtp_publication(*kind, track)
                 .is_some_and(|live| {
                     if !live.ready {
                         sender.framer.discard_pending();
                     }
                     sender.generation == live.generation && sender.binding == live.binding
-                });
-            current
+                })
         });
     }
 
@@ -448,13 +446,11 @@ impl LinuxAgent {
                 sender.framer.discard_pending();
                 continue;
             };
-            match socket.offer_media_packet(&mut sender.framer, now) {
-                Ok(
-                    SendProgress::Partial | SendProgress::Deferred(DatagramAdmission::ControlTurn),
-                ) => {
-                    return Some(sender.generation);
-                }
-                Ok(_) | Err(_) => {}
+            if let Ok(
+                SendProgress::Partial | SendProgress::Deferred(DatagramAdmission::ControlTurn),
+            ) = socket.offer_media_packet(&mut sender.framer, now)
+            {
+                return Some(sender.generation);
             }
         }
         None

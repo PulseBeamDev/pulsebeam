@@ -296,6 +296,7 @@ pub(crate) struct QuicAdmission {
     pub host: String,
     pub port: u16,
     pub valid_for_ms: u32,
+    pub initial_dcid: [u8; pulsebeam_agent_quic::transport::routing::ROUTED_CID_BYTES],
 }
 
 struct OwnedCreateCommand {
@@ -777,7 +778,7 @@ pub struct ControllerActor {
     deletion_bytes: usize,
     ownership: ownership::Authority,
     quic_placements: quic_placement::Placements,
-    quic_addresses: BTreeMap<ShardId, (String, u16)>,
+    quic_authority: Option<(String, u16)>,
     peer_ownership: ownership::observations::Observations,
     provisioned_peers: Vec<peer_ownership::provisioned::Peer>,
     ownership_entropy: pulsebeam_runtime::rand::Rng,
@@ -864,7 +865,7 @@ impl ControllerActor {
             deletion_bytes: 0,
             ownership: ownership::Authority::default(),
             quic_placements: quic_placement::Placements::default(),
-            quic_addresses: BTreeMap::new(),
+            quic_authority: None,
             peer_ownership: peer_ownership::new_observations(),
             provisioned_peers: Vec::new(),
             ownership_entropy,
@@ -888,8 +889,8 @@ impl ControllerActor {
         self.receipt_trust = Some(ownership::receipt::Authority::Local(peer.trust()));
     }
 
-    pub(crate) fn set_quic_addresses(&mut self, addresses: BTreeMap<ShardId, (String, u16)>) {
-        self.quic_addresses = addresses;
+    pub(crate) fn set_quic_authority(&mut self, authority: Option<(String, u16)>) {
+        self.quic_authority = authority;
     }
 
     pub(crate) fn set_ownership_mode(&mut self, mode: OwnershipMode) {
@@ -1427,9 +1428,7 @@ impl ControllerActor {
         continuation: Option<QuicContinuation>,
         wall_now: SystemTime,
     ) -> Result<QuicAdmission, ControllerError> {
-        if self.quic_addresses.is_empty() {
-            return Err(ControllerError::ServiceUnavailable);
-        }
+        let (host, port) = self.quic_authority.clone().ok_or(ControllerError::ServiceUnavailable)?;
         let verified = principal
             .clone()
             .authorize_presence(room)
@@ -1439,11 +1438,7 @@ impl ControllerActor {
             room,
         };
         let (partition, shard) = self.select_placement(scope, verified.participant_id)?;
-        let (host, port) = self
-            .quic_addresses
-            .get(&shard)
-            .cloned()
-            .ok_or(ControllerError::ServiceUnavailable)?;
+        let route = u16::try_from(shard.index()).map_err(|_| ControllerError::ServiceUnavailable)?;
         let now = pulsebeam_runtime::time::Instant::now();
         let connection = ConnectionId::new();
         let (proof, successor) = if let Some(QuicContinuation { proof, successor }) = continuation {
@@ -1498,6 +1493,7 @@ impl ControllerActor {
             host,
             port,
             valid_for_ms: quic_placement::VALID_FOR_MS,
+            initial_dcid: pulsebeam_agent_quic::transport::routing::mint(route),
         })
     }
 
@@ -4641,9 +4637,7 @@ mod replacement_tests {
         ));
         actor.set_ownership_mode(OwnershipMode::Standalone);
         let shard = ShardId::new(0);
-        actor
-            .quic_addresses
-            .insert(shard, ("edge.example".to_owned(), 9443));
+        actor.set_quic_authority(Some(("edge.example".to_owned(), 9443)));
         let participant = *principal.participant_id();
         let result = actor
             .issue_quic_placement(principal.clone(), Some(room), None, wall)
@@ -4921,7 +4915,7 @@ mod replacement_tests {
                 deletion_bytes: 0,
                 ownership: ownership::Authority::default(),
                 quic_placements: quic_placement::Placements::default(),
-                quic_addresses: BTreeMap::new(),
+                quic_authority: None,
                 peer_ownership: peer_ownership::new_observations(),
                 provisioned_peers: Vec::new(),
                 ownership_entropy: pulsebeam_runtime::rand::seeded_rng(19),

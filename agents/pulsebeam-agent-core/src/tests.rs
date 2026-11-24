@@ -108,7 +108,7 @@ fn quic_placement_fences_late_http_and_transport_outcomes() {
         })
     );
     let (generation, operation) = start(&mut agent);
-    let response = HttpResponse { status: 200, headers: vec![], body: br#"{"profile":"pulsebeam-rt-v1","owner":"owner","authority":{"host":"edge.example","port":443},"valid_for_ms":5000}"#.to_vec() };
+    let response = HttpResponse { status: 200, headers: vec![], body: br#"{"profile":"pulsebeam-rt-v1","owner":"owner","initial_dcid":"AAAAAAAAAAAAAAAAAAAAAAAAAAA","authority":{"host":"edge.example","port":443},"valid_for_ms":5000}"#.to_vec() };
     agent
         .handle(HostEvent::Http(HttpEvent::Response {
             operation: old_operation,
@@ -223,7 +223,7 @@ fn quic_transport_loss_recovers_joined_session_only_with_current_continuation() 
     };
     let response = |owner: &str, port: u16| {
         HttpResponse {
-        status: 200, headers: vec![], body: serde_json::to_vec(&serde_json::json!({"profile":"pulsebeam-rt-v1","owner":owner,"authority":{"host":"edge.example","port":port},"valid_for_ms":5000})).unwrap(),
+        status: 200, headers: vec![], body: serde_json::to_vec(&serde_json::json!({"profile":"pulsebeam-rt-v1","owner":owner,"initial_dcid":"AAAAAAAAAAAAAAAAAAAAAAAAAAA","authority":{"host":"edge.example","port":port},"valid_for_ms":5000})).unwrap(),
     }
     };
     agent

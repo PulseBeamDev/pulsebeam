@@ -29,6 +29,7 @@ struct QuicAdmissionResponse {
     profile: &'static str,
     authority: QuicAuthority,
     valid_for_ms: u32,
+    initial_dcid: String,
 }
 
 #[derive(serde::Serialize)]
@@ -120,6 +121,7 @@ pub(super) async fn issue(
                     port: issuance.port,
                 },
                 valid_for_ms: issuance.valid_for_ms,
+                initial_dcid: URL_SAFE_NO_PAD.encode(issuance.initial_dcid),
             }),
         )
             .into_response());

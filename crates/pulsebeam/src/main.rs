@@ -83,6 +83,40 @@ struct Args {
     json_logs: bool,
     #[command(flatten)]
     host_clock: HostClockOptions,
+    #[command(flatten)]
+    native_quic: NativeQuicOptions,
+}
+
+#[derive(clap::Args, Debug)]
+struct NativeQuicOptions {
+    /// Advertise this TLS DNS name for native QUIC on the RTC UDP port.
+    #[arg(long, requires_all = ["quic_cert", "quic_key"])]
+    quic_host: Option<String>,
+    /// PEM certificate chain for the native QUIC authority.
+    #[arg(long, requires = "quic_host")]
+    quic_cert: Option<PathBuf>,
+    /// PEM private key for the native QUIC certificate.
+    #[arg(long, requires = "quic_host")]
+    quic_key: Option<PathBuf>,
+}
+
+impl NativeQuicOptions {
+    fn load(self) -> Result<Option<(String, pulsebeam_agent_quic::transport::ServerConfig)>> {
+        match (self.quic_host, self.quic_cert, self.quic_key) {
+            (None, None, None) => Ok(None),
+            (Some(host), Some(cert), Some(key)) => {
+                anyhow::ensure!(
+                    pulsebeam_proto::valid_native_quic_host(&host),
+                    "invalid QUIC advertised DNS authority"
+                );
+                let tls = pulsebeam_agent_quic::transport::server_config_from_pem(&cert, &key)?;
+                Ok(Some((host, tls)))
+            }
+            _ => {
+                anyhow::bail!("native QUIC requires a DNS name, certificate chain and private key")
+            }
+        }
+    }
 }
 
 #[derive(clap::Args, Debug)]
@@ -96,7 +130,7 @@ struct HostClockOptions {
 }
 
 fn main() {
-    let args = Args::parse();
+    let mut args = Args::parse();
     let (non_blocking_writer, _guard) = tracing_appender::non_blocking(std::io::stdout());
 
     let fmt_layer = tracing_subscriber::fmt::layer().with_writer(non_blocking_writer);
@@ -149,23 +183,13 @@ fn main() {
         pulsebeam::cluster::ServerConfig::read(args.config.as_deref()).unwrap_or_else(|error| {
             pulsebeam_runtime::fatal!("invalid server configuration: {error:#}")
         });
-    let rtc_port: u16 = if args.dev { 3478 } else { 443 };
     let shutdown = CancellationToken::new();
     if let Err(err) = pulsebeam_runtime::rt::block_on(async {
         let cluster = config
-            .resolve(args.data_dir)
+            .resolve(args.data_dir.take())
             .await
             .context("invalid cluster configuration")?;
-        run(
-            shutdown.clone(),
-            execution,
-            rtc_port,
-            args.iface,
-            registry,
-            cluster,
-            args.host_clock,
-        )
-        .await
+        run(shutdown.clone(), execution, args, registry, cluster).await
     })
     .unwrap_or_else(|error| pulsebeam_runtime::fatal!("cannot build the node runtime: {error}"))
     {
@@ -192,14 +216,13 @@ fn configured_key_registry(args: &Args, path: &Path) -> Result<KeyRegistry> {
 async fn run(
     shutdown: CancellationToken,
     execution: ExecutionConfig,
-    rtc_port: u16,
-    network_interface: Option<String>,
+    args: Args,
     key_registry: KeyRegistry,
     cluster: Option<pulsebeam::cluster::Options>,
-    host_clock: HostClockOptions,
 ) -> Result<()> {
-    let external_ips =
-        pulsebeam_runtime::system::select_host_addresses(network_interface.as_deref());
+    let rtc_port = if args.dev { 3478 } else { 443 };
+    let native_quic = args.native_quic.load()?;
+    let external_ips = pulsebeam_runtime::system::select_host_addresses(args.iface.as_deref());
     let external_addrs: Vec<SocketAddr> = external_ips
         .iter()
         .copied()
@@ -216,7 +239,7 @@ async fn run(
     );
     let rng = rand::os_rng();
     let node_builder = NodeBuilder::new()
-        .host_utc_policy(host_clock.utc_policy, host_clock.unsmeared_utc)
+        .host_utc_policy(args.host_clock.utc_policy, args.host_clock.unsmeared_utc)
         .workers(execution.workers)
         .local_addr(local_addr)
         .external_addrs(external_addrs)
@@ -228,6 +251,10 @@ async fn run(
 
     let node_builder = match cluster {
         Some(options) => node_builder.with_cluster(options),
+        None => node_builder,
+    };
+    let node_builder = match native_quic {
+        Some((host, tls)) => node_builder.with_native_quic(host, tls),
         None => node_builder,
     };
     let node = node_builder.run(shutdown.child_token());
@@ -284,6 +311,68 @@ mod tests {
             "pulsebeam-server-key-registry-{}.json",
             ApiKeyId::new()
         ))
+    }
+
+    #[test]
+    fn native_quic_requires_an_explicit_dns_authority_and_both_tls_files() {
+        let disabled = Args::try_parse_from(["pulsebeam"]).unwrap();
+        assert!(disabled.native_quic.load().unwrap().is_none());
+        for partial in [
+            vec!["pulsebeam", "--quic-key", "key.pem"],
+            vec!["pulsebeam", "--quic-cert", "cert.pem"],
+            vec![
+                "pulsebeam",
+                "--quic-host",
+                "edge.example",
+                "--quic-key",
+                "key.pem",
+            ],
+        ] {
+            assert!(Args::try_parse_from(partial).is_err());
+        }
+        let invalid = Args::try_parse_from([
+            "pulsebeam",
+            "--quic-host",
+            "127.0.0.1",
+            "--quic-cert",
+            "cert.pem",
+            "--quic-key",
+            "key.pem",
+        ])
+        .unwrap();
+        let Err(error) = invalid.native_quic.load() else {
+            panic!("accepted an IP literal as QUIC DNS authority")
+        };
+        assert_eq!(error.to_string(), "invalid QUIC advertised DNS authority");
+    }
+
+    #[test]
+    fn native_quic_loads_a_matching_pem_identity() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+        let identity = rcgen::generate_simple_self_signed(vec!["edge.example".into()]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cert = dir.path().join("certificate.pem");
+        let key = dir.path().join("key.pem");
+        let write_pem = |path: &Path, label, der: &[u8]| {
+            let body = STANDARD.encode(der);
+            std::fs::write(
+                path,
+                format!("-----BEGIN {label}-----\n{body}\n-----END {label}-----\n"),
+            )
+            .unwrap();
+        };
+        write_pem(&cert, "CERTIFICATE", identity.cert.der().as_ref());
+        write_pem(&key, "PRIVATE KEY", &identity.signing_key.serialize_der());
+        let (host, _) = NativeQuicOptions {
+            quic_host: Some("edge.example".into()),
+            quic_cert: Some(cert),
+            quic_key: Some(key),
+        }
+        .load()
+        .unwrap()
+        .unwrap();
+        assert_eq!(host, "edge.example");
     }
 
     #[test]

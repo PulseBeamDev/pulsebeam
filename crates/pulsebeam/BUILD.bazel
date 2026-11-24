@@ -21,7 +21,7 @@ rust_library(
     rustc_env_files = [":cargo_env"],
     lint_config = ":lints",
     aliases = aliases(),
-    deps = all_crate_deps(normal = True) + ["//crates/pulsebeam-udp:pulsebeam-udp", "//crates/pulsebeam-queue:pulsebeam-queue", "//crates/pulsebeam-link:pulsebeam-link", "//crates/pulsebeam-core:pulsebeam-core", "//crates/pulsebeam-proto:pulsebeam-proto-json", "//crates/pulsebeam-rtc:pulsebeam-rtc", "//crates/pulsebeam-steer:pulsebeam-steer", "//crates/pulsebeam-clock", "//crates/pulsebeam-runtime:pulsebeam-runtime", "//crates/pulsebeam-membership", "//agents/pulsebeam-agent-quic"],
+    deps = all_crate_deps(normal = True) + ["//crates/pulsebeam-udp:pulsebeam-udp", "//crates/pulsebeam-queue:pulsebeam-queue", "//crates/pulsebeam-link:pulsebeam-link", "//crates/pulsebeam-core:pulsebeam-core", "//crates/pulsebeam-proto:pulsebeam-proto-json", "//crates/pulsebeam-rtc:pulsebeam-rtc", "//crates/pulsebeam-steer:pulsebeam-steer", "//crates/pulsebeam-clock", "//crates/pulsebeam-runtime:pulsebeam-runtime", "//crates/pulsebeam-membership", "//agents/pulsebeam-agent-quic", "//crates/pulsebeam-transport:dtls_srtp"],
     proc_macro_deps = all_crate_deps(proc_macro = True),
 )
 
@@ -45,7 +45,7 @@ sfu_variant_sources(glob(["README.md", "src/**"], exclude = ["src/bin/**"]))
     rustc_env_files = [":cargo_env"],
     lint_config = ":lints",
     aliases = aliases(),
-    deps = all_crate_deps(normal = True) + ["//crates/pulsebeam-udp:pulsebeam-udp-sim", "//crates/pulsebeam-queue:pulsebeam-queue", "//crates/pulsebeam-link:pulsebeam-link", "//crates/pulsebeam-core:pulsebeam-core-sim", "//crates/pulsebeam-proto:pulsebeam-proto-json", "//crates/pulsebeam-rtc:pulsebeam-rtc", "//crates/pulsebeam-steer:pulsebeam-steer", "//crates/pulsebeam-clock", "//crates/pulsebeam-runtime:pulsebeam-runtime-sim", "//crates/pulsebeam-membership:pulsebeam-membership-sim", "//agents/pulsebeam-agent-quic:pulsebeam-agent-quic-sim"],
+    deps = all_crate_deps(normal = True) + ["//crates/pulsebeam-udp:pulsebeam-udp-sim", "//crates/pulsebeam-queue:pulsebeam-queue", "//crates/pulsebeam-link:pulsebeam-link", "//crates/pulsebeam-core:pulsebeam-core-sim", "//crates/pulsebeam-proto:pulsebeam-proto-json", "//crates/pulsebeam-rtc:pulsebeam-rtc", "//crates/pulsebeam-steer:pulsebeam-steer", "//crates/pulsebeam-clock", "//crates/pulsebeam-runtime:pulsebeam-runtime-sim", "//crates/pulsebeam-membership:pulsebeam-membership-sim", "//agents/pulsebeam-agent-quic:pulsebeam-agent-quic-sim", "//crates/pulsebeam-transport:dtls_srtp"],
     proc_macro_deps = all_crate_deps(proc_macro = True),
 ) for variant in ["control"] + VARIANTS]
 
@@ -71,7 +71,7 @@ rust_binary(
     rustc_env_files = [":cargo_env"],
     lint_config = ":lints",
     aliases = aliases(),
-    deps = all_crate_deps(normal = True) + ["//crates/pulsebeam-udp:pulsebeam-udp", "//crates/pulsebeam-queue:pulsebeam-queue", "//crates/pulsebeam-link:pulsebeam-link", "//crates/pulsebeam-core:pulsebeam-core", "//crates/pulsebeam-proto:pulsebeam-proto-json", "//crates/pulsebeam-rtc:pulsebeam-rtc", "//crates/pulsebeam-steer:pulsebeam-steer", "//crates/pulsebeam-runtime:pulsebeam-runtime", "//crates/pulsebeam-membership", "//agents/pulsebeam-agent-quic"] + [":pulsebeam"],
+    deps = all_crate_deps(normal = True) + ["//crates/pulsebeam-udp:pulsebeam-udp", "//crates/pulsebeam-queue:pulsebeam-queue", "//crates/pulsebeam-link:pulsebeam-link", "//crates/pulsebeam-core:pulsebeam-core", "//crates/pulsebeam-proto:pulsebeam-proto-json", "//crates/pulsebeam-rtc:pulsebeam-rtc", "//crates/pulsebeam-steer:pulsebeam-steer", "//crates/pulsebeam-runtime:pulsebeam-runtime", "//crates/pulsebeam-membership", "//agents/pulsebeam-agent-quic", "//crates/pulsebeam-transport:dtls_srtp"] + [":pulsebeam"],
     proc_macro_deps = all_crate_deps(proc_macro = True),
 )
 

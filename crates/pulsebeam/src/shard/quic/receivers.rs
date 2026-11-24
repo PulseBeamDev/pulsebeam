@@ -59,7 +59,7 @@ enum SubscriberPayload {
         capture_clock: Option<DataV1CaptureClock>,
         wire: FramedOutput<()>,
     },
-    Rtp(RtpOutput),
+    Rtp(Box<RtpOutput>),
 }
 
 struct RtpOutput {
@@ -203,8 +203,10 @@ impl RtpOutput {
                     self.last_branch.is_some_and(|previous| previous != branch),
                 )
                 .ok()?;
+            let [.., a, b, c, d] = projected.sequence.to_be_bytes();
+            let wire_sequence = u32::from_be_bytes([a, b, c, d]);
             Some((
-                packet.with_receiver_media_position(projected.sequence as u32, projected.timestamp),
+                packet.with_receiver_media_position(wire_sequence, projected.timestamp),
                 (projected, next),
             ))
         })?;
@@ -289,14 +291,14 @@ impl Installed {
                         let (wire, emission) = FramedOutput::new(peer, profile, binding_id)?;
                         (
                             PayloadBinding::from(binding),
-                            SubscriberPayload::Rtp(RtpOutput {
+                            SubscriberPayload::Rtp(Box::new(RtpOutput {
                                 profile,
                                 ssrc: binding.ssrc().get(),
                                 wire,
                                 timeline,
                                 admitted: None,
                                 last_branch: None,
-                            }),
+                            })),
                             emission,
                         )
                     }

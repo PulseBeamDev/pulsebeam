@@ -146,7 +146,7 @@ impl Association {
     pub fn connect(
         clock_origin: Instant,
         now: Instant,
-        config: ClientConfig,
+        mut config: ClientConfig,
         resolved: SocketAddr,
         admit: QuicAdmit,
     ) -> Result<Self, QuicEvent> {
@@ -177,6 +177,10 @@ impl Association {
         )
         .map_err(|_| failed(protocol("invalid QUIC admission")))?;
         let address = SocketAddr::new(resolved.ip(), admit.placement.port.get());
+        crate::transport::routing::set_initial_destination(
+            &mut config,
+            admit.placement.initial_dcid,
+        );
         let transport = ClientTransport::connect(now, config, address, &admit.placement.host)
             .map_err(|_| failed(transient("could not start QUIC transport")))?;
         Ok(Self {
@@ -590,7 +594,7 @@ fn receive_packet(
         } => {
             // Reuse the Linux encoded depacketizer's RTP-shaped input locally.
             // Packet authority and extensions are resolved before this adapter.
-            let mut payload = Vec::with_capacity(12 + packet.payload().len());
+            let mut payload = Vec::with_capacity(12_usize.saturating_add(packet.payload().len()));
             payload.extend_from_slice(&[0x80, payload_type | (u8::from(header.marker) << 7)]);
             let [.., a, b] = header.sequence.to_be_bytes();
             payload.extend_from_slice(&[a, b]);
@@ -752,7 +756,7 @@ mod tests {
             panic!("placement request")
         };
         agent.handle(HostEvent::Http(HttpEvent::Response { operation, response: HttpResponse {
-            status: 200, headers: vec![], body: br#"{"profile":"pulsebeam-rt-v1","authority":{"host":"edge.example","port":4443},"owner":"owner","valid_for_ms":1000}"#.to_vec(),
+            status: 200, headers: vec![], body: br#"{"profile":"pulsebeam-rt-v1","authority":{"host":"edge.example","port":4443},"owner":"owner","initial_dcid":"AAAAAAAAAAAAAAAAAAAAAAAAAAA","valid_for_ms":1000}"#.to_vec(),
         } })).unwrap();
         let Some(Effect::Quic(QuicEffect::Admit(admit))) = agent.next_effect() else {
             panic!("dial effect")

@@ -10,6 +10,32 @@ use std::net::SocketAddr;
 const MAX_ADDRS_PER_ROUTE: usize = 16;
 const MAX_ADDR_ENTRIES: usize = MAX_ADDRS_PER_ROUTE * 4096;
 
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum UdpDestination {
+    Rtc,
+    Quic(ShardId),
+}
+
+pub(super) fn classify_udp(packet: &[u8], quic_shards: usize) -> Option<UdpDestination> {
+    use pulsebeam_transport::{PacketKind, classify};
+    // This server is an ICE endpoint, not a TURN client. A relay forwards
+    // the unwrapped peer datagram here, not a ChannelData response.
+    match classify(packet, false) {
+        PacketKind::Stun if pulsebeam_steer::stun::is_stun(packet) => Some(UdpDestination::Rtc),
+        PacketKind::Dtls if packet.len() >= 13 => Some(UdpDestination::Rtc),
+        PacketKind::RtpRtcp
+            if pulsebeam_transport::dtls_srtp::Transport::classify(packet).is_some() =>
+        {
+            Some(UdpDestination::Rtc)
+        }
+        PacketKind::Quic if quic_shards != 0 => {
+            pulsebeam_agent_quic::transport::routing::destination(packet, quic_shards)
+                .map(|shard| UdpDestination::Quic(ShardId::new(usize::from(shard))))
+        }
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct LruList {
     head: Option<SocketAddr>,

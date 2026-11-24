@@ -322,7 +322,21 @@ impl Socket {
         })
     }
 
-    pub(crate) fn send_ect0(&mut self, entry: &SendDatagram<'_>) -> SendReport {
+    pub(crate) fn send_one(
+        &mut self,
+        entry: &SendDatagram<'_>,
+        source: Option<IpAddr>,
+        ect0: bool,
+    ) -> SendReport {
+        let remote = entry.destination.ip().to_canonical();
+        if source.is_some_and(|ip| ip.is_unspecified() || ip.is_ipv4() != remote.is_ipv4()) {
+            return SendReport {
+                accepted: 0,
+                stop: Some(SendStop::Error(invalid(
+                    "UDP source IP family does not match destination",
+                ))),
+            };
+        }
         let destination = match (self.local_addr, entry.destination) {
             (SocketAddr::V6(_), SocketAddr::V4(addr)) => {
                 SocketAddr::new(IpAddr::V6(addr.ip().to_ipv6_mapped()), addr.port())
@@ -330,20 +344,55 @@ impl Socket {
             (_, addr) => addr,
         };
         let address = SockaddrStorage::from(destination);
-        let cmsg = if entry.destination.is_ipv4() {
-            ControlMessage::Ipv4Tos(&2)
-        } else {
-            ControlMessage::Ipv6TClass(&2)
+        let ecn = ect0.then(|| {
+            if remote.is_ipv4() {
+                ControlMessage::Ipv4Tos(&2)
+            } else {
+                ControlMessage::Ipv6TClass(&2)
+            }
+        });
+        let v4;
+        let v6;
+        let pktinfo = match source {
+            Some(IpAddr::V4(ip)) => {
+                v4 = libc::in_pktinfo {
+                    ipi_ifindex: 0,
+                    ipi_addr: libc::in_addr { s_addr: 0 },
+                    ipi_spec_dst: libc::in_addr {
+                        s_addr: u32::from_ne_bytes(ip.octets()),
+                    },
+                };
+                Some(ControlMessage::Ipv4PacketInfo(&v4))
+            }
+            Some(IpAddr::V6(ip)) => {
+                v6 = libc::in6_pktinfo {
+                    ipi6_addr: libc::in6_addr {
+                        s6_addr: ip.octets(),
+                    },
+                    ipi6_ifindex: 0,
+                };
+                Some(ControlMessage::Ipv6PacketInfo(&v6))
+            }
+            None => None,
         };
         submit_prefix(std::slice::from_ref(entry), 1, |_| {
             let transmit = |socket: &socket2::Socket| {
-                sendmsg(
-                    socket.as_raw_fd(),
-                    &[IoSlice::new(entry.payload)],
-                    std::slice::from_ref(&cmsg),
-                    MsgFlags::MSG_DONTWAIT,
-                    Some(&address),
-                )
+                let send = |controls: &[ControlMessage<'_>]| {
+                    sendmsg(
+                        socket.as_raw_fd(),
+                        &[IoSlice::new(entry.payload)],
+                        controls,
+                        MsgFlags::MSG_DONTWAIT,
+                        Some(&address),
+                    )
+                };
+                match (pktinfo.as_ref(), ecn.as_ref()) {
+                    (Some(pktinfo), Some(ecn)) => send(&[*pktinfo, *ecn]),
+                    (Some(control), None) | (None, Some(control)) => {
+                        send(std::slice::from_ref(control))
+                    }
+                    (None, None) => send(&[]),
+                }
                 .map_err(io::Error::from)
                 .and_then(|bytes| {
                     if bytes == entry.payload.len() {

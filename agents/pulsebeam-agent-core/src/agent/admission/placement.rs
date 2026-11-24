@@ -1,6 +1,8 @@
 use alloc::{format, string::String};
 use core::{fmt, num::NonZeroU16, time::Duration};
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use pulsebeam_proto::NATIVE_QUIC_INITIAL_CID_BYTES as INITIAL_CID_BYTES;
 use serde::{Deserialize, Serialize};
 
 use super::{MAX_CAPABILITY_BODY_BYTES, valid_proof};
@@ -34,6 +36,7 @@ pub struct Placed {
 #[derive(Clone, PartialEq, Eq)]
 pub struct Placement {
     pub owner: String,
+    pub initial_dcid: [u8; INITIAL_CID_BYTES],
     pub host: String,
     pub port: NonZeroU16,
     pub valid_for: Duration,
@@ -171,6 +174,7 @@ impl Placement {
         struct Response {
             profile: String,
             owner: String,
+            initial_dcid: String,
             authority: Authority,
             valid_for_ms: u64,
         }
@@ -189,35 +193,25 @@ impl Placement {
             serde_json::from_slice(&response.body).map_err(|_| PlacementError::InvalidResponse)?;
         if response.profile != PROFILE
             || !valid_proof(&response.owner)
-            || !dns_name(&response.authority.host)
+            || !pulsebeam_proto::valid_native_quic_host(&response.authority.host)
             || !(1..=MAX_PLACEMENT_MS).contains(&response.valid_for_ms)
+        {
+            return Err(PlacementError::InvalidResponse);
+        }
+        let mut initial_dcid = [0; INITIAL_CID_BYTES];
+        if URL_SAFE_NO_PAD.decode_slice(response.initial_dcid.as_bytes(), &mut initial_dcid)
+            != Ok(INITIAL_CID_BYTES)
         {
             return Err(PlacementError::InvalidResponse);
         }
         Ok(Self {
             owner: response.owner,
+            initial_dcid,
             host: response.authority.host,
             port: response.authority.port,
             valid_for: Duration::from_millis(response.valid_for_ms),
         })
     }
-}
-
-fn dns_name(value: &str) -> bool {
-    let host = value.strip_suffix('.').unwrap_or(value);
-    host.len() <= 253
-        && host
-            .rsplit('.')
-            .next()
-            .is_some_and(|label| label.bytes().any(|b| b.is_ascii_alphabetic()))
-        && host.split('.').all(|label| {
-            (1..=63).contains(&label.len())
-                && !label.starts_with('-')
-                && !label.ends_with('-')
-                && label
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-        })
 }
 
 #[cfg(test)]
@@ -280,7 +274,7 @@ mod tests {
         let response = HttpResponse {
             status: 200,
             headers: Vec::new(),
-            body: br#"{"profile":"pulsebeam-rt-v1","owner":"owner","authority":{"host":"edge.example","port":443},"valid_for_ms":2000}"#.to_vec(),
+            body: br#"{"profile":"pulsebeam-rt-v1","owner":"owner","initial_dcid":"AAAAAAAAAAAAAAAAAAAAAAAAAAA","authority":{"host":"edge.example","port":443},"valid_for_ms":2000}"#.to_vec(),
         };
         let placed = pending.complete(Duration::from_secs(6), &response).unwrap();
         assert_eq!(placed.generation, generation);
@@ -301,7 +295,7 @@ mod tests {
             HttpResponse {
             status: 200,
             headers: Vec::new(),
-            body: serde_json::to_vec(&serde_json::json!({"profile": profile, "owner": owner, "authority": {"host": host, "port": port}, "valid_for_ms": valid_for_ms})).unwrap(),
+            body: serde_json::to_vec(&serde_json::json!({"profile": profile, "owner": owner, "initial_dcid":"AAAAAAAAAAAAAAAAAAAAAAAAAAA", "authority": {"host": host, "port": port}, "valid_for_ms": valid_for_ms})).unwrap(),
         }
         };
         let valid = response(PROFILE, "owner", "edge.example", 443, 10_000);

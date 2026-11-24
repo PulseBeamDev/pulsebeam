@@ -92,13 +92,14 @@ fn witness(ip: IpAddr) -> Result<()> {
         NonZeroUsize::MIN,
     )
     .map_err(|error| anyhow!("server TLS: {error:?}"))?;
-    let config = transport::client_config(roots, Arc::new(DefaultTimeProvider))
+    let mut config = transport::client_config(roots, Arc::new(DefaultTimeProvider))
         .map_err(|error| anyhow!("client TLS: {error:?}"))?;
+    transport::routing::set_initial_destination(&mut config, transport::routing::mint(0));
     let server_socket = bind(ip)?;
     let mut socket = bind(ip)?;
     let server_addr = server_socket.local_addr()?;
     let mut local = socket.local_addr()?;
-    let mut listener = Listener::new(tls)?;
+    let mut listener = Listener::on_shard(tls, 0)?;
     let mut now = Instant::now();
     let mut client = ClientTransport::connect(now, config, server_addr, AUTHORITY)
         .map_err(|error| anyhow!("client start: {error:?}"))?;

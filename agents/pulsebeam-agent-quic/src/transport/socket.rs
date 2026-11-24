@@ -5,7 +5,7 @@ use std::num::NonZeroU16;
 use noq_proto::{EcnCodepoint, Transmit};
 #[cfg(not(feature = "sim"))]
 use pulsebeam_udp::DetachedUdpSocket;
-use pulsebeam_udp::{BindOptions, SendDatagram, SendStop, UdpSocket};
+use pulsebeam_udp::{BindOptions, SendStop, UdpSocket};
 
 use super::UDP_PAYLOAD_BYTES;
 
@@ -114,7 +114,10 @@ impl Egress {
             || tx.size == 0
             || tx.size > self.bytes.len()
             || tx.size > usize::from(UDP_PAYLOAD_BYTES)
-            || tx.src_ip.is_some_and(|ip| ip != local_addr.ip())
+            || (!local_addr.ip().is_unspecified()
+                && tx
+                    .src_ip
+                    .is_some_and(|ip| ip.to_canonical() != local_addr.ip().to_canonical()))
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -132,15 +135,12 @@ impl Egress {
         let Some(tx) = &self.pending else {
             return Ok(Flush::Empty);
         };
-        let report = if tx.ecn == Some(EcnCodepoint::Ect0) && socket.supports_ect0() {
-            socket.try_send_ect0(tx.destination, &self.bytes)
-        } else {
-            socket.try_send_batch(&[SendDatagram {
-                destination: tx.destination,
-                payload: &self.bytes,
-                gso_segment_size: None,
-            }])
-        };
+        let report = socket.try_send_one(
+            tx.destination,
+            &self.bytes,
+            tx.src_ip,
+            tx.ecn == Some(EcnCodepoint::Ect0) && socket.supports_ect0(),
+        );
         match report.stop {
             None if report.accepted == 1 => {
                 self.pending = None;

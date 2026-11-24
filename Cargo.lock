@@ -3777,6 +3777,7 @@ dependencies = [
  "pulsebeam-server",
  "pulsebeam-steer",
  "pulsebeam-testdata",
+ "pulsebeam-transport",
  "pulsebeam-udp",
  "rand 0.10.2",
  "rcgen",

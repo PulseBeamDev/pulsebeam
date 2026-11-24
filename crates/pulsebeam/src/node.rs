@@ -8,7 +8,7 @@ use pulsebeam_runtime::net::UdpMode;
 use pulsebeam_runtime::net::tcp::TcpListener;
 use pulsebeam_runtime::rand;
 use pulsebeam_runtime::rand::SeedableRng;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::future::Future;
 use std::net::{Ipv6Addr, SocketAddr};
 #[allow(
@@ -62,14 +62,9 @@ pub enum IceTcpConfig {
     },
 }
 
-/// One dedicated QUIC socket for a logical shard. The advertised DNS name and
-/// port are supplied by the operator and need not equal the local bind mapping.
-#[derive(Clone)]
-pub struct QuicListener {
-    pub bind: SocketAddr,
-    pub host: String,
-    pub port: u16,
-    pub tls: pulsebeam_agent_quic::transport::ServerConfig,
+struct NativeQuic {
+    host: String,
+    tls: pulsebeam_agent_quic::transport::ServerConfig,
 }
 
 pub struct NodeBuilder {
@@ -91,7 +86,7 @@ pub struct NodeBuilder {
     local_addr: Option<SocketAddr>,
     external_addrs: Vec<SocketAddr>,
     advertise_bound_udp: bool,
-    quic_listeners: Vec<QuicListener>,
+    native_quic: Option<NativeQuic>,
 
     // Dependencies (Transport / Logic)
     rng: Option<rand::Rng>,
@@ -146,7 +141,7 @@ impl NodeBuilder {
             local_addr: None,
             external_addrs: Vec::new(),
             advertise_bound_udp: false,
-            quic_listeners: Vec::new(),
+            native_quic: None,
             rng: None,
             udp_mode: UdpMode::Batch,
             #[cfg(not(test))]
@@ -297,14 +292,14 @@ impl NodeBuilder {
         self.shard_runtime.shard_count()
     }
 
-    /// Set the local bind address for UDP/TCP transports.
-    /// Ignored if transports are injected manually.
-    /// Opt into one dedicated QUIC socket per logical shard, in shard order.
-    pub fn quic_listeners(mut self, listeners: Vec<QuicListener>) -> Self {
-        self.quic_listeners = listeners;
+    /// Serve authenticated native QUIC on the RTC UDP port using this DNS authority and TLS identity.
+    pub fn with_native_quic(mut self, host: String, tls: pulsebeam_agent_quic::transport::ServerConfig) -> Self {
+        self.native_quic = Some(NativeQuic { host, tls });
         self
     }
 
+    /// Set the local bind address for UDP/TCP transports.
+    /// Ignored if transports are injected manually.
     pub fn local_addr(mut self, addr: SocketAddr) -> Self {
         self.local_addr = Some(addr);
         self
@@ -507,6 +502,7 @@ impl NodeBuilder {
             advertised_addrs.first().copied(),
             self.configured_shard_count()?,
             self.udp_mode,
+            self.native_quic.is_some(),
         )
         .await?;
         self.run_bound(
@@ -611,54 +607,26 @@ impl NodeBuilder {
             );
         }
 
-        if !self.quic_listeners.is_empty() {
+        let (quic_authority, quic_tls) = if let Some(NativeQuic { host, tls }) = self.native_quic {
             anyhow::ensure!(
-                self.quic_listeners.len() == shard_count,
-                "QUIC requires a listener for each logical shard"
+                !self.tcp_only && self.key_registry.is_some() && self.http_api.is_some(),
+                "QUIC requires RTC UDP, native admission and a key registry"
             );
             anyhow::ensure!(
-                self.key_registry.is_some() && self.http_api.is_some(),
-                "QUIC requires native admission and a key registry"
-            );
-        }
-        let mut quic_listeners = self.quic_listeners.into_iter();
-        let mut quic_addresses = BTreeMap::new();
-        let mut quic_bound = Vec::with_capacity(quic_listeners.len());
-        let mut authorities = HashSet::new();
-        for (index, listener) in quic_listeners.by_ref().enumerate() {
-            let label = |name: &str| {
-                !name.is_empty()
-                    && name.len() <= 63
-                    && !name.starts_with('-')
-                    && !name.ends_with('-')
-                    && name
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-            };
-            anyhow::ensure!(
-                listener.host.len() <= 253
-                    && listener.host.split('.').all(label)
-                    && listener.host.parse::<std::net::IpAddr>().is_err(),
+                pulsebeam_proto::valid_native_quic_host(&host),
                 "invalid QUIC advertised DNS authority"
             );
-            let socket = pulsebeam_agent_quic::transport::socket::bind(listener.bind)
-                .await
-                .context("binding dedicated shard QUIC socket")?;
-            let port = if listener.port == 0 {
-                socket.local_addr().port()
-            } else {
-                listener.port
-            };
+            let port = advertised_addrs.first().copied()
+                .or_else(|| udp_sockets.first().map(pulsebeam_udp::BoundUdpSocket::local_addr))
+                .map_or(0, |addr| addr.port());
             anyhow::ensure!(
-                port != 0 && authorities.insert((listener.host.to_ascii_lowercase(), port)),
-                "QUIC advertised authorities must distinguish logical shards"
+                port != 0 && advertised_addrs.iter().all(|addr| addr.port() == port),
+                "QUIC requires a common advertised RTC UDP port"
             );
-            let ingress = pulsebeam_agent_quic::transport::ingress::Ingress::new(listener.tls)
-                .context("configuring shard QUIC listener")?;
-            quic_addresses.insert(ShardId::new(index), (listener.host, port));
-            quic_bound.push((socket, ingress));
-        }
-        let mut quic_bound = quic_bound.into_iter();
+            (Some((host, port)), Some(tls))
+        } else {
+            (None, None)
+        };
 
         let steering = match self.steering {
             Some(attach) => Some(attach(&udp_sockets).context("attaching UDP steering")?),
@@ -825,7 +793,11 @@ impl NodeBuilder {
             let (clock_tx, clock_rx) = mailbox::bounded(core::num::NonZeroUsize::MIN);
             clock_senders.push(clock_tx);
             let initial_global_clock = initial_global_clock.clone();
-            let quic = quic_bound.next();
+            let quic = quic_tls.as_ref().map(|tls| -> Result<_> {
+                let shard = u16::try_from(shard_id.index()).context("QUIC shard index exceeds CID prefix")?;
+                pulsebeam_agent_quic::transport::ingress::Ingress::on_shard(tls.clone(), shard)
+                    .context("configuring shard QUIC endpoint")
+            }).transpose()?;
             let controller = controller_command_tx.clone();
 
             let launch =
@@ -847,12 +819,10 @@ impl NodeBuilder {
                         initial_global_clock,
                         clock_rx,
                     );
-                    if let Some((socket, ingress)) = quic {
+                    if let Some(ingress) = quic {
                         shard.enable_quic(ingress, controller);
-                        Ok(pulsebeam_runtime::rt::ManagedService::new(shard, udp_sock).with_secondary_socket(socket.activate()?))
-                    } else {
-                        Ok(pulsebeam_runtime::rt::ManagedService::new(shard, udp_sock))
                     }
+                    Ok(pulsebeam_runtime::rt::ManagedService::new(shard, udp_sock))
                 };
 
             let worker = crate::control::placement::initial_worker(shard_id, shard_executor.worker_count())
@@ -890,7 +860,7 @@ impl NodeBuilder {
             view_writers,
         );
         controller.set_ownership_mode(ownership_mode);
-        controller.set_quic_addresses(quic_addresses);
+        controller.set_quic_authority(quic_authority);
         #[cfg(feature = "sim")]
         if let Some(peer) = self.sim_ownership_peer.as_ref() {
             controller.set_sim_ownership_peer(peer.clone());
@@ -1076,10 +1046,11 @@ async fn bind_udp_socket(
 }
 
 async fn bind_udp_sockets(
-    local_addr: SocketAddr,
+    mut local_addr: SocketAddr,
     advertised_addr: Option<SocketAddr>,
     shards: usize,
     mode: UdpMode,
+    shared_port: bool,
 ) -> Result<Vec<pulsebeam_udp::BoundUdpSocket>> {
     let mut sockets = Vec::with_capacity(shards);
 
@@ -1102,6 +1073,9 @@ async fn bind_udp_sockets(
                 break;
             }
         };
+        if shared_port && local_addr.port() == 0 {
+            local_addr.set_port(socket.local_addr().port());
+        }
         sockets.push(socket);
     }
     Ok(sockets)

@@ -15,7 +15,6 @@ pub trait Service: Unpin + 'static {
 /// Resources belonging to one logical service across worker placements.
 pub struct ManagedIo {
     primary: SocketSlot,
-    secondary: SocketSlot,
     timer: Option<Pin<Box<Sleep>>>,
     deadline: Option<Instant>,
     runnable_since: Option<Instant>,
@@ -65,7 +64,6 @@ impl ManagedIo {
                 attached: Some(socket),
                 ..SocketSlot::default()
             },
-            secondary: SocketSlot::default(),
             timer: None,
             deadline: None,
             runnable_since: None,
@@ -89,24 +87,16 @@ impl ManagedIo {
             .expect("polling detached service")
     }
 
-    pub fn secondary_socket(&mut self) -> Option<&mut pulsebeam_udp::UdpSocket> {
-        self.secondary.attached.as_mut()
-    }
-
     /// End a budgeted tick and record only runnable-to-poll delay, excluding idle waits.
     pub fn yield_after_tick(&mut self, cx: &mut Context<'_>) {
         self.runnable_since = Some(Instant::now());
         cx.waker().wake_by_ref();
     }
 
-    pub async fn readable(&mut self, deadline: Option<Instant>) -> io::Result<()> {
-        self.readable_with_secondary(deadline, None).await
-    }
-
-    pub async fn readable_with_secondary(
+    pub async fn udp_ready(
         &mut self,
         deadline: Option<Instant>,
-        secondary_write: Option<bool>,
+        wait_for_write: bool,
     ) -> io::Result<()> {
         if self.deadline != deadline {
             self.timer = None;
@@ -126,16 +116,8 @@ impl ManagedIo {
             if let Poll::Ready(result) = socket.poll_readable(cx) {
                 return Poll::Ready(result);
             }
-            if let (Some(write), Some(socket)) = (secondary_write, self.secondary.attached.as_ref())
-            {
-                let ready = if write {
-                    socket.poll_writable(cx)
-                } else {
-                    socket.poll_readable(cx)
-                };
-                if ready.is_ready() {
-                    return ready;
-                }
+            if wait_for_write && let Poll::Ready(result) = socket.poll_writable(cx) {
+                return Poll::Ready(result);
             }
             match self.timer.as_mut() {
                 Some(timer) => timer.as_mut().poll(cx).map(|()| Ok(())),
@@ -172,7 +154,6 @@ impl ManagedIo {
         {
             self.timer = None;
             self.primary.detach();
-            self.secondary.detach();
             Ok(())
         }
         #[cfg(not(all(target_os = "linux", not(feature = "sim"))))]
@@ -191,12 +172,7 @@ impl ManagedIo {
         }
         #[cfg(all(target_os = "linux", not(feature = "sim")))]
         {
-            self.primary.attach()?;
-            if let Err(error) = self.secondary.attach() {
-                self.primary.detach();
-                return Err(error);
-            }
-            Ok(())
+            self.primary.attach()
         }
         #[cfg(not(all(target_os = "linux", not(feature = "sim"))))]
         Ok(())
@@ -222,11 +198,6 @@ impl<S: Service> ManagedService<S> {
             service,
             io: ManagedIo::new(socket),
         }
-    }
-
-    pub fn with_secondary_socket(mut self, socket: pulsebeam_udp::UdpSocket) -> Self {
-        self.io.secondary.attached = Some(socket);
-        self
     }
 }
 
@@ -283,46 +254,32 @@ mod tests {
         .unwrap();
         let destination = socket.local_addr();
         let mut io = ManagedIo::new(socket.activate().unwrap());
-        let secondary = pulsebeam_udp::bind(pulsebeam_udp::BindOptions::new(
-            "127.0.0.1:0".parse().unwrap(),
-        ))
-        .await
-        .unwrap();
-        let secondary_addr = secondary.local_addr();
-        io.secondary.attached = Some(secondary.activate().unwrap());
         let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let signal = Arc::new(Signal(tokio::sync::Notify::new()));
         let waker = std::task::Waker::from(signal.clone());
         let mut cx = Context::from_waker(&waker);
         for reattach in [false, true] {
             if reattach {
-                sender.send_to(b"secondary", secondary_addr).await.unwrap();
+                sender
+                    .send_to(b"before migration", destination)
+                    .await
+                    .unwrap();
                 io.detach().unwrap();
-                assert!(io.secondary_socket().is_none());
                 io.attach().unwrap();
-                let secondary = io.secondary_socket().unwrap();
-                assert_eq!(secondary.local_addr(), secondary_addr);
-                tokio::time::timeout(Duration::from_secs(1), secondary.readable())
+                assert_eq!(io.socket().local_addr(), destination);
+                tokio::time::timeout(Duration::from_secs(1), io.udp_ready(None, false))
                     .await
                     .unwrap()
                     .unwrap();
-                assert_eq!(
-                    secondary
-                        .try_recv_batch()
-                        .unwrap()
-                        .iter()
-                        .next()
-                        .unwrap()
-                        .payload,
-                    b"secondary"
-                );
+                let batch = io.socket().try_recv_batch().unwrap();
+                assert_eq!(batch.iter().next().unwrap().payload, b"before migration");
             }
             match io.socket().try_recv_batch() {
                 Err(error) => assert_eq!(error.kind(), io::ErrorKind::WouldBlock),
                 Ok(_) => panic!("unexpected queued datagram"),
             }
             {
-                let wait = io.readable(None);
+                let wait = io.udp_ready(None, false);
                 tokio::pin!(wait);
                 assert!(wait.as_mut().poll(&mut cx).is_pending());
             }

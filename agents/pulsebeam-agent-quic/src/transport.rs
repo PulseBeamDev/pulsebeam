@@ -6,12 +6,12 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Instant;
 
-pub use noq_proto::ServerConfig;
 use noq_proto::crypto::rustls::{HandshakeData, QuicClientConfig, QuicServerConfig};
 use noq_proto::{
-    ClientConfig, Connection, ConnectionHandle, Endpoint, EndpointConfig, SendDatagramError,
-    Transmit, TransportConfig,
+    ClientConfig, ConnectionHandle, Endpoint, EndpointConfig, SendDatagramError, Transmit,
+    TransportConfig,
 };
+pub use noq_proto::{Connection, ServerConfig};
 
 use crate::records::Datagram;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -65,12 +65,28 @@ fn endpoint_with_cid_bytes(
     server: Option<ServerConfig>,
     cid_bytes: usize,
 ) -> Result<Endpoint, noq_proto::ConfigError> {
+    endpoint_with_generator(server, move || {
+        Box::new(noq_proto::RandomConnectionIdGenerator::new(cid_bytes))
+    })
+}
+
+fn endpoint_on_shard(server: ServerConfig, shard: u16) -> Result<Endpoint, noq_proto::ConfigError> {
+    endpoint_with_generator(Some(server), move || Box::new(routing::Generator(shard)))
+}
+
+#[allow(
+    clippy::disallowed_types,
+    reason = "Noq requires shared immutable endpoint configuration"
+)]
+fn endpoint_with_generator(
+    server: Option<ServerConfig>,
+    generate: impl Fn() -> Box<dyn noq_proto::ConnectionIdGenerator> + Send + Sync + 'static,
+) -> Result<Endpoint, noq_proto::ConfigError> {
     let mut config = EndpointConfig::default();
     config
         .supported_versions(vec![1])
-        .cid_generator(Arc::new(move || {
-            Box::new(noq_proto::RandomConnectionIdGenerator::new(cid_bytes))
-        }))
+        .grease_quic_bit(false)
+        .cid_generator(Arc::new(generate))
         .max_udp_payload_size(UDP_PAYLOAD_BYTES)?;
     Ok(Endpoint::new(Arc::new(config), server.map(Arc::new), true))
 }
@@ -154,6 +170,34 @@ pub fn server_config(
         .incoming_buffer_size_total(256 * 1024)
         .time_source(token_time);
     Ok(config)
+}
+
+/// Load a PEM certificate chain and its private key using the host clocks.
+#[allow(
+    clippy::disallowed_types,
+    reason = "Noq and rustls require shared immutable clock providers"
+)]
+pub fn server_config_from_pem(
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+) -> std::io::Result<ServerConfig> {
+    use rustls::pki_types::pem::PemObject;
+
+    let invalid_cert = |_| std::io::Error::other("cannot load QUIC certificate chain PEM");
+    let certificates = CertificateDer::pem_file_iter(cert_path)
+        .map_err(invalid_cert)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(invalid_cert)?;
+    let key = PrivateKeyDer::from_pem_file(key_path)
+        .map_err(|_| std::io::Error::other("cannot load QUIC private key PEM"))?;
+    server_config(
+        certificates,
+        key,
+        Arc::new(rustls::time_provider::DefaultTimeProvider),
+        Arc::new(noq_proto::StdSystemTime),
+        NonZeroUsize::MIN,
+    )
+    .map_err(|_| std::io::Error::other("invalid QUIC TLS certificate or key"))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -389,6 +433,7 @@ pub mod control;
 pub mod framing;
 pub mod ingress;
 pub mod listener;
+pub mod routing;
 pub mod socket;
 
 #[cfg(test)]

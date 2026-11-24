@@ -421,7 +421,7 @@ async fn native_modes_receive_limits_mixed_destinations_and_reuse() {
 
 #[cfg(all(target_os = "linux", not(feature = "sim")))]
 #[tokio::test]
-async fn dual_stack_reader_preserves_actual_ipv4_and_ipv6_destinations() {
+async fn dual_stack_preserves_actual_ipv4_and_ipv6_reply_addresses() {
     for mode in [Mode::Batch, Mode::Scalar] {
         let mut options = BindOptions::new("[::]:0".parse().unwrap());
         options.mode = mode;
@@ -436,7 +436,7 @@ async fn dual_stack_reader_preserves_actual_ipv4_and_ipv6_destinations() {
         // Alternate families across reused payload storage and kernel metadata.
         for _ in 0..8 {
             for (sender, destination) in [
-                (&v4, SocketAddr::from(([127, 0, 0, 1], port))),
+                (&v4, SocketAddr::from(([127, 0, 0, 2], port))),
                 (&v6, SocketAddr::new("::1".parse().unwrap(), port)),
             ] {
                 sender.send_to(b"destination", destination).await.unwrap();
@@ -445,6 +445,16 @@ async fn dual_stack_reader_preserves_actual_ipv4_and_ipv6_destinations() {
                 let datagram = batch.iter().next().unwrap();
                 assert_eq!(datagram.source, sender.local_addr().unwrap());
                 assert_eq!(datagram.destination, destination);
+                let source = datagram.source;
+                let local = datagram.destination;
+                socket.writable().await.unwrap();
+                let report = socket.try_send_one(source, b"reply", Some(local.ip()), true);
+                assert_eq!(report.accepted, 1, "{report:?}");
+                assert!(report.stop.is_none());
+                let mut reply = [0; 5];
+                let (len, actual) = sender.recv_from(&mut reply).await.unwrap();
+                assert_eq!(&reply[..len], b"reply");
+                assert_eq!(actual, destination);
             }
             let outbound = [
                 SendDatagram {

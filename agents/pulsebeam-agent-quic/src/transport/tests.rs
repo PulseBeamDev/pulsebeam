@@ -40,6 +40,7 @@ struct Peer {
     scheduler: PacketScheduler,
     control_runnable: bool,
     cid_bytes: usize,
+    routed_shard: Option<u16>,
     last_short_dcid: Vec<u8>,
     largest_delivered: usize,
 }
@@ -73,6 +74,13 @@ impl Peer {
                 continue;
             }
             self.largest_delivered = self.largest_delivered.max(tx.size);
+            if let Some(shard) = other.routed_shard {
+                assert_eq!(
+                    routing::destination(&self.out[..tx.size], usize::from(shard) + 1),
+                    Some(shard)
+                );
+            }
+            assert!(self.out.first().is_some_and(|flags| flags & 0x40 != 0));
             if self.out.first().is_some_and(|flags| flags & 0x80 == 0) {
                 self.last_short_dcid.clear();
                 self.last_short_dcid
@@ -167,6 +175,7 @@ impl Pair {
             alpn,
             CONNECTION_ID_BYTES,
             datagrams.then_some(DATAGRAM_QUEUE_BYTES),
+            None,
         )
     }
 
@@ -176,6 +185,7 @@ impl Pair {
         alpn: &[u8],
         cid_bytes: usize,
         receive_buffer: Option<usize>,
+        routed_shard: Option<u16>,
     ) -> Self {
         let (roots, server_config) = credentials(trusted);
         let mut client_config = client_config_for_alpn(roots, Arc::new(Clock), alpn).unwrap();
@@ -183,15 +193,24 @@ impl Pair {
         transport.datagram_receive_buffer_size(receive_buffer);
         client_config.transport_config(Arc::new(transport));
         let now = Instant::now();
+        let server_endpoint = if let Some(shard) = routed_shard {
+            assert_eq!(cid_bytes, routing::ROUTED_CID_BYTES);
+            routing::set_initial_destination(&mut client_config, routing::mint(shard));
+            endpoint_on_shard(server_config, shard)
+        } else {
+            endpoint_with_cid_bytes(Some(server_config), cid_bytes)
+        }
+        .unwrap();
         let server = Peer {
             address: "[2001:db8:1::1]:8443".parse().unwrap(),
-            endpoint: endpoint_with_cid_bytes(Some(server_config), cid_bytes).unwrap(),
+            endpoint: server_endpoint,
             connection: None,
             rejected: None,
             out: Vec::new(),
             scheduler: PacketScheduler::default(),
             control_runnable: false,
             cid_bytes,
+            routed_shard,
             last_short_dcid: Vec::new(),
             largest_delivered: 0,
         };
@@ -208,6 +227,7 @@ impl Pair {
             scheduler: PacketScheduler::default(),
             control_runnable: false,
             cid_bytes,
+            routed_shard: None,
             last_short_dcid: Vec::new(),
             largest_delivered: 0,
         };
@@ -356,6 +376,7 @@ fn floor_budget_is_identical_through_rebind_and_cid_rotation() {
         ALPN,
         MAX_V1_CID_BYTES,
         Some(DATAGRAM_QUEUE_BYTES),
+        Some(257),
     );
     assert_eq!(data_readiness(pair.client.conn()), Readiness::Handshaking);
     pair.advance(100);
@@ -445,7 +466,14 @@ fn peer_datagram_capacity_is_an_admission_check_not_a_sizing_input() {
     assert_eq!(received, Some(payload));
 
     // Noq advertises its receive-buffer limit and accounts for its frame bound.
-    let mut pair = Pair::with_cid("edge.example", true, ALPN, CONNECTION_ID_BYTES, Some(1158));
+    let mut pair = Pair::with_cid(
+        "edge.example",
+        true,
+        ALPN,
+        CONNECTION_ID_BYTES,
+        Some(1158),
+        None,
+    );
     pair.advance(100);
     assert_eq!(pair.server.conn().datagrams().max_size(), Some(1149));
     assert_eq!(
@@ -670,7 +698,7 @@ fn executor_admits_and_renews_a_core_session() {
         panic!("placement request")
     };
     core.handle(HostEvent::Http(HttpEvent::Response { operation, response: HttpResponse {
-        status: 200, headers: vec![], body: br#"{"profile":"pulsebeam-rt-v1","authority":{"host":"edge.example","port":4443},"owner":"owner","valid_for_ms":5000}"#.to_vec(),
+        status: 200, headers: vec![], body: br#"{"profile":"pulsebeam-rt-v1","authority":{"host":"edge.example","port":4443},"owner":"owner","initial_dcid":"AAAAAAAAAAAAAAAAAAAAAAAAAAA","valid_for_ms":5000}"#.to_vec(),
     } })).unwrap();
     let Some(Effect::Quic(QuicEffect::Admit(admit))) = core.next_effect() else {
         panic!("admission effect")

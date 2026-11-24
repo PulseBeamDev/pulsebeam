@@ -43,6 +43,7 @@ pulsebeam-core = { path = "../pulsebeam-core" }
 pulsebeam-queue = { path = "../pulsebeam-queue" }
 pulsebeam-link = { path = "../pulsebeam-link" }
 pulsebeam-rtc = { path = "../pulsebeam-rtc" }
+pulsebeam-transport = { path = "../pulsebeam-transport", default-features = false, features = ["dtls-srtp"] }
 pulsebeam-proto = { path = "../pulsebeam-proto", features = ["json"] }
 pulsebeam-steer = { path = "../pulsebeam-steer" }
 pulsebeam-clock = { path = "../pulsebeam-clock" }

@@ -308,7 +308,28 @@ impl QuicShard {
         }
     }
 
-    pub fn turn(
+    pub fn receive(
+        &mut self,
+        local: std::net::SocketAddr,
+        datagram: pulsebeam_udp::ReceivedDatagram<'_>,
+        now: Instant,
+        core: &mut super::core::ShardCore,
+    ) -> std::io::Result<()> {
+        let sessions = &mut self.sessions;
+        self.ingress
+            .receive(local, datagram, now.into_std(), |handle, peer| {
+                if let Some(session) = sessions.get_mut(&handle)
+                    && session.admitted
+                    && let Some(installed) = &mut session.installed
+                    && !installed.failed
+                    && !installed.handoff.failed()
+                {
+                    installed.receive_datagram(session.serial, &mut peer.connection, now, core);
+                }
+            })
+    }
+
+    pub fn poll(
         &mut self,
         shard: ShardId,
         socket: &mut pulsebeam_udp::UdpSocket,
@@ -321,7 +342,7 @@ impl QuicShard {
         }
         let now_std = now.into_std();
         let mut commands_pending = false;
-        self.ingress.turn(socket, now_std, |handle, peer| {
+        self.ingress.poll(socket, now_std, |handle, peer| {
             if peer.connection.is_closed() {
                 Self::closed(&mut self.sessions, handle, events, core);
                 return;
@@ -400,6 +421,33 @@ impl QuicShard {
     }
 }
 
+impl Installed {
+    fn receive_datagram(
+        &mut self,
+        serial: NonZeroU64,
+        connection: &mut pulsebeam_agent_quic::transport::Connection,
+        now: Instant,
+        core: &mut super::core::ShardCore,
+    ) -> bool {
+        if self.admissions.len() >= MAX_PENDING_ADMISSIONS {
+            return false;
+        }
+        let Some(received) =
+            pulsebeam_agent_quic::transport::read_native_datagram(connection, |datagram| {
+                self.ingest_native_datagram(serial, datagram, core, now)
+            })
+        else {
+            return false;
+        };
+        if let Ok(Some(admission)) = received
+            && !self.admissions.contains(&admission)
+        {
+            self.admissions.push_back(admission);
+        }
+        true
+    }
+}
+
 impl Session {
     fn poll(
         &mut self,
@@ -448,20 +496,8 @@ impl Session {
                     return false;
                 }
             }
-            self.data_runnable = false;
-            if installed.admissions.len() < MAX_PENDING_ADMISSIONS
-                && let Some(received) = pulsebeam_agent_quic::transport::read_native_datagram(
-                    &mut peer.connection,
-                    |datagram| installed.ingest_native_datagram(self.serial, datagram, core, now),
-                )
-            {
-                self.data_runnable = true;
-                if let Ok(Some(admission)) = received
-                    && !installed.admissions.contains(&admission)
-                {
-                    installed.admissions.push_back(admission);
-                }
-            }
+            self.data_runnable =
+                installed.receive_datagram(self.serial, &mut peer.connection, now, core);
             let input = control.read(&mut peer.connection, Phase::Admitted, now.into_std());
             // A single QUIC read can leave another complete frame buffered without a UDP wake.
             self.data_runnable |= matches!(input, Ok(Read::Frame(_)));

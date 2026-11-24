@@ -1,16 +1,14 @@
-use std::io;
 use std::time::Instant;
+use std::{io, net::SocketAddr};
 
 use noq_proto::{ConnectionHandle, EcnCodepoint, FourTuple, ServerConfig};
-use pulsebeam_udp::{Ecn, UdpSocket};
+use pulsebeam_udp::{Ecn, ReceivedDatagram, UdpSocket};
 
 use super::close;
 use super::listener::{Association, Listener};
 use super::socket::{Egress, Flush};
 
-const RECEIVE_BUDGET: usize = 32;
-
-/// Packet execution for a dedicated socket owned by the caller's logical shard.
+/// Packet execution owned by the caller's logical shard.
 /// Socket registration is managed separately; all protocol and egress state
 /// stays in this value when the shard moves.
 pub struct Ingress {
@@ -22,9 +20,9 @@ pub struct Ingress {
 }
 
 impl Ingress {
-    pub fn new(config: ServerConfig) -> Result<Self, noq_proto::ConfigError> {
+    pub fn on_shard(config: ServerConfig, shard: u16) -> Result<Self, noq_proto::ConfigError> {
         Ok(Self {
-            listener: Listener::new(config)?,
+            listener: Listener::on_shard(config, shard)?,
             egress: Egress::default(),
             pending: None,
             scan: 0,
@@ -75,18 +73,38 @@ impl Ingress {
         Ok(true)
     }
 
-    /// Packet and connection work per call is bounded. A WouldBlock send
-    /// keeps the exact committed UDP packet until writable; further protocol
-    /// output is not pulled into a second queue.
-    pub fn turn(
+    pub fn receive(
+        &mut self,
+        local: SocketAddr,
+        item: ReceivedDatagram<'_>,
+        now: Instant,
+        service: impl FnOnce(ConnectionHandle, &mut Association),
+    ) -> io::Result<()> {
+        let path = FourTuple::new(item.source, Some(item.destination.ip()));
+        // Interleave application DATAGRAM reads with batched socket input. Noq
+        // evicts old DATAGRAMs when its byte window fills, even on a lossless path.
+        let receive = |out: &mut Vec<u8>| {
+            self.listener
+                .receive_then(now, path, ecn(item.ecn), item.payload, out, service)
+        };
+        // Stateless replies are best-effort when the single send slot is full.
+        if self.egress.is_pending() {
+            receive(&mut self.stateless_scratch);
+        } else {
+            self.egress.stage(local, receive)?;
+        }
+        self.schedule();
+        Ok(())
+    }
+
+    /// A WouldBlock send retains the exact committed packet; further output
+    /// is not pulled into a second queue.
+    pub fn poll(
         &mut self,
         socket: &mut UdpSocket,
         now: Instant,
         service: impl FnMut(ConnectionHandle, &mut Association),
     ) -> io::Result<()> {
-        if !self.flush(socket, now)? {
-            return Ok(());
-        }
         if self
             .listener
             .deadline()
@@ -95,36 +113,6 @@ impl Ingress {
             self.schedule();
         }
         let local = socket.local_addr();
-        let mut received = false;
-        match socket.try_recv_batch() {
-            Ok(batch) => {
-                for item in batch.iter().take(RECEIVE_BUDGET) {
-                    received = true;
-                    let path = FourTuple::new(item.source, Some(item.destination.ip()));
-                    // Stateless replies are best-effort. Continue processing
-                    // this receive batch even if the single reply slot is full.
-                    if self.egress.is_pending() {
-                        self.listener.receive(
-                            now,
-                            path,
-                            ecn(item.ecn),
-                            item.payload,
-                            &mut self.stateless_scratch,
-                        );
-                    } else {
-                        self.egress.stage(local, |out| {
-                            self.listener
-                                .receive(now, path, ecn(item.ecn), item.payload, out)
-                        })?;
-                    }
-                }
-            }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-            Err(error) => return Err(error),
-        }
-        if received {
-            self.schedule();
-        }
         if !self.flush(socket, now)? {
             return Ok(());
         }

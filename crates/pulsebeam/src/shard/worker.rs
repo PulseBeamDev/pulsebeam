@@ -209,6 +209,10 @@ pub(crate) enum ShardFrame {
         address: crate::route::NodeTransportAddress,
         source_shard: ShardId,
     },
+    QuicIngress {
+        shard: ShardId,
+        datagram: NativeDatagram,
+    },
     Fabric(crate::route::fabric::ShardOffer),
     FabricDataExpectation(crate::route::fabric::ShardDataExpectation),
     FabricDataReceipt(crate::route::fabric::ShardDataReceipt),
@@ -223,6 +227,37 @@ pub(crate) enum ShardFrame {
         address: crate::route::NodeRouteAddress,
         packet: crate::participant::reverse::ReversePacket,
     },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct NativeDatagram {
+    source: std::net::SocketAddr,
+    destination: std::net::SocketAddr,
+    received_at: net::ReceiveTime,
+    ecn: Option<pulsebeam_udp::Ecn>,
+    payload: Box<[u8]>,
+}
+
+impl NativeDatagram {
+    fn new(item: pulsebeam_udp::ReceivedDatagram<'_>) -> Self {
+        Self {
+            source: item.source,
+            destination: item.destination,
+            received_at: item.received_at,
+            ecn: item.ecn,
+            payload: item.payload.into(),
+        }
+    }
+
+    fn as_received(&self) -> pulsebeam_udp::ReceivedDatagram<'_> {
+        pulsebeam_udp::ReceivedDatagram {
+            source: self.source,
+            destination: self.destination,
+            received_at: self.received_at,
+            ecn: self.ecn,
+            payload: &self.payload,
+        }
+    }
 }
 
 pub(crate) struct RenewalToken(pub(crate) String);
@@ -340,6 +375,15 @@ pub(crate) fn send_link_frame(
         ShardFrame::Ingress { batch, .. } => {
             (batch.received_at.monotonic, Some(batch.received_at.wall))
         }
+        ShardFrame::QuicIngress { shard, datagram } => {
+            if tx.local_delivery_tag() != Some(shard_tag(*shard)) {
+                return false;
+            }
+            (
+                datagram.received_at.monotonic,
+                Some(datagram.received_at.wall),
+            )
+        }
         ShardFrame::Fabric(offer) => (offer.arrival, None),
         ShardFrame::FabricDataExpectation(notice) => {
             if tx.local_delivery_tag()
@@ -425,6 +469,9 @@ pub(super) fn bind_received_frame(
             true
         }
         ShardFrame::Ingress { .. } => true,
+        ShardFrame::QuicIngress { shard: target, .. } => {
+            *target == shard && received.tag == shard_tag(shard)
+        }
     }
 }
 
@@ -530,11 +577,11 @@ impl Service for ShardWorker {
         let recorder = self.recorder.clone();
         let result = metrics::with_local_recorder(&*recorder, || {
             self.observe_health(previous_busy);
-            self.tick(at, io.socket());
-            if let (Some(quic), Some(socket)) = (&mut self.quic, io.secondary_socket()) {
-                quic.turn(
+            self.tick(at, io.socket())?;
+            if let Some(quic) = &mut self.quic {
+                quic.poll(
                     self.router.shard_id,
-                    socket,
+                    io.socket(),
                     Instant::now(),
                     &mut self.shard_event_backlog,
                     &mut self.core,
@@ -684,7 +731,8 @@ impl ShardWorker {
             return Ok(());
         }
         let mut deadline = self.next_wait_deadline();
-        let secondary_write = self.quic.as_ref().map(|quic| {
+        let quic_enabled = self.quic.is_some();
+        let wait_for_write = self.quic.as_ref().is_some_and(|quic| {
             deadline = deadline.into_iter().chain(quic.deadline()).min();
             quic.wants_write()
         });
@@ -696,8 +744,8 @@ impl ShardWorker {
             true = self.clock_rx.readable() => {}
             () = async {
                 if let Some(quic) = &mut self.quic { quic.ready().await; }
-            }, if secondary_write.is_some() => {}
-            ready = io.readable_with_secondary(deadline, secondary_write) => { ready?; }
+            }, if quic_enabled => {}
+            ready = io.udp_ready(deadline, wait_for_write) => { ready?; }
             true = self.frame_rx.readable() => {}
             true = async {
                 match self.tcp_inbox.as_mut() {
@@ -716,8 +764,9 @@ impl ShardWorker {
         &mut self,
         at: pulsebeam_runtime::net::ReceiveTime,
         udp_socket: &mut pulsebeam_udp::UdpSocket,
-    ) {
+    ) -> std::io::Result<()> {
         let now = self.core.observe_execution_time(at).monotonic;
+        let local = udp_socket.local_addr();
         if let Ok(snapshot) = self.clock_rx.try_recv() {
             self.core.set_global_clock(snapshot);
         }
@@ -831,8 +880,16 @@ impl ShardWorker {
             if !bind_received_frame(self.router.shard_id, &mut received) {
                 continue;
             }
-            self.core
-                .on_shard_frames(std::iter::once(received.packet), now, &self.router);
+            match received.packet {
+                ShardFrame::QuicIngress { datagram, .. } => {
+                    if let Some(quic) = &mut self.quic {
+                        quic.receive(local, datagram.as_received(), now, &mut self.core)?;
+                    }
+                }
+                frame => self
+                    .core
+                    .on_shard_frames(std::iter::once(frame), now, &self.router),
+            }
         }
         if frames == SHARD_FRAME_BUDGET {
             self.tick_budget_hit("frames");
@@ -844,10 +901,37 @@ impl ShardWorker {
                 net::UdpMode::Scalar
             };
             if let Ok(batch) = udp_socket.try_recv_batch() {
-                // Routing can transfer packets to another shard. Ownership is
-                // materialized here, not imposed on immediate socket inspection.
+                use super::demux::{UdpDestination, classify_udp};
+                let quic_shards = if self.quic.is_some() {
+                    self.router.frame_txs.len()
+                } else {
+                    0
+                };
+                let mut native_budget = SHARD_UDP_BATCH_BUDGET;
                 for datagram in batch.iter() {
-                    append_owned_udp(&mut self.recv_batch, mode, datagram);
+                    match classify_udp(datagram.payload, quic_shards) {
+                        Some(UdpDestination::Rtc) => {
+                            append_owned_udp(&mut self.recv_batch, mode, datagram);
+                        }
+                        Some(UdpDestination::Quic(shard)) if native_budget != 0 => {
+                            native_budget = native_budget.saturating_sub(1);
+                            if shard != self.router.shard_id {
+                                self.router.send_frame(
+                                    shard,
+                                    ShardFrame::QuicIngress {
+                                        shard,
+                                        datagram: NativeDatagram::new(datagram),
+                                    },
+                                );
+                            } else if let Some(quic) = &mut self.quic {
+                                quic.receive(local, datagram, now, &mut self.core)?;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if native_budget == 0 {
+                    self.tick_budget_hit("quic_udp");
                 }
             }
         }
@@ -907,6 +991,7 @@ impl ShardWorker {
                 self.core.on_tcp_ingress(event);
             }
         }
+        Ok(())
     }
 
     /// Hand this tick's topology events to the controller without dropping
@@ -1029,6 +1114,107 @@ mod tests {
         append_owned_udp(&mut out, net::UdpMode::Scalar, later);
         append_owned_udp(&mut out, net::UdpMode::Scalar, later);
         assert_eq!(out.len(), 6);
+    }
+
+    #[test]
+    fn shared_udp_routes_same_peer_by_header_and_bounds_wrong_shard_handoff() {
+        use super::super::demux::{UdpDestination, classify_udp};
+        use pulsebeam_agent_quic::transport::routing::{ROUTED_CID_BYTES, mint};
+        use pulsebeam_link::{Destination, LinkControl, LinkTime};
+
+        let ingress = ShardId::new(0);
+        let owner = ShardId::new(1);
+        let now = Instant::now();
+        let mut links = LinkControl::<ShardFrame>::new(|| LinkTime::from_nanos(0)).unwrap();
+        let mut receivers = Vec::new();
+        let mut frame_txs = Vec::new();
+        for shard in [ingress, owner] {
+            let (port, rx) = links.create_port().unwrap();
+            receivers.push(rx);
+            let (_, tx) = links
+                .bind_send(Destination::Local {
+                    port,
+                    tag: shard_tag(shard),
+                })
+                .unwrap();
+            frame_txs.push(tx);
+        }
+        let router = LinkTransport {
+            shard_id: ingress,
+            frame_txs,
+            clock_origin: now,
+        };
+
+        let mut rtp = [0; 12];
+        *rtp.first_mut().unwrap() = 0x80;
+        let peer = pulsebeam_udp::ReceivedDatagram {
+            source: "192.0.2.10:1000".parse().unwrap(),
+            destination: "192.0.2.20:2000".parse().unwrap(),
+            payload: &rtp,
+            received_at: net::ReceiveTime::now(),
+            ecn: Some(pulsebeam_udp::Ecn::Ect1),
+        };
+        assert_eq!(classify_udp(peer.payload, 2), Some(UdpDestination::Rtc));
+        for short in [
+            &[][..],
+            &[0][..],
+            &[22][..],
+            &[0x80][..],
+            &[0x40][..],
+            &[0xc0][..],
+        ] {
+            assert_eq!(classify_udp(short, 2), None);
+        }
+        let mut short_header = Vec::with_capacity(1 + ROUTED_CID_BYTES + 20);
+        short_header.push(0x40);
+        short_header.extend(mint(1));
+        short_header.extend([0; 20]);
+        let rebound = pulsebeam_udp::ReceivedDatagram {
+            source: "192.0.2.10:1001".parse().unwrap(),
+            payload: &short_header,
+            ..peer
+        };
+        for item in [
+            pulsebeam_udp::ReceivedDatagram {
+                payload: &short_header,
+                ..peer
+            },
+            rebound,
+        ] {
+            assert_eq!(
+                classify_udp(item.payload, 2),
+                Some(UdpDestination::Quic(owner))
+            );
+            assert_eq!(classify_udp(item.payload, 1), None);
+        }
+        let frame = ShardFrame::QuicIngress {
+            shard: owner,
+            datagram: NativeDatagram::new(rebound),
+        };
+        assert!(!router.enqueue(ingress, frame.clone()));
+        assert!(router.enqueue(owner, frame.clone()));
+        assert!((0..2048).any(|_| !router.enqueue(owner, frame.clone())));
+
+        let mut received = Vec::new();
+        assert_eq!(
+            receivers
+                .last_mut()
+                .unwrap()
+                .try_recv_batch(&mut received, 1),
+            1
+        );
+        let mut received = received.pop().unwrap();
+        assert!(!bind_received_frame(ingress, &mut received));
+        assert!(bind_received_frame(owner, &mut received));
+        let ShardFrame::QuicIngress { datagram, .. } = received.packet else {
+            panic!("expected native ingress")
+        };
+        let forwarded = datagram.as_received();
+        assert_eq!(forwarded.payload, rebound.payload);
+        assert_eq!(forwarded.source, rebound.source);
+        assert_eq!(forwarded.destination, rebound.destination);
+        assert_eq!(forwarded.ecn, rebound.ecn);
+        assert_eq!(forwarded.received_at, rebound.received_at);
     }
 
     fn find(keys: &[MetricSeries], name: &str) -> usize {

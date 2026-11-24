@@ -33,7 +33,7 @@ pub async fn start_destination() -> TestResult<(DestinationServer, QuicEndpoint)
     let destination = DestinationServer::start_observed(move |node, address| {
         let listener = TcpListener::from_std(listener)?;
         tokio::task::spawn_local(serve_placement_tls(listener, acceptor, address));
-        Ok(node.quic_listeners(vec![quic]))
+        Ok(node.with_native_quic("localhost".into(), quic))
     })
     .await?;
     Ok((destination, endpoint))
@@ -47,7 +47,7 @@ fn quic_endpoint() -> TestResult<(
     QuicEndpoint,
     std::net::TcpListener,
     tokio_rustls::TlsAcceptor,
-    pulsebeam::node::QuicListener,
+    pulsebeam_agent_quic::transport::ServerConfig,
 )> {
     use noq_proto::rustls::{
         self, pki_types::PrivatePkcs8KeyDer, time_provider::DefaultTimeProvider,
@@ -79,12 +79,7 @@ fn quic_endpoint() -> TestResult<(
         },
         listener,
         tokio_rustls::TlsAcceptor::from(Arc::new(tls)),
-        pulsebeam::node::QuicListener {
-            bind: "127.0.0.1:0".parse()?,
-            host: "localhost".into(),
-            port: 0,
-            tls: quic,
-        },
+        quic,
     ))
 }
 

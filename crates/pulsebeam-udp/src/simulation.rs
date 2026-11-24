@@ -28,6 +28,14 @@ pub trait Io {
     fn writable(&self) -> Readiness<'_>;
     fn receive(&mut self, payload: &mut [u8]) -> io::Result<Metadata>;
     fn submit(&mut self, entry: &SendDatagram<'_>) -> io::Result<()>;
+    fn submit_from(&mut self, entry: &SendDatagram<'_>, source: IpAddr) -> io::Result<()> {
+        // Turmoil chooses the host IP on a wildcard socket.
+        if self.local_addr().ip().is_unspecified() && source == turmoil::current_ip() {
+            self.submit(entry)
+        } else {
+            Err(io::ErrorKind::Unsupported.into())
+        }
+    }
 }
 
 pub fn from_io(options: BindOptions, io: Box<dyn Io>) -> io::Result<BoundUdpSocket> {
@@ -168,6 +176,22 @@ impl Socket {
         }
         Ok(())
     }
+    pub(crate) fn send_one(
+        &mut self,
+        entry: &SendDatagram<'_>,
+        source: Option<IpAddr>,
+        ect0: bool,
+    ) -> SendReport {
+        submit_prefix(std::slice::from_ref(entry), 1, |_| {
+            if ect0 {
+                return Err(io::ErrorKind::Unsupported.into());
+            }
+            self.io
+                .submit_from(entry, source.ok_or(io::ErrorKind::InvalidInput)?)?;
+            Ok(1)
+        })
+    }
+
     pub(crate) fn send(&mut self, entries: &[SendDatagram<'_>]) -> SendReport {
         // One adapter call is one atomic input entry, including a GSO aggregate.
         submit_prefix(entries, 1, |group| {
