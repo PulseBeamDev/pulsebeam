@@ -694,33 +694,39 @@ impl SimClientBuilder {
                 }
             },
         ));
+        let publication = self.publishes_video.then(|| VideoPublicationConfig {
+            slot: "v0".into(),
+            source: source_profile.clone(),
+        });
+        let simulcast = source_profile.encodings.len() > 1;
         config.media = MediaConfig {
             audio_input: self.audio_input,
             video_input: VideoInput::EncodedH264,
-            video_publications: self
-                .publishes_video
-                .then(|| VideoPublicationConfig {
-                    slot: "v0".into(),
-                    source: source_profile.clone(),
-                })
+            video_publications: publication
+                .clone()
+                .filter(|_| !simulcast)
                 .into_iter()
                 .collect(),
         };
 
         let join_set = JoinSet::new();
-        let (agent, actor) = Agent::managed_with_services(
-            config,
-            Host::new(Box::new(AdmissionClient {
-                inner: create_http_client(),
-                admission: self.admission.clone(),
-                bootstrap_hold: self.bootstrap_hold,
-            })),
-            move || self.native_host.runtime(),
-        )?;
-        let actor = tokio::task::spawn_local(actor);
+        let host = Host::new(Box::new(AdmissionClient {
+            inner: create_http_client(),
+            admission: self.admission.clone(),
+            bootstrap_hold: self.bootstrap_hold,
+        }));
+        let runtime = move || self.native_host.runtime();
+        let (agent, actor) = if let Some(fixture) = publication.filter(|_| simulcast) {
+            let (agent, actor) =
+                Agent::managed_with_simulcast_fixture(config, fixture, host, runtime)?;
+            (agent, tokio::task::spawn_local(actor))
+        } else {
+            let (agent, actor) = Agent::managed_with_services(config, host, runtime)?;
+            (agent, tokio::task::spawn_local(actor))
+        };
         let events = NativeEventCollector::new(agent.events());
         let video_source = if self.publishes_video {
-            Some(agent.create_video_input(source_profile.clone()).await?)
+            Some(create_video_fixture_input(&agent, &source_profile).await?)
         } else {
             None
         };
@@ -4796,11 +4802,8 @@ impl SimClient {
         let feed = self.video_feed.take().expect("checked attached video feed");
         self.retired_video_sources.push(feed.source.clone());
         feed.stop().await?;
-        let source = self
-            .ctx
-            .agent
-            .create_video_input(self.ctx.video_source_config.clone())
-            .await?;
+        let source =
+            create_video_fixture_input(&self.ctx.agent, &self.ctx.video_source_config).await?;
         if let Some(pipe) = self.ctx.video_pipe.take() {
             pipe.close().await?;
         }
@@ -5355,6 +5358,17 @@ fn generic_video_reference(encodings: &[Option<String>]) -> &'static QualityVide
             frames: frames.into(),
         }
     })
+}
+
+async fn create_video_fixture_input(
+    agent: &Agent,
+    profile: &VideoSourceConfig,
+) -> Result<ProducerInput, pulsebeam_agent_native::Error> {
+    if profile.encodings.len() > 1 {
+        agent.create_simulcast_fixture_input().await
+    } else {
+        agent.create_video_input(profile.clone()).await
+    }
 }
 
 fn create_video_source(encoding: Option<&str>) -> VideoSource {

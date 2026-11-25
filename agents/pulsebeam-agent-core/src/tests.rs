@@ -558,6 +558,7 @@ fn offer() -> String {
 
 fn resources(channel: ChannelId) -> OfferResources {
     OfferResources {
+        reserved_mids: Vec::new(),
         slots: negotiated_slot_bindings(
             &offer(),
             [
@@ -1704,6 +1705,7 @@ fn malformed_offer_resources_are_rejected_without_consuming_the_attempt() {
             generation,
             offer: offer(),
             resources: OfferResources {
+                reserved_mids: Vec::new(),
                 slots: vec![],
                 signaling_channel: channel(3),
                 data_channels: vec![],
@@ -1746,6 +1748,7 @@ fn malformed_offer_resources_are_rejected_without_consuming_the_attempt() {
                 "v=0\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=mid:data-channel\r\n"
                     .into(),
             resources: OfferResources {
+                reserved_mids: Vec::new(),
                 slots: vec![],
                 signaling_channel: channel(3),
                 data_channels: vec![],
@@ -1792,6 +1795,7 @@ fn malformed_offer_resources_are_rejected_without_consuming_the_attempt() {
     assert_eq!(
         allocations,
         [client_sdp::Allocation {
+            video_codec: None,
             slot: MediaSlot::LocalVideo("v0".into()),
             format: None,
         }]
@@ -2322,6 +2326,7 @@ fn transport_loss_fences_incumbent_signaling_during_replacement() {
                 generation: replacement,
                 offer: native_connection::OFFER.into(),
                 resources: OfferResources {
+                    reserved_mids: Vec::new(),
                     slots: vec![],
                     signaling_channel: channel(15),
                     data_channels: vec![],
@@ -2377,6 +2382,26 @@ fn reconnect_posts_a_new_resource_and_swaps_only_after_the_candidate_is_ready() 
     );
     assert!(agent.snapshot().publications.contains_key("old-video"));
     assert!(agent.snapshot().remote_tracks.contains_key("old-video"));
+    let ResourceResult::Publication { owner, slot, .. } = agent
+        .resource(ResourceCommand::ClaimPublication {
+            spec: TrackSpec::Video {
+                track_id: "camera".into(),
+            },
+            options: MediaPublishOptions::Video(ffi::VideoPublishOptions {
+                enabled: false,
+                codec: Some(ffi::VideoCodec::H264),
+            }),
+        })
+        .unwrap()
+    else {
+        panic!("video owner");
+    };
+    agent
+        .resource(ResourceCommand::SetPublicationMuted {
+            owner,
+            muted: false,
+        })
+        .unwrap();
     agent
         .handle(HostEvent::Rtc(RtcEvent::Disconnected {
             generation: old_generation,
@@ -2404,6 +2429,7 @@ fn reconnect_posts_a_new_resource_and_swaps_only_after_the_candidate_is_ready() 
             generation: replacement_generation,
             offer: native_connection::OFFER.into(),
             resources: OfferResources {
+                reserved_mids: Vec::new(),
                 slots: vec![],
                 signaling_channel: replacement_cid,
                 data_channels: vec![],
@@ -2458,6 +2484,13 @@ fn reconnect_posts_a_new_resource_and_swaps_only_after_the_candidate_is_ready() 
             generation: old_generation
         })
     );
+    assert!(matches!(
+        next_effect(&mut agent),
+        Effect::Rtc(RtcEffect::AllocateMedia { generation, allocations, .. })
+            if generation == replacement_generation && allocations == [client_sdp::Allocation {
+                slot: MediaSlot::LocalVideo(slot), format: None, video_codec: Some(VideoCodecRequirement::H264),
+            }],
+    ));
     assert!(
         agent.next_effect_after_turn().is_none(),
         "no declarations without prepared resources"
@@ -2470,6 +2503,13 @@ fn reconnect_posts_a_new_resource_and_swaps_only_after_the_candidate_is_ready() 
     assert!(agent.snapshot().audio_mapping.is_empty());
     assert_eq!(agent.snapshot().participant_id.as_deref(), Some("p1"));
     assert_eq!(agent.snapshot().room_id.as_deref(), Some("room"));
+    assert!(
+        agent
+            .publication_state(owner)
+            .unwrap()
+            .configuration
+            .enabled
+    );
 }
 
 #[test]
@@ -2595,6 +2635,7 @@ fn rejected_reconnect_is_terminal_without_a_legacy_fallback() {
             generation: replacement_generation,
             offer: native_connection::OFFER.into(),
             resources: OfferResources {
+                reserved_mids: Vec::new(),
                 slots: vec![],
                 signaling_channel: channel(11),
                 data_channels: vec![],
@@ -3039,7 +3080,7 @@ fn explicit_disconnect_preserves_resource_owners_and_declared_intent() {
         track_id: "microphone".into(),
     };
     let ResourceResult::Publication { owner, slot, .. } = agent
-        .resource(ResourceCommand::ClaimPublication { spec: spec.clone() })
+        .resource(ResourceCommand::claim_publication(spec.clone()))
         .unwrap()
     else {
         panic!("publication owner")
@@ -3083,7 +3124,7 @@ fn explicit_disconnect_preserves_resource_owners_and_declared_intent() {
     assert!(agent.is_publishing(&owned));
     assert!(agent.is_publishing(&declared));
     assert_eq!(
-        agent.resource(ResourceCommand::ClaimPublication { spec }),
+        agent.resource(ResourceCommand::claim_publication(spec)),
         Err(AgentError::InvalidResource(
             TrackResourceError::AlreadyOwned
         ))
@@ -4043,6 +4084,7 @@ fn malformed_native_state_is_transactional_and_cancels_a_pending_renewal() {
             generation: replacement,
             offer: native_connection::OFFER.into(),
             resources: OfferResources {
+                reserved_mids: Vec::new(),
                 slots: vec![],
                 signaling_channel: channel(13),
                 data_channels: vec![],
@@ -4088,6 +4130,7 @@ fn cancelled_native_replacement_cleans_orphaned_http_resources_without_activatin
             generation: replacement,
             offer: native_connection::OFFER.into(),
             resources: OfferResources {
+                reserved_mids: Vec::new(),
                 slots: vec![],
                 signaling_channel: channel(14),
                 data_channels: vec![],
@@ -4864,11 +4907,9 @@ fn native_owned_source_readiness_does_not_wait_for_discovery_completion() {
 fn accepted_room_roundtrip_preserves_owned_input_and_pinned_selector() {
     let mut agent = Agent::new(config()).unwrap();
     let ResourceResult::Publication { owner, slot, .. } = agent
-        .resource(ResourceCommand::ClaimPublication {
-            spec: TrackSpec::Video {
-                track_id: "camera".into(),
-            },
-        })
+        .resource(ResourceCommand::claim_publication(TrackSpec::Video {
+            track_id: "camera".into(),
+        }))
         .unwrap()
     else {
         panic!("publication owner");
@@ -4970,6 +5011,7 @@ fn accepted_room_roundtrip_preserves_owned_input_and_pinned_selector() {
                 generation,
                 offer: native_connection::OFFER.into(),
                 resources: OfferResources {
+                    reserved_mids: Vec::new(),
                     slots: vec![],
                     signaling_channel: control,
                     data_channels: vec![],
@@ -5096,11 +5138,9 @@ fn owned_input_attachment_is_exclusive_and_cleanup_is_lifetime_scoped() {
 
     let mut agent = Agent::new(config()).unwrap();
     let ResourceResult::Publication { owner, slot, .. } = agent
-        .resource(ResourceCommand::ClaimPublication {
-            spec: TrackSpec::Video {
-                track_id: "camera".into(),
-            },
-        })
+        .resource(ResourceCommand::claim_publication(TrackSpec::Video {
+            track_id: "camera".into(),
+        }))
         .unwrap()
     else {
         panic!("publication lease");
@@ -5232,7 +5272,7 @@ fn owned_publications_reconcile_without_legacy_lifetime_binding_or_cross_owner_c
         slot,
         after_generation,
     } = agent
-        .resource(ResourceCommand::ClaimPublication { spec: spec.clone() })
+        .resource(ResourceCommand::claim_publication(spec.clone()))
         .unwrap()
     else {
         panic!("publication lease")
@@ -5258,7 +5298,7 @@ fn owned_publications_reconcile_without_legacy_lifetime_binding_or_cross_owner_c
         .unwrap();
     assert!(agent.is_publishing(&sender));
     assert_eq!(
-        agent.resource(ResourceCommand::ClaimPublication { spec }),
+        agent.resource(ResourceCommand::claim_publication(spec)),
         Err(AgentError::InvalidResource(
             TrackResourceError::AlreadyOwned
         ))
@@ -5287,11 +5327,9 @@ fn owned_publications_reconcile_without_legacy_lifetime_binding_or_cross_owner_c
         slot: reused,
         after_generation: next_generation,
     } = agent
-        .resource(ResourceCommand::ClaimPublication {
-            spec: TrackSpec::Video {
-                track_id: "screen".into(),
-            },
-        })
+        .resource(ResourceCommand::claim_publication(TrackSpec::Video {
+            track_id: "screen".into(),
+        }))
         .unwrap()
     else {
         panic!("replacement lease")
@@ -5327,7 +5365,7 @@ fn owned_publication_replacement_ends_the_lifetime_but_input_loss_does_not() {
         slot,
         after_generation,
     } = agent
-        .resource(ResourceCommand::ClaimPublication { spec: camera })
+        .resource(ResourceCommand::claim_publication(camera))
         .unwrap()
     else {
         panic!("camera owner")
@@ -5376,11 +5414,9 @@ fn owned_publication_replacement_ends_the_lifetime_but_input_loss_does_not() {
         slot: reused,
         after_generation,
     } = agent
-        .resource(ResourceCommand::ClaimPublication {
-            spec: TrackSpec::Video {
-                track_id: "screen".into(),
-            },
-        })
+        .resource(ResourceCommand::claim_publication(TrackSpec::Video {
+            track_id: "screen".into(),
+        }))
         .unwrap()
     else {
         panic!("screen owner")
@@ -5448,15 +5484,7 @@ fn owned_publication_replacement_ends_the_lifetime_but_input_loss_does_not() {
         &mut agent,
         generation,
         channel,
-        vec![fresh[0].installed(
-            participant.clone(),
-            native_media::track(
-                "replacement-screen-source",
-                &participant.participant_id,
-                "screen",
-                MediaKind::Video,
-            ),
-        )],
+        vec![fresh[0].installed_video_publication(participant, "replacement-screen-source")],
     );
     agent
         .handle(HostEvent::Rtc(RtcEvent::MediaPrepared {
@@ -5578,7 +5606,7 @@ fn owned_publication_budget_is_shared_and_rejections_do_not_allocate_owners() {
             }
         };
         let ResourceResult::Publication { owner, .. } = agent
-            .resource(ResourceCommand::ClaimPublication { spec })
+            .resource(ResourceCommand::claim_publication(spec))
             .unwrap()
         else {
             panic!("media publication")
@@ -5604,11 +5632,9 @@ fn owned_publication_budget_is_shared_and_rejections_do_not_allocate_owners() {
         data_owners.push(owner);
     }
     assert_eq!(
-        agent.resource(ResourceCommand::ClaimPublication {
-            spec: TrackSpec::Video {
-                track_id: "over-capacity-media".into(),
-            },
-        }),
+        agent.resource(ResourceCommand::claim_publication(TrackSpec::Video {
+            track_id: "over-capacity-media".into(),
+        })),
         Err(AgentError::InvalidResource(
             TrackResourceError::PublicationCapacityExceeded
         ))

@@ -338,6 +338,7 @@ pub(super) struct MediaWant {
 
 pub(super) struct MediaAllocation {
     pub operation: OperationId,
+    reserved: Option<SlotBinding>,
     wanted: BTreeMap<MediaSlot, MediaWant>,
 }
 
@@ -348,11 +349,7 @@ fn media_want(
     source: Option<&str>,
 ) -> Option<MediaWant> {
     let format = match source {
-        Some(source) => match session.state.source(source)?.kind.as_ref()? {
-            state::track::Kind::Audio(track) => Some(track.format.clone()?),
-            state::track::Kind::Video(track) => Some(track.format.clone()?),
-            _ => return None,
-        },
+        Some(source) => Some(source_format(session, source)?.clone()),
         None => None,
     };
     Some(MediaWant {
@@ -362,6 +359,7 @@ fn media_want(
         allocation: crate::client_sdp::Allocation {
             slot: slot.clone(),
             format,
+            video_codec: None,
         },
     })
 }
@@ -401,12 +399,38 @@ fn selected<'a>(
         .map(|track| track.publication_id.as_str())
 }
 
+fn source_format<'a>(session: &'a Session, source: &str) -> Option<&'a state::CodecFormat> {
+    match session.state.source(source)?.kind.as_ref()? {
+        state::track::Kind::Audio(track) => track.format.as_ref(),
+        state::track::Kind::Video(track) => track.format.as_ref(),
+        _ => None,
+    }
+}
+
+fn binding_matches_format(
+    binding: &state::TrackBinding,
+    expected: Option<&state::CodecFormat>,
+    video_codec: Option<crate::VideoCodecRequirement>,
+) -> bool {
+    let Some(state::track_binding::Transport::Rtp(rtp)) = binding.transport.as_ref() else {
+        return false;
+    };
+    rtp.codec
+        .as_ref()
+        .and_then(|codec| codec.format.as_ref())
+        .is_some_and(|format| {
+            expected.is_none_or(|expected| state::validation::formats_equivalent(expected, format))
+                && video_codec.is_none_or(|codec| codec.matches(format))
+        })
+}
+
 fn rtp(
     session: &mut Session,
     logs: &mut crate::logging::LogBuffer,
     resource: &Resource,
     slot: &MediaSlot,
     source: Option<&str>,
+    video_codec: Option<crate::VideoCodecRequirement>,
 ) -> Option<state::TrackBinding> {
     if let Some(lease) = session.media_leases.get_mut(slot)
         && (lease.resource != *resource || lease.source.as_deref() != source)
@@ -425,7 +449,17 @@ fn rtp(
         prepared,
         Some(Err(crate::client_sdp::Error::IdentityPending))
     );
-    let Some(prepared) = prepared.and_then(|prepared| prepared.as_ref().ok()) else {
+    let prepared = prepared.and_then(|prepared| prepared.as_ref().ok());
+    let expected = match source {
+        Some(source) => Some(source_format(session, source)?),
+        None => None,
+    };
+    let incompatible = prepared
+        .is_some_and(|prepared| !binding_matches_format(&prepared.binding, expected, video_codec));
+    let Some(prepared) = prepared.filter(|_| !incompatible) else {
+        if incompatible && let Some(lease) = session.media_leases.get_mut(slot) {
+            lease.retired = true;
+        }
         if media_want(session, resource.clone(), slot, source).is_some()
             && let Some(coordinate) = session.coordinates.get(slot).and_then(Option::as_ref)
         {
@@ -489,7 +523,7 @@ fn receive_rtp(
     if session.state.target_spec(resource).and_then(|spec| spec.declaration.as_ref()).is_some_and(|declaration| matches!(declaration, state::resource_spec::Declaration::Subscription(value) if value.publication_id != source)) {
         return None;
     }
-    rtp(session, logs, resource, slot, Some(source))
+    rtp(session, logs, resource, slot, Some(source), None)
 }
 
 fn receiver_spec_available(
@@ -622,10 +656,8 @@ fn reconcile_logical_media(
         // subsequent offer must wait for retirement and fresh preparation.
         let compatible = prepared_binding(session, slot).is_some_and(|binding| {
             matches!(binding.transport.as_ref(), Some(state::track_binding::Transport::Rtp(rtp))
-                if rtp.mid == coordinate.mid && rtp.codec.as_ref().and_then(|codec| codec.format.as_ref())
-                    .zip(want.allocation.format.as_ref()).is_some_and(|(actual, expected)| {
-                        state::validation::formats_equivalent(actual, expected)
-                    }))
+                if rtp.mid == coordinate.mid)
+                && binding_matches_format(binding, want.allocation.format.as_ref(), None)
         });
         session.media_leases.insert(
             slot.clone(),
@@ -1012,15 +1044,20 @@ pub(super) fn reconcile(
             kind: wire_kind,
             track_id: value.track_id.clone(),
         };
-        let binding = if session.state.binding_profile() == state::validation::BindingProfile::Quic
-        {
+        let binding = if session.state.binding_profile() == state::validation::BindingProfile::Quic {
             let profile = quic_publication_profiles.get(&value.track_id).copied();
             quic_rtp_binding(session, &resource, None, profile, None, ids)
         } else {
-            if let Some(want) = media_want(session, resource.clone(), &slot, None) {
+            let video_codec = if kind == crate::MediaKind::Video {
+                resources.publication_video_codec(&value.track_id)
+            } else {
+                None
+            };
+            if let Some(mut want) = media_want(session, resource.clone(), &slot, None) {
+                want.allocation.video_codec = video_codec;
                 media.insert(slot.clone(), want);
             }
-            rtp(session, logs, &resource, &slot, None)
+            rtp(session, logs, &resource, &slot, None, video_codec)
         };
         if let Some(binding) = binding {
             let kind = if kind == crate::MediaKind::Audio {
@@ -1711,29 +1748,82 @@ fn allocate_media(session: &mut Session, ids: &mut IdGenerator, effects: &mut Ve
     if session.media_retirement.is_some() || session.media_allocation.is_some() {
         return;
     }
-    let wanted = session
-        .media_wanted
-        .iter()
-        .filter(|(slot, want)| {
-            !session.media_leases.contains_key(*slot)
-                && session.media_blocked.get(*slot) != Some(*want)
-        })
-        .map(|(slot, want)| (slot.clone(), want.clone()))
-        .take(1)
-        .collect::<BTreeMap<_, _>>();
-    if wanted.is_empty() {
+    loop {
+        let eligible = session
+            .media_wanted
+            .iter()
+            .filter(|(slot, want)| {
+                !session.media_leases.contains_key(*slot)
+                    && session.media_blocked.get(*slot) != Some(*want)
+            })
+            .map(|(slot, want)| (slot.clone(), want.clone()));
+        let Some((slot, want)) = eligible.into_iter().next() else {
+            return;
+        };
+        let allocation = want.allocation.clone();
+        let reserved = session
+            .bootstrap_slots
+            .values()
+            .find(|reserved| {
+                session.bootstrap_anchor.as_deref() != Some(reserved.mid.as_str())
+                    && reserved.kind == allocation.slot.kind()
+                    && reserved.direction == allocation.slot.direction()
+                    && prepared_binding(session, &reserved.slot).is_some_and(|binding| {
+                        binding_matches_format(
+                            binding,
+                            allocation.format.as_ref(),
+                            allocation.video_codec,
+                        )
+                    })
+            })
+            .cloned();
+        let needs_bootstrap = allocation.video_codec == Some(crate::VideoCodecRequirement::Av1)
+            || allocation
+                .format
+                .as_ref()
+                .is_some_and(|format| crate::VideoCodecRequirement::Av1.matches(format));
+        if needs_bootstrap && reserved.is_none() {
+            if let Some(offer) = want.offer {
+                let _ = session.state.report_logical_receiver(
+                    &want.resource,
+                    offer,
+                    state::logical_receiver_report::Outcome::Failure(state::Failure {
+                        code: state::FailureCode::Incompatible as i32,
+                        diagnostic: "no compatible AV1 receiver slot in the applied answer".into(),
+                    }),
+                );
+            }
+            session.media_blocked.insert(slot, want);
+            continue;
+        }
+        let operation = ids.operation();
+        let generation = session.generation;
+        let effect = if let Some(reserved) = &reserved {
+            session.bootstrap_slots.remove(&reserved.slot);
+            if let Some(Ok(prepared)) = &mut session.media_preparation {
+                prepared.remove(&reserved.slot);
+            }
+            RtcEffect::ClaimBootstrapMedia {
+                generation,
+                operation,
+                reserved: reserved.clone(),
+                allocation,
+            }
+        } else {
+            RtcEffect::AllocateMedia {
+                generation,
+                operation,
+                allocations: vec![allocation],
+            }
+        };
+        effects.push_back(Effect::Rtc(effect));
+        session.media_allocation = Some(MediaAllocation {
+            operation,
+            reserved,
+            wanted: [(slot, want)].into(),
+        });
         return;
     }
-    let operation = ids.operation();
-    effects.push_back(Effect::Rtc(RtcEffect::AllocateMedia {
-        generation: session.generation,
-        operation,
-        allocations: wanted
-            .values()
-            .map(|want| want.allocation.clone())
-            .collect(),
-    }));
-    session.media_allocation = Some(MediaAllocation { operation, wanted });
 }
 
 pub(super) fn receiver_track<'a>(
@@ -1927,6 +2017,7 @@ impl Agent {
             .coordinates
             .values()
             .flatten()
+            .chain(active.bootstrap_slots.values())
             .cloned()
             .collect::<Vec<_>>();
         let Ok(observed) = crate::rtc_preparation::prepare_bootstrap_bindings(
@@ -2045,6 +2136,9 @@ impl Agent {
                 pending.wanted.contains_key(&slot.slot)
                     && slot.kind == slot.slot.kind()
                     && slot.direction == slot.slot.direction()
+                    && pending.reserved.as_ref().is_none_or(|reserved| {
+                        slot.mid == reserved.mid && slot.media_index == reserved.media_index
+                    })
             });
         let mut geometry = active
             .coordinates
@@ -2055,6 +2149,12 @@ impl Agent {
                     .map(|binding| (slot.clone(), binding.clone()))
             })
             .collect::<BTreeMap<_, _>>();
+        geometry.extend(
+            active
+                .bootstrap_slots
+                .iter()
+                .map(|(slot, binding)| (slot.clone(), binding.clone())),
+        );
         if correlated {
             for slot in &slots {
                 geometry.insert(slot.slot.clone(), slot.clone());
@@ -2101,11 +2201,13 @@ impl Agent {
                     "RTP allocation {operation:?} for {slot:?} facts rejected: {error:?}"
                 );
             }
-            let complete = value.is_some_and(|value| want.allocation.format.as_ref().is_none_or(|expected| {
-                matches!(&value.binding.transport, Some(state::track_binding::Transport::Rtp(parameters))
-                    if parameters.codec.as_ref().and_then(|codec| codec.format.as_ref())
-                        .is_some_and(|format| state::validation::formats_equivalent(expected, format)))
-            }));
+            let complete = value.is_some_and(|value| {
+                binding_matches_format(
+                    &value.binding,
+                    want.allocation.format.as_ref(),
+                    want.allocation.video_codec,
+                )
+            });
             let accepted = active.media_wanted.get(&slot) == Some(&want)
                 && media_needed(active, &self.desired, &slot, &want)
                 && (identity_pending && want.allocation.format.is_none() || complete);

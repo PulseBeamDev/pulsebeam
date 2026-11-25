@@ -325,6 +325,7 @@ fn joining_with_data_version(
             generation,
             offer: OFFER.into(),
             resources: OfferResources {
+                reserved_mids: Vec::new(),
                 slots: Vec::new(),
                 signaling_channel: channel,
                 data_channels: Vec::new(),

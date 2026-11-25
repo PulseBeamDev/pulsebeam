@@ -865,6 +865,9 @@ impl Connection {
 
         self.advance_rtc_clock(now, now);
         self.begin_native_control_turn(now, events);
+        // A due egress deadline or a new media handoff can end each drain
+        // before quiescence. Admit one datagram before giving egress its turn.
+        self.transport.service_ingress_before_drain();
         let mut work_budget = POLL_WORK_BUDGET;
         let mut control_blocked = false;
         'drain: loop {

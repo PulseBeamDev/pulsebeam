@@ -1189,6 +1189,357 @@ fn relay_error(error: impl std::fmt::Debug) -> anyhow::Error {
 }
 
 #[test]
+fn native_claims_h264_and_av1_senders_after_join() {
+    let seed = std::env::var("PULSEBEAM_SIM_SEED")
+        .map(|value| value.parse().expect("simulation seed must be a u64"))
+        .unwrap_or(NATIVE_RUNTIME_SEED);
+    let _sim_clocks = crate::sim_clock::SimClocksGuard::init();
+    crate::sim_rand::set_thread_rng(seed);
+    fastrand::seed(seed);
+    pulsebeam_runtime::net::shaper::seed_impairments(seed);
+    let subnet = reserve_subnet();
+    let server = subnet_ip(subnet, 1);
+    let client = subnet_ip(subnet, 2);
+    let mut sim = turmoil::Builder::new()
+        .simulation_duration(Duration::from_secs(25))
+        .rng_seed(seed)
+        .build();
+    sim.host(server, move || async move {
+        sfu_node_builder(
+            server,
+            pulsebeam_runtime::rand::seeded_rng(seed),
+            DEFAULT_SIM_SHARDS,
+        )
+        .run(tokio_util::sync::CancellationToken::new())
+        .await
+        .map_err(Into::into)
+    });
+    sim.client(client, async move {
+        async move {
+            let host = NativeHost::bind(client)?;
+            let token = pulsebeam_server::sign_participant_token(
+                &pulsebeam_server::insecure_dev_api_key().unwrap(),
+                &serde_json::from_value(
+                    serde_json::json!([{"rooms":["mixed"],"allow":["join","publish"]}]),
+                )?,
+                "mixed-publisher",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_secs()
+                    .saturating_add(60),
+            )?
+            .token;
+            let config = Config::new(pulsebeam_agent_core::AgentConfig {
+                endpoint: format!("http://{server}:7070"),
+                token,
+                retry: Default::default(),
+                log_level: Default::default(),
+            });
+            let (runtime, actor) = RuntimeAgent::managed_with_services(
+                config,
+                Host::new(create_http_client()),
+                move || host.runtime(),
+            )?;
+            tokio::task::spawn_local(actor);
+            let agent = Agent::from_runtime(runtime.clone());
+            runtime.join("mixed".into())?;
+            let connected = wait_connected(&agent, None).await?;
+            let camera = agent.video("camera".into())?.publish(None)?;
+            let screen = agent.video("screen".into())?.publish(Some(core_ffi::VideoPublishOptions {
+                codec: Some(core_ffi::VideoCodec::Av1),
+                ..Default::default()
+            }))?;
+            let h264 = wait_publication_admitted(camera.updates()?.as_ref()).await?;
+            let av1 = wait_publication_admitted(screen.updates()?.as_ref()).await?;
+            anyhow::ensure!(h264.admission.connection_generation == connected.generation);
+            anyhow::ensure!(av1.admission.connection_generation == connected.generation);
+            for (admission, mime, parameters) in [
+                (
+                    &h264.admission,
+                    "video/h264",
+                    [("profile-level-id", "42e01f"), ("packetization-mode", "1")],
+                ),
+                (
+                    &av1.admission,
+                    "video/av1",
+                    [("profile", "0"), ("level-idx", "5")],
+                ),
+            ] {
+                let format = admission
+                    .effective_format
+                    .as_ref()
+                    .context("confirmed source format")?;
+                anyhow::ensure!(
+                    format.mime_type == mime
+                        && format.clock_rate == 90_000
+                        && format.channels.is_none()
+                );
+                anyhow::ensure!(parameters.iter().all(|(name, value)| {
+                    format
+                        .parameters
+                        .iter()
+                        .any(|parameter| parameter.name == *name && parameter.value == *value)
+                }));
+            }
+            anyhow::ensure!(
+                av1.admission.publication_id.is_some()
+                    && av1.admission.publication_id != h264.admission.publication_id
+            );
+            let camera_input = agent.create_video_input(Default::default()).await?;
+            let screen_input = agent.create_video_input(Default::default()).await?;
+            let _camera_pipe = camera_input.pipe_to(&camera)?;
+            let _screen_pipe = screen_input.pipe_to(&screen)?;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                screen.ready().await?;
+                anyhow::Ok(())
+            })
+            .await??;
+            let attached = screen.state();
+            anyhow::ensure!(attached.input_attached && attached.forwarding_requested);
+            anyhow::ensure!(attached.admission.publication_id == av1.admission.publication_id);
+            anyhow::ensure!(agent.snapshot().generation == connected.generation);
+            let make_viewer = |name: &str, h264_only: bool| -> anyhow::Result<_> {
+                let token = pulsebeam_server::sign_participant_token(
+                    &pulsebeam_server::insecure_dev_api_key().unwrap(),
+                    &serde_json::from_value(serde_json::json!([{"rooms":["mixed"],"allow":["join","publish","subscribe","discover"]}]))?,
+                    name,
+                    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs().saturating_add(60),
+                )?.token;
+                let mut config = Config::new(pulsebeam_agent_core::AgentConfig {
+                    endpoint: format!("http://{server}:7070"), token,
+                    retry: Default::default(), log_level: Default::default(),
+                });
+                let host = NativeHost::bind(client)?;
+                let runtime = move || host.runtime();
+                let http = Host::new(create_http_client());
+                let runtime = if h264_only {
+                    config.media.video_input = VideoInput::EncodedH264;
+                    let (runtime, actor) = RuntimeAgent::managed_h264_receiver_fixture(config, http, runtime)?;
+                    tokio::task::spawn_local(actor);
+                    runtime
+                } else {
+                    let (runtime, actor) = RuntimeAgent::managed_with_services(config, http, runtime)?;
+                    tokio::task::spawn_local(actor);
+                    runtime
+                };
+                runtime.join("mixed".into())?;
+                Ok(Agent::from_runtime(runtime))
+            };
+            let compatible = make_viewer("mixed-av1-viewer", false)?;
+            let late = make_viewer("mixed-h264-viewer", true)?;
+            let compatible_session = wait_connected(&compatible, None).await?;
+            let late_session = wait_connected(&late, None).await?;
+            let unsupported = late.video("unsupported-av1".into())?.publish(Some(core_ffi::VideoPublishOptions {
+                codec: Some(core_ffi::VideoCodec::Av1),
+                ..Default::default()
+            }))?;
+            let unsupported_updates = unsupported.updates()?;
+            let unsupported_state = tokio::time::timeout(Duration::from_secs(4), async {
+                loop {
+                    let state = unsupported_updates.next().await?.context("AV1 publication closed before evaluation")?;
+                    match state.admission.status {
+                        core_ffi::PublicationAdmissionStatus::Pending => continue,
+                        core_ffi::PublicationAdmissionStatus::Rejected => return anyhow::Ok(state),
+                        core_ffi::PublicationAdmissionStatus::Admitted => anyhow::bail!("encoded H.264 sender admitted AV1"),
+                    }
+                }
+            }).await.context("unsupported AV1 publication must be evaluated")??;
+            anyhow::ensure!(unsupported_state.admission.error.is_some_and(|error| error.code == core_ffi::ErrorCode::Unsupported));
+            anyhow::ensure!(unsupported_state.admission.effective_format.is_none());
+            unsupported.close().await?;
+            let subscribe = |viewer: &Agent, label: &str| -> anyhow::Result<_> {
+                Ok(viewer.room("mixed".into())?.participant("mixed-publisher".into())?
+                    .video(label.into())?.subscribe(None)?)
+            };
+            let compatible_screen = subscribe(&compatible, "screen")?;
+            let late_camera = subscribe(&late, "camera")?;
+            wait_mixed_video_installed(&compatible_screen).await.context("install AV1 viewer")?;
+            wait_mixed_video_installed(&late_camera).await.context("install H.264 viewer")?;
+            let screen_frames = compatible_screen.frames()?;
+            let camera_frames = late_camera.frames()?;
+            camera.ready().await?;
+            let screen_generation = compatible_session.generation.context("screen viewer generation")?;
+            let camera_generation = late_session.generation.context("camera viewer generation")?;
+            let phase = std::cell::Cell::new(0);
+            let pump = async {
+                let mut frame = 0;
+                loop {
+                    let timestamp = camera_input.capture_time_us().await?;
+                    let phase = phase.get();
+                    camera_input.submit(mixed_raw_frame(320, 180, timestamp, frame / 4, phase)).await?;
+                    screen_input.submit(mixed_raw_frame(640, 360, timestamp, frame / 4, phase)).await?;
+                    frame += 1;
+                    tokio::time::sleep(Duration::from_millis(34)).await;
+                }
+            };
+            let exchange = async |phase: u8| {
+                tokio::try_join!(
+                    mixed_decode(&screen_frames, screen_generation, (640, 360), phase),
+                    mixed_decode(&camera_frames, camera_generation, (320, 180), phase),
+                )
+            };
+            let scenario = async {
+            let (first_screen, first_camera) = exchange(0).await.context("first mixed video exchange")?;
+            anyhow::ensure!(compatible_screen.state().source_track_id == av1.admission.publication_id);
+            anyhow::ensure!(compatible_screen.state().source_format == av1.admission.effective_format);
+            anyhow::ensure!(late_camera.state().source_track_id == h264.admission.publication_id);
+            let rejected_screen = subscribe(&late, "screen")?;
+            let updates = rejected_screen.updates()?;
+            let incompatible = tokio::time::timeout(Duration::from_secs(4), async {
+                loop {
+                    let state = updates.next().await?.context("incompatible subscription observer closed")?;
+                    if state.execution == core_ffi::PublicationExecution::Failed { break anyhow::Ok(state); }
+                }
+            }).await??;
+            anyhow::ensure!(incompatible.admission == core_ffi::PublicationAdmissionStatus::Admitted);
+            anyhow::ensure!(incompatible.execution_error.is_some_and(|error| error.code == core_ffi::ErrorCode::Unsupported));
+            anyhow::ensure!(incompatible.source_track_id == av1.admission.publication_id && incompatible.source_format == av1.admission.effective_format);
+            phase.set(1);
+            let (next_screen, next_camera) = exchange(1).await.context("mixed video exchange after incompatibility")?;
+            anyhow::ensure!(next_screen == first_screen && next_camera == first_camera);
+            anyhow::Ok((rejected_screen, updates))
+            };
+            let (_screen_subscription, updates) = tokio::select! { result = pump => result, result = scenario => result }?;
+            anyhow::ensure!(compatible.snapshot().generation == compatible_session.generation);
+            anyhow::ensure!(late.snapshot().generation == late_session.generation);
+            screen.close().await?;
+            anyhow::ensure!(screen.state().admission.effective_format.is_none());
+            tokio::time::timeout(Duration::from_secs(4), async {
+                loop {
+                    let state = updates.next().await?.context("screen subscription closed at withdrawal")?;
+                    if state.source_status == core_ffi::SubscriptionSourceStatus::Unavailable {
+                        anyhow::ensure!(state.source_track_id.is_none() && state.source_format.is_none());
+                        anyhow::ensure!(state.execution_error.is_none());
+                        break anyhow::Ok(());
+                    }
+                }
+            }).await.context("waiting for AV1 withdrawal")??;
+            let replacement = agent.video("screen".into())?.publish(None)?;
+            let replacement_updates = replacement.updates()?;
+            let replacement = wait_publication_admitted(&replacement_updates).await?;
+            anyhow::ensure!(replacement.admission.publication_id != av1.admission.publication_id);
+            anyhow::ensure!(replacement.admission.effective_format == h264.admission.effective_format);
+            tokio::time::timeout(Duration::from_secs(4), async {
+                loop {
+                    let state = updates.next().await?.context("screen subscription closed at replacement")?;
+                    if state.execution == core_ffi::PublicationExecution::Installed {
+                        anyhow::ensure!(state.source_track_id == replacement.admission.publication_id);
+                        anyhow::ensure!(state.source_format == replacement.admission.effective_format);
+                        anyhow::ensure!(state.execution_error.is_none());
+                        break anyhow::Ok(());
+                    }
+                }
+            }).await.context("waiting for compatible replacement")??;
+            anyhow::ensure!(late.snapshot().generation == late_session.generation);
+            compatible.close().await?;
+            late.close().await?;
+            runtime.close().await?;
+            anyhow::Ok(())
+        }
+        .await
+        .map_err(Into::into)
+    });
+    run_sim_or_timeout(&mut sim, Duration::from_secs(20)).expect("same-session video codec slots");
+}
+
+fn mixed_raw_frame(
+    width: u32,
+    height: u32,
+    timestamp_us: i64,
+    pattern: usize,
+    phase: u8,
+) -> InputFrame {
+    let width_px = width as usize;
+    let luma = width_px * height as usize;
+    let mut data = vec![128; luma + luma / 2];
+    for (index, pixel) in data[..luma].iter_mut().enumerate() {
+        let x = index % width_px;
+        let y = index / width_px;
+        *pixel = if x >= width_px / 2 {
+            if phase == 0 { 60 } else { 180 }
+        } else if (x / 32 + y / 32 + pattern) % 2 == 0 {
+            55
+        } else {
+            175
+        };
+    }
+    InputFrame::I420 {
+        frame: pulsebeam_agent_native::I420Frame {
+            width,
+            height,
+            data,
+            timestamp_us,
+            rotation_degrees: 0,
+        },
+    }
+}
+
+async fn wait_mixed_video_installed(
+    subscription: &pulsebeam_agent_native::ffi::VideoSubscription,
+) -> anyhow::Result<()> {
+    let updates = subscription.updates()?;
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            let state = updates.next().await?.context("video subscription closed")?;
+            match state.execution {
+                core_ffi::PublicationExecution::Installed => return Ok(()),
+                core_ffi::PublicationExecution::Failed => {
+                    anyhow::bail!("video execution: {:?}", state.execution_error)
+                }
+                _ => {}
+            }
+        }
+    })
+    .await?
+}
+
+async fn mixed_decode(
+    frames: &pulsebeam_agent_native::ffi::VideoFrames,
+    generation: u64,
+    dimensions: (u32, u32),
+    phase: u8,
+) -> anyhow::Result<pulsebeam_agent_native::NativeReceiverInfo> {
+    let mut first = None;
+    let mut last_phase = None;
+    let mut pictures = 0;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let picture = tokio::time::timeout_at(deadline, frames.next())
+            .await
+            .with_context(|| format!("fewer than two fresh {dimensions:?} pictures: saw {pictures}, expected phase {phase}, last {last_phase:?}, first {first:?}"))?
+            .with_context(|| format!("decode {dimensions:?} video"))?
+            .context("mixed video frames closed")?;
+        let frame = picture.frame;
+        anyhow::ensure!(picture.track.generation == generation);
+        anyhow::ensure!((frame.width, frame.height) == dimensions);
+        pictures += 1;
+        let index =
+            frame.width as usize * (frame.height as usize / 2) + 3 * frame.width as usize / 4;
+        let observed = u8::from(frame.data[index] > 120);
+        last_phase = Some(observed);
+        if observed != phase {
+            continue;
+        }
+        anyhow::ensure!(
+            frame.data[16].abs_diff(frame.data[48]) > 60,
+            "decoded video was not the submitted pattern"
+        );
+        let timestamp = picture
+            .metadata
+            .rtp_timestamp
+            .context("decoded RTP timestamp")?;
+        if let Some((id, previous)) = &first {
+            anyhow::ensure!(&picture.track == id);
+            if timestamp != *previous {
+                return Ok(picture.track);
+            }
+        } else {
+            first = Some((picture.track, timestamp));
+        }
+    }
+}
+
+#[test]
 fn native_roomless_reception_survives_join_and_leave() {
     let seed = std::env::var("PULSEBEAM_SIM_SEED")
         .map(|value| value.parse().expect("simulation seed must be a u64"))

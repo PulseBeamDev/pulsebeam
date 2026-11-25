@@ -61,6 +61,39 @@ impl Target {
         )
     }
 
+    pub fn installed_video_publication(
+        &self,
+        participant: state::Participant,
+        publication_id: &str,
+    ) -> state::ServerStateRecord {
+        let Some(state::resource_spec::Declaration::Publication(publication)) =
+            self.spec().declaration.as_ref()
+        else {
+            panic!("publication declaration");
+        };
+        let Some(state::publication_spec::Kind::Video(video)) = publication.kind.as_ref() else {
+            panic!("video publication");
+        };
+        let Some(state::track_binding::Transport::Rtp(rtp)) = video
+            .binding
+            .as_ref()
+            .and_then(|binding| binding.transport.as_ref())
+        else {
+            panic!("prepared RTP sender");
+        };
+        let track = state::Track {
+            publication_id: publication_id.into(),
+            participant_id: participant.participant_id.clone(),
+            room_id: participant.room_id.clone(),
+            track_id: publication.track_id.clone(),
+            kind: Some(state::track::Kind::Video(state::VideoTrack {
+                av1_whole_source: false,
+                format: rtp.codec.as_ref().and_then(|codec| codec.format.clone()),
+            })),
+        };
+        self.installed(participant, track)
+    }
+
     pub fn installed(
         &self,
         participant: state::Participant,
@@ -343,6 +376,9 @@ pub(super) fn finish_allocation(
     assert_eq!(
         allocations,
         [client_sdp::Allocation {
+            video_codec: (assigned.kind == MediaKind::Video
+                && assigned.direction == MediaDirection::SendOnly)
+                .then_some(VideoCodecRequirement::H264),
             slot: assigned.slot.clone(),
             format: (assigned.direction == MediaDirection::ReceiveOnly)
                 .then(|| format(assigned.kind)),
@@ -377,7 +413,14 @@ pub(super) fn prepared_media(
     let mut bindings = client_sdp::Bindings::default();
     let mut capabilities = state::RtpCapabilities::default();
     for assigned in &resources.slots {
-        let (mut binding, capability) = rtc_preparation::binding_fixture(format(assigned.kind));
+        let format = if assigned.kind == MediaKind::Video
+            && assigned.direction == MediaDirection::SendOnly
+        {
+            state::CodecFormat::from(state::codec_format::Codec::H264(Default::default()))
+        } else {
+            format(assigned.kind)
+        };
+        let (mut binding, capability) = rtc_preparation::binding_fixture(format);
         binding.key = rtc_preparation::bootstrap_media_key(&assigned.slot);
         binding.mid = assigned.mid.clone();
         binding.codec.payload_type = if assigned.kind == MediaKind::Video {
@@ -595,15 +638,7 @@ fn connected_with_tracks(
         &mut agent,
         generation,
         channel,
-        vec![publication.installed(
-            participant.clone(),
-            track(
-                "local-camera-source",
-                &participant.participant_id,
-                "camera",
-                MediaKind::Video,
-            ),
-        )],
+        vec![publication.installed_video_publication(participant, "local-camera-source")],
     );
     assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
     assert!(agent.next_effect_after_turn().is_none());

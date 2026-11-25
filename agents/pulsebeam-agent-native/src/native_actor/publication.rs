@@ -608,7 +608,7 @@ where
     pub(super) fn claim_publication(&mut self, spec: TrackSpec) -> Result<Publication, Error> {
         let ResourceResult::Publication { owner, .. } = self
             .core
-            .resource(ResourceCommand::ClaimPublication { spec: spec.clone() })?
+            .resource(ResourceCommand::claim_publication(spec.clone()))?
         else {
             return Err(Error::Rtc("Core did not claim a publication".into()));
         };

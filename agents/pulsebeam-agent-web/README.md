@@ -96,6 +96,19 @@ const pipe = source.pipeTo(publication);
 publication.configure({ enabled: false });
 ```
 
+A video publication uses one encoding. Publish independent video streams under
+separate names, such as `camera` and `screen`.
+
+H.264 is the default. For AV1, import `VideoCodec` and use
+`screen.publish({ enabled: true, codec: VideoCodec.Av1 })`. Chromium is verified
+with the stock AV1 profile 0, tier 0, level index 5. Other browsers and hardware
+paths are not qualified by that check. The applied SDP must provide an AV1 slot;
+read `publication.state().admission` to detect `Unsupported` and use
+`effectiveFormat` to check the confirmed codec. There is no automatic fallback.
+To switch codecs, close the publication and create a new one with the new option.
+For AV1 reception, omit height and frame-rate constraints; they are not supported
+on the whole-stream AV1 receiver.
+
 Use `AudioSource.fromTrack(track)` with an audio publication. To change input,
 close the prior pipe before piping the replacement source into the same
 publication. Configuring `enabled` changes mute without releasing the publication.

@@ -47,32 +47,6 @@ const REMOTE_VIDEO_SLOTS: u8 = 7;
 const REMOTE_AUDIO_SLOTS: u8 = 3;
 
 #[derive(Clone)]
-struct VideoAssets {
-    full: VideoAsset,
-    half: VideoAsset,
-    quarter: VideoAsset,
-}
-
-impl VideoAssets {
-    fn new() -> Result<Self> {
-        use pulsebeam_testdata::QualityVideoLayer::{P180, P360, P720};
-        Ok(Self {
-            full: VideoAsset::new(P720)?,
-            half: VideoAsset::new(P360)?,
-            quarter: VideoAsset::new(P180)?,
-        })
-    }
-
-    fn for_encoding(&self, encoding: Option<&str>) -> VideoAsset {
-        match encoding {
-            Some("f") => self.full.clone(),
-            Some("q") => self.quarter.clone(),
-            _ => self.half.clone(),
-        }
-    }
-}
-
-#[derive(Clone)]
 struct VideoAsset {
     frames: Arc<[Arc<[u8]>]>,
     first_keyframe: usize,
@@ -122,24 +96,22 @@ impl VideoAsset {
 }
 
 struct VideoSource {
-    assets: Vec<VideoAsset>,
+    asset: VideoAsset,
     index: usize,
     fps: u32,
 }
 
 impl VideoSource {
-    fn new(assets: Vec<VideoAsset>, fps: u32) -> Self {
+    fn new(asset: VideoAsset, fps: u32) -> Self {
         Self {
-            assets,
+            asset,
             index: 0,
             fps: fps.max(1),
         }
     }
 
     fn rewind(&mut self) {
-        if let Some(asset) = self.assets.first() {
-            self.index = asset.first_keyframe;
-        }
+        self.index = self.asset.first_keyframe;
     }
 
     async fn run(mut self, media: ProducerInput, publication: Publication) {
@@ -177,18 +149,13 @@ impl VideoSource {
                             tracing::warn!("native producer capture timestamp exhausted");
                             return;
                         };
-                    let Some(mut frames): Option<Vec<_>> = self.assets.iter().map(|asset| asset.frame(self.index, timestamp_us)).collect() else { return; };
-                    let frame = match frames.len() {
-                        1 => { let Some(frame) = frames.pop() else { return; }; InputFrame::H264 { frame } },
-                        3 => InputFrame::H264Simulcast { frames },
-                        _ => return,
-                    };
-                    if let Err(error) = media.submit(frame).await {
+                    let Some(frame) = self.asset.frame(self.index, timestamp_us) else { return; };
+                    if let Err(error) = media.submit(InputFrame::H264 { frame }).await {
                         if media.is_closed() { return; }
                         tracing::warn!(%error, "bench native input admission refused");
                     }
                     self.index = self.index.saturating_add(1);
-                    if self.assets.first().is_some_and(|asset| self.index >= asset.frames.len()) { self.index = 0; }
+                    if self.index >= self.asset.frames.len() { self.index = 0; }
                 }
             }
         }
@@ -250,8 +217,6 @@ pub struct BenchConfig {
     session_duration: u64,
     #[arg(long, default_value_t = 60)]
     join_spread_secs: u64,
-    #[arg(long)]
-    simulcast: bool,
     #[arg(long, default_value = "latency.csv")]
     latency_file: String,
     #[arg(long, default_value = "snapshots.csv")]
@@ -264,7 +229,7 @@ struct AgentContext {
     room_id: usize,
     agent_id: usize,
     logger: Logger,
-    assets: VideoAssets,
+    asset: VideoAsset,
 }
 
 pub struct EventLatency {
@@ -433,7 +398,7 @@ async fn run_bench(api_url: String, config: BenchConfig) -> Result<()> {
         latency: latency_tx,
         snapshot: snapshot_tx,
     };
-    let assets = VideoAssets::new()?;
+    let asset = VideoAsset::new(pulsebeam_testdata::QualityVideoLayer::P360)?;
     let started = Instant::now();
     let mut join_set = JoinSet::new();
 
@@ -449,7 +414,7 @@ async fn run_bench(api_url: String, config: BenchConfig) -> Result<()> {
             room_id,
             &config,
             logger.clone(),
-            assets.clone(),
+            asset.clone(),
         )
         .await;
         total_rooms = total_rooms.saturating_add(1);
@@ -469,7 +434,7 @@ async fn run_bench(api_url: String, config: BenchConfig) -> Result<()> {
                 let delay = Duration::from_secs_f64((-u.ln() / config.arrival_rate).max(0.001));
                 tokio::time::sleep(delay).await;
 
-                spawn_room(&mut join_set, &api_url, total_rooms, &config, logger.clone(), assets.clone()).await;
+                spawn_room(&mut join_set, &api_url, total_rooms, &config, logger.clone(), asset.clone()).await;
                 total_rooms = total_rooms.saturating_add(1);
             }
             // Keep running inside this block until all active agents complete their session schedules
@@ -495,7 +460,7 @@ async fn spawn_room(
     room_id: usize,
     config: &BenchConfig,
     logger: Logger,
-    assets: VideoAssets,
+    asset: VideoAsset,
 ) {
     let room_name = format!("bench-room-{room_id}");
 
@@ -503,46 +468,38 @@ async fn spawn_room(
         let delay_ms =
             rand::random_range(0u64..config.join_spread_secs.saturating_mul(1_000).max(1));
         let session_duration = Duration::from_secs(config.session_duration);
-        let simulcast = config.simulcast;
 
         let ctx = AgentContext {
             api_url: api_url.to_string(),
             room_id,
             agent_id: benchmark_agent_id(room_id, user_id),
             logger: logger.clone(),
-            assets: assets.clone(),
+            asset: asset.clone(),
         };
         let r_name = room_name.clone();
 
         join_set.spawn(async move {
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
             let agent_id = ctx.agent_id;
-            if let Err(error) = spawn_agent(ctx, r_name.clone(), simulcast, session_duration).await
-            {
+            if let Err(error) = spawn_agent(ctx, r_name.clone(), session_duration).await {
                 tracing::error!(room = %r_name, agent_id, %error, "bench agent stopped");
             }
         });
     }
 }
 
-async fn spawn_agent(
-    ctx: AgentContext,
-    room_name: String,
-    simulcast: bool,
-    duration: Duration,
-) -> Result<()> {
+async fn spawn_agent(ctx: AgentContext, room_name: String, duration: Duration) -> Result<()> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let session = benchmark_agent_config(&ctx.api_url, &room_name, ctx.agent_id, duration, now)?;
     let mut config = Config::new(session);
     config.media.video_input = VideoInput::EncodedH264;
+    let source = benchmark_video_profile();
     config.media.video_publications = vec![VideoPublicationConfig {
         slot: "v0".into(),
-        source: benchmark_video_profile(simulcast),
+        source: source.clone(),
     }];
     let agent = Agent::spawn(config, Host::new(Box::new(reqwest::Client::new()))).await?;
-    let camera = agent
-        .create_video_input(benchmark_video_profile(simulcast))
-        .await?;
+    let camera = agent.create_video_input(source).await?;
     let microphone = agent.create_audio_input().await?;
     let camera_owner = agent.video("camera".into())?.publish(Default::default())?;
     let _camera_pipe = camera.pipe_to(&camera_owner)?;
@@ -555,16 +512,8 @@ async fn spawn_agent(
     wait_until_connected(&mut snapshots).await?;
 
     let mut media_tasks = JoinSet::new();
-    let assets = if simulcast {
-        ["q", "h", "f"]
-            .into_iter()
-            .map(|encoding| ctx.assets.for_encoding(Some(encoding)))
-            .collect()
-    } else {
-        vec![ctx.assets.for_encoding(None)]
-    };
     media_tasks.spawn(
-        VideoSource::new(assets, pulsebeam_testdata::QUALITY_VIDEO_FPS)
+        VideoSource::new(ctx.asset.clone(), pulsebeam_testdata::QUALITY_VIDEO_FPS)
             .run(camera, camera_owner.clone()),
     );
 
@@ -842,31 +791,13 @@ fn csv_cell<T: ToString>(value: Option<T>) -> String {
     value.map(|value| value.to_string()).unwrap_or_default()
 }
 
-fn benchmark_video_profile(simulcast: bool) -> VideoSourceConfig {
-    let encodings = if simulcast {
-        [
-            ("q", 4.0, 100_000),
-            ("h", 2.0, 400_000),
-            ("f", 1.0, 1_000_000),
-        ]
-        .into_iter()
-        .map(|(rid, scale_down_by, max_bitrate_bps)| Encoding {
-            rid: Some(rid.into()),
-            scale_down_by,
-            max_bitrate_bps: Some(max_bitrate_bps),
-            max_framerate: Some(30.0),
-            temporal_layers: 1,
-        })
-        .collect()
-    } else {
-        vec![Encoding {
+fn benchmark_video_profile() -> VideoSourceConfig {
+    VideoSourceConfig {
+        encodings: vec![Encoding {
             max_bitrate_bps: Some(400_000),
             max_framerate: Some(30.0),
             ..Encoding::default()
-        }]
-    };
-    VideoSourceConfig {
-        encodings,
+        }],
         ..VideoSourceConfig::default()
     }
 }
@@ -987,56 +918,22 @@ mod tests {
     }
 
     #[test]
-    fn native_fixture_rungs_have_genuine_units_and_matching_dimensions() {
-        let assets = VideoAssets::new().unwrap();
-        let frames: Vec<_> = ["q", "h", "f"]
-            .into_iter()
-            .map(|rid| {
-                let asset = assets.for_encoding(Some(rid));
-                assert_eq!(
-                    asset.frames.len(),
-                    pulsebeam_testdata::QUALITY_CORPUS_VIDEO_FRAME_COUNT
-                );
-                asset.frame(asset.first_keyframe, 42).unwrap()
-            })
-            .collect();
+    fn native_fixture_starts_on_a_genuine_360p_keyframe() {
+        let asset = VideoAsset::new(pulsebeam_testdata::QualityVideoLayer::P360).unwrap();
         assert_eq!(
-            frames
-                .iter()
-                .map(|frame| (frame.width, frame.height))
-                .collect::<Vec<_>>(),
-            [(320, 180), (640, 360), (1280, 720)]
+            asset.frames.len(),
+            pulsebeam_testdata::QUALITY_CORPUS_VIDEO_FRAME_COUNT
         );
-        assert!(
-            frames
-                .iter()
-                .all(|frame| frame.keyframe && frame.timestamp_us == 42)
-        );
-        let mut payloads = frames.iter().map(|frame| &frame.payload);
-        let q = payloads.next().unwrap();
-        let h = payloads.next().unwrap();
-        let f = payloads.next().unwrap();
-        assert_ne!(q, h);
-        assert_ne!(h, f);
-        assert_ne!(q, f);
-        let profile = benchmark_video_profile(true);
-        assert_eq!(
-            profile
-                .encodings
-                .iter()
-                .map(|encoding| encoding.rid.as_deref())
-                .collect::<Vec<_>>(),
-            [Some("q"), Some("h"), Some("f")]
-        );
-        assert_eq!(
-            profile
-                .encodings
-                .iter()
-                .map(|encoding| encoding.scale_down_by.to_bits())
-                .collect::<Vec<_>>(),
-            [4.0f64.to_bits(), 2.0f64.to_bits(), 1.0f64.to_bits()]
-        );
-        assert_eq!(benchmark_video_profile(false).encodings.len(), 1);
+        let frame = asset.frame(asset.first_keyframe, 42).unwrap();
+        assert_eq!((frame.width, frame.height), (640, 360));
+        assert!(frame.keyframe && frame.timestamp_us == 42);
+        let profile = benchmark_video_profile();
+        let [encoding] = profile.encodings.as_slice() else {
+            panic!("one benchmark encoding");
+        };
+        assert!(encoding.rid.is_none());
+        assert_eq!(encoding.scale_down_by.to_bits(), 1.0f64.to_bits());
+        assert_eq!(encoding.max_bitrate_bps, Some(400_000));
     }
 
     #[test]
@@ -1083,7 +980,6 @@ mod tests {
             "3",
             "--max-rooms",
             "8",
-            "--simulcast",
         ])
         .expect("documented benchmark arguments must parse");
         let Commands::Bench(config) = cli.command else {
@@ -1092,7 +988,6 @@ mod tests {
         assert_eq!(config.rooms, 2);
         assert_eq!(config.users_per_room, 3);
         assert_eq!(config.max_rooms, 8);
-        assert!(config.simulcast);
     }
 
     #[test]
@@ -1295,6 +1190,7 @@ mod tests {
                         id: format!("publication-{index}"),
                         track_id: "camera".into(),
                         kind: CatalogPublicationKind::Video,
+                        effective_format: None,
                     }]
                 },
             })

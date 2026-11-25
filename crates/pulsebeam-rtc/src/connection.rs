@@ -429,11 +429,9 @@ impl RtcConnection {
     }
 
     /// Exact video FID declared in the bootstrap answer, including paused
-    /// senders. This does not prove that the peer applied the receive description.
+    /// senders. This identifies the pair independently of the negotiated packet
+    /// feedback mode and does not prove the peer applied the receive description.
     pub fn rtp_egress_answer_fid(&self, mid: &str, primary: u32) -> Option<[u32; 2]> {
-        if self.feedback != Some(PacketFeedbackKind::Rfc8888) {
-            return None;
-        }
         self.egress.declared_answer_fid(mid, Some(primary))
     }
 
@@ -1007,6 +1005,13 @@ impl RtcConnection {
             sctp.begin_shutdown(at, deadline);
         }
         Ok(())
+    }
+
+    /// Whether the caller can advance to the next datagram without losing
+    /// attribution of the previous datagram's transport events or changing
+    /// the path underneath a protected transmit awaiting disposition.
+    pub fn can_advance_ingress(&self) -> bool {
+        self.handoff.is_none() && !self.transport.has_pending_events()
     }
 
     pub fn receive(

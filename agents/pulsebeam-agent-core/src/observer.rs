@@ -138,6 +138,7 @@ trait ResourceState: RevisionedState {
 impl ResourceState for crate::ffi::PublicationState {
     fn mark_closed(&mut self) {
         self.closed = true;
+        self.admission.effective_format = None;
     }
 }
 
@@ -163,9 +164,23 @@ macro_rules! closable_resource_state {
     )+ };
 }
 
-closable_resource_state!(
+macro_rules! closable_media_subscription_state {
+    ($($state:ty),+ $(,)?) => {$ (
+        impl ResourceState for $state {
+            fn mark_closed(&mut self) {
+                self.closed = true;
+                self.source_format = None;
+            }
+        }
+    )+ };
+}
+
+closable_media_subscription_state!(
     crate::ffi::VideoSubscriptionState,
-    crate::ffi::AudioSubscriptionState,
+    crate::ffi::AudioSubscriptionState
+);
+
+closable_resource_state!(
     crate::ffi::DataSubscriptionState,
     crate::ffi::DataPublicationState,
 );
@@ -686,11 +701,11 @@ mod tests {
         })
         .unwrap();
         let crate::ResourceResult::Publication { owner, .. } = core
-            .resource(crate::ResourceCommand::ClaimPublication {
-                spec: crate::TrackSpec::Video {
+            .resource(crate::ResourceCommand::claim_publication(
+                crate::TrackSpec::Video {
                     track_id: "camera".into(),
                 },
-            })
+            ))
             .unwrap()
         else {
             panic!("expected publication");

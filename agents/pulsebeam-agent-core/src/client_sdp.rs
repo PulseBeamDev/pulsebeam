@@ -183,6 +183,7 @@ pub struct MediaOwner {
 pub struct Allocation {
     pub slot: crate::MediaSlot,
     pub format: Option<pulsebeam_proto::state::CodecFormat>,
+    pub video_codec: Option<crate::VideoCodecRequirement>,
 }
 
 // The wire format has no floating-point fields.

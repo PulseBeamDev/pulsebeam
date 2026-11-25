@@ -954,7 +954,7 @@ impl<H: Host> Actor<H> {
                     _ => None,
                 };
                 let publication_kind = match &command {
-                    agent_core::ResourceCommand::ClaimPublication { spec } => spec.media_kind(),
+                    agent_core::ResourceCommand::ClaimPublication { spec, .. } => spec.media_kind(),
                     _ => None,
                 };
                 let (result, turn) = self.driver.resource(command);
@@ -1320,11 +1320,9 @@ mod tests {
             .send_public(PublicCommand::SetLogLevel(agent_core::LogLevel::Off))
             .unwrap();
         let ResourceResult::Publication { owner, .. } = handle
-            .resource_now(ResourceCommand::ClaimPublication {
-                spec: TrackSpec::Video {
-                    track_id: "pipe".into(),
-                },
-            })
+            .resource_now(ResourceCommand::claim_publication(TrackSpec::Video {
+                track_id: "pipe".into(),
+            }))
             .unwrap()
         else {
             panic!("expected publication");
@@ -1371,6 +1369,7 @@ mod tests {
                 offer: "v=0\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=mid:data\r\n"
                     .into(),
                 resources: OfferResources {
+                    reserved_mids: Vec::new(),
                     slots: Vec::new(),
                     signaling_channel: channel,
                     data_channels: Vec::new(),
@@ -1851,6 +1850,7 @@ mod tests {
             generation,
             offer: String::new(),
             resources: OfferResources {
+                reserved_mids: Vec::new(),
                 slots: Vec::new(),
                 signaling_channel: ChannelId::new(1).unwrap(),
                 data_channels: Vec::new(),

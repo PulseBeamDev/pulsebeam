@@ -262,23 +262,16 @@ impl Control {
     pub(super) fn declare_publication(
         &self,
         spec: agent_core::TrackSpec,
-        enabled: bool,
+        options: agent_core::MediaPublishOptions,
     ) -> Result<(u64, Arc<agent_core::observer::PublicationStateObserver>), Error> {
         let owner = self.update(|core| {
-            let agent_core::ResourceResult::Publication { owner, .. } = core
-                .resource(agent_core::ResourceCommand::ClaimPublication { spec: spec.clone() })?
+            let agent_core::ResourceResult::Publication { owner, .. } =
+                core.resource(agent_core::ResourceCommand::ClaimPublication { spec, options })?
             else {
                 return Err(agent_core::AgentError::InvalidResource(
                     agent_core::TrackResourceError::WrongKind,
                 ));
             };
-            if let Err(error) = core.resource(agent_core::ResourceCommand::SetPublicationMuted {
-                owner,
-                muted: !enabled,
-            }) {
-                let _ = core.resource(agent_core::ResourceCommand::Release { owner });
-                return Err(error);
-            }
             Ok::<_, agent_core::AgentError>(owner)
         })?;
         match self.publication_observer(owner) {
@@ -883,11 +876,9 @@ mod tests {
             .unwrap(),
         );
         let ResourceResult::Publication { owner, .. } = control
-            .resource(ResourceCommand::ClaimPublication {
-                spec: TrackSpec::Video {
-                    track_id: "camera".into(),
-                },
-            })
+            .resource(ResourceCommand::claim_publication(TrackSpec::Video {
+                track_id: "camera".into(),
+            }))
             .unwrap()
         else {
             panic!("Core did not create publication")

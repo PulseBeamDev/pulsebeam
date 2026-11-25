@@ -73,6 +73,68 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
             })
     }
 
+    pub fn claim_bootstrap_media(
+        &mut self,
+        operation: OperationId,
+        reserved: SlotBinding,
+        allocation: Allocation,
+    ) -> HostEvent {
+        let result = (|| {
+            if !matches!(self.stage, Stage::Ready)
+                || self.bindings.get(&reserved.slot) != Some(&reserved)
+                || self.transceivers.contains_key(&allocation.slot)
+            {
+                return Err(Error::CandidateState);
+            }
+            let transceiver = self
+                .transceivers
+                .get(&reserved.slot)
+                .copied()
+                .ok_or(Error::Observation)?;
+            let context = self
+                .sdp
+                .as_mut()
+                .ok_or(Error::CandidateState)?
+                .context_mut();
+            context.claim_bootstrap_media(&reserved.mid, &allocation)?;
+            let bindings = context.bindings().cloned().ok_or(Error::CandidateState)?;
+            self.transceivers.remove(&reserved.slot);
+            self.bindings.remove(&reserved.slot);
+            self.transceivers
+                .insert(allocation.slot.clone(), transceiver);
+            if let Some(source) = self.sources.remove(&reserved.slot) {
+                self.sources.insert(allocation.slot.clone(), source);
+            }
+            if let Some(receiver) = self.receivers.remove(&reserved.slot) {
+                self.receivers.insert(allocation.slot.clone(), receiver);
+            }
+            let assigned = SlotBinding {
+                slot: allocation.slot,
+                ..reserved
+            };
+            self.bindings
+                .insert(assigned.slot.clone(), assigned.clone());
+            #[cfg(debug_assertions)]
+            self.assert_slot_ownership();
+            Ok((assigned, bindings))
+        })();
+        match result {
+            Ok((slot, bindings)) => HostEvent::Rtc(RtcEvent::MediaPrepared {
+                generation: self.generation,
+                operation,
+                slots: vec![slot],
+                outcome: ApplyOutcome::Applied,
+                preparation: Ok(bindings),
+            }),
+            Err(error) => media_event(
+                self.generation,
+                operation,
+                ApplyOutcome::NotApplied,
+                Err(error),
+            ),
+        }
+    }
+
     pub fn retire_media(&mut self, operation: OperationId, mids: Vec<String>) -> Option<HostEvent> {
         self.sdp
             .as_mut()

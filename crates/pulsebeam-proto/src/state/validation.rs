@@ -442,6 +442,7 @@ fn validate_live_for(live: &LiveResource, profile: BindingProfile) -> Result {
             {
                 return Err(ValidationError::Identity);
             }
+            validate_receiver_format(subscription.binding.as_ref(), track)?;
             false
         }
     };
@@ -584,6 +585,7 @@ fn validate_logical_subscription_for(
                     let kind =
                         TrackKind::try_from(address.kind).map_err(|_| ValidationError::Binding)?;
                     validate_binding(Some(binding), kind, false, profile)?;
+                    validate_receiver_format(Some(binding), track)?;
                 }
             }
             Some(logical_subscription_state::Execution::Failure(failure)) => {
@@ -609,6 +611,14 @@ fn track_kind(kind: &track::Kind) -> i32 {
         track::Kind::Audio(_) => TrackKind::Audio as i32,
         track::Kind::Video(_) => TrackKind::Video as i32,
         track::Kind::Data(_) => TrackKind::Data as i32,
+    }
+}
+
+fn validate_receiver_format(binding: Option<&TrackBinding>, track: &Track) -> Result {
+    match track.kind.as_ref() {
+        Some(track::Kind::Audio(source)) => validate_source_format(binding, source.format.as_ref()),
+        Some(track::Kind::Video(source)) => validate_source_format(binding, source.format.as_ref()),
+        _ => Ok(()),
     }
 }
 

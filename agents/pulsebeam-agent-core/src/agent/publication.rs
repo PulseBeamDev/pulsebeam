@@ -1,6 +1,6 @@
 use super::*;
 use crate::ffi::{
-    ErrorCode, ErrorInfo, PublicationAdmission, PublicationAdmissionStatus,
+    EffectiveMediaFormat, ErrorCode, ErrorInfo, PublicationAdmission, PublicationAdmissionStatus,
     PublicationConfigurationSnapshot, PublicationDemand, PublicationExecution, PublicationState,
 };
 use crate::native_state::Resource;
@@ -37,6 +37,7 @@ impl Agent {
             status: PublicationAdmissionStatus::Pending,
             connection_generation: None,
             publication_id: None,
+            effective_format: None,
             evaluation_pending: true,
             error: None,
             execution: PublicationExecution::Unavailable,
@@ -66,6 +67,10 @@ impl Agent {
                     .track
                     .as_ref()
                     .map(|track| track.publication_id.clone());
+                admission.effective_format = live
+                    .track
+                    .as_ref()
+                    .and_then(EffectiveMediaFormat::from_track);
                 admission.execution = match live.execution() {
                     wire::ExecutionStatus::Disabled => PublicationExecution::Disabled,
                     wire::ExecutionStatus::Installed => PublicationExecution::Installed,
@@ -94,6 +99,17 @@ impl Agent {
                 if admission.error.is_some() {
                     admission.status = PublicationAdmissionStatus::Rejected;
                 }
+            }
+            if admission.status == PublicationAdmissionStatus::Pending
+                && let Some(slot) = self.resources.publication_video_slot(&spec)
+                && self.source_preparation(&slot).readiness == SourceReadiness::Failed
+            {
+                admission.status = PublicationAdmissionStatus::Rejected;
+                admission.evaluation_pending = false;
+                admission.error = Some(ErrorInfo::new(
+                    ErrorCode::Unsupported,
+                    "Could not prepare a sender for the required video codec",
+                ));
             }
         }
         Ok(PublicationState {

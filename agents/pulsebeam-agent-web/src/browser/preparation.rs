@@ -88,7 +88,6 @@ fn create_media(
             &peer.connection,
             if video { "video" } else { "audio" },
             sending,
-            video && sending && !peer.single_video_encoding,
         )
         .map_err(|_| Error::Observation)?;
         peer.transceivers
@@ -213,6 +212,86 @@ impl RuntimeInner {
                 Err(error),
             )),
         }
+    }
+
+    pub(super) fn claim_bootstrap_media(
+        self: &Rc<Self>,
+        generation: Generation,
+        operation: OperationId,
+        reserved: SlotBinding,
+        allocation: Allocation,
+    ) {
+        let inner = self.clone();
+        spawn_local(async move {
+            let local = match &allocation.slot {
+                MediaSlot::LocalVideo(name) | MediaSlot::LocalAudio(name) => {
+                    Some(inner.local_operations(name))
+                }
+                _ => None,
+            };
+            let _permit = match &local {
+                Some(operations) => Some(operations.gate.enter().await),
+                None => None,
+            };
+            let claim = (|| {
+                let mut peers = inner.peers.borrow_mut();
+                let peer = peers
+                    .get_mut(&generation.get())
+                    .ok_or(Error::CandidateState)?;
+                if peer
+                    .transceivers
+                    .iter()
+                    .any(|(slot, _)| *slot == allocation.slot)
+                {
+                    return Err(Error::CandidateState);
+                }
+                let (slot, _) = peer
+                    .transceivers
+                    .iter_mut()
+                    .find(|(slot, transceiver)| {
+                        *slot == reserved.slot
+                            && transceiver.mid().as_deref() == Some(&reserved.mid)
+                    })
+                    .ok_or(Error::Observation)?;
+                let context = peer
+                    .sdp
+                    .as_mut()
+                    .ok_or(Error::CandidateState)?
+                    .context_mut();
+                context.claim_bootstrap_media(&reserved.mid, &allocation)?;
+                let bindings = context.bindings().cloned().ok_or(Error::CandidateState)?;
+                *slot = allocation.slot.clone();
+                Ok(bindings)
+            })();
+            let (slots, outcome, preparation) = match claim {
+                Ok(bindings) => {
+                    let preparation = match &allocation.slot {
+                        MediaSlot::LocalVideo(name) | MediaSlot::LocalAudio(name) => inner
+                            .sync_local_slot(name, None)
+                            .await
+                            .map_err(|_| Error::Observation),
+                        _ => Ok(()),
+                    }
+                    .map(|()| bindings);
+                    (
+                        vec![SlotBinding {
+                            slot: allocation.slot,
+                            ..reserved
+                        }],
+                        ApplyOutcome::Applied,
+                        preparation,
+                    )
+                }
+                Err(error) => (Vec::new(), ApplyOutcome::NotApplied, Err(error)),
+            };
+            inner.send_event(HostEvent::Rtc(RtcEvent::MediaPrepared {
+                generation,
+                operation,
+                slots,
+                outcome,
+                preparation,
+            }));
+        });
     }
 
     pub(super) fn retire_media(

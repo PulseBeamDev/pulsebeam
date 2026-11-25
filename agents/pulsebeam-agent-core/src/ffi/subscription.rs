@@ -1,6 +1,6 @@
 use super::{
-    ErrorInfo, PublicationAdmissionStatus, PublicationExecution, TopicMode, TrackSelector,
-    VideoObservation,
+    EffectiveMediaFormat, ErrorInfo, PublicationAdmissionStatus, PublicationExecution, TopicMode,
+    TrackSelector, VideoObservation,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
@@ -24,6 +24,7 @@ pub struct VideoSubscriptionState {
     pub closed: bool,
     pub source_status: SubscriptionSourceStatus,
     pub source_track_id: Option<String>,
+    pub source_format: Option<EffectiveMediaFormat>,
     pub admission: PublicationAdmissionStatus,
     pub admission_pending: bool,
     pub error: Option<ErrorInfo>,
@@ -43,6 +44,7 @@ pub struct AudioSubscriptionState {
     pub closed: bool,
     pub source_status: SubscriptionSourceStatus,
     pub source_track_id: Option<String>,
+    pub source_format: Option<EffectiveMediaFormat>,
     pub admission: PublicationAdmissionStatus,
     pub admission_pending: bool,
     pub error: Option<ErrorInfo>,

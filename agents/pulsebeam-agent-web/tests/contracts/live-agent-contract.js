@@ -606,6 +606,14 @@
       }
       return false;
     }, `browser sends encoded ${selectedVideoCodec} frames`);
+    const videoSenders = [...peers]
+      .flatMap((peer) => peer.getSenders())
+      .filter((sender) => sender.track?.kind === "video");
+    assert(
+      videoSenders.length === 1 &&
+        videoSenders[0].getParameters().encodings.length === 1,
+      "the decoded video publication uses one browser sender encoding",
+    );
     let fixedPresentation = video.srcObject.getVideoTracks()[0];
     assert(
       presentedFrom(fixedTrack) &&
@@ -956,9 +964,10 @@
       const offers = localOffers.get(observedPeer);
       const initial = offers?.[0];
       assert(
-        initial?.filter((line) => line.startsWith("m=")).length === 1 &&
-          initial.some((line) => line.startsWith("m=application ")),
-        "bootstrap reserves only the SCTP transport anchor",
+        initial?.some((line) => line.startsWith("m=application ")) &&
+          initial.filter((line) => line.startsWith("m=video ")).length <= 5 &&
+          !initial.some((line) => line.startsWith("m=audio ")),
+        "bootstrap uses the SCTP anchor and bounded video reservations",
       );
       const transport = (offer) =>
         JSON.stringify(
@@ -987,6 +996,56 @@
         ),
       "in-place receiver replacement keeps the two negotiated reliable ordered SID 0 channels",
     );
+    // Keep the existing H264 witness and exercise one explicit AV1 publication
+    // with the same shipping SDK and real browser decoder.
+    const screen = sender.video("av1-screen").publish({
+      enabled: true,
+      codec: pulsebeam.VideoCodec.Av1,
+    });
+    const screenSource = VideoSource.fromTrack(replacementVideoTrack);
+    const screenElement = document.createElement("video");
+    screenElement.muted = true;
+    screenElement.playsInline = true;
+    document.body.append(screenElement);
+    let screenSubscription;
+    let screenAttachment;
+    let screenPipe;
+    try {
+      screenPipe = screenSource.pipeTo(screen);
+      screenSubscription = receiver
+        .room(receiver.state().room)
+        .participant("web-sender")
+        .video("av1-screen")
+        .subscribe();
+      screenAttachment = present(screenSubscription, screenElement);
+      await until(async () => {
+        const track = presentedTrack(screenElement);
+        const rtpReceiver = track && peerForTrack(track)
+          ?.getReceivers()
+          .find((candidate) => candidate.track === track);
+        if (!rtpReceiver) return false;
+        const stats = await rtpReceiver.getStats();
+        return (
+          [...stats.values()].some(
+            (entry) => entry.type === "inbound-rtp"
+              && entry.framesDecoded > 1
+              && stats.get(entry.codecId)?.mimeType?.toLowerCase() === "video/av1",
+          ) && screenElement.videoWidth > 0 && !screenElement.paused
+        );
+      }, "rendered AV1 from public VideoCodec.Av1 publication");
+      assert(
+        screen.state().admission.effectiveFormat?.mimeType === "video/av1" &&
+          screenSubscription.state().sourceFormat?.mimeType === "video/av1",
+        "public AV1 endpoints report the applied source format",
+      );
+    } finally {
+      await screenAttachment?.close();
+      await screenSubscription?.close();
+      await screenPipe?.close();
+      await screen.close();
+      await screenSource.close();
+      screenElement.remove();
+    }
     // Real Core pages exercise the WASM projection cache without a second transport fixture.
     const catalogAgent = new Agent({
       endpoint,

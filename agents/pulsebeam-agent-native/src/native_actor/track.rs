@@ -84,7 +84,7 @@ impl MediaAddress {
 }
 
 macro_rules! local_track {
-    ($name:ident, $kind:ident, $lookup:ident) => {
+    ($name:ident, $kind:ident, $lookup:ident, $options:ident) => {
         #[derive(Clone)]
         pub struct $name {
             address: MediaAddress,
@@ -94,14 +94,15 @@ macro_rules! local_track {
         impl $name {
             pub(crate) fn declare(
                 &self,
-                configuration: agent_core::ffi::PublicationConfig,
+                options: agent_core::ffi::$options,
             ) -> Result<Publication, Error> {
+                let options = agent_core::MediaPublishOptions::$kind(options);
                 if self.address.closed.is_closed() || self.address.finished.is_closed() {
                     return Err(Error::Closed);
                 }
                 let (owner, observer) = self
                     .core
-                    .declare_publication(self.address.spec.clone(), configuration.enabled)?;
+                    .declare_publication(self.address.spec.clone(), options)?;
                 let inner = PublicationLease::new(
                     owner,
                     self.address.spec.clone(),
@@ -139,9 +140,9 @@ macro_rules! local_track {
 
             pub fn publish(
                 &self,
-                configuration: agent_core::ffi::PublicationConfig,
+                options: agent_core::ffi::$options,
             ) -> Result<Publication, Error> {
-                self.declare(configuration)
+                self.declare(options)
             }
         }
 
@@ -163,8 +164,8 @@ macro_rules! local_track {
     };
 }
 
-local_track!(LocalVideoTrack, Video, video);
-local_track!(LocalAudioTrack, Audio, audio);
+local_track!(LocalVideoTrack, Video, video, VideoPublishOptions);
+local_track!(LocalAudioTrack, Audio, audio, PublicationConfig);
 
 #[derive(Clone)]
 pub struct RemoteVideoTrack {

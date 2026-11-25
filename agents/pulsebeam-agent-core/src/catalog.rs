@@ -255,6 +255,7 @@ impl Catalogs {
                     .tracks
                     .into_iter()
                     .map(|track| {
+                        let effective_format = crate::ffi::EffectiveMediaFormat::from_track(&track);
                         let kind = match track.kind.ok_or_else(invalid)? {
                             wire::track::Kind::Audio(_) => CatalogPublicationKind::Audio,
                             wire::track::Kind::Video(_) => CatalogPublicationKind::Video,
@@ -273,6 +274,7 @@ impl Catalogs {
                             id: track.publication_id,
                             track_id: track.track_id,
                             kind,
+                            effective_format,
                         })
                     })
                     .collect::<Result<Vec<_>, ErrorInfo>>()?;

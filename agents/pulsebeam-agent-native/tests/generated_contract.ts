@@ -11,7 +11,9 @@ import {
   ResourceFailure,
   RetryPolicy,
   TopicMode,
+  VideoCodec,
   VideoObservation,
+  VideoPublishOptions,
   Agent,
   RoomRef,
   Watch,
@@ -140,7 +142,6 @@ if (!VideoSource.instanceOf(videoSource) || !AudioSource.instanceOf(audioSource)
     agent.state().observationRevision !== revision) {
   throw new Error("source construction acquired publication intent");
 }
-const publicationConfig = PublicationConfig.create({ enabled: true });
 const videoPublication = localVideo.publish();
 if (videoPublication instanceof Promise || !videoPublication.state().configuration.enabled) {
   throw new Error("zero-argument publish was not synchronous with RFC enabled default");
@@ -201,7 +202,12 @@ if (videoSource.isClosed() ||
 publicationUpdates.close();
 rebound.uniffiDestroy();
 videoPipe.uniffiDestroy();
-const videoReplacement = sameVideo.publish(publicationConfig);
+const videoReplacement = sameVideo.publish(VideoPublishOptions.create({
+  enabled: false, codec: VideoCodec.Av1,
+}));
+if (videoReplacement.state().configuration.enabled) {
+  throw new Error("video creation ignored disabled intent");
+}
 const replacementPipe = videoSource.pipeTo(videoReplacement);
 const feedback = videoSource.feedback();
 const siblingFeedback = videoSource.feedback();

@@ -27,29 +27,15 @@ pub(super) fn normalize_sender_config(
     mut config: SenderConfig,
 ) -> Result<SenderConfig, String> {
     if config.encodings.is_empty() {
-        config.encodings = match kind {
-            MediaKind::Video => ["q", "h", "f"]
-                .into_iter()
-                .map(|rid| EncodingConfig {
-                    rid: Some(rid.to_owned()),
-                    active: true,
-                    scale_resolution_down_by: None,
-                    max_bitrate: None,
-                    max_framerate: None,
-                    scalability_mode: None,
-                    dtx: None,
-                })
-                .collect(),
-            MediaKind::Audio => vec![EncodingConfig {
-                rid: None,
-                active: true,
-                scale_resolution_down_by: None,
-                max_bitrate: None,
-                max_framerate: None,
-                scalability_mode: None,
-                dtx: None,
-            }],
-        };
+        config.encodings.push(EncodingConfig {
+            rid: None,
+            active: true,
+            scale_resolution_down_by: None,
+            max_bitrate: None,
+            max_framerate: None,
+            scalability_mode: None,
+            dtx: None,
+        });
     }
     validate_sender_config(kind, &config)?;
     Ok(config)
@@ -67,43 +53,40 @@ fn validate_sender_config(kind: MediaKind, config: &SenderConfig) -> Result<(), 
             config.content_hint
         ));
     }
-    let expected = match kind {
-        MediaKind::Video => 3,
-        MediaKind::Audio => 1,
-    };
-    if config.encodings.len() != expected {
+    let [encoding] = config.encodings.as_slice() else {
         return Err(format!(
-            "{} sender configuration requires {expected} encoding entries",
+            "{} publications require one encoding; publish separate tracks for independent streams",
             media_kind_name(kind)
         ));
+    };
+    if encoding.rid.is_some() {
+        return Err("sender encoding must not name a simulcast RID".into());
     }
-    for encoding in &config.encodings {
-        for value in [
-            encoding.scale_resolution_down_by,
-            encoding.max_bitrate,
-            encoding.max_framerate,
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if !value.is_finite() || value <= 0.0 {
-                return Err("sender encoding values must be finite and positive".into());
-            }
+    for value in [
+        encoding.scale_resolution_down_by,
+        encoding.max_bitrate,
+        encoding.max_framerate,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !value.is_finite() || value <= 0.0 {
+            return Err("sender encoding values must be finite and positive".into());
         }
-        if encoding
-            .scalability_mode
-            .as_deref()
-            .is_some_and(|mode| !matches!(mode, "L1T1" | "L1T2" | "L1T3"))
-        {
-            return Err("sender scalability mode must be L1T1, L1T2, or L1T3".into());
-        }
-        if encoding
-            .dtx
-            .as_deref()
-            .is_some_and(|dtx| !matches!(dtx, "enabled" | "disabled"))
-        {
-            return Err("audio DTX must be enabled or disabled".into());
-        }
+    }
+    if encoding
+        .scalability_mode
+        .as_deref()
+        .is_some_and(|mode| !matches!(mode, "L1T1" | "L1T2" | "L1T3"))
+    {
+        return Err("sender scalability mode must be L1T1, L1T2, or L1T3".into());
+    }
+    if encoding
+        .dtx
+        .as_deref()
+        .is_some_and(|dtx| !matches!(dtx, "enabled" | "disabled"))
+    {
+        return Err("audio DTX must be enabled or disabled".into());
     }
     Ok(())
 }
@@ -120,7 +103,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_video_preserves_three_active_rids_without_forcing_scalability() {
+    fn default_video_has_one_active_encoding_without_forcing_scalability() {
         let config = normalize_sender_config(
             MediaKind::Video,
             SenderConfig {
@@ -130,20 +113,40 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(
-            config
-                .encodings
-                .iter()
-                .map(|encoding| encoding.rid.as_deref())
-                .collect::<Vec<_>>(),
-            [Some("q"), Some("h"), Some("f")],
-        );
+        let [encoding] = config.encodings.as_slice() else {
+            panic!("one video encoding");
+        };
+        assert!(encoding.active && encoding.rid.is_none() && encoding.scalability_mode.is_none());
         assert!(config.degradation_preference.is_none());
+    }
+
+    #[test]
+    fn video_keeps_temporal_and_rate_options_but_rejects_multiple_encodings() {
+        let encoding = EncodingConfig {
+            rid: None,
+            active: true,
+            scale_resolution_down_by: None,
+            max_bitrate: Some(300_000.0),
+            max_framerate: Some(30.0),
+            scalability_mode: Some("L1T3".into()),
+            dtx: None,
+        };
+        let config = SenderConfig {
+            content_hint: "motion".into(),
+            degradation_preference: None,
+            encodings: vec![encoding.clone()],
+        };
+        let mut accepted = normalize_sender_config(MediaKind::Video, config).unwrap();
+        assert_eq!(accepted.encodings[0].max_bitrate, Some(300_000.0));
+        assert_eq!(accepted.encodings[0].max_framerate, Some(30.0));
+        assert_eq!(
+            accepted.encodings[0].scalability_mode.as_deref(),
+            Some("L1T3")
+        );
+        accepted.encodings.push(encoding);
         assert!(
-            config
-                .encodings
-                .iter()
-                .all(|encoding| { encoding.active && encoding.scalability_mode.is_none() })
+            matches!(normalize_sender_config(MediaKind::Video, accepted), Err(error)
+            if error.contains("require one encoding"))
         );
     }
 }

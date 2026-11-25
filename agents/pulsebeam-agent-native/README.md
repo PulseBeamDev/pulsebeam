@@ -38,10 +38,18 @@ Factory input choices are independent for audio and video:
 | --- | --- |
 | `AudioInput::Pcm` (default) | Owned PCM samples, native Opus encoding |
 | `AudioInput::EncodedOpus { channels }` | Owned Opus packets matching the declared mono/stereo source; factory input is fixed to this mode |
-| `VideoInput::I420` (default) | Owned CPU I420 pixels, stock native H.264 encoding |
+| `VideoInput::I420` (default) | Owned CPU I420 pixels, stock native encoding |
 | `VideoInput::EncodedH264` | Owned Annex-B H.264 access units |
 
-`MediaConfig.video_publications` names local core slots and their native encodings. Raw video admits one to three encodings. Encoded H.264 admits one encoding or three simulcast encodings, not two, with a uniform L1T1 or L1T3 profile. Multiple encodings require distinct valid RIDs and appropriate scale/rate declarations. L1T3 requires dependency-descriptor configuration and actual negotiation on attached senders before encoded input is admitted. Unsupported combinations return errors rather than adding a peer, transcoding, or substituting a runtime-specific pipeline. Both runtimes explicitly register the stock H.264 decoder, including with encoded local input. For L1T1 input, an absent temporal index or explicit base index zero is accepted and normalized to the native absent-index representation; enhancement indices are rejected. Each L1T3 unit requires its genuine temporal index (0, 1 or 2), with keyframes at index zero and the producer's base-layer sync flag preserved.
+Each video publication uses one encoding, including when `MediaConfig.video_publications`
+sets a profile for a local slot. Multiple encodings are rejected. For independent
+streams, create separate named publications such as `camera` and `screen`.
+
+A single H.264 stream can use L1T1 or L1T3. Encoded L1T3 input requires configured
+and negotiated dependency descriptors. Supply the genuine temporal index (0, 1,
+or 2) and base-layer sync flag for each unit; keyframes use index zero. For L1T1,
+omit the temporal index or set it to zero. Both runtimes use the stock H.264
+decoder, including when the local input is already encoded.
 
 ## Discover one bounded live page
 
@@ -89,11 +97,11 @@ Create an independently owned native input, then lend it to a publication. With 
 spawned Rust `agent`:
 
 ```rust
-use pulsebeam_agent_native::agent_core::ffi::PublicationConfig;
+use pulsebeam_agent_native::agent_core::ffi::{PublicationConfig, VideoPublishOptions};
 
 let camera = agent.create_video_input(Default::default()).await?;
 let publication = agent.video("camera".into())?
-    .publish(PublicationConfig { enabled: true })?;
+    .publish(VideoPublishOptions::default())?;
 let pipe = camera.pipe_to(&publication)?;
 agent.join("conference-42".into())?;
 publication.ready().await?;
@@ -111,6 +119,19 @@ enables the publication by default. Python uses
 `pipe = source.pipe_to(publication)` to attach an existing concrete
 `VideoSource` or `AudioSource`. Audio inputs use `create_audio_input`; native video inputs take
 `VideoSourceConfig`. No source objects are nested in configuration records.
+
+Video defaults to H.264. To publish AV1, use I420 input and set `codec` when
+calling `publish`: `VideoCodec::Av1` in Rust, `VideoCodec.Av1` in Node, or
+`VideoCodec.AV1` in Python. The codec is fixed for that publication. To change
+it, close the publication and create a new one; you can reuse the I420 source.
+After connection, observe `admission`: a missing compatible sender is reported
+as `Rejected` with `Unsupported`, not as an H.264 fallback. On success,
+`effective_format` (`effectiveFormat` in Node) reports the negotiated format.
+
+The controlled Linux Native runtime verifies stock AV1 encoding and decoding
+through the public API. `EncodedH264` input does not support AV1 publication.
+Mobile, hardware codec, and other native runtime combinations are not qualified
+for AV1 by these checks.
 
 Retain the pipe for as long as the publication borrows the source. Closing the
 pipe withdraws that borrow, `configure` changes enabled state, and closing the
@@ -138,10 +159,7 @@ returns its native encoding readback, not an unbound producer configuration.
 
 The shared pending media-command queue has four entries and an aggregate 16 MiB
 payload limit per submission. Admission reports backpressure, invalid input,
-native refusal or closure explicitly. Encoded simulcast takes three genuine
-encoding-specific access units in declared RID order, with equal capture
-timestamps and ascending dimensions, not duplicated payload labeled as different
-rungs. Temporal indices may differ between rungs of an L1T3 batch.
+native refusal or closure explicitly. Submit one H.264 access unit per frame.
 
 ### Remote observations
 

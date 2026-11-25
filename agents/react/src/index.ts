@@ -12,6 +12,7 @@ export {
   DataEvent,
   ErrorCode,
   LogLevel,
+  VideoCodec,
 } from "@pulsebeam/web";
 export type {
   Agent,
@@ -20,6 +21,8 @@ export type {
   AgentUpdates,
   AgentError,
   ErrorInfo,
+  EffectiveMediaFormat,
+  MediaFormatParameter,
   CatalogPublicationInfo,
   CatalogPublicationKind,
   DataPublishOptions,
@@ -29,6 +32,7 @@ export type {
   PublicationState,
   TrackSelector,
   VideoObservation,
+  VideoPublishOptions,
   VideoSubscriptionState,
   AudioSubscriptionState,
   DataPublicationState,

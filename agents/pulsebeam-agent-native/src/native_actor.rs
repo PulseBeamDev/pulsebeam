@@ -334,6 +334,10 @@ enum Command {
         video: Option<VideoSourceConfig>,
         response: oneshot::Sender<Result<ProducerInput, Error>>,
     },
+    #[cfg(feature = "sim")]
+    CreateSimulcastFixtureProducer {
+        response: oneshot::Sender<Result<ProducerInput, Error>>,
+    },
     InstallPipe {
         producer: ProducerInput,
         input: PublicationInput,
@@ -515,6 +519,55 @@ impl Agent {
         Ok((agent, actor.run()))
     }
 
+    /// Drives the existing managed peer with an encoded ladder for SFU
+    /// transport tests. Ordinary publication configuration stays single-stream.
+    #[cfg(feature = "sim")]
+    pub fn managed_with_simulcast_fixture<F, O>(
+        config: Config,
+        fixture: crate::VideoPublicationConfig,
+        host: Host,
+        runtime: F,
+    ) -> Result<(Self, impl Future<Output = ()> + 'static), Error>
+    where
+        F: FnMut() -> Result<(rtc::ManagedRuntime, O), Error> + 'static,
+        O: 'static,
+    {
+        let kind = producer::SourceKind::Video(VideoInput::EncodedH264);
+        if config.media.video_input != VideoInput::EncodedH264
+            || fixture.source.encodings.len() != 3
+            || config
+                .media
+                .video_publications
+                .iter()
+                .any(|profile| profile.slot == fixture.slot)
+        {
+            return Err(Error::InvalidInput(
+                "invalid encoded simulcast transport fixture".into(),
+            ));
+        }
+        crate::native_source::NativeProducer::validate(kind, &fixture.source)?;
+        let (agent, mut actor) = Self::parts(config, host, runtime)?;
+        actor.config.media.video_publications.push(fixture);
+        Ok((agent, actor.run()))
+    }
+
+    /// Simulation fixture for an applied answer with no AV1 receive slot.
+    #[cfg(feature = "sim")]
+    #[doc(hidden)]
+    pub fn managed_h264_receiver_fixture<F, O>(
+        config: Config,
+        host: Host,
+        runtime: F,
+    ) -> Result<(Self, impl Future<Output = ()> + 'static), Error>
+    where
+        F: FnMut() -> Result<(rtc::ManagedRuntime, O), Error> + 'static,
+        O: 'static,
+    {
+        let (agent, mut actor) = Self::parts(config, host, runtime)?;
+        actor.bootstrap_av1_receiver = false;
+        Ok((agent, actor.run()))
+    }
+
     fn parts<R, F, O>(
         config: Config,
         host: Host,
@@ -524,6 +577,9 @@ impl Agent {
         R: rtc::SessionRuntime,
         F: FnMut() -> Result<(R, O), Error>,
     {
+        for profile in &config.media.video_publications {
+            profile.source.validate_owned()?;
+        }
         let core = agent_core::Agent::new(config.session.clone())?;
         let (commands, command_rx) = mpsc::channel(COMMANDS);
         let (media, media_rx) = mpsc::channel(MEDIA_COMMANDS);
@@ -555,6 +611,7 @@ impl Agent {
             clock_origin: Instant::now(),
             next_clock_probe: Duration::ZERO,
             peer: None,
+            bootstrap_av1_receiver: true,
             peer_owner: None,
             runtime,
             http: host.http,
@@ -986,6 +1043,7 @@ where
     // A generation is destroyed before the factory closure (which may own the
     // controlled world's affine services). There is no closed-peer history.
     peer: Option<NativePeer<R>>,
+    bootstrap_av1_receiver: bool,
     peer_owner: Option<O>,
     runtime: F,
     http: Arc<dyn AsyncHttpClient>,
@@ -1196,6 +1254,11 @@ where
         match command {
             Command::CreateProducer { video, response } => {
                 let result = self.create_producer(video);
+                let _ = response.send(result);
+            }
+            #[cfg(feature = "sim")]
+            Command::CreateSimulcastFixtureProducer { response } => {
+                let result = self.create_simulcast_fixture_producer();
                 let _ = response.send(result);
             }
             Command::InstallPipe {
@@ -1646,6 +1709,7 @@ where
                                 generation,
                                 &[],
                                 &data_channels,
+                                self.bootstrap_av1_receiver,
                             )
                             .map(|peer| (peer, owner))
                             .map_err(Error::from)
@@ -1778,6 +1842,30 @@ where
                         if let Some(event) = event {
                             self.accept(event);
                         }
+                    }
+                    RtcEffect::ClaimBootstrapMedia {
+                        generation,
+                        operation,
+                        reserved,
+                        allocation,
+                    } => {
+                        let event = match self
+                            .peer
+                            .as_mut()
+                            .filter(|peer| peer.generation == generation)
+                        {
+                            Some(peer) => {
+                                peer.claim_bootstrap_media(operation, reserved, allocation)
+                            }
+                            None => HostEvent::Rtc(RtcEvent::MediaPrepared {
+                                generation,
+                                operation,
+                                slots: Vec::new(),
+                                outcome: agent_core::client_sdp::ApplyOutcome::NotApplied,
+                                preparation: Err(agent_core::client_sdp::Error::CandidateState),
+                            }),
+                        };
+                        self.accept(event);
                     }
                     RtcEffect::RetireMedia {
                         generation,
@@ -3228,7 +3316,7 @@ mod tests {
                 agent_core::TrackSpec::Audio {
                     track_id: "rollback".into(),
                 },
-                true,
+                agent_core::MediaPublishOptions::Audio(Default::default()),
             )
             .unwrap();
         agent.core.revoke_publication(owner);
@@ -3246,7 +3334,7 @@ mod tests {
                 agent_core::TrackSpec::Audio {
                     track_id: "closed-queue".into(),
                 },
-                true,
+                agent_core::MediaPublishOptions::Audio(Default::default()),
             )
             .unwrap();
         agent.core.revoke_publication(owner);
@@ -3436,6 +3524,43 @@ mod tests {
                 actor.shutdown();
                 drop(agent);
             });
+    }
+
+    #[test]
+    fn owned_video_rejects_independent_encodings_before_allocating_a_producer() {
+        let host = || Host::new(Box::new(PendingHttp(Arc::new(AtomicBool::new(false)))));
+        for input in [VideoInput::I420, VideoInput::EncodedH264] {
+            let mut base = config();
+            base.media.video_input = input;
+            let source = VideoSourceConfig {
+                encodings: ["q", "h", "f"]
+                    .map(|rid| Encoding {
+                        rid: Some(rid.into()),
+                        ..Default::default()
+                    })
+                    .into(),
+                ..Default::default()
+            };
+            let mut old_config = base.clone();
+            old_config
+                .media
+                .video_publications
+                .push(crate::VideoPublicationConfig {
+                    slot: "v0".into(),
+                    source: source.clone(),
+                });
+            assert!(
+                matches!(Agent::parts(old_config, host(), || Ok((rtc::ThreadedRuntime, ()))),
+                Err(Error::InvalidInput(message)) if message.contains("require one encoding"))
+            );
+            let (_agent, mut actor) =
+                Agent::parts(base, host(), || Ok((rtc::ThreadedRuntime, ()))).unwrap();
+            assert!(matches!(actor.create_producer(Some(source)),
+                Err(Error::InvalidInput(message)) if message.contains("require one encoding")));
+            assert!(actor.producers.is_empty());
+            assert_eq!(actor.next_producer, 0);
+            actor.shutdown();
+        }
     }
 
     #[test]
@@ -3717,11 +3842,11 @@ mod tests {
         // Queue ownership only, not native admission or target readiness.
         let mut core = agent_core::Agent::new(config().session).unwrap();
         let agent_core::ResourceResult::Publication { owner, .. } = core
-            .resource(agent_core::ResourceCommand::ClaimPublication {
-                spec: agent_core::TrackSpec::Audio {
+            .resource(agent_core::ResourceCommand::claim_publication(
+                agent_core::TrackSpec::Audio {
                     track_id: "microphone".into(),
                 },
-            })
+            ))
             .unwrap()
         else {
             panic!("publication");

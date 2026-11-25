@@ -26,7 +26,10 @@ async fn connect(
         .transpose()?;
     let bootstrap = input
         .as_ref()
-        .map_or(Av1Bootstrap::Stock, Av1Bootstrap::External);
+        .map_or(Av1Bootstrap::Stock, |input| Av1Bootstrap::External {
+            input,
+            remap_payload_types: !publish,
+        });
     let mut created = None;
     let direction = if publish {
         RtpTransceiverDirection::SendOnly
@@ -196,6 +199,75 @@ async fn connect(
     Ok((wire, transceiver, source, parameters))
 }
 
+pub(super) fn remap_offer_payload_types(offer: &mut String) -> anyhow::Result<()> {
+    let sections = client::inspect(offer)?;
+    let section = sections
+        .iter()
+        .find(|section| section.kind == client::Kind::Video)
+        .context("AV1 offer section")?;
+    let codec = section
+        .codecs
+        .iter()
+        .find(|codec| codec.parameters.name == "av1")
+        .context("AV1 offer codec")?;
+    let repair = codec.repair.as_ref().context("AV1 offer RTX")?;
+    let mut available = (96_u8..=127).rev().filter(|pt| {
+        !sections
+            .iter()
+            .flat_map(|section| &section.codecs)
+            .any(|codec| {
+                codec.payload_type == *pt
+                    || codec
+                        .repair
+                        .as_ref()
+                        .is_some_and(|repair| repair.payload_type == *pt)
+            })
+    });
+    let primary = available.next().context("unused AV1 payload type")?;
+    let rtx = available.next().context("unused AV1 RTX payload type")?;
+    let remap = |pt: &str| match pt.parse::<u8>() {
+        Ok(pt) if pt == codec.payload_type => primary.to_string(),
+        Ok(pt) if pt == repair.payload_type => rtx.to_string(),
+        _ => pt.to_owned(),
+    };
+    let mut output = Vec::new();
+    let mut video = false;
+    for line in offer.lines() {
+        if line.starts_with("m=") {
+            video = line.starts_with("m=video ");
+            if video {
+                let mut fields = line.split_ascii_whitespace();
+                let mut media = fields
+                    .by_ref()
+                    .take(3)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                media.extend(fields.map(remap));
+                output.push(media.join(" "));
+                continue;
+            }
+        }
+        if video
+            && let Some((attribute, value)) = line.split_once(':')
+            && matches!(attribute, "a=rtpmap" | "a=fmtp" | "a=rtcp-fb")
+            && let Some((pt, details)) = value.split_once(' ')
+        {
+            let details = if attribute == "a=fmtp" && pt.parse::<u8>() == Ok(repair.payload_type) {
+                let apt = details.strip_prefix("apt=").context("AV1 offer RTX apt")?;
+                anyhow::ensure!(apt.parse::<u8>() == Ok(codec.payload_type));
+                format!("apt={primary}")
+            } else {
+                details.to_owned()
+            };
+            output.push(format!("{attribute}:{} {details}", remap(pt)));
+        } else {
+            output.push(line.to_owned());
+        }
+    }
+    *offer = output.join("\r\n") + "\r\n";
+    Ok(())
+}
+
 async fn install(
     peer: &mut WirePeer,
     declaration: wire::resource_spec::Declaration,
@@ -270,6 +342,7 @@ async fn session(
 ) -> anyhow::Result<()> {
     let (mut publisher, _, source, parameters) = connect(host.clone(), server, true, dd).await?;
     let publisher_ssrc = parameters.encodings[0].ssrc.context("AV1 publisher SSRC")?;
+    let publisher_codec = parameters.codec.clone().context("AV1 publisher codec")?;
     let track = install(
         &mut publisher,
         wire::resource_spec::Declaration::Publication(wire::PublicationSpec {
@@ -291,6 +364,25 @@ async fn session(
             .rtx_ssrc
             .context("AV1 receiver RTX SSRC")?,
     ];
+    let receiver_codec = parameters.codec.as_ref().context("AV1 receiver codec")?;
+    let payload_types = [
+        publisher_codec.payload_type.context("AV1 publisher PT")?,
+        receiver_codec.payload_type.context("AV1 receiver PT")?,
+        receiver_codec
+            .rtx_payload_type
+            .context("AV1 receiver RTX PT")?,
+    ]
+    .map(u8::try_from);
+    let [ingress_pt, egress_pt, repair_pt] = payload_types;
+    let (ingress_pt, egress_pt, repair_pt) = (ingress_pt?, egress_pt?, repair_pt?);
+    if !dd {
+        assert_eq!(publisher_codec.format, receiver_codec.format);
+        assert_ne!(ingress_pt, egress_pt, "applied primary PTs did not differ");
+        assert_ne!(
+            publisher_codec.rtx_payload_type, receiver_codec.rtx_payload_type,
+            "applied repair PTs did not differ"
+        );
+    }
     let remote_track = receiver.receiver().track().context("AV1 video track")?;
     let sink = remote_track.attach_sink()?;
     assert_eq!(
@@ -415,13 +507,19 @@ async fn session(
     udp.drop_second_primary(publisher_ssrc, receiver_fid);
     push()?;
     let refreshed = tokio::time::timeout(Duration::from_secs(1), async {
+        let mut decoded = None;
         loop {
             if let Some(timestamp) = udp.repaired_timestamp() {
                 while let Some(frame) = sink.try_next_frame() {
                     if frame.rtp_timestamp == timestamp {
-                        return frame;
+                        decoded = Some(frame);
                     }
                 }
+            }
+            // A receiver-local repair can overtake an original datagram on
+            // this reordered path. Decode and primary arrival are separate.
+            if udp.saw_all_primary_fragments() && let Some(frame) = decoded.take() {
+                return frame;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -432,12 +530,30 @@ async fn session(
         .context("protected AV1 repair witness")?;
     let refreshed = refreshed.with_context(|| {
         format!(
-            "Native AV1 did not decode repaired timestamp: {proof:?}, UDP peaks={:?}",
+            "Native AV1 did not complete repaired decode and primary packet witness: {proof:?}, UDP peaks={:?}",
             udp.peaks()
         )
     })?;
     assert_ne!(refreshed.rtp_timestamp, last);
     assert_eq!((refreshed.width, refreshed.height), (1280, 720));
+    assert!(
+        proof
+            .input
+            .iter()
+            .all(|packet| packet.payload_type == ingress_pt)
+    );
+    assert!(
+        proof
+            .output
+            .iter()
+            .all(|packet| packet.payload_type == egress_pt)
+    );
+    assert!(
+        proof
+            .repairs
+            .iter()
+            .all(|packet| packet.payload_type == repair_pt)
+    );
     let dropped = proof.dropped.with_context(|| {
         format!(
             "lost interior AV1 primary: {proof:?}, UDP peaks={:?}",
@@ -445,13 +561,44 @@ async fn session(
         )
     })?;
     assert!(proof.output.len() >= 3);
-    assert_eq!(proof.input.len(), proof.output.len());
+    assert_eq!(proof.input.len(), proof.output.len(), "{proof:?}");
+    for leg in [&proof.input, &proof.output] {
+        // Network delivery can reorder fragments. The marker still terminates
+        // one complete contiguous primary sequence on each leg.
+        let mut markers = leg.iter().filter(|packet| packet.marker);
+        let end = markers.next().context("AV1 frame marker")?;
+        assert!(markers.next().is_none());
+        let mut offsets = leg
+            .iter()
+            .map(|packet| {
+                assert_eq!(packet.timestamp, end.timestamp);
+                end.sequence.wrapping_sub(packet.sequence)
+            })
+            .collect::<Vec<_>>();
+        offsets.sort_unstable();
+        assert!(offsets.iter().copied().eq(0..u16::try_from(leg.len())?));
+    }
     const UDP_PAYLOAD_CAP: usize = 1_232;
-    assert!(proof.output.iter().all(|&bytes| bytes <= UDP_PAYLOAD_CAP));
+    assert!(
+        proof
+            .output
+            .iter()
+            .all(|packet| packet.bytes <= UDP_PAYLOAD_CAP)
+    );
     // Repeated Native NACKs may cause several copies before decode completes.
     assert!(!proof.repairs.is_empty());
-    assert!(proof.repairs.iter().all(|&bytes| bytes == dropped + 2));
-    assert!(proof.repairs.iter().all(|&bytes| bytes <= UDP_PAYLOAD_CAP));
+    assert!(
+        proof
+            .repairs
+            .iter()
+            .all(|packet| packet.bytes == dropped + 2)
+    );
+    assert!(
+        proof
+            .repairs
+            .iter()
+            .all(|packet| packet.bytes <= UDP_PAYLOAD_CAP)
+    );
     Ok(())
 }
 

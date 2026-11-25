@@ -211,6 +211,7 @@ fn executor_bounds_unfinished_work_and_reclaims_cancelled_queue_credit() {
         Err(Error::Capacity)
     );
     let allocation = Allocation {
+        video_codec: None,
         slot: crate::MediaSlot::LocalVideo("camera".into()),
         format: None,
     };
@@ -231,6 +232,7 @@ fn executor_bounds_unfinished_work_and_reclaims_cancelled_queue_credit() {
     let mut name = String::with_capacity(2 * MAX_SDP_BYTES);
     name.push_str("camera");
     let allocation = Allocation {
+        video_codec: None,
         slot: crate::MediaSlot::LocalVideo(name),
         format: None,
     };
@@ -264,6 +266,7 @@ fn executor_bounds_unfinished_work_and_reclaims_cancelled_queue_credit() {
             executor.enqueue_allocation(
                 ids.operation(),
                 vec![Allocation {
+                    video_codec: None,
                     slot: crate::MediaSlot::RemoteVideo(0),
                     format: Some(format),
                 }]
@@ -283,6 +286,7 @@ fn executor_bounds_unfinished_work_and_reclaims_cancelled_queue_credit() {
     let mut mids = Vec::with_capacity(2 * MAX_SDP_BYTES / size_of::<String>() + 1);
     for index in 0..257 {
         allocations.push(Allocation {
+            video_codec: None,
             slot: crate::MediaSlot::LocalVideo(format!("camera{index}")),
             format: None,
         });
@@ -303,6 +307,7 @@ fn executor_bounds_unfinished_work_and_reclaims_cancelled_queue_credit() {
     );
     assert!(!executor.ready());
     let invalid = Allocation {
+        video_codec: None,
         slot: crate::MediaSlot::RemoteVideo(0),
         format: None,
     };
@@ -313,15 +318,66 @@ fn executor_bounds_unfinished_work_and_reclaims_cancelled_queue_credit() {
 }
 
 #[test]
+fn video_sender_allocation_requires_h264_even_when_vp8_is_usable() {
+    use crate::{MediaSlot, VideoCodecRequirement};
+
+    let mut capabilities = caps();
+    let mut h264 = capabilities.codecs[0].clone();
+    h264.parameters.name = "h264".into();
+    h264.parameters
+        .fmtp
+        .insert("packetization-mode".into(), "1".into());
+    capabilities.codecs.push(h264);
+    let mut executor = Executor::new(
+        Context::new(
+            &bootstrap(),
+            &remote(),
+            capabilities,
+            100,
+            Limits::default(),
+        )
+        .unwrap(),
+    );
+    let slot = MediaSlot::LocalVideo("camera".into());
+    let operation = crate::id::IdGenerator::new().operation();
+    executor
+        .enqueue_allocation(
+            operation,
+            vec![Allocation {
+                slot: slot.clone(),
+                format: None,
+                video_codec: Some(VideoCodecRequirement::H264),
+            }],
+        )
+        .unwrap();
+    assert_eq!(executor.start(), Some(operation));
+    let vp8 = offer("v", "sendonly", "a=ssrc:101 cname:native\r\n");
+    let slots = assigned_slot_bindings(&vp8, [(slot, "v".into())]).unwrap();
+    assert!(matches!(
+        executor.prepare_allocated(operation, &vp8, &slots),
+        Err(Error::Envelope(_))
+    ));
+    let mixed = vp8.replace("SAVPF 96 97", "SAVPF 96 97 98")
+        + "a=rtpmap:98 H264/90000\r\na=fmtp:98 packetization-mode=1\r\n";
+    let candidate = executor
+        .prepare_allocated(operation, &mixed, &slots)
+        .unwrap();
+    assert_eq!(candidate.bindings().publications[0].codec.payload_type, 98);
+    assert!(candidate.answer().contains("a=rtpmap:98 H264/90000"));
+}
+
+#[test]
 fn allocation_lowers_only_actual_sections_and_reconciles_cancelled_physical_history() {
     use crate::{MediaDirection, MediaKind, MediaSlot};
     use pulsebeam_proto::state::{CodecFormat, codec_format};
 
     let publication = Allocation {
+        video_codec: None,
         slot: MediaSlot::LocalVideo("camera".into()),
         format: None,
     };
     let reception = Allocation {
+        video_codec: None,
         slot: MediaSlot::RemoteVideo(7),
         format: Some(CodecFormat::from(codec_format::Codec::Vp8(
             Default::default(),
@@ -513,6 +569,7 @@ fn allocation_lowers_only_actual_sections_and_reconciles_cancelled_physical_hist
         .enqueue_allocation(
             failed,
             vec![Allocation {
+                video_codec: None,
                 slot: pub_slot,
                 format: None,
             }],
@@ -630,6 +687,7 @@ fn bootstrap_capabilities_preserve_per_codec_repair_and_rtcp_modes() {
             .enqueue_allocation(
                 operation,
                 vec![Allocation {
+                    video_codec: None,
                     slot,
                     format: envelope.codecs[index].format.clone(),
                 }],
@@ -807,6 +865,59 @@ fn bootstrap_selected_feedback_is_retained_when_capabilities_allow_more() {
             .bindings(),
         &adopted
     );
+}
+
+#[test]
+fn claiming_an_applied_bootstrap_mid_preserves_transport_and_consumes_it_once() {
+    use crate::{MediaSlot, VideoCodecRequirement, rtc_preparation::bootstrap_media_key};
+
+    let local = offer(
+        "v",
+        "sendonly",
+        "a=ssrc:200 cname:native\r\na=ssrc:201 cname:native\r\na=ssrc-group:FID 200 201\r\n",
+    );
+    let mut generator = context();
+    let answer = generator
+        .prepare(&local, &[request("v", true, false)])
+        .unwrap();
+    let mut applied =
+        Context::new(&local, answer.answer(), caps(), 900, Limits::default()).unwrap();
+    let before = applied
+        .adopt_bootstrap_media(&[request("v", true, false)])
+        .unwrap()
+        .clone();
+    assert_eq!(
+        applied.reserve_bootstrap_media(&["missing".into()]),
+        Err(Error::Identifier)
+    );
+    applied.reserve_bootstrap_media(&["v".into()]).unwrap();
+    let mut target = Allocation {
+        slot: MediaSlot::LocalVideo("camera".into()),
+        format: None,
+        video_codec: Some(VideoCodecRequirement::H264),
+    };
+    assert!(matches!(
+        applied.claim_bootstrap_media("v", &target),
+        Err(Error::Envelope(_))
+    ));
+    assert_eq!(applied.bindings(), Some(&before));
+    target.video_codec = None;
+    let binding = applied.claim_bootstrap_media("v", &target).unwrap();
+    let mut expected = before.publications[0].clone();
+    expected.key = bootstrap_media_key(&target.slot);
+    expected.group = None;
+    assert_eq!(binding, expected);
+    assert_eq!(applied.bindings().unwrap().publications, [expected.clone()]);
+    assert_eq!(
+        applied.claim_bootstrap_media("v", &target),
+        Err(Error::Identifier)
+    );
+    assert_eq!(
+        applied.reserve_bootstrap_media(&["v".into()]),
+        Err(Error::CandidateState)
+    );
+    let later = applied.prepare(&local, &[]).unwrap();
+    assert_eq!(later.bindings().publications, [expected]);
 }
 
 #[test]
@@ -1541,6 +1652,7 @@ fn descriptions_scale_without_count_ceilings_and_capacity_remains_non_destructiv
         actual.push_str("m=video");
         actual.push_str(section.split_once("m=video").unwrap().1);
         let allocation = Allocation {
+            video_codec: None,
             slot: crate::MediaSlot::LocalVideo(format!("camera{index}")),
             format: None,
         };

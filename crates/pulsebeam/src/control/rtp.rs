@@ -108,6 +108,7 @@ pub(crate) fn capabilities() -> wire::RtpCapabilities {
                     wire::RtpScalabilityMode::L1t3.as_str().into(),
                 ],
             },
+            stock_av1_capability(wire::RtcpFeedback::TransportCc.as_str()),
         ],
         header_extensions: vec![
             wire::RtpHeaderExtensionType::RtpHeaderExtensionMid
@@ -150,29 +151,33 @@ pub(crate) fn bootstrap_capabilities(offer: &str) -> wire::RtpCapabilities {
     }
 }
 
+fn stock_av1_capability(packet_feedback: &str) -> wire::RtpCodecCapability {
+    wire::RtpCodecCapability {
+        format: Some(wire::CodecFormat {
+            mime_type: "video/av1".into(),
+            clock_rate: 90_000,
+            channels: None,
+            parameters: STOCK_AV1_PARAMETERS
+                .iter()
+                .map(|&(name, value)| wire::CodecParameter {
+                    name: name.into(),
+                    value: value.into(),
+                })
+                .collect(),
+        }),
+        feedback: vec![
+            wire::RtcpFeedback::Nack.as_str().into(),
+            wire::RtcpFeedback::NackPli.as_str().into(),
+            packet_feedback.into(),
+        ],
+        rtx_supported: true,
+        scalability_modes: vec![wire::RtpScalabilityMode::L1t1.as_str().into()],
+    }
+}
+
 fn av1_rfc8888_capabilities() -> wire::RtpCapabilities {
     wire::RtpCapabilities {
-        codecs: vec![wire::RtpCodecCapability {
-            format: Some(wire::CodecFormat {
-                mime_type: "video/av1".into(),
-                clock_rate: 90_000,
-                channels: None,
-                parameters: STOCK_AV1_PARAMETERS
-                    .iter()
-                    .map(|&(name, value)| wire::CodecParameter {
-                        name: name.into(),
-                        value: value.into(),
-                    })
-                    .collect(),
-            }),
-            feedback: vec![
-                wire::RtcpFeedback::Nack.as_str().into(),
-                wire::RtcpFeedback::NackPli.as_str().into(),
-                "ack ccfb".into(),
-            ],
-            rtx_supported: true,
-            scalability_modes: vec![wire::RtpScalabilityMode::L1t1.as_str().into()],
-        }],
+        codecs: vec![stock_av1_capability("ack ccfb")],
         header_extensions: vec![
             wire::RtpHeaderExtensionType::RtpHeaderExtensionMid.into(),
             wire::RtpHeaderExtensionType::RtpHeaderExtensionDependencyDescriptor.into(),

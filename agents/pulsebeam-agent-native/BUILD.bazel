@@ -39,6 +39,8 @@ rust_library(
 
 rust_library(
     name = "pulsebeam-agent-native-sim",
+    testonly = True,
+    visibility = ["//crates/pulsebeam-simulator:__pkg__"],
     crate_name = "pulsebeam_agent_native",
     crate_root = "src/lib.rs",
     srcs = glob(["src/**/*.rs"], exclude = ["src/bin/**"]),

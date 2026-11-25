@@ -2,7 +2,7 @@ use super::{Agent, Arc, ErrorCode, ErrorInfo, WebAgentError};
 use agent_core::{TrackSpec, ffi};
 
 macro_rules! media_publication {
-    ($track:ident, $publication:ident, $kind:ident) => {
+    ($track:ident, $publication:ident, $kind:ident, $options:ident) => {
         #[derive(uniffi::Object)]
         pub struct $track {
             #[cfg(target_arch = "wasm32")]
@@ -38,10 +38,12 @@ macro_rules! media_publication {
             #[uniffi::method(default(options = None))]
             pub fn publish(
                 &self,
-                options: Option<ffi::PublicationConfig>,
+                options: Option<ffi::$options>,
             ) -> Result<Arc<$publication>, WebAgentError> {
                 #[cfg(target_arch = "wasm32")]
                 {
+                    let options =
+                        agent_core::MediaPublishOptions::$kind(options.unwrap_or_default());
                     let (owner, observer) = claim(&self.agent, self.spec.clone(), options)?;
                     Ok(Arc::new($publication {
                         owner,
@@ -120,7 +122,7 @@ macro_rules! media_publication {
 fn claim(
     agent: &Agent,
     spec: TrackSpec,
-    options: Option<ffi::PublicationConfig>,
+    options: agent_core::MediaPublishOptions,
 ) -> Result<
     (
         u64,
@@ -130,22 +132,22 @@ fn claim(
 > {
     let runtime = &agent.runtime;
     let agent_core::ResourceResult::Publication { owner, .. } =
-        runtime.claim_media_publication(spec)?
+        runtime.claim_media_publication(spec, options)?
     else {
         return Err(ErrorInfo::new(ErrorCode::Internal, "Missing media publication owner").into());
     };
-    let result = (|| {
-        if !options.unwrap_or_default().enabled {
-            runtime.configure_publication_state(owner, false)?;
-        }
-        runtime.publication_state_observer(owner)
-    })();
+    let result = runtime.publication_state_observer(owner);
     if result.is_err() {
         let _ = runtime.release_media_owner(owner);
     }
     Ok((owner, result?))
 }
 
-media_publication!(LocalVideoTrack, VideoPublication, Video);
-media_publication!(LocalAudioTrack, AudioPublication, Audio);
+media_publication!(
+    LocalVideoTrack,
+    VideoPublication,
+    Video,
+    VideoPublishOptions
+);
+media_publication!(LocalAudioTrack, AudioPublication, Audio, PublicationConfig);
 state_cursor!(PublicationUpdates, PublicationState);

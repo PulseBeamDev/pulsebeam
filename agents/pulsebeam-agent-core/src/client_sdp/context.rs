@@ -65,6 +65,7 @@ pub struct Context {
     capabilities: Capabilities,
     accepted: Accepted,
     pending: Option<(CandidateId, Accepted)>,
+    bootstrap_reservations: Option<BTreeSet<String>>,
     identities: IdentityHistory,
     next_identity: u32,
     next_candidate: u64,
@@ -131,6 +132,7 @@ impl Context {
                 declarable: false,
             },
             pending: None,
+            bootstrap_reservations: None,
             identities,
             next_identity: seed,
             next_candidate: 0,
@@ -315,6 +317,127 @@ impl Context {
         Ok(&self.accepted.bindings)
     }
 
+    /// Mark inactive application ownership, not inactive SDP, on selected
+    /// unidirectional sections of the already applied bootstrap answer.
+    pub fn reserve_bootstrap_media(&mut self, mids: &[String]) -> Result<(), Error> {
+        if self.next_candidate != 0
+            || self.pending.is_some()
+            || !self.accepted.declarable
+            || self.bootstrap_reservations.is_some()
+        {
+            return Err(Error::CandidateState);
+        }
+        let reservations: BTreeSet<_> = mids.iter().cloned().collect();
+        let bindings = &self.accepted.bindings;
+        if reservations.len() != mids.len()
+            || mids.iter().any(|mid| {
+                let sending = bindings
+                    .publications
+                    .iter()
+                    .any(|binding| binding.mid == *mid);
+                let receiving = bindings
+                    .receptions
+                    .iter()
+                    .any(|binding| binding.mid == *mid);
+                sending == receiving
+            })
+        {
+            return Err(Error::Identifier);
+        }
+        self.bootstrap_reservations = Some(reservations);
+        Ok(())
+    }
+
+    /// Assign one reservation without generating SDP or changing its RTP
+    /// coordinates. An assigned MID is consumed for this peer's lifetime.
+    pub fn claim_bootstrap_media(
+        &mut self,
+        mid: &str,
+        target: &Allocation,
+    ) -> Result<Binding, Error> {
+        if self.pending.is_some() || !self.accepted.declarable {
+            return Err(Error::CandidateState);
+        }
+        target.validate()?;
+        let reservations = self
+            .bootstrap_reservations
+            .as_mut()
+            .ok_or(Error::CandidateState)?;
+        if !reservations.contains(mid)
+            || self
+                .accepted
+                .document
+                .bundle
+                .first()
+                .is_some_and(|anchor| anchor == mid)
+        {
+            return Err(Error::Identifier);
+        }
+        let owner = target.owner();
+        let sending = target.slot.direction() == crate::MediaDirection::SendOnly;
+        let expected = target
+            .format
+            .as_ref()
+            .map(pulsebeam_proto::state::sdp::codec_parameters)
+            .transpose()
+            .map_err(|_| Error::Identifier)?;
+        let expected_kind = match target.slot.kind() {
+            crate::MediaKind::Audio => Kind::Audio,
+            crate::MediaKind::Video => Kind::Video,
+        };
+        fn list(bindings: &Bindings, sending: bool) -> &[Binding] {
+            if sending {
+                bindings.publications.as_slice()
+            } else {
+                bindings.receptions.as_slice()
+            }
+        }
+        let active = list(&self.accepted.bindings, sending);
+        let index = active
+            .iter()
+            .position(|binding| binding.mid == mid)
+            .ok_or_else(|| Error::Envelope(mid.into()))?;
+        let binding = &active[index];
+        let codec = &binding.codec.parameters;
+        if binding.kind != expected_kind
+            || !(binding.complete() || sending && binding.identities_pending())
+            || !target
+                .video_codec
+                .is_none_or(|required| required.matches_name(&codec.name))
+            || !expected.as_ref().is_none_or(|expected| {
+                codec.name.eq_ignore_ascii_case(&expected.name)
+                    && codec.clock_rate == expected.clock_rate
+                    && codec.channels == expected.channels
+                    && codec.fmtp == expected.fmtp
+            })
+            || list(&self.accepted.retained, sending)
+                .iter()
+                .any(|binding| binding.mid != mid && binding.key == owner.key)
+        {
+            return Err(Error::Envelope(mid.into()));
+        }
+        let retained = if sending {
+            &mut self.accepted.retained.publications
+        } else {
+            &mut self.accepted.retained.receptions
+        };
+        let retained = retained
+            .iter_mut()
+            .find(|binding| binding.mid == mid)
+            .ok_or(Error::CandidateState)?;
+        let mut claimed = binding.clone();
+        claimed.key = owner.key;
+        claimed.group = owner.group;
+        *retained = claimed.clone();
+        if sending {
+            self.accepted.bindings.publications[index] = claimed.clone();
+        } else {
+            self.accepted.bindings.receptions[index] = claimed.clone();
+        }
+        reservations.remove(mid);
+        Ok(claimed)
+    }
+
     /// Reconcile the current actual offer. Only new/replaced media need requests.
     pub fn prepare(&mut self, offer: &str, requests: &[Preparation]) -> Result<Candidate, Error> {
         self.prepare_inner(offer, requests, &[], None)
@@ -439,17 +562,20 @@ impl Context {
                 .map(pulsebeam_proto::state::sdp::codec_parameters)
                 .transpose()
                 .map_err(|_| Error::Identifier)?;
-            // A source format constrains codec selection, never receiver PT/SSRCs.
+            // Codec constraints do not prescribe the local PT or SSRCs.
             let codec = media
                 .codecs
                 .iter()
                 .filter(|codec| {
-                    expected.as_ref().is_none_or(|expected| {
-                        codec.parameters.name.eq_ignore_ascii_case(&expected.name)
-                            && codec.parameters.clock_rate == expected.clock_rate
-                            && codec.parameters.channels == expected.channels
-                            && codec.parameters.fmtp == expected.fmtp
-                    })
+                    allocation
+                        .video_codec
+                        .is_none_or(|required| required.matches_name(&codec.parameters.name))
+                        && expected.as_ref().is_none_or(|expected| {
+                            codec.parameters.name.eq_ignore_ascii_case(&expected.name)
+                                && codec.parameters.clock_rate == expected.clock_rate
+                                && codec.parameters.channels == expected.channels
+                                && codec.parameters.fmtp == expected.fmtp
+                        })
                 })
                 .find_map(|codec| self.select_codec(codec).ok())
                 .ok_or_else(|| Error::Envelope(media.mid.clone()))?;

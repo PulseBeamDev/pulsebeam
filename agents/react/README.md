@@ -40,7 +40,10 @@ Look up local handles with `agent.video(trackId)`, `agent.audio(trackId)`, or
 `agent.room(room).participant(id).video(trackId)`, `.audio(trackId)`, or
 `.data(trackId)`. The room and participant ID are fixed
 by that reference and do not follow Agent room changes. Lookup is inert.
-`usePublish` owns publication; `useSubscribe` owns reception. Data owners default
+`usePublish` owns publication; `useSubscribe` owns reception. Video defaults to
+H.264; pass `{ enabled: true, codec: VideoCodec.Av1 }` to request AV1. Check
+`publication.state().admission` and see the
+[Web codec requirements](../pulsebeam-agent-web/README.md#publish-caller-owned-capture). Data owners default
 to Reliable delivery. Select another mode through their options, not lookup. Pass the resulting
 subscription to `Video` or `Audio` through `source`. Playback owns only its
 observation clone, never the independent subscription. Configure receive hints

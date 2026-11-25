@@ -112,6 +112,17 @@ impl NativeSource {
         kind: SourceKind,
         video: &VideoSourceConfig,
     ) -> Result<Self, rtc::PeerError> {
+        Self::create_with_codec(session, peer, track_id, kind, video, None)
+    }
+
+    pub fn create_with_codec<R: rtc::SessionRuntime>(
+        session: &mut rtc::Session<R>,
+        peer: rtc::SessionPeerId,
+        track_id: &str,
+        kind: SourceKind,
+        video: &VideoSourceConfig,
+        codec: Option<&[u8]>,
+    ) -> Result<Self, rtc::PeerError> {
         let encodings = match kind {
             SourceKind::Audio(_) => Vec::new(),
             SourceKind::Video(_) => encoding_values(video)?,
@@ -138,20 +149,9 @@ impl NativeSource {
                 SourceKind::Audio(_) => rtc::MediaType::Audio,
                 SourceKind::Video(_) => rtc::MediaType::Video,
             };
-            let capabilities = session.get_rtp_sender_capabilities(media_type)?;
-            let codecs: Vec<_> = capabilities
-                .codecs()
-                .into_iter()
-                .filter(|codec| {
-                    let name = codec.base_codec().name_bytes();
-                    match kind {
-                        SourceKind::Audio(_) => name.eq_ignore_ascii_case(b"opus"),
-                        SourceKind::Video(_) => {
-                            name.eq_ignore_ascii_case(b"H264") || name.eq_ignore_ascii_case(b"rtx")
-                        }
-                    }
-                })
-                .collect();
+            let codecs = crate::native_media::directional_codec_preferences(
+                session, media_type, false, codec,
+            )?;
             session
                 .set_rtp_codec_preferences(transceiver, &codecs)
                 .map_err(native)?;

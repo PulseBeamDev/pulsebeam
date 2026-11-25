@@ -40,7 +40,10 @@ struct WirePeer {
 const DATA_ROOM: &str = "native-state-wire";
 
 enum Av1Bootstrap<'a> {
-    External(&'a pulsebeam_rtc_simulation::EncodedVideoInput),
+    External {
+        input: &'a pulsebeam_rtc_simulation::EncodedVideoInput,
+        remap_payload_types: bool,
+    },
     Stock,
 }
 
@@ -84,7 +87,7 @@ impl WirePeer {
     ) -> anyhow::Result<(Self, String)> {
         let (_runtime, lease) = host.runtime()?;
         let factory = host.raw_peer_factory(match &av1 {
-            Some(Av1Bootstrap::External(input)) => Some(input.encoder_factory()),
+            Some(Av1Bootstrap::External { input, .. }) => Some(input.encoder_factory()),
             Some(Av1Bootstrap::Stock) => {
                 Some(pulsebeam_rtc_simulation::VideoEncoderFactoryHandle::builtin()?)
             }
@@ -100,9 +103,9 @@ impl WirePeer {
                 pulsebeam_rtc_simulation::CryptoOptions::prefer_gcm();
         }
         let mut dependencies = pulsebeam_rtc_simulation::PeerConnectionDependencies::default();
-        if let Some(av1) = av1 {
+        if let Some(av1) = &av1 {
             let trials = match av1 {
-                Av1Bootstrap::External(_) => {
+                Av1Bootstrap::External { .. } => {
                     "WebRTC-RFC8888CongestionControlFeedback/Enabled,offer:true/"
                 }
                 Av1Bootstrap::Stock => concat!(
@@ -149,10 +152,19 @@ impl WirePeer {
             _host: host,
         };
         prepare(&result._factory, &result.peer)?;
-        let offer = result
+        let mut offer = result
             .operation(result.peer.create_offer()?)
             .await?
             .context("native offer")?;
+        if matches!(
+            av1,
+            Some(Av1Bootstrap::External {
+                remap_payload_types: true,
+                ..
+            })
+        ) {
+            av1::remap_offer_payload_types(&mut offer.sdp)?;
+        }
         result
             .operation(result.peer.set_local_description(offer)?)
             .await?;

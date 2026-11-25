@@ -139,7 +139,6 @@ async def witness():
         assert isinstance(video_source, native.VideoSource)
         assert isinstance(audio_source, native.AudioSource)
         assert agent.state().observation_revision == revision, "source creation changed Agent state"
-        configuration = core.PublicationConfig(enabled=True)
         video_publication = local_video.publish()
         assert not inspect.isawaitable(video_publication)
         assert video_publication.state().configuration.enabled is True
@@ -199,7 +198,10 @@ async def witness():
         assert (await publication_updates.next()) is None
         publication_updates.close()
         assert not video_source.is_closed(), "publication close stopped producer"
-        video_replacement = same_video.publish(configuration)
+        video_replacement = same_video.publish(core.VideoPublishOptions(
+            enabled=False, codec=core.VideoCodec.AV1,
+        ))
+        assert video_replacement.state().configuration.enabled is False
         assert not hasattr(video_replacement, "set_source")
         replacement_pipe = video_source.pipe_to(video_replacement)
         feedback = video_source.feedback()

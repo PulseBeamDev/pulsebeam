@@ -8,6 +8,7 @@ use alloc::{
 use crate::{
     MediaKind, PublicationIntent, TopicChannel, TopicMode, TopicNotification, TopicPublisher,
     TopicRegistrations, TopicSubscriber, TrackSelector, ValidationError, VideoSubscription,
+    ffi::{PublicationConfig, VideoCodec, VideoPublishOptions},
     model::validate_identifier,
 };
 
@@ -313,6 +314,7 @@ impl PublicationInputControl {
 struct PublicationOwner {
     owner: TrackOwner,
     slot: String,
+    video_codec: Option<VideoCodecRequirement>,
     input: Option<PublicationInputId>,
     input_revision: u64,
     pending_input: bool,
@@ -430,10 +432,52 @@ impl DataReceiver {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VideoCodecRequirement {
+    H264,
+    Av1,
+}
+
+impl VideoCodecRequirement {
+    pub(crate) fn matches(self, format: &pulsebeam_proto::state::CodecFormat) -> bool {
+        use pulsebeam_proto::state::{codec_format::Codec, sdp};
+        match self {
+            Self::H264 => matches!(format.known_codec(), Some(Codec::H264(_))),
+            Self::Av1 => sdp::codec_parameters(format).is_ok_and(|parameters| {
+                self.matches_name(&parameters.name) && parameters.clock_rate == 90_000
+            }),
+        }
+    }
+
+    pub(crate) fn matches_name(self, name: &str) -> bool {
+        name.eq_ignore_ascii_case(match self {
+            Self::H264 => "h264",
+            Self::Av1 => "av1",
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MediaPublishOptions {
+    Video(VideoPublishOptions),
+    #[doc(hidden)]
+    Audio(PublicationConfig),
+}
+
+impl MediaPublishOptions {
+    pub(crate) fn default_for(spec: &TrackSpec) -> Self {
+        match spec {
+            TrackSpec::Video { .. } => Self::Video(VideoPublishOptions::default()),
+            _ => Self::Audio(PublicationConfig::default()),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ResourceCommand {
     ClaimPublication {
         spec: TrackSpec,
+        options: MediaPublishOptions,
     },
     DeclareDataPublication {
         spec: TrackSpec,
@@ -519,6 +563,15 @@ pub enum ResourceCommand {
     Release {
         owner: u64,
     },
+}
+
+impl ResourceCommand {
+    pub fn claim_publication(spec: TrackSpec) -> Self {
+        Self::ClaimPublication {
+            options: MediaPublishOptions::default_for(&spec),
+            spec,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -641,10 +694,24 @@ impl TrackResources {
         &mut self,
         owner: TrackOwner,
         spec: TrackSpec,
+        options: MediaPublishOptions,
         occupied: &BTreeSet<String>,
     ) -> Result<String, TrackResourceError> {
         spec.validate()?;
-        let kind = spec.media_kind().ok_or(TrackResourceError::WrongKind)?;
+        let (kind, enabled, video_codec) = match (&spec, options) {
+            (TrackSpec::Video { .. }, MediaPublishOptions::Video(options)) => (
+                MediaKind::Video,
+                options.enabled,
+                Some(match options.codec.unwrap_or_default() {
+                    VideoCodec::H264 => VideoCodecRequirement::H264,
+                    VideoCodec::Av1 => VideoCodecRequirement::Av1,
+                }),
+            ),
+            (TrackSpec::Audio { .. }, MediaPublishOptions::Audio(options)) => {
+                (MediaKind::Audio, options.enabled, None)
+            }
+            _ => return Err(TrackResourceError::WrongKind),
+        };
         if let Some(existing) = self.publications.get(&spec) {
             return if existing.owner == owner {
                 Ok(existing.slot.clone())
@@ -674,21 +741,22 @@ impl TrackResources {
             PublicationOwner {
                 owner,
                 slot: slot.clone(),
+                video_codec,
                 input: None,
                 input_revision: 0,
                 pending_input: false,
                 input_error: None,
                 last_control: None,
                 control_completed: false,
-                muted: false,
+                muted: !enabled,
                 desired_revision: 1,
                 evaluated_revision: 1,
                 accepted_revision: 1,
-                accepted_enabled: true,
+                accepted_enabled: enabled,
                 rejected_revision: None,
                 last_control_configuration_revision: None,
                 last_control_accepted_revision: 1,
-                last_control_accepted_enabled: true,
+                last_control_accepted_enabled: enabled,
                 present: None,
             },
         );
@@ -1206,6 +1274,21 @@ impl TrackResources {
         self.audio_views.remove(&owner);
         self.release_video(owner);
         self.release_receiver(owner);
+    }
+
+    pub(crate) fn publication_video_slot(&self, spec: &TrackSpec) -> Option<crate::MediaSlot> {
+        let entry = self.publications.get(spec)?;
+        entry
+            .video_codec
+            .map(|_| crate::MediaSlot::LocalVideo(entry.slot.clone()))
+    }
+
+    pub(crate) fn publication_video_codec(&self, track_id: &str) -> Option<VideoCodecRequirement> {
+        self.publications
+            .get(&TrackSpec::Video {
+                track_id: track_id.into(),
+            })?
+            .video_codec
     }
 
     pub fn publications(&self) -> Vec<PublicationIntent> {

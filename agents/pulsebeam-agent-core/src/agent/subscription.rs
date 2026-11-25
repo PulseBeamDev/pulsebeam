@@ -1,7 +1,7 @@
 use super::*;
 use crate::ffi::{
-    AudioSubscriptionState, DataPublicationState, DataSubscriptionState, ErrorInfo,
-    PublicationAdmissionStatus, PublicationExecution, SubscriptionSourceStatus,
+    AudioSubscriptionState, DataPublicationState, DataSubscriptionState, EffectiveMediaFormat,
+    ErrorInfo, PublicationAdmissionStatus, PublicationExecution, SubscriptionSourceStatus,
     VideoSubscriptionState,
 };
 use crate::native_state::Resource;
@@ -54,6 +54,7 @@ impl Agent {
             local_enabled: configuration.visible,
             closed: false,
             source_status,
+            source_format: source_format(self, source_track_id.as_deref()),
             source_track_id,
             admission,
             admission_pending,
@@ -105,6 +106,7 @@ impl Agent {
             local_enabled: true,
             closed: false,
             source_status,
+            source_format: source_format(self, source_track_id.as_deref()),
             source_track_id,
             admission,
             admission_pending,
@@ -339,6 +341,11 @@ fn source_resource(selector: &crate::TrackSelector, kind: wire::TrackKind) -> Re
         kind,
         track_id: selector.track_id.clone(),
     }
+}
+
+fn source_format(agent: &Agent, publication_id: Option<&str>) -> Option<EffectiveMediaFormat> {
+    let track = active_agent(agent)?.state.source(publication_id?)?;
+    EffectiveMediaFormat::from_track(track)
 }
 
 fn source_state(

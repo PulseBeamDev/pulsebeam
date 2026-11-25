@@ -86,6 +86,18 @@ pub struct VideoSourceConfig {
     pub dependency_descriptor: bool,
 }
 
+impl VideoSourceConfig {
+    pub(crate) fn validate_owned(&self) -> Result<(), crate::Error> {
+        if self.encodings.len() == 1 {
+            Ok(())
+        } else {
+            Err(crate::Error::InvalidInput(
+                "video publications require one encoding; publish separate tracks for independent streams".into(),
+            ))
+        }
+    }
+}
+
 impl Default for VideoSourceConfig {
     fn default() -> Self {
         Self {
@@ -409,6 +421,64 @@ impl rtc::FieldTrialsView for ReceiverFieldTrials {
     fn create_copy(&self) -> std::sync::Arc<dyn rtc::FieldTrialsView> {
         std::sync::Arc::new(self.clone())
     }
+}
+
+pub(crate) fn directional_codec_preferences<R: rtc::SessionRuntime>(
+    session: &mut rtc::Session<R>,
+    kind: rtc::MediaType,
+    receiving: bool,
+    preferred_video_codec: Option<&[u8]>,
+) -> Result<Vec<rtc::RtpCodecCapability>, rtc::PeerError> {
+    let capabilities = if receiving {
+        session.get_rtp_receiver_capabilities(kind)?
+    } else {
+        session.get_rtp_sender_capabilities(kind)?
+    };
+    let codecs = capabilities.codecs();
+    let usable = |codec: &rtc::RtpCodec| {
+        let name = codec.name_bytes();
+        match kind {
+            rtc::MediaType::Audio => name.eq_ignore_ascii_case(b"opus"),
+            rtc::MediaType::Video => preferred_video_codec.map_or_else(
+                || name.eq_ignore_ascii_case(b"h264") || name.eq_ignore_ascii_case(b"av1"),
+                |preferred| name.eq_ignore_ascii_case(preferred),
+            ),
+            _ => false,
+        }
+    };
+    let mut primaries = codecs
+        .iter()
+        .filter(|codec| usable(&codec.base_codec()))
+        .peekable();
+    if primaries.peek().is_none() {
+        return Ok(Vec::new());
+    }
+    let primary_payloads: Vec<_> = primaries
+        .filter_map(rtc::RtpCodecCapability::preferred_payload_type)
+        .collect();
+    Ok(codecs
+        .into_iter()
+        .filter(|codec| {
+            let base = codec.base_codec();
+            if usable(&base) {
+                return true;
+            }
+            if kind != rtc::MediaType::Video || !base.name_bytes().eq_ignore_ascii_case(b"rtx") {
+                return false;
+            }
+            // Some SDKs expose a generic repair capability, while others expose
+            // an apt tied to a preferred PT. Never carry a dangling apt.
+            base.parameters()
+                .iter()
+                .find(|p| p.key == b"apt")
+                .is_none_or(|apt| {
+                    core::str::from_utf8(&apt.value)
+                        .ok()
+                        .and_then(|pt| pt.parse::<i32>().ok())
+                        .is_some_and(|pt| primary_payloads.contains(&pt))
+                })
+        })
+        .collect())
 }
 
 pub(crate) fn session<R: rtc::SessionRuntime>(

@@ -22,8 +22,8 @@ Bazel owns the resulting libraries and native desktop runtime closure. Generated
 foreign bindings remain build outputs, not editable source.
 
 Local inputs are owned PCM/I420 or admitted encoded Opus/Annex-B H.264. H.264
-supports one encoding or three RID encodings with a uniform L1T1 or L1T3
-profile. Direct temporal input requires actual negotiated dependency descriptors
+publications support one encoding with an L1T1 or L1T3 profile.
+Direct temporal input requires actual negotiated dependency descriptors
 on attached senders, including when temporal mode was supplied at initial
 transceiver creation. This is not an opaque encrypted-video or arbitrary-codec
 passthrough guarantee. Native validation and feedback remain authoritative;
@@ -122,7 +122,8 @@ counts/modes/layer counts, and temporal input with DD omitted from negotiation,
 including initially configured L1T3. Its sender-only SFU answer fixture does not
 claim simultaneous three-rung stock reception or enhancement decoding.
 
-The existing simulator replay owner also includes distinct focused scenarios:
+The simulator exercises supported SDK scenarios and lower-level RTP behavior.
+Its test-only encoded ladder fixture does not extend the public SDK contract.
 
 - `tests::bwe::clean_native_source_windows_respect_explicit_fixed_buffers_test`:
   genuine precomputed three-rung T3 input with complete full-rate 720p native

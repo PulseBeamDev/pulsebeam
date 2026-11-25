@@ -147,6 +147,8 @@ struct Session {
     participant_id: String,
     room_id: Option<String>,
     coordinates: BTreeMap<MediaSlot, Option<SlotBinding>>,
+    bootstrap_slots: BTreeMap<MediaSlot, SlotBinding>,
+    bootstrap_anchor: Option<String>,
     state: NativeState,
     payloads: BTreeMap<ChannelId, native::PayloadChannel>,
     payload_resources: BTreeMap<crate::native_state::Resource, ChannelId>,
@@ -199,6 +201,8 @@ impl Session {
             capabilities,
             rtc: None,
             coordinates: BTreeMap::new(),
+            bootstrap_slots: BTreeMap::new(),
+            bootstrap_anchor: None,
             payloads: BTreeMap::new(),
             payload_resources: BTreeMap::new(),
             next_stream: 1,
@@ -281,6 +285,7 @@ struct Attempt {
     room: Option<String>,
     mode: AttemptMode,
     stage: AttemptStage,
+    bootstrap_anchor: Option<String>,
     resources: Option<OfferResources>,
     capability: Option<CapabilityRequest>,
     request: Option<CreateRequest>,
@@ -576,7 +581,7 @@ impl Agent {
         use crate::{ResourceCommand, ResourceResult, TrackOwner, TrackResourceError};
         let releasing = matches!(&command, ResourceCommand::Release { .. });
         let result = match command {
-            ResourceCommand::ClaimPublication { spec } => {
+            ResourceCommand::ClaimPublication { spec, options } => {
                 spec.validate()?;
                 let kind = spec.media_kind().ok_or(TrackResourceError::WrongKind)?;
                 if self.resources.has_publication(&spec) {
@@ -603,7 +608,9 @@ impl Agent {
                     })
                     .collect();
                 let owner = self.resources.new_owner()?;
-                let slot = self.resources.claim_publication(owner, spec, &occupied)?;
+                let slot = self
+                    .resources
+                    .claim_publication(owner, spec, options, &occupied)?;
                 let after_generation = None;
                 ResourceResult::Publication {
                     owner: owner.id(),
@@ -1077,7 +1084,11 @@ impl Agent {
             attempt
                 .resources
                 .as_ref()
-                .and_then(|resources| resources.slots.iter().find(|binding| binding.slot == slot))
+                .and_then(|resources| {
+                    resources.slots.iter().find(|binding| {
+                        binding.slot == slot && !resources.reserved_mids.contains(&binding.mid)
+                    })
+                })
                 .map(|binding| crate::PublicationInputTarget {
                     generation: attempt.generation,
                     binding: binding.clone(),
@@ -1547,6 +1558,7 @@ impl Agent {
             room: self.snapshot.desired_room.clone(),
             mode,
             stage: AttemptStage::Offering,
+            bootstrap_anchor: None,
             resources: None,
             capability: None,
             request: None,
@@ -1808,6 +1820,7 @@ impl Agent {
         };
         if let Some(attempt) = self.attempt.as_mut() {
             attempt.stage = AttemptStage::Acquiring;
+            attempt.bootstrap_anchor = crate::effect::bundle_anchor(&offer).map(str::to_owned);
             attempt.resources = Some(resources);
         }
         if self.ownership.available() {
@@ -2741,8 +2754,15 @@ impl Agent {
             debug_assert!(false, "ready attempt must have admission receipts");
             return Ok(());
         };
-        let coordinates = resources
+        let (reserved, bound): (Vec<_>, _) = resources
             .slots
+            .into_iter()
+            .partition(|binding| resources.reserved_mids.contains(&binding.mid));
+        let bootstrap_slots = reserved
+            .into_iter()
+            .map(|binding| (binding.slot.clone(), binding))
+            .collect();
+        let coordinates = bound
             .into_iter()
             .map(|binding| (binding.slot.clone(), Some(binding)))
             .collect();
@@ -2778,6 +2798,8 @@ impl Agent {
             resource_uri: candidate.resource_uri,
         });
         session.coordinates = coordinates;
+        session.bootstrap_slots = bootstrap_slots;
+        session.bootstrap_anchor = attempt.bootstrap_anchor;
         session.reliable_data_enabled = reliable_data_enabled;
         session.data_preparations = attempt.data_preparations;
         session.media_preparation = attempt.media_preparation;
@@ -3524,6 +3546,16 @@ fn validate_offer(
         if !mids.insert(mid.as_str()) {
             return Err(AgentError::InvalidOffer("mid is mapped more than once"));
         }
+    }
+    let mut reserved = BTreeSet::new();
+    if resources
+        .reserved_mids
+        .iter()
+        .any(|mid| !mids.contains(mid.as_str()) || !reserved.insert(mid))
+    {
+        return Err(AgentError::InvalidOffer(
+            "bootstrap reservation does not identify a unique offered MID",
+        ));
     }
     let actual_bindings = crate::negotiated_slot_bindings(
         offer,

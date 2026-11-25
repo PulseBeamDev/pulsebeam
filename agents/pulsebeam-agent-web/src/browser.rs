@@ -25,9 +25,7 @@ use web_sys::{
 use crate::engine::{ActorHandle, Host, PublicCommand, Turn, TurnErrorSource, spawn_actor};
 use crate::local_operation::LocalOperationGate;
 use crate::logger::{BrowserLogger, LogLevel};
-use crate::sender_config::{
-    EncodingConfig, SenderConfig, media_kind_name, normalize_sender_config,
-};
+use crate::sender_config::{SenderConfig, media_kind_name, normalize_sender_config};
 
 pub(crate) mod catalog;
 pub(crate) mod media_observation;
@@ -220,6 +218,7 @@ struct Peer {
     connection: RtcPeerConnection,
     sdp: Option<agent_core::client_sdp::Executor>,
     transceivers: Vec<(MediaSlot, RtcRtpTransceiver)>,
+    bootstrap_reservations: Vec<MediaSlot>,
     receiver_mids: BTreeMap<u32, String>,
     remote_tracks: BTreeMap<String, RemoteTrackState>,
     channels: BTreeMap<u64, DataChannel>,
@@ -764,6 +763,7 @@ impl BrowserRuntime {
     pub(crate) fn claim_media_publication(
         &self,
         spec: agent_core::TrackSpec,
+        options: agent_core::MediaPublishOptions,
     ) -> Result<agent_core::ResourceResult, agent_core::ffi::ErrorInfo> {
         use agent_core::{ResourceCommand, ResourceResult, ffi};
         let actor = self.inner.intent_actor()?;
@@ -773,7 +773,7 @@ impl BrowserRuntime {
                 "Expected a media publication declaration",
             )
         })?;
-        let result = actor.resource_now(ResourceCommand::ClaimPublication { spec })?;
+        let result = actor.resource_now(ResourceCommand::ClaimPublication { spec, options })?;
         let ResourceResult::Publication {
             owner,
             slot,
@@ -1540,6 +1540,12 @@ impl RuntimeInner {
             } => {
                 self.allocate_media(generation, operation, allocations);
             }
+            RtcEffect::ClaimBootstrapMedia {
+                generation,
+                operation,
+                reserved,
+                allocation,
+            } => self.claim_bootstrap_media(generation, operation, reserved, allocation),
             RtcEffect::RetireMedia {
                 generation,
                 operation,
@@ -1690,13 +1696,51 @@ impl RuntimeInner {
             debug_assert!(previous.is_none(), "channel IDs must be unique");
         }
 
+        let reserved = (|| {
+            let mut transceivers = Vec::new();
+            // Browsers may put video ahead of the data m-line. Keep a
+            // receiver as a spare so the BUNDLE tag is never claimed/retired.
+            for (slot, codec) in (u32::MAX - 2..=u32::MAX).zip(["h264", "h264", "av1"]) {
+                let Some(preferences) = browser_video_codec_preferences(false, codec)? else {
+                    continue;
+                };
+                let transceiver = add_transceiver(&connection, "video", false)?;
+                set_codec_preferences(&transceiver, &preferences)?;
+                transceivers.push((MediaSlot::RemoteVideo(slot), transceiver));
+            }
+            for codec in ["h264", "av1"] {
+                let Some(preferences) = browser_video_codec_preferences(true, codec)? else {
+                    continue;
+                };
+                let transceiver = add_transceiver(&connection, "video", true)?;
+                set_codec_preferences(&transceiver, &preferences)?;
+                transceivers.push((
+                    MediaSlot::LocalVideo(format!("bootstrap-{codec}")),
+                    transceiver,
+                ));
+            }
+            Ok::<_, String>(transceivers)
+        })();
+        let transceivers = match reserved {
+            Ok(transceivers) => transceivers,
+            Err(error) => {
+                connection.set_onconnectionstatechange(None);
+                connection.set_ontrack(None);
+                for channel in channels.into_values() {
+                    channel.close();
+                }
+                connection.close();
+                return Err(error);
+            }
+        };
+        let bootstrap_reservations = transceivers.iter().map(|(slot, _)| slot.clone()).collect();
         Ok(Peer {
             generation,
             single_video_encoding: self.single_video_encoding,
             connection,
             sdp: None,
-            // Keep the initial SCTP m-line as the non-retiring BUNDLE anchor.
-            transceivers: Vec::new(),
+            transceivers,
+            bootstrap_reservations,
             receiver_mids: BTreeMap::new(),
             remote_tracks: BTreeMap::new(),
             channels,
@@ -1963,6 +2007,11 @@ impl RuntimeInner {
             });
         }
         let resources = OfferResources {
+            reserved_mids: slots
+                .iter()
+                .filter(|binding| peer.bootstrap_reservations.contains(&binding.slot))
+                .map(|binding| binding.mid.clone())
+                .collect(),
             slots,
             signaling_channel,
             data_channels,
@@ -2007,7 +2056,21 @@ impl RuntimeInner {
                         .ok_or(agent_core::client_sdp::Error::Identifier)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            agent_core::adopt_bootstrap_media(&mut context, &slots)
+            let bindings = agent_core::adopt_bootstrap_media(&mut context, &slots)?;
+            let mids = slots
+                .iter()
+                .filter(|(slot, mid)| {
+                    peer.bootstrap_reservations.contains(slot)
+                        && bindings
+                            .receptions
+                            .iter()
+                            .chain(&bindings.publications)
+                            .any(|binding| &binding.mid == mid)
+                })
+                .map(|(_, mid)| mid.clone())
+                .collect::<Vec<_>>();
+            context.reserve_bootstrap_media(&mids)?;
+            Ok(bindings)
         })();
         peer.sdp = Some(agent_core::client_sdp::Executor::new(context));
         Ok(preparation)
@@ -2387,11 +2450,92 @@ async fn complete_data_send(
         })
 }
 
+fn browser_video_codec_preferences(sending: bool, codec: &str) -> Result<Option<Array>, String> {
+    let class = if sending {
+        "RTCRtpSender"
+    } else {
+        "RTCRtpReceiver"
+    };
+    let constructor =
+        Reflect::get(&js_sys::global(), &JsValue::from_str(class)).map_err(js_message)?;
+    if constructor.is_null() || constructor.is_undefined() {
+        return Ok(None);
+    }
+    let method =
+        Reflect::get(&constructor, &JsValue::from_str("getCapabilities")).map_err(js_message)?;
+    let Ok(method) = method.dyn_into::<Function>() else {
+        return Ok(None);
+    };
+    let capabilities = method
+        .call1(&constructor, &JsValue::from_str("video"))
+        .map_err(js_message)?;
+    if capabilities.is_null() || capabilities.is_undefined() {
+        return Ok(None);
+    }
+    let codecs = Reflect::get(&capabilities, &JsValue::from_str("codecs")).map_err(js_message)?;
+    let codecs: Array = codecs.dyn_into().map_err(js_message)?;
+    let field = |value: &JsValue, name: &str| {
+        Reflect::get(value, &JsValue::from_str(name))
+            .ok()
+            .and_then(|value| value.as_string())
+    };
+    let preferences = Array::new();
+    let mime = format!("video/{codec}");
+    for value in codecs.iter() {
+        if !field(&value, "mimeType").is_some_and(|mime_type| mime_type.eq_ignore_ascii_case(&mime))
+        {
+            continue;
+        }
+        let fmtp = field(&value, "sdpFmtpLine").unwrap_or_default();
+        let has = |parameter| {
+            fmtp.split(';')
+                .any(|field| field.trim().eq_ignore_ascii_case(parameter))
+        };
+        let supported = match codec {
+            "h264" => {
+                has("packetization-mode=1")
+                    && has("profile-level-id=42e01f")
+                    && has("level-asymmetry-allowed=1")
+            }
+            "av1" => has("profile=0") && has("tier=0") && has("level-idx=5"),
+            _ => false,
+        };
+        if supported {
+            preferences.push(&value);
+        }
+    }
+    if preferences.length() == 0 {
+        return Ok(None);
+    }
+    for value in codecs.iter() {
+        if field(&value, "mimeType")
+            .is_some_and(|mime_type| mime_type.eq_ignore_ascii_case("video/rtx"))
+            && field(&value, "sdpFmtpLine").is_none_or(|fmtp| fmtp.is_empty())
+        {
+            preferences.push(&value);
+        }
+    }
+    Ok(Some(preferences))
+}
+
+fn set_codec_preferences(transceiver: &RtcRtpTransceiver, codecs: &Array) -> Result<(), String> {
+    let method: Function = Reflect::get(
+        transceiver.as_ref(),
+        &JsValue::from_str("setCodecPreferences"),
+    )
+    .map_err(js_message)?
+    .dyn_into()
+    .map_err(js_message)?;
+    method
+        .call1(transceiver.as_ref(), codecs.as_ref())
+        .map_err(js_message)?;
+    Ok(())
+}
+
 fn add_transceiver(
     connection: &RtcPeerConnection,
     kind: &str,
     send: bool,
-    simulcast: bool,
 ) -> Result<RtcRtpTransceiver, String> {
     let init = RtcRtpTransceiverInit::new();
     init.set_direction(if send {
@@ -2399,16 +2543,6 @@ fn add_transceiver(
     } else {
         RtcRtpTransceiverDirection::Recvonly
     });
-    if simulcast {
-        let encodings = Array::new();
-        for rid in ["q", "h", "f"] {
-            let encoding = Object::new();
-            set(&encoding, "rid", rid);
-            set(&encoding, "active", false);
-            encodings.push(&encoding);
-        }
-        init.set_send_encodings(&encodings);
-    }
     let method: Function = Reflect::get(connection.as_ref(), &JsValue::from_str("addTransceiver"))
         .map_err(js_message)?
         .dyn_into()
@@ -2463,16 +2597,18 @@ async fn apply_sender_parameters(
         .map_err(js_message)?
         .dyn_into()
         .map_err(js_message)?;
-    for (index, value) in encodings.iter().enumerate() {
-        let Some(config) = encoding_for(&state.config.encodings, &value, index) else {
-            continue;
-        };
-        if scalability_only {
-            if let Some(mode) = &config.scalability_mode {
-                set_property(&value, "scalabilityMode", &JsValue::from_str(mode))?;
-            }
-            continue;
+    let [config] = state.config.encodings.as_slice() else {
+        return Err("expected one configured sender encoding".into());
+    };
+    if encodings.length() != 1 {
+        return Err("expected one negotiated sender encoding".into());
+    }
+    let value = encodings.get(0);
+    if scalability_only {
+        if let Some(mode) = &config.scalability_mode {
+            set_property(&value, "scalabilityMode", &JsValue::from_str(mode))?;
         }
+    } else {
         set_property(&value, "active", &JsValue::from_bool(config.active))?;
         set_optional_number(
             &value,
@@ -2496,23 +2632,6 @@ async fn apply_sender_parameters(
         .await
         .map_err(js_message)?;
     Ok(())
-}
-
-fn encoding_for<'a>(
-    configs: &'a [EncodingConfig],
-    value: &JsValue,
-    index: usize,
-) -> Option<&'a EncodingConfig> {
-    let rid = Reflect::get(value, &JsValue::from_str("rid"))
-        .ok()
-        .and_then(|value| value.as_string());
-    rid.as_deref()
-        .and_then(|rid| {
-            configs
-                .iter()
-                .find(|config| config.rid.as_deref() == Some(rid))
-        })
-        .or_else(|| configs.get(index))
 }
 
 fn set_optional_number(object: &JsValue, name: &str, value: Option<f64>) -> Result<(), String> {

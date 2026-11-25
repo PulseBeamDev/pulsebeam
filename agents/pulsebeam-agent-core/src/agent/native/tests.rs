@@ -39,6 +39,7 @@ fn media_allocation_fences_callbacks_and_retires_superseded_physical_facts() {
             source: receiving.then(|| track_id.into()),
             offer: None,
             allocation: Allocation {
+                video_codec: None,
                 slot: slot.clone(),
                 format: requested_format.clone(),
             },
@@ -87,7 +88,7 @@ fn media_allocation_fences_callbacks_and_retires_superseded_physical_facts() {
                 .coordinates
                 .insert(slot.clone(), Some(assigned.clone()));
             active.media_preparation = preparation;
-            assert!(rtp(active, &mut agent.logs, &resource, &slot, None).is_none());
+            assert!(rtp(active, &mut agent.logs, &resource, &slot, None, None).is_none());
             assert!(active.media_leases[&slot].retired);
             assert_eq!(active.media_leases[&slot].mid, assigned.mid);
             retire_media(active, &mut agent.ids, &mut agent.effects);
@@ -111,7 +112,7 @@ fn media_allocation_fences_callbacks_and_retires_superseded_physical_facts() {
             assert!(active.coordinates.contains_key(&slot));
             assert!(active.coordinates[&slot].is_none());
             assert!(!active.media_leases.contains_key(&slot));
-            assert!(rtp(active, &mut agent.logs, &resource, &slot, None).is_none());
+            assert!(rtp(active, &mut agent.logs, &resource, &slot, None, None).is_none());
             assert!(!active.media_leases.contains_key(&slot));
             assert!(agent.next_effect_after_turn().is_none());
         }
@@ -140,6 +141,7 @@ fn media_allocation_fences_callbacks_and_retires_superseded_physical_facts() {
         assert_eq!(
             allocations,
             [Allocation {
+                video_codec: None,
                 slot: slot.clone(),
                 format: requested_format.clone()
             }]
@@ -290,6 +292,172 @@ fn media_allocation_fences_callbacks_and_retires_superseded_physical_facts() {
         Some("a-source")
     );
     assert!(agent.next_effect_after_turn().is_none());
+}
+
+#[test]
+fn allocation_claims_a_compatible_bootstrap_mid_without_an_offer() {
+    let (mut agent, generation, _) = connected(crate::TopicRegistrations::default());
+    let format = state::CodecFormat::from(state::codec_format::Codec::H264(Default::default()));
+    let active = agent.active.as_mut().unwrap();
+    let kind = crate::MediaKind::Video;
+    let direction = crate::MediaDirection::SendOnly;
+    let reserved = SlotBinding {
+        slot: MediaSlot::LocalVideo("reserved".into()),
+        mid: "fixed".into(),
+        media_index: 3,
+        kind,
+        direction,
+    };
+    let (mut binding, capabilities) = crate::rtc_preparation::binding_fixture(format);
+    binding.key = crate::rtc_preparation::bootstrap_media_key(&reserved.slot);
+    binding.mid = reserved.mid.clone();
+    active.capabilities.rtp = capabilities;
+    active.media_preparation = Some(crate::rtc_preparation::prepare_bootstrap_bindings(
+        crate::client_sdp::Bindings {
+            publications: vec![binding],
+            receptions: Vec::new(),
+        },
+        core::slice::from_ref(&reserved),
+        &active.capabilities.rtp,
+    ));
+    active
+        .bootstrap_slots
+        .insert(reserved.slot.clone(), reserved.clone());
+    let slot = MediaSlot::LocalVideo("camera".into());
+    let resource = Resource::Publication {
+        kind: state::TrackKind::Video,
+        track_id: "camera".into(),
+    };
+    let mut want = media_want(active, resource, &slot, None).unwrap();
+    want.allocation.video_codec = Some(crate::VideoCodecRequirement::H264);
+    active.media_wanted.insert(slot.clone(), want.clone());
+    let av1_slot = MediaSlot::LocalVideo("before-camera".into());
+    let mut unavailable = media_want(
+        active,
+        Resource::Publication {
+            kind: state::TrackKind::Video,
+            track_id: "before-camera".into(),
+        },
+        &av1_slot,
+        None,
+    )
+    .unwrap();
+    unavailable.allocation.video_codec = Some(crate::VideoCodecRequirement::Av1);
+    active
+        .media_wanted
+        .insert(av1_slot.clone(), unavailable.clone());
+    allocate_media(active, &mut agent.ids, &mut agent.effects);
+    assert_eq!(active.media_blocked.get(&av1_slot), Some(&unavailable));
+    let Some(Effect::Rtc(RtcEffect::ClaimBootstrapMedia {
+        generation: actual,
+        operation,
+        reserved: claimed,
+        allocation,
+    })) = agent.next_effect()
+    else {
+        panic!("claim already-applied media");
+    };
+    assert_eq!(
+        (actual, claimed, allocation),
+        (generation, reserved, want.allocation)
+    );
+    let stale = agent.ids.generation();
+    assert!(!agent.media_allocated(
+        stale,
+        operation,
+        Vec::new(),
+        crate::client_sdp::ApplyOutcome::NotApplied,
+        Err(crate::client_sdp::Error::Observation)
+    ));
+    let wrong = SlotBinding {
+        slot: slot.clone(),
+        mid: "unrelated".into(),
+        media_index: 3,
+        kind,
+        direction,
+    };
+    assert!(agent.media_allocated(
+        generation,
+        operation,
+        vec![wrong],
+        crate::client_sdp::ApplyOutcome::Applied,
+        Ok(Default::default())
+    ));
+    let active = agent.active.as_ref().unwrap();
+    assert!(active.bootstrap_slots.is_empty());
+    assert!(!active.coordinates.contains_key(&slot));
+    assert!(!active.media_leases.contains_key(&slot));
+}
+
+#[test]
+fn bootstrap_receiver_checks_the_effective_source_format_before_claiming() {
+    let (mut agent, generation, channel) = connected(crate::TopicRegistrations::default());
+    let h264 = state::CodecFormat::from(state::codec_format::Codec::H264(Default::default()));
+    let av1 = state::CodecFormat {
+        mime_type: "video/av1".into(),
+        clock_rate: 90_000,
+        channels: None,
+        parameters: Vec::new(),
+    };
+    observe(
+        &mut agent,
+        generation,
+        channel,
+        [("camera", h264.clone()), ("screen", av1)]
+            .into_iter()
+            .map(|(id, format)| {
+                confirmed(
+                    state::resource_key::Key::Publication(id.into()),
+                    0,
+                    state::confirmed_state::Value::Track(state::Track {
+                        publication_id: id.into(),
+                        participant_id: "remote".into(),
+                        room_id: "room".into(),
+                        track_id: id.into(),
+                        kind: Some(state::track::Kind::Video(state::VideoTrack {
+                            av1_whole_source: false,
+                            format: Some(format),
+                        })),
+                    }),
+                )
+            })
+            .collect(),
+    );
+    let active = agent.active.as_mut().unwrap();
+    for (index, source, compatible) in [(0, "camera", true), (1, "screen", false)] {
+        let slot = MediaSlot::RemoteVideo(index);
+        let mid = format!("v{index}");
+        let resource = Resource::Reception(slot.clone());
+        active.coordinates.insert(
+            slot.clone(),
+            Some(SlotBinding {
+                mid: mid.clone(),
+                slot: slot.clone(),
+                media_index: index,
+                kind: crate::MediaKind::Video,
+                direction: crate::MediaDirection::ReceiveOnly,
+            }),
+        );
+        let prepared = crate::rtc_preparation::PreparedRtp {
+            encodings: Vec::new(),
+            binding: state::TrackBinding {
+                transport: Some(state::track_binding::Transport::Rtp(state::RtpParameters {
+                    mid,
+                    codec: Some(state::RtpCodecParameters {
+                        format: Some(h264.clone()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })),
+            },
+        };
+        active.media_preparation = Some(Ok([(slot.clone(), Ok(prepared))].into()));
+        assert_eq!(
+            receive_rtp(active, &mut agent.logs, &resource, &slot, source).is_some(),
+            compatible
+        );
+        assert_eq!(active.media_leases[&slot].retired, !compatible);
+    }
 }
 
 #[test]

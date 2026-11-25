@@ -5,7 +5,7 @@
 
 use alloc::{string::String, sync::Arc, vec::Vec};
 
-use super::{ErrorInfo, TopicMode};
+use super::{EffectiveMediaFormat, ErrorInfo, TopicMode};
 
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct WatchConfig {
@@ -42,6 +42,7 @@ pub struct CatalogPublicationInfo {
     pub id: String,
     pub track_id: String,
     pub kind: CatalogPublicationKind,
+    pub effective_format: Option<EffectiveMediaFormat>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]

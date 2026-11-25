@@ -1,6 +1,17 @@
 use super::*;
 use crate::TopicMessage;
 
+impl TrackResources {
+    fn claim_default_publication(
+        &mut self,
+        owner: TrackOwner,
+        spec: TrackSpec,
+    ) -> Result<String, TrackResourceError> {
+        let options = MediaPublishOptions::default_for(&spec);
+        self.claim_publication(owner, spec, options, &BTreeSet::new())
+    }
+}
+
 fn video(track_id: &str) -> TrackSpec {
     TrackSpec::Video {
         track_id: track_id.into(),
@@ -129,7 +140,7 @@ fn owned_data_declarations_are_label_unique_mode_sensitive_and_reclaimable() {
     );
     let media_owner = resources.new_owner().unwrap();
     resources
-        .claim_publication(media_owner, video("events"), &BTreeSet::new())
+        .claim_default_publication(media_owner, video("events"))
         .unwrap();
     resources.retain_producer(&spec).unwrap();
     assert!(resources.producers.is_empty());
@@ -199,13 +210,13 @@ fn publication_claim_is_atomic_exclusive_and_reuses_released_coordinates() {
         let camera = spec("camera");
         assert_eq!(
             resources
-                .claim_publication(first, camera.clone(), &BTreeSet::new())
+                .claim_default_publication(first, camera.clone())
                 .unwrap(),
             format!("{prefix}0")
         );
         resources.update_publication(first, &camera, true).unwrap();
         assert_eq!(
-            resources.claim_publication(second, camera.clone(), &BTreeSet::new()),
+            resources.claim_default_publication(second, camera.clone()),
             Err(TrackResourceError::AlreadyOwned)
         );
         for index in 1..=63 {
@@ -213,7 +224,7 @@ fn publication_claim_is_atomic_exclusive_and_reuses_released_coordinates() {
             let input = spec(&format!("input-{index}"));
             assert_eq!(
                 resources
-                    .claim_publication(owner, input.clone(), &BTreeSet::new())
+                    .claim_default_publication(owner, input.clone())
                     .unwrap(),
                 format!("{prefix}{index}")
             );
@@ -222,7 +233,7 @@ fn publication_claim_is_atomic_exclusive_and_reuses_released_coordinates() {
         assert_eq!(resources.publications().len(), 64);
         let over_capacity = resources.new_owner().unwrap();
         assert_eq!(
-            resources.claim_publication(over_capacity, spec("over-capacity"), &BTreeSet::new()),
+            resources.claim_default_publication(over_capacity, spec("over-capacity")),
             Err(TrackResourceError::PublicationCapacityExceeded)
         );
         assert!(
@@ -242,7 +253,7 @@ fn publication_claim_is_atomic_exclusive_and_reuses_released_coordinates() {
         );
         assert_eq!(
             resources
-                .claim_publication(second, spec("replacement"), &BTreeSet::new())
+                .claim_default_publication(second, spec("replacement"))
                 .unwrap(),
             format!("{prefix}0")
         );
@@ -256,7 +267,7 @@ fn publication_configuration_revisions_settle_without_input_and_exhaust_atomical
     let owner = resources.new_owner().unwrap();
     let spec = video("camera");
     resources
-        .claim_publication(owner, spec.clone(), &BTreeSet::new())
+        .claim_default_publication(owner, spec.clone())
         .unwrap();
     let initial = PublicationConfigurationState {
         desired_revision: 1,
@@ -305,7 +316,7 @@ fn publication_configuration_pending_completion_accepts_rejects_and_fences_stale
     let owner = resources.new_owner().unwrap();
     let spec = video("camera");
     resources
-        .claim_publication(owner, spec, &BTreeSet::new())
+        .claim_default_publication(owner, spec.clone())
         .unwrap();
     let (operation, _) = resources
         .begin_publication_input(owner, PublicationInputIntent::Replace, true, false)
@@ -422,12 +433,12 @@ fn new_lifetime_fences_stale_source_updates_and_cleanup_after_reacquisition() {
     let spec = video("camera");
     let previous = resources.new_owner().unwrap();
     resources
-        .claim_publication(previous, spec.clone(), &BTreeSet::new())
+        .claim_default_publication(previous, spec.clone())
         .unwrap();
     resources.release_publication(previous, &spec).unwrap();
     let current = resources.new_owner().unwrap();
     resources
-        .claim_publication(current, spec.clone(), &BTreeSet::new())
+        .claim_default_publication(current, spec.clone())
         .unwrap();
     assert_eq!(
         resources.update_publication(previous, &spec, true),
@@ -576,7 +587,7 @@ fn new_lifetime_fences_stale_source_updates_and_cleanup_after_reacquisition() {
     resources.release_publication(current, &spec).unwrap();
     let replacement = resources.new_owner().unwrap();
     resources
-        .claim_publication(replacement, spec, &BTreeSet::new())
+        .claim_default_publication(replacement, spec.clone())
         .unwrap();
     assert!(!resources.publication_input_current(&latest));
     assert!(
@@ -593,7 +604,7 @@ fn source_availability_does_not_gate_declarations_and_audio_cleanup_is_owner_sco
     let first = TrackOwner(1);
     let second = TrackOwner(2);
     resources
-        .claim_publication(first, video("camera"), &BTreeSet::new())
+        .claim_default_publication(first, video("camera"))
         .unwrap();
     let expected = PublicationIntent {
         slot: "v0".into(),
@@ -615,7 +626,7 @@ fn source_availability_does_not_gate_declarations_and_audio_cleanup_is_owner_sco
     }
     assert_eq!(
         resources
-            .claim_publication(second, video("screen"), &BTreeSet::new())
+            .claim_default_publication(second, video("screen"))
             .unwrap(),
         "v1"
     );

@@ -21,6 +21,7 @@ const PENDING_SENDS: usize = 256;
 const NATIVE_CHANNEL_SENDS: usize = 64;
 const DD: &str =
     "https://aomediacodec.github.io/av1-rtp-spec/#dependency-descriptor-rtp-header-extension";
+const BOOTSTRAP_VIDEO_RECEIVERS: [&[u8]; 3] = [b"H264", b"H264", b"AV1"];
 const VLA: &str = "http://www.webrtc.org/experiments/rtp-hdrext/video-layers-allocation00";
 
 #[derive(Clone, Copy, Debug)]
@@ -85,6 +86,7 @@ pub(crate) struct NativePeer<R: rtc::SessionRuntime> {
     stats: Option<rtc::OperationId>,
     transceivers: BTreeMap<MediaSlot, rtc::SessionTransceiverId>,
     bindings: BTreeMap<MediaSlot, agent_core::SlotBinding>,
+    bootstrap_reservations: Vec<MediaSlot>,
     pub sources: BTreeMap<MediaSlot, NativeSource>,
     producers: BTreeMap<u64, NativeProducer>,
     pub receivers: BTreeMap<MediaSlot, NativeReceiver>,
@@ -159,19 +161,7 @@ fn codecs_and_extensions<R: rtc::SessionRuntime>(
 ) -> Result<(), rtc::PeerError> {
     let kind = session.transceiver_media_type(transceiver)?;
     if receiving {
-        let capabilities = session.get_rtp_receiver_capabilities(kind)?;
-        let codecs: Vec<_> = capabilities
-            .codecs()
-            .into_iter()
-            .filter(|codec| {
-                let name = codec.base_codec().name_bytes();
-                if kind == rtc::MediaType::Audio {
-                    name.eq_ignore_ascii_case(b"opus")
-                } else {
-                    name.eq_ignore_ascii_case(b"H264") || name.eq_ignore_ascii_case(b"rtx")
-                }
-            })
-            .collect();
+        let codecs = native_media::directional_codec_preferences(session, kind, true, None)?;
         session
             .set_rtp_codec_preferences(transceiver, &codecs)
             .map_err(|e| error(e.to_string()))?;
@@ -201,6 +191,7 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
         generation: Generation,
         slots: &[MediaSlot],
         specs: &[DataChannelSpec],
+        bootstrap_av1_receiver: bool,
     ) -> Result<Self, rtc::PeerError> {
         let mut profiles = HashMap::new();
         for profile in &config.video_publications {
@@ -302,6 +293,64 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
             codecs_and_extensions(&mut session, transceiver, receiving, dependency_descriptor)?;
             transceivers.insert(slot, transceiver);
         }
+        let mut bootstrap_reservations = Vec::new();
+        if slots.is_empty() {
+            for (slot, name) in (u32::MAX - 2..=u32::MAX).zip(BOOTSTRAP_VIDEO_RECEIVERS) {
+                if name == b"AV1" && !bootstrap_av1_receiver {
+                    continue;
+                }
+                let codecs = native_media::directional_codec_preferences(
+                    &mut session,
+                    rtc::MediaType::Video,
+                    true,
+                    Some(name),
+                )?;
+                if codecs.is_empty() {
+                    continue;
+                }
+                let mut init = rtc::RtpTransceiverInit::default();
+                init.set_direction(rtc::RtpTransceiverDirectionValue::ReceiveOnly);
+                let transceiver = session
+                    .add_transceiver(peer, rtc::MediaType::Video, &init)
+                    .map_err(|failure| error(failure.to_string()))?;
+                codecs_and_extensions(&mut session, transceiver, false, true)?;
+                session
+                    .set_rtp_codec_preferences(transceiver, &codecs)
+                    .map_err(|failure| error(failure.to_string()))?;
+                let slot = MediaSlot::RemoteVideo(slot);
+                transceivers.insert(slot.clone(), transceiver);
+                bootstrap_reservations.push(slot);
+            }
+            if config.video_publications.is_empty() {
+                for (name, codec) in [
+                    ("bootstrap-h264", b"H264".as_slice()),
+                    ("bootstrap-av1", b"AV1".as_slice()),
+                ] {
+                    let codecs = native_media::directional_codec_preferences(
+                        &mut session,
+                        rtc::MediaType::Video,
+                        false,
+                        Some(codec),
+                    )?;
+                    if codecs.is_empty() {
+                        continue;
+                    }
+                    let source = NativeSource::create_with_codec(
+                        &mut session,
+                        peer,
+                        name,
+                        SourceKind::Video(config.video_input),
+                        &VideoSourceConfig::default(),
+                        Some(codec),
+                    )?;
+                    codecs_and_extensions(&mut session, source.transceiver, false, true)?;
+                    let slot = MediaSlot::LocalVideo(name.into());
+                    transceivers.insert(slot.clone(), source.transceiver);
+                    sources.insert(slot.clone(), source);
+                    bootstrap_reservations.push(slot);
+                }
+            }
+        }
         let operation = session.set_local_description_auto(peer)?;
         let value = Self {
             generation,
@@ -323,6 +372,7 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
             stats: None,
             transceivers,
             bindings: BTreeMap::new(),
+            bootstrap_reservations,
             sources,
             producers: BTreeMap::new(),
             receivers: BTreeMap::new(),
@@ -501,7 +551,24 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
             .values()
             .map(|binding| (binding.slot.clone(), binding.mid.clone()))
             .collect::<Vec<_>>();
-        let preparation = agent_core::adopt_bootstrap_media(&mut context, &slots);
+        let preparation =
+            agent_core::adopt_bootstrap_media(&mut context, &slots).and_then(|bindings| {
+                let mids = self
+                    .bootstrap_reservations
+                    .iter()
+                    .filter_map(|slot| {
+                        let mid = &self.bindings.get(slot)?.mid;
+                        bindings
+                            .receptions
+                            .iter()
+                            .chain(&bindings.publications)
+                            .any(|binding| &binding.mid == mid)
+                            .then(|| mid.clone())
+                    })
+                    .collect::<Vec<_>>();
+                context.reserve_bootstrap_media(&mids)?;
+                Ok(bindings)
+            });
         self.sdp = Some(agent_core::client_sdp::Executor::new(context));
         Ok(preparation)
     }
@@ -826,6 +893,13 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
                 generation: self.generation,
                 offer,
                 resources: OfferResources {
+                    reserved_mids: self
+                        .bootstrap_reservations
+                        .iter()
+                        .filter_map(|slot| {
+                            self.bindings.get(slot).map(|binding| binding.mid.clone())
+                        })
+                        .collect(),
                     slots: bindings,
                     signaling_channel: self.signaling_channel,
                     data_channels: self.channel_bindings.clone(),
@@ -1390,7 +1464,7 @@ mod tests {
                 _ => continue,
             }
         };
-        let mut peer = NativePeer::new(runtime, &config, generation, &slots, &specs).unwrap();
+        let mut peer = NativePeer::new(runtime, &config, generation, &slots, &specs, true).unwrap();
         let resources = loop {
             let progress = peer.progress().unwrap();
             let mut found = None;
@@ -1421,6 +1495,18 @@ mod tests {
                         "native per-publication DD negotiation"
                     );
                     assert!(offer.contains("H264/90000"));
+                    let remote_video = offer
+                        .split("m=video ")
+                        .nth(2)
+                        .unwrap()
+                        .split("\r\nm=")
+                        .next()
+                        .unwrap();
+                    assert!(remote_video.contains("AV1/90000"));
+                    assert_eq!(
+                        local_video.contains("AV1/90000"),
+                        config.video_input == crate::VideoInput::I420,
+                    );
                     assert!(!offer.contains("VP8/90000"));
                     assert!(offer.contains("opus/48000"));
                     found = Some(resources);

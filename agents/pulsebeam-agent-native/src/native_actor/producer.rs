@@ -11,6 +11,8 @@ fn ownership_conflict() -> Error {
 pub(super) struct ProducerLease {
     pub(super) owner: u64,
     pub(super) kind: SourceKind,
+    #[cfg(feature = "sim")]
+    grouped_input: bool,
     pub(super) binding_owner: std::sync::atomic::AtomicU64,
     pipe_reservation: std::sync::Mutex<Option<agent_core::PublicationInputId>>,
     pub(super) closed: Arc<Signal>,
@@ -191,6 +193,15 @@ impl ProducerInput {
 
     /// Acknowledges native producer admission, including while detached, not delivery.
     pub async fn submit(&self, frame: InputFrame) -> Result<(), Error> {
+        #[cfg(not(feature = "sim"))]
+        let grouped_input = false;
+        #[cfg(feature = "sim")]
+        let grouped_input = self.inner.grouped_input;
+        if !grouped_input && matches!(frame, InputFrame::H264Simulcast { .. }) {
+            return Err(Error::InvalidInput(
+                "video publications accept one access unit per frame".into(),
+            ));
+        }
         let identity = self.target()?;
         validate_frame(&frame)?;
         let (response, result) = oneshot::channel();
@@ -314,6 +325,16 @@ impl Agent {
         self.create_producer(Some(config)).await
     }
 
+    #[cfg(feature = "sim")]
+    pub async fn create_simulcast_fixture_input(&self) -> Result<ProducerInput, Error> {
+        let (response, result) = oneshot::channel();
+        self.commands
+            .send(Command::CreateSimulcastFixtureProducer { response })
+            .await
+            .map_err(|_| Error::Closed)?;
+        result.await.map_err(|_| Error::Closed)?
+    }
+
     async fn create_producer(
         &self,
         video: Option<VideoSourceConfig>,
@@ -336,17 +357,43 @@ where
         &mut self,
         video: Option<VideoSourceConfig>,
     ) -> Result<ProducerInput, Error> {
-        self.retire_producers();
-        if self.producers.len() >= MAX_PRODUCER_LEASES {
-            return Err(Error::CapacityExceeded);
-        }
         let (kind, config) = match video {
-            Some(config) => (SourceKind::Video(self.config.media.video_input), config),
+            Some(config) => {
+                config.validate_owned()?;
+                (SourceKind::Video(self.config.media.video_input), config)
+            }
             None => (
                 SourceKind::Audio(self.config.media.audio_input),
                 VideoSourceConfig::default(),
             ),
         };
+        self.create_producer_with_profile(kind, config)
+    }
+
+    #[cfg(feature = "sim")]
+    pub(super) fn create_simulcast_fixture_producer(&mut self) -> Result<ProducerInput, Error> {
+        let profile = self
+            .config
+            .media
+            .video_publications
+            .iter()
+            .find(|profile| profile.source.encodings.len() == 3)
+            .ok_or_else(|| Error::InvalidInput("no encoded simulcast transport fixture".into()))?;
+        self.create_producer_with_profile(
+            SourceKind::Video(VideoInput::EncodedH264),
+            profile.source.clone(),
+        )
+    }
+
+    fn create_producer_with_profile(
+        &mut self,
+        kind: SourceKind,
+        config: VideoSourceConfig,
+    ) -> Result<ProducerInput, Error> {
+        self.retire_producers();
+        if self.producers.len() >= MAX_PRODUCER_LEASES {
+            return Err(Error::CapacityExceeded);
+        }
         crate::native_source::NativeProducer::validate(kind, &config)?;
         let owner = self
             .next_producer
@@ -359,6 +406,8 @@ where
         let inner = Arc::new(ProducerLease {
             owner,
             kind,
+            #[cfg(feature = "sim")]
+            grouped_input: config.encodings.len() == 3,
             binding_owner: std::sync::atomic::AtomicU64::new(0),
             pipe_reservation: std::sync::Mutex::new(None),
             closed: Arc::new(Signal::default()),

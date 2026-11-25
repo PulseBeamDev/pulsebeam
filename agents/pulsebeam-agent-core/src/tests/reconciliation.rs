@@ -110,11 +110,9 @@ fn whole_state_churn_reduces_once_without_physical_work_or_wire_revisions() {
 fn creation_release_before_first_boundary_has_no_physical_or_wire_lifetime() {
     let (mut agent, _, _) = native_connection::connected(Default::default());
     let ResourceResult::Publication { owner, .. } = agent
-        .resource(ResourceCommand::ClaimPublication {
-            spec: TrackSpec::Video {
-                track_id: "canceled-camera".into(),
-            },
-        })
+        .resource(ResourceCommand::claim_publication(TrackSpec::Video {
+            track_id: "canceled-camera".into(),
+        }))
         .unwrap()
     else {
         panic!("publication owner")
@@ -150,11 +148,9 @@ fn released_preparation_cannot_install_or_serialize_its_late_success() {
     use pulsebeam_proto::state;
     let (mut agent, generation, _, _) = native_media::connected();
     let ResourceResult::Publication { owner, slot, .. } = agent
-        .resource(ResourceCommand::ClaimPublication {
-            spec: TrackSpec::Video {
-                track_id: "extra-camera".into(),
-            },
-        })
+        .resource(ResourceCommand::claim_publication(TrackSpec::Video {
+            track_id: "extra-camera".into(),
+        }))
         .unwrap()
     else {
         panic!("publication owner")

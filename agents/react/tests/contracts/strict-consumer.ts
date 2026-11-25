@@ -1,4 +1,4 @@
-import { DataDelivery, DataEvent } from "@pulsebeam/react";
+import { DataDelivery, DataEvent, VideoCodec } from "@pulsebeam/react";
 import {
   Audio,
   Data,
@@ -79,7 +79,27 @@ const absentWatch: WebCatalog | null = useWatch(null);
 void [watch, absentWatch];
 declare const videoSource: VideoSource;
 declare const audioSource: AudioSource;
-const videoPublication = usePublish(actualAgent.video("video"), videoSource);
+const videoOptions = { enabled: true, codec: VideoCodec.H264 };
+const videoPublication = usePublish(
+  actualAgent.video("video"),
+  videoSource,
+  videoOptions,
+);
+// @ts-expect-error Codec is video-only, even through a named options value.
+usePublish(actualAgent.audio("audio"), audioSource, videoOptions);
+const dataWithCodec = { delivery: DataDelivery.Latest, codec: VideoCodec.H264 };
+// @ts-expect-error Codec is not a data delivery option.
+usePublish(actualAgent.data("data"), null, dataWithCodec);
+// @ts-expect-error Codec cannot be configured on an existing publication.
+videoPublication?.configure({ enabled: true, codec: VideoCodec.H264 });
+const av1Publication: VideoPublication | null = usePublish(
+  actualAgent.video("screen"),
+  videoSource,
+  { enabled: true, codec: VideoCodec.Av1 },
+);
+void av1Publication;
+// @ts-expect-error VP9 is not a public publication codec.
+void VideoCodec.Vp9;
 const audioPublication = usePublish(actualAgent.audio("audio"), audioSource, {
   enabled: true,
 });

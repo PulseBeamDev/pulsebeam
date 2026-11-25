@@ -186,11 +186,20 @@ pub(in crate::tests) struct UdpRtpWindow {
 pub(in crate::tests) struct UdpRtpRepair {
     source: u32,
     target: [u32; 2],
-    pub input: Vec<usize>,
-    pub output: Vec<usize>,
+    pub input: Vec<ObservedRtp>,
+    pub output: Vec<ObservedRtp>,
     pub output_timestamp: Option<u32>,
     pub dropped: Option<usize>,
-    pub repairs: Vec<usize>,
+    pub repairs: Vec<ObservedRtp>,
+}
+
+#[derive(Debug)]
+pub(in crate::tests) struct ObservedRtp {
+    pub bytes: usize,
+    pub payload_type: u8,
+    pub sequence: u16,
+    pub timestamp: u32,
+    pub marker: bool,
 }
 
 impl UdpRtpWindow {
@@ -213,6 +222,14 @@ impl UdpRtpWindow {
             return None;
         }
         repair.output_timestamp
+    }
+
+    pub(in crate::tests) fn saw_all_primary_fragments(&self) -> bool {
+        self.repair.borrow().as_ref().is_some_and(|repair| {
+            repair.input.len() == repair.output.len()
+                && repair.input.iter().any(|packet| packet.marker)
+                && repair.output.iter().any(|packet| packet.marker)
+        })
     }
 
     pub(in crate::tests) fn finish_repair(&self) -> Option<UdpRtpRepair> {
@@ -252,12 +269,19 @@ impl UdpRtpWindow {
                 && let Some(ssrc) = bytes.get(8..12).and_then(|value| value.try_into().ok())
             {
                 let ssrc = u32::from_be_bytes(ssrc);
+                let packet = ObservedRtp {
+                    bytes: bytes.len(),
+                    payload_type: pt & 0x7f,
+                    sequence: u16::from_be_bytes([bytes[2], bytes[3]]),
+                    timestamp: u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+                    marker: pt & 0x80 != 0,
+                };
                 if outgoing && ssrc == repair.source {
-                    repair.input.push(bytes.len());
+                    repair.input.push(packet);
                 } else if !outgoing && ssrc == repair.target[0] {
                     let timestamp = u32::from_be_bytes(bytes[4..8].try_into().unwrap());
                     assert_eq!(*repair.output_timestamp.get_or_insert(timestamp), timestamp);
-                    repair.output.push(bytes.len());
+                    repair.output.push(packet);
                     if repair.output.len() == 2 {
                         repair.dropped = Some(bytes.len());
                         return false;
@@ -265,7 +289,7 @@ impl UdpRtpWindow {
                 } else if !outgoing && ssrc == repair.target[1] {
                     let timestamp = u32::from_be_bytes(bytes[4..8].try_into().unwrap());
                     if repair.output_timestamp == Some(timestamp) {
-                        repair.repairs.push(bytes.len());
+                        repair.repairs.push(packet);
                     }
                 }
             }

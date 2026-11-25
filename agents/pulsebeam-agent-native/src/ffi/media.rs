@@ -197,7 +197,7 @@ impl LocalVideoTrack {
     #[uniffi::method(default(options = None))]
     pub fn publish(
         &self,
-        options: Option<core_ffi::PublicationConfig>,
+        options: Option<core_ffi::VideoPublishOptions>,
     ) -> Result<Arc<VideoPublication>, NativeError> {
         Ok(Arc::new(VideoPublication {
             runtime: self.runtime.publish(options.unwrap_or_default())?,

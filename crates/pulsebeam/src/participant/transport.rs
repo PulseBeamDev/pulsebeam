@@ -1275,6 +1275,12 @@ impl RtcDriver {
         }
         AppliedMutation::RtpWritten
     }
+    pub(super) fn service_ingress_before_drain(&mut self) {
+        if self.needs_drain() && self.has_pending_ingress() && self.rtc.can_advance_ingress() {
+            self.receive_pending(self.rtc_clock);
+        }
+    }
+
     pub(crate) fn receive_pending(&mut self, at: Instant) -> IngressResult {
         let (protocol, local, remote, received_at, tcp_flow, source_shard, input) =
             if let Some(pending) = self.pending_ingress.front_mut() {

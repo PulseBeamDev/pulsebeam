@@ -10,6 +10,7 @@ import {
   RemoteAudioTrack,
   RemoteDataTrack,
   RemoteVideoTrack,
+  VideoCodec,
   VideoPublication,
   VideoSource,
   VideoSubscription,
@@ -22,6 +23,7 @@ import {
   type PublicationConfig,
   type RoomRef,
   type VideoObservation,
+  type VideoPublishOptions,
   type WatchConfig,
 } from "@pulsebeam/web";
 import { useCommittedRef } from "./committed-ref.js";
@@ -40,6 +42,12 @@ type Source =
   | PublishableVideoSource
   | PublishableAudioSource;
 type Publication = VideoPublication | AudioPublication | DataPublication;
+type AudioPublishOptions = PublicationConfig & { codec?: never };
+type TopicPublishOptions = DataPublishOptions & { codec?: never };
+type PublishOptions =
+  | VideoPublishOptions
+  | AudioPublishOptions
+  | TopicPublishOptions;
 type Remote = RemoteVideoTrack | RemoteAudioTrack | RemoteDataTrack;
 type Subscription = VideoSubscription | AudioSubscription | DataSubscription;
 
@@ -63,23 +71,31 @@ export function useWatch(
 export function usePublication(
   track: Local | null,
   source?: Source | null,
-  options?: PublicationConfig | DataPublishOptions,
+  options?: PublishOptions,
 ) {
   const mode =
     track instanceof LocalDataTrack
       ? ((options as DataPublishOptions | undefined)?.delivery ??
         DataDelivery.Reliable)
       : undefined;
-  const target = useMemo(() => track && { track, mode }, [track, mode]);
+  const codec =
+    track instanceof LocalVideoTrack
+      ? (options?.codec ?? VideoCodec.H264)
+      : undefined;
+  const enabled = (options as PublicationConfig | undefined)?.enabled ?? true;
+  const target = useMemo(
+    () => track && { track, mode, codec },
+    [track, mode, codec],
+  );
   const publication = useResource<Publication>(target, () => {
     if (track instanceof LocalDataTrack)
       return track.publish(options as DataPublishOptions | undefined);
-    if (track instanceof LocalVideoTrack || track instanceof LocalAudioTrack)
-      return track.publish(options as PublicationConfig | undefined);
+    if (track instanceof LocalVideoTrack)
+      return track.publish({ enabled, codec: codec ?? VideoCodec.H264 });
+    if (track instanceof LocalAudioTrack) return track.publish({ enabled });
     throw new TypeError("Expected an SDK local track");
   });
   const owner = publication.value;
-  const enabled = (options as PublicationConfig | undefined)?.enabled ?? true;
   useLayoutEffect(() => {
     if (
       !(owner instanceof VideoPublication) &&
@@ -147,22 +163,22 @@ export function usePublication(
 export function usePublish(
   track: LocalVideoTrack | null,
   source?: VideoSource | PublishableVideoSource | null,
-  options?: PublicationConfig,
+  options?: VideoPublishOptions,
 ): VideoPublication | null;
 export function usePublish(
   track: LocalAudioTrack | null,
   source?: AudioSource | PublishableAudioSource | null,
-  options?: PublicationConfig,
+  options?: AudioPublishOptions,
 ): AudioPublication | null;
 export function usePublish(
   track: LocalDataTrack | null,
   source?: null,
-  options?: DataPublishOptions,
+  options?: TopicPublishOptions,
 ): DataPublication | null;
 export function usePublish(
   track: Local | null,
   source?: Source | null,
-  options?: PublicationConfig | DataPublishOptions,
+  options?: PublishOptions,
 ): Publication | null {
   return usePublication(track, source, options).value;
 }

@@ -1631,9 +1631,12 @@ impl SourceFanout {
             .and_then(|frozen| frozen.live_arrival)
             .unwrap_or(arrival);
         let work = LiveWork::new(high, sequence, arrival, hops).ok_or(Rejection::Stale)?;
+        // Stock AV1 decoders use the descriptor to resolve delta frames even
+        // on whole-stream branches. Reorder before qualifying their metadata.
         let ordered = self.evidence.is_some()
-            && (self.emission.selects_dd_encoding() || !self.branches.is_empty())
-            && self.branches.values().all(|branch| branch.filter.is_some());
+            && (self.emission.profile() == Profile::Av1
+                || (self.emission.selects_dd_encoding() || !self.branches.is_empty())
+                    && self.branches.values().all(|branch| branch.filter.is_some()));
         let qualified = if ordered {
             None
         } else if let Some(evidence) = &mut self.evidence {

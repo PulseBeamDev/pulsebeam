@@ -150,6 +150,12 @@ pub enum RtcEffect {
         operation: OperationId,
         allocations: Vec<crate::client_sdp::Allocation>,
     },
+    ClaimBootstrapMedia {
+        generation: Generation,
+        operation: OperationId,
+        reserved: SlotBinding,
+        allocation: crate::client_sdp::Allocation,
+    },
     RetireMedia {
         generation: Generation,
         operation: OperationId,
@@ -261,6 +267,8 @@ pub enum DataChannelReliability {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OfferResources {
     pub slots: Vec<SlotBinding>,
+    /// Applied media to reserve rather than associate with a logical owner.
+    pub reserved_mids: Vec<String>,
     pub signaling_channel: ChannelId,
     pub data_channels: Vec<DataChannelBinding>,
 }
@@ -269,6 +277,14 @@ pub struct OfferResources {
 pub struct DataChannelBinding {
     pub label: String,
     pub channel: ChannelId,
+}
+
+pub(crate) fn bundle_anchor(offer: &str) -> Option<&str> {
+    offer.lines().find_map(|line| {
+        line.strip_prefix("a=group:BUNDLE ")?
+            .split_whitespace()
+            .next()
+    })
 }
 
 pub fn negotiated_slot_bindings(
