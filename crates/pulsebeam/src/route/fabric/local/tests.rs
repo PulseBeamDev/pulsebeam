@@ -1548,6 +1548,128 @@ fn stale_filtered_head_fences_live_continuation_until_fresh_entry() {
 }
 
 #[test]
+fn spatial_dd_reports_height_and_cumulative_target_bytes_before_subscribers_exist() {
+    use pulsebeam_core::dd::{
+        DecodeTargetIndication::{NotPresent, Switch},
+        DependencyDescriptor, FrameDependencyTemplate, RenderResolution,
+        TemplateDependencyStructure,
+    };
+    let emission = Emission::new(Profile::Vp9, &[ExtensionKind::DependencyDescriptor]).unwrap();
+    let mut fanout = SourceFanout::new(emission);
+    let base = FrameDependencyTemplate {
+        dtis: [Switch, Switch].into_iter().collect(),
+        ..Default::default()
+    };
+    let upper = FrameDependencyTemplate {
+        spatial_id: 1,
+        dtis: [NotPresent, Switch].into_iter().collect(),
+        frame_diffs: [1].into_iter().collect(),
+        ..Default::default()
+    };
+    let structure = TemplateDependencyStructure {
+        decode_target_count: 2,
+        templates: [base.clone(), upper.clone()].into_iter().collect(),
+        resolutions: [
+            RenderResolution {
+                width: 320,
+                height: 180,
+            },
+            RenderResolution {
+                width: 640,
+                height: 360,
+            },
+        ]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    };
+    let now = Instant::now();
+    let mut writer = DependencyDescriptorWriter::new();
+    for (index, template, bytes) in [(0, base, [6, 6, 0]), (1, upper, [0, 6, 0])] {
+        let packet = write_dd_test_packet(
+            &mut writer,
+            Profile::Vp9,
+            100 + u32::from(index),
+            9000,
+            &DependencyDescriptor {
+                start_of_frame: true,
+                end_of_frame: true,
+                template_id: index,
+                frame_number: 10 + u16::from(index),
+                attached_structure: (index == 0).then(|| Box::new(structure.clone())),
+                frame_dependencies: template,
+                ..Default::default()
+            },
+        );
+        let report = fanout
+            .offer(now, now, u64::from(100 + u32::from(index)), packet)
+            .unwrap();
+        assert_eq!(
+            report.dd_sample,
+            DecodeTargetSample::Measured {
+                context: DecodeTargetRateContext {
+                    structure_origin: 100,
+                    active_targets: 0b11
+                },
+                through: 100 + u64::from(index),
+                bytes,
+            }
+        );
+        assert_eq!(
+            report
+                .dd_structure
+                .map(|facts| (facts.decode_target_heights, facts.temporal_only)),
+            (index == 0).then_some((Some([180, 360, 0]), Some(false)))
+        );
+        assert_eq!(report.enqueued, 0);
+    }
+}
+
+#[test]
+fn vp9_picture_marker_follows_the_highest_retained_spatial_frame() {
+    use pulsebeam_core::dd::{
+        DecodeTargetIndication::{NotPresent, Switch},
+        DependencyDescriptor, FrameDependencyTemplate, TemplateDependencyStructure,
+    };
+    let template = |spatial_id, dtis: [_; 3]| FrameDependencyTemplate {
+        spatial_id,
+        dtis: dtis.into_iter().collect(),
+        ..Default::default()
+    };
+    let base = template(0, [Switch, Switch, Switch]);
+    let middle = template(1, [Switch, Switch, NotPresent]);
+    let top = template(2, [NotPresent, Switch, NotPresent]);
+    let structure = TemplateDependencyStructure {
+        decode_target_count: 3,
+        templates: [base.clone(), middle.clone(), top.clone()]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    };
+    for (frame, ending_target) in [(base, 2), (middle, 0), (top, 1)] {
+        let mut qualified = Qualified {
+            descriptor: DependencyDescriptor {
+                frame_dependencies: frame,
+                ..Default::default()
+            },
+            active_targets: 0b111,
+            structure_sequence: 0,
+            structure_origin: 0,
+            target_chains: Default::default(),
+        };
+        for end_of_frame in [false, true] {
+            qualified.descriptor.end_of_frame = end_of_frame;
+            for target in 0..3 {
+                assert_eq!(
+                    vp9_filtered_marker(&qualified, Some(&structure), target),
+                    Some(end_of_frame && target == ending_target),
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn ordered_filter_compacts_only_qualified_omissions() {
     let emission = Emission::new(Profile::H264, &[ExtensionKind::DependencyDescriptor]).unwrap();
     let mut fanout = SourceFanout::new(emission);
@@ -1565,7 +1687,14 @@ fn ordered_filter_compacts_only_qualified_omissions() {
         let selected_bytes = if omit { 0 } else { 6 };
         assert_eq!(
             report.dd_sample,
-            DecodeTargetSample::Bytes([selected_bytes, 0, 0])
+            DecodeTargetSample::Measured {
+                context: DecodeTargetRateContext {
+                    structure_origin: 100,
+                    active_targets: 1
+                },
+                through: u64::from(sequence),
+                bytes: [selected_bytes, 0, 0],
+            }
         );
     }
     let take = |fanout: &mut SourceFanout, at, expected| {
@@ -1593,6 +1722,32 @@ fn ordered_filter_compacts_only_qualified_omissions() {
     let later = now + DD_REORDER_WAIT;
     fanout.offer(later, now, 104, packet).unwrap();
     take(&mut fanout, later, (104, 103));
+}
+
+#[test]
+fn wan_rtp_admission_matrix_distinguishes_whole_stream_and_dd() {
+    // Admission only. Native decoder and switch proofs belong to the simulator.
+    for (profile, bare, with_dd) in [
+        (Profile::Opus, true, true),
+        (Profile::H264, true, true),
+        (Profile::Vp8, false, false),
+        (Profile::Vp9, false, true),
+        (Profile::Av1, true, true),
+        (Profile::Data, false, false),
+    ] {
+        assert_eq!(
+            Emission::new(profile, &[]).unwrap().supports_wan_rtp(),
+            bare,
+            "{profile:?} without DD"
+        );
+        assert_eq!(
+            Emission::new(profile, &[ExtensionKind::DependencyDescriptor])
+                .unwrap()
+                .supports_wan_rtp(),
+            with_dd,
+            "{profile:?} with DD",
+        );
+    }
 }
 
 #[test]
@@ -1732,6 +1887,49 @@ fn same_encoding_can_stage_one_distinct_decode_target_per_destination() {
     assert!(fanout.retire_branch(staged));
     assert_eq!(fanout.branch_target(staged), None);
     assert_eq!(fanout.branch_target(first), Some(target(0)));
+}
+
+#[test]
+fn vp9_member_can_stage_whole_or_one_distinct_decode_target_without_replacing_the_other() {
+    let emission = Emission::new(Profile::Vp9, &[ExtensionKind::DependencyDescriptor]).unwrap();
+    let mut fanout = SourceFanout::new(emission);
+    let mut destinations = SlotMap::with_key();
+    let member = destinations.insert(());
+    let other = destinations.insert(());
+    let low = DecodeTarget::new(0).unwrap();
+    let high = DecodeTarget::new(2).unwrap();
+    let whole = fanout.install_branch(member, emission).unwrap();
+    let staged = fanout
+        .install_filtered_branch(member, emission, low)
+        .unwrap();
+    assert_eq!(fanout.branch_for_target(member, None), Some(whole));
+    assert_eq!(fanout.branch_for_target(member, Some(low)), Some(staged));
+    assert_eq!(fanout.branch_for_target(other, Some(low)), None);
+    assert!(fanout.install_branch(member, emission).is_none());
+    assert!(
+        fanout
+            .install_filtered_branch(member, emission, high)
+            .is_none()
+    );
+    assert!(fanout.retire_branch(staged));
+    let committed = fanout
+        .install_filtered_branch(member, emission, high)
+        .unwrap();
+    assert!(fanout.retire_branch(whole));
+    assert!(
+        fanout
+            .install_filtered_branch(member, emission, high)
+            .is_none()
+    );
+    let fallback = fanout.install_branch(member, emission).unwrap();
+    assert_eq!(
+        fanout.branch_for_target(member, Some(high)),
+        Some(committed)
+    );
+    assert_eq!(fanout.branch_for_target(member, None), Some(fallback));
+    fanout.retain_destinations(|destination| destination != member);
+    assert_eq!(fanout.branch_for_target(member, Some(high)), None);
+    assert_eq!(fanout.branch_for_target(member, None), None);
 }
 
 #[test]

@@ -27,7 +27,6 @@ pub struct ProvisionedPeer {
     pub remote: (NodeId, NonZeroU64),
     pub transport: NetworkPeer,
     /// Explicit programmatic selection of the WAN carrier, with no fallback.
-    pub fabric_wan: bool,
     pub regional_control: Option<RegionalControlConfig>,
     /// Explicitly allow WAN sources from this pinned upstream on this outgoing edge.
     pub relay_from: Option<NodeId>,
@@ -261,7 +260,6 @@ impl PeerConfig {
             authority_epoch,
             receipt_key,
             peer_receipt_key: self.peer_receipt_key,
-            fabric_wan: true,
             regional_control: Some(self.regional_control),
             relay_from: None,
             transport: NetworkPeer {
@@ -416,7 +414,7 @@ impl Options {
                 let control = peer
                     .regional_control
                     .as_ref()
-                    .context("regional and legacy control peers cannot be mixed")?;
+                    .context("all regional adjacencies require regional control")?;
                 ensure!(
                     valid_region_name(&control.region),
                     "invalid regional control region name"
@@ -434,10 +432,6 @@ impl Options {
                     local_region.get_or_insert(scope) == &scope,
                     "all regional adjacencies must share a local region and role"
                 );
-                ensure!(
-                    peer.fabric_wan,
-                    "regional control requires a separate Fabric WAN association"
-                );
                 RegionalControlConfig::ipv6(peer.listen, false)?;
                 RegionalControlConfig::ipv6(peer.transport.endpoint, false)?;
                 RegionalControlConfig::ipv6(control.listen, true)?;
@@ -454,12 +448,9 @@ impl Options {
             }
             if let Some(upstream) = peer.relay_from {
                 ensure!(
-                    peer.fabric_wan
-                        && upstream != peer.remote.0
+                    upstream != peer.remote.0
                         && self.ownership_peers.iter().any(|candidate| {
-                            candidate.remote.0 == upstream
-                                && candidate.fabric_wan
-                                && candidate.relay_from.is_none()
+                            candidate.remote.0 == upstream && candidate.relay_from.is_none()
                         }),
                     "WAN transit requires a distinct pinned upstream without an export policy"
                 );
@@ -474,8 +465,7 @@ impl Options {
             }
             if self.ownership_peers.len() > 1 {
                 ensure!(
-                    peer.fabric_wan
-                        && listeners.insert(peer.listen)
+                    listeners.insert(peer.listen)
                         && endpoints.insert(peer.transport.endpoint)
                         && nodes.insert(peer.remote.0),
                     "multiple ownership peers require distinct WAN listeners, endpoints and nodes"
@@ -492,12 +482,9 @@ impl Options {
             ensure!(
                 peer.listen.port() != 0
                     && !peer.listen.ip().is_multicast()
+                    && !peer.listen.ip().is_unspecified()
                     && !matches!(peer.listen.ip(), IpAddr::V4(ip) if ip.is_broadcast()),
-                "ownership Link must listen on a fixed unicast or wildcard address"
-            );
-            ensure!(
-                !peer.fabric_wan || !peer.listen.ip().is_unspecified(),
-                "Fabric WAN requires a concrete local address and cannot use legacy Fabric carriage"
+                "Fabric WAN must listen on a fixed unicast address"
             );
             let remote = unique_endpoint(std::iter::once(peer.transport.endpoint))
                 .context("invalid ownership peer endpoint")?;

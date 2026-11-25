@@ -14,6 +14,7 @@ use crate::{
         ConnectionId, EndpointKey, ProjectId, ProjectRoomKey, PublicationId, PublicationKey, RoomId,
     },
     route::fabric::local::Emission,
+    rtp::monitor::MeasuredTargetLadder,
     shard_update::PublisherAnchor,
 };
 
@@ -46,7 +47,11 @@ pub(in crate::control) fn plan_windows(
             let timing = (previous.sequence_anchor == source.sequence_anchor)
                 .then_some(source.timing)
                 .flatten();
-            *source = WanSourceWindow { timing, ..previous };
+            *source = WanSourceWindow {
+                timing,
+                ladder: source.ladder,
+                ..previous
+            };
         }
     }
     let sources = current.len();
@@ -63,6 +68,7 @@ pub(in crate::control) fn plan_windows(
         {
             current.push(WanSourceWindow {
                 timing: None,
+                ladder: None,
                 ..predecessor
             });
         }
@@ -81,6 +87,7 @@ pub(in crate::control) fn plan_windows(
             };
             current.push(WanSourceWindow {
                 timing: None,
+                ladder: None,
                 ..stable(successor).unwrap_or(successor)
             });
         }
@@ -136,6 +143,7 @@ pub(in crate::control) struct WanSourceWindow {
     pub sequence_anchor: u64,
     pub window_start: u64,
     pub timing: Option<WanTimingPoint>,
+    pub ladder: Option<MeasuredTargetLadder>,
     // Routing provenance, not the owner or signer of the publication.
     pub origin: Option<Member>,
     pub offer_cut: Option<NonZeroU64>,
@@ -153,6 +161,7 @@ impl WanSourceWindow {
             sequence_anchor,
             window_start: Window::start_for(sequence_anchor),
             timing: None,
+            ladder: None,
             origin: None,
             offer_cut: None,
         }
@@ -163,6 +172,37 @@ impl WanSourceWindow {
             .filter(|value| value.binding.domain.0 == self.publisher.incarnation.get())
             .map(WanTimingPoint::from_projection);
         self
+    }
+
+    pub(in crate::control) fn with_ladder(mut self, ladder: Option<MeasuredTargetLadder>) -> Self {
+        self.ladder = ladder.filter(|&ladder| {
+            self.publisher.emission.profile() == Profile::Vp9
+                && Window::start_for(ladder.through) == self.window_start
+                && ladder.valid()
+        });
+        self
+    }
+
+    pub(in crate::control) fn refresh_track_ladder(
+        self,
+        track: &crate::track::Track,
+        expires: pulsebeam_runtime::time::Instant,
+        now: pulsebeam_runtime::time::Instant,
+    ) {
+        // Only the sampled window is authoritative; prearmed windows do not withdraw it.
+        if self.publisher.emission.profile() != Profile::Vp9
+            || Window::start_for(self.sequence_anchor) != self.window_start
+        {
+            return;
+        }
+        let Some(video) = track.as_video() else {
+            return;
+        };
+        let _refreshed = video.refresh_wan_ladder(self.publisher, self.ladder, expires, now);
+        #[cfg(feature = "sim")]
+        if _refreshed && video.wan_ladder(now).is_some() {
+            crate::sim_metrics::record_routing_counter("wan_vp9_ladder_installed");
+        }
     }
 
     pub(in crate::control) fn scope(self) -> super::Key {
@@ -271,7 +311,9 @@ impl WanSourceWindow {
                         .data_publisher(self.publisher.connection)
                         .is_some_and(|data| PublisherAnchor::from(data) == self.publisher),
                     profile => {
-                        fact.wan_rtp_publication() == Some((self.publisher.publication, profile))
+                        self.publisher.emission.supports_wan_rtp()
+                            && fact.wan_rtp_publication()
+                                == Some((self.publisher.publication, profile))
                     }
                 })
     }
@@ -293,6 +335,8 @@ pub(in crate::control) struct WireWanSourceWindow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     timing: Option<WanTimingPoint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    ladder: Option<MeasuredTargetLadder>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     origin: Option<Member>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     offer_cut: Option<NonZeroU64>,
@@ -313,6 +357,7 @@ impl From<WanSourceWindow> for WireWanSourceWindow {
             extensions,
             forms: source.forms(),
             timing: source.timing,
+            ladder: source.ladder,
             origin: source.origin,
             offer_cut: source.offer_cut,
         }
@@ -326,8 +371,10 @@ impl WireWanSourceWindow {
         let publication = match emission.profile() {
             Profile::Data => PublicationKey::Data(self.publication),
             Profile::Opus => PublicationKey::Audio(self.publication),
-            Profile::H264 | Profile::Av1 => PublicationKey::Video(self.publication),
-            Profile::Vp8 | Profile::Vp9 => return None,
+            profile if emission.supports_wan_rtp() && profile.is_video() => {
+                PublicationKey::Video(self.publication)
+            }
+            _ => return None,
         };
         let source = WanSourceWindow {
             room: ProjectRoomKey {
@@ -344,10 +391,12 @@ impl WireWanSourceWindow {
             window_start: self.window_start,
             origin: self.origin,
             offer_cut: self.offer_cut,
+            ladder: None,
             timing: self.timing.filter(|point| {
                 Window::start_for(self.sequence_anchor) == self.window_start && point.valid()
             }),
-        };
+        }
+        .with_ladder(self.ladder);
         (Window::start_for(self.window_start) == self.window_start && source.forms() == self.forms)
             .then_some(source)
     }

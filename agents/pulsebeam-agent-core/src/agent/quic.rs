@@ -18,7 +18,7 @@ use crate::{Effect, Generation, HttpResponse, OperationId, QuicAdmit, QuicEffect
 #[derive(Clone, Copy)]
 pub(super) enum PublicationProfile {
     LegacyH264Dd,
-    UnlayeredVideo(&'static str),
+    Video { mime: &'static str, emits_dd: bool },
 }
 
 pub(super) enum Attempt {
@@ -234,7 +234,24 @@ impl Agent {
             "video/av1" => "video/av1",
             _ => return Err(crate::ValidationError::QuicPublicationProfile.into()),
         };
-        self.configure_quic_publication(track_id, PublicationProfile::UnlayeredVideo(mime))
+        self.configure_quic_publication(
+            track_id,
+            PublicationProfile::Video {
+                mime,
+                emits_dd: false,
+            },
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn configure_quic_vp9_dd(&mut self, track_id: &str) -> Result<(), AgentError> {
+        self.configure_quic_publication(
+            track_id,
+            PublicationProfile::Video {
+                mime: "video/vp9",
+                emits_dd: true,
+            },
+        )
     }
 
     fn configure_quic_publication(

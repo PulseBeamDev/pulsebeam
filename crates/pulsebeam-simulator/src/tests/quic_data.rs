@@ -506,6 +506,84 @@ fn quic_media_h264_exchanges_with_webrtc_encoded_endpoints() {
 }
 
 #[allow(clippy::unwrap_used, reason = "simulated node fixture must complete")]
+#[test]
+fn quic_single_encoding_vp9_spatial_targets_reach_live_receivers() {
+    let host = pulsebeam_runtime::testing::test_host_ip("192.168.250.103");
+    for target in [0, 2] {
+        replay_scenario(host, Scenario::SpatialVp9 { target });
+    }
+}
+
+#[test]
+#[allow(clippy::expect_used, reason = "simulated VP9 receiver must complete")]
+fn quic_spatial_vp9_native_receiver_switches_height_on_one_subscription() {
+    let host = pulsebeam_runtime::testing::test_host_ip("192.168.250.103");
+    let mut sim = turmoil::Builder::new().build();
+    sim.client(host, async move {
+        witness(Scenario::SpatialVp9Rtc { host }).await?;
+        Ok(())
+    });
+    super::common::run_sim_or_timeout(&mut sim, Duration::from_secs(15))
+        .expect("VP9 RTC height policy changes");
+}
+
+#[test]
+#[allow(clippy::expect_used, reason = "simulated VP9 receiver must adapt")]
+fn quic_spatial_vp9_native_receiver_adapts_to_bandwidth_across_shards() {
+    use super::native_state::spatial_vp9::{Check, receive};
+    use tokio::sync::oneshot;
+
+    let server = pulsebeam_runtime::testing::test_host_ip("192.168.250.103");
+    let viewer = pulsebeam_runtime::testing::test_host_ip("192.168.250.104");
+    let (publish, publication) = oneshot::channel();
+    let (begin, begun) = oneshot::channel();
+    let (finish, finished) = oneshot::channel();
+    let mut sim = turmoil::Builder::new()
+        .simulation_duration(Duration::from_secs(42))
+        .build();
+    sim.client(server, async move {
+        witness(Scenario::SpatialVp9Bandwidth {
+            server,
+            publish,
+            begun,
+            finished,
+        })
+        .await?;
+        Ok(())
+    });
+    sim.client(viewer, async move {
+        let host = super::common::native::NativeHost::bind(viewer)?;
+        let (address, id) = publication.await.context("VP9 publisher stopped")?;
+        receive(
+            address,
+            host,
+            &id,
+            Check::Bandwidth {
+                receiver_ip: viewer,
+            },
+            || {
+                begin
+                    .send(())
+                    .map_err(|()| anyhow::anyhow!("VP9 replay stopped"))
+            },
+        )
+        .await?;
+        finish
+            .send(())
+            .map_err(|()| anyhow::anyhow!("VP9 replay stopped"))?;
+        Ok(())
+    });
+    let cross_shard_packets =
+        || pulsebeam::sim_metrics::routing_counter("fabric_rtp_shard_enqueued");
+    let before = cross_shard_packets();
+    super::common::run_sim_or_timeout(&mut sim, Duration::from_secs(42))
+        .expect("VP9 RTC bandwidth adaptation");
+    assert!(
+        cross_shard_packets() > before,
+        "VP9 RTP did not cross a shard boundary"
+    );
+}
+
 fn replay_scenario(host: std::net::IpAddr, scenario: Scenario) {
     pulsebeam_runtime::testing::run_local(host, async move {
         pulsebeam_runtime::time::timeout(Duration::from_secs(10), witness(scenario))
@@ -1014,11 +1092,12 @@ fn sim_quic_agent(
     roots: RootCertStore,
     token: &str,
 ) -> Result<pulsebeam_agent_quic::executor::host::Agent> {
-    sim_quic_agent_with_placement(address, edge, roots, token, sim_placement)
+    sim_quic_agent_with_placement(address, edge.ip(), edge, roots, token, sim_placement)
 }
 
 fn sim_quic_agent_with_placement<F, Fut>(
     address: SocketAddr,
+    local: std::net::IpAddr,
     edge: SocketAddr,
     roots: RootCertStore,
     token: &str,
@@ -1037,7 +1116,7 @@ where
             retry: Default::default(),
             log_level: Default::default(),
         },
-        edge.ip(),
+        local,
         roots,
     )
     .map_err(|error| anyhow::anyhow!("QUIC Agent startup: {error:?}"))?
@@ -1458,32 +1537,34 @@ async fn failed_path_exchange(
     });
     let continuations = Rc::new(Cell::new(0_u32));
     let seen = continuations.clone();
-    let mut agent = sim_quic_agent_with_placement(address, edge, roots, token, move |request| {
-        let seen = seen.clone();
-        async move {
-            let inputs: serde_json::Value = serde_json::from_slice(&request.body).ok()?;
-            let mut response = sim_placement(request).await?;
-            if response.status != 200 {
-                return Some(response);
-            }
-            let mut placement: serde_json::Value = serde_json::from_slice(&response.body).ok()?;
-            if let Some(owner) = inputs.get("owner").and_then(serde_json::Value::as_str) {
-                if inputs
-                    .get("successor_receipt")
-                    .and_then(serde_json::Value::as_str)
-                    .is_none()
-                    || placement.get("owner").and_then(serde_json::Value::as_str) != Some(owner)
-                {
-                    return None;
+    let mut agent =
+        sim_quic_agent_with_placement(address, edge.ip(), edge, roots, token, move |request| {
+            let seen = seen.clone();
+            async move {
+                let inputs: serde_json::Value = serde_json::from_slice(&request.body).ok()?;
+                let mut response = sim_placement(request).await?;
+                if response.status != 200 {
+                    return Some(response);
                 }
-                seen.set(seen.get().saturating_add(1));
-            } else {
-                *placement.get_mut("authority")?.get_mut("port")? = proxy_port.into();
-                response.body = serde_json::to_vec(&placement).ok()?;
+                let mut placement: serde_json::Value =
+                    serde_json::from_slice(&response.body).ok()?;
+                if let Some(owner) = inputs.get("owner").and_then(serde_json::Value::as_str) {
+                    if inputs
+                        .get("successor_receipt")
+                        .and_then(serde_json::Value::as_str)
+                        .is_none()
+                        || placement.get("owner").and_then(serde_json::Value::as_str) != Some(owner)
+                    {
+                        return None;
+                    }
+                    seen.set(seen.get().saturating_add(1));
+                } else {
+                    *placement.get_mut("authority")?.get_mut("port")? = proxy_port.into();
+                    response.body = serde_json::to_vec(&placement).ok()?;
+                }
+                Some(response)
             }
-            Some(response)
-        }
-    })?;
+        })?;
     agent.command(AgentCommand::ReplaceDesired(DesiredState {
         revision: 1,
         publications: vec![PublicationIntent {
@@ -2849,6 +2930,8 @@ async fn mixed_h264_exchange(
     Ok(())
 }
 
+pub(super) mod spatial_vp9;
+
 async fn descriptor_h264_exchange(
     publisher: &mut pulsebeam_agent_quic::executor::host::Agent,
     mut receiver: pulsebeam_agent_quic::executor::host::Agent,
@@ -3198,6 +3281,18 @@ enum Scenario {
         sctp_host: Option<std::net::IpAddr>,
     },
     DataRecordDd,
+    SpatialVp9 {
+        target: u32,
+    },
+    SpatialVp9Rtc {
+        host: std::net::IpAddr,
+    },
+    SpatialVp9Bandwidth {
+        server: std::net::IpAddr,
+        publish: tokio::sync::oneshot::Sender<(SocketAddr, String)>,
+        begun: tokio::sync::oneshot::Receiver<()>,
+        finished: tokio::sync::oneshot::Receiver<()>,
+    },
     Opus,
     Mobility,
     FailedPath,
@@ -3215,11 +3310,7 @@ enum Scenario {
     clippy::disallowed_types,
     reason = "Noq and rustls require shared immutable configuration and clocks"
 )]
-async fn witness(scenario: Scenario) -> Result<()> {
-    let host = std::net::Ipv4Addr::LOCALHOST.into();
-    let edge = SocketAddr::new(host, 8443);
-    let http = TcpListener::bind("127.0.0.1:0".parse()?).await?;
-    let address = http.local_addr()?;
+pub(super) fn sim_quic_tls() -> Result<(transport::ServerConfig, RootCertStore)> {
     let identity = rcgen::generate_simple_self_signed(vec!["edge.example".to_owned()])?;
     let mut roots = RootCertStore::empty();
     roots.add(identity.cert.der().clone())?;
@@ -3231,6 +3322,27 @@ async fn witness(scenario: Scenario) -> Result<()> {
         NonZeroUsize::new(64).context("incoming limit")?,
     )
     .map_err(|e| anyhow::anyhow!("server TLS configuration: {e:?}"))?;
+    Ok((tls, roots))
+}
+
+async fn witness(scenario: Scenario) -> Result<()> {
+    let host = std::net::Ipv4Addr::LOCALHOST.into();
+    let edge = SocketAddr::new(host, 8443);
+    let rtc_address = match scenario {
+        Scenario::SpatialVp9Bandwidth { server, .. } => Some(SocketAddr::new(server, edge.port())),
+        _ => None,
+    };
+    let http = TcpListener::bind(
+        if rtc_address.is_some() {
+            "0.0.0.0:0"
+        } else {
+            "127.0.0.1:0"
+        }
+        .parse()?,
+    )
+    .await?;
+    let address = SocketAddr::new(host, http.local_addr()?.port());
+    let (tls, roots) = sim_quic_tls()?;
     let keys = KeyRegistry::new(
         *DEVELOPMENT_PROJECT_ID,
         vec![KeyRegistryEntry {
@@ -3238,6 +3350,7 @@ async fn witness(scenario: Scenario) -> Result<()> {
             public_key: *DEVELOPMENT_API_PUBLIC_KEY,
         }],
     )?;
+
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let grants = pulsebeam_core::auth::grants::GrantSet::new(vec![
         pulsebeam_core::auth::grants::Grant::new(
@@ -3270,8 +3383,13 @@ async fn witness(scenario: Scenario) -> Result<()> {
     let builder = NodeBuilder::new()
         .sim_utc_clock(crate::sim_clock::unix_nanos)
         .with_current_runtime()
-        .local_addr(edge)
+        .local_addr(if rtc_address.is_some() {
+            "0.0.0.0:8443".parse()?
+        } else {
+            edge
+        })
         .advertise_bound_udp()
+        .external_addrs(rtc_address.into_iter().collect())
         .ice_tcp(IceTcpConfig::Disabled)
         .rng(rand::Rng::seed_from_u64(19))
         .with_http_api_listener(http)
@@ -3284,6 +3402,7 @@ async fn witness(scenario: Scenario) -> Result<()> {
             ..
         } | Scenario::DataRecordDd
             | Scenario::MixedOpus { .. }
+            | Scenario::SpatialVp9Bandwidth { .. }
             | Scenario::MixedH264 {
                 cross_shard: true,
                 ..
@@ -3304,6 +3423,40 @@ async fn witness(scenario: Scenario) -> Result<()> {
         result = &mut node => anyhow::bail!("node stopped before startup: {result:?}"),
     }
     let result = async {
+        if let Scenario::SpatialVp9Bandwidth { server, publish, begun, finished } = scenario {
+            let (mut publisher, source) = spatial_vp9::connect_publisher(address, edge.ip(), edge, roots, &credential).await?;
+            publish.send((SocketAddr::new(server, address.port()), source.publication_id().to_owned()))
+                .map_err(|_| anyhow::anyhow!("VP9 viewer stopped before connecting"))?;
+            begun.await.context("VP9 viewer stopped before subscribing")?;
+            return pulsebeam_runtime::select! {
+                result = finished => result.context("VP9 viewer stopped before completing"),
+                result = spatial_vp9::replay(&mut publisher, &source, pulsebeam_runtime::time::Instant::now(), true) => result,
+            };
+        }
+        if let Scenario::SpatialVp9Rtc { host } = scenario {
+            use super::native_state::spatial_vp9::Check;
+            let (mut publisher, source) = spatial_vp9::connect_publisher(address, edge.ip(), edge, roots, &credential).await?;
+            let host = super::common::native::NativeHost::bind(host)?;
+            let (begin, begun) = tokio::sync::oneshot::channel();
+            let send = async {
+                begun.await.context("VP9 receiver stopped before replay")?;
+                spatial_vp9::replay(&mut publisher, &source, pulsebeam_runtime::time::Instant::now(), true).await
+            };
+            let receive = super::native_state::spatial_vp9::receive(address, host, source.publication_id(), Check::HeightChanges,
+                || begin.send(()).map_err(|()| anyhow::anyhow!("VP9 replay stopped")));
+            return pulsebeam_runtime::select! { result = receive => result, result = send => result };
+        }
+        if let Scenario::SpatialVp9 { target } = scenario {
+            return spatial_vp9::exchange(
+                address,
+                edge,
+                roots,
+                &credential,
+                &subscriber_token,
+                target,
+            )
+            .await;
+        }
         if let Scenario::Data {
             sctp_host: Some(sctp_host),
             delivery,

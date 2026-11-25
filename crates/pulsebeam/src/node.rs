@@ -531,15 +531,10 @@ impl NodeBuilder {
             Topology::SingleNode => OwnershipMode::Standalone,
             Topology::MultiNode => OwnershipMode::Unavailable,
         };
-        if let Some(peer) = options.ownership_peers.first() {
-            anyhow::ensure!(
-                self.link_listen.is_none_or(
-                    |address| options.ownership_peers.len() == 1 && address == peer.listen
-                ),
-                "explicit Link listener must match the only provisioned peer"
-            );
-            self.link_listen = (!peer.fabric_wan).then_some(peer.listen);
-        }
+        anyhow::ensure!(
+            options.ownership_peers.is_empty() || self.link_listen.is_none(),
+            "an explicit Link listener cannot be combined with provisioned Fabric WAN peers"
+        );
         self.provisioned_peers = options.ownership_peers.clone();
         self.region_tree = options.region_tree.clone();
         if self.operator_socket {
@@ -1025,17 +1020,13 @@ impl NodeBuilder {
                 }
                 port
             };
-            let provisioner = if peer.fabric_wan {
-                let (host, provisioner) = crate::link::wan_host::Service::bind(peer.listen, clock_origin).await.context("binding nonfragmenting Fabric WAN UDP")?;
-                hosts.push(SocketHost::Wan(host));
-                Some(provisioner)
-            } else {
-                None
-            };
+            let (host, provisioner) = crate::link::wan_host::Service::bind(peer.listen, clock_origin)
+                .await.context("binding nonfragmenting Fabric WAN UDP")?;
+            hosts.push(SocketHost::Wan(host));
             if scope.is_some_and(|scope| scope.is_border()) {
                 let remote = member(peer.remote);
                 controller.add_regional_border(remote, regional.context("region border requires regional control")?)?;
-                controller.attach_regional_border_media(remote, peer.transport, provisioner.context("region border requires a Fabric WAN socket")?)?;
+                controller.attach_regional_border_media(remote, peer.transport, provisioner)?;
             } else {
                 controller.add_provisioned_peer(peer, provisioner, regional)?;
             }

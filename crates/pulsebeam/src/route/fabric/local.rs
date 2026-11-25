@@ -86,6 +86,7 @@ pub struct OutputEvidence {
     pub reset_after: Option<u64>,
     pub dd: Option<(u64, Qualified)>,
     pub(crate) output_position: u64,
+    pub(crate) marker: bool,
     pub(crate) ingress: Option<NonZeroU64>,
     pub(crate) capture: Option<pulsebeam_clock::deadline::Timing>,
     pub(crate) sender_ntp: Option<u64>,
@@ -162,7 +163,15 @@ impl Emission {
     }
 
     pub(crate) fn selects_dd_encoding(self) -> bool {
-        self.profile == Profile::H264 && self.carries_video_dd()
+        matches!(self.profile, Profile::H264 | Profile::Vp9) && self.carries_video_dd()
+    }
+
+    pub(crate) fn supports_wan_rtp(self) -> bool {
+        match self.profile {
+            Profile::Opus | Profile::H264 | Profile::Av1 => true,
+            Profile::Vp9 => self.carries_video_dd(),
+            Profile::Vp8 | Profile::Data => false,
+        }
     }
 
     pub(crate) const fn wire_profile(self) -> (u8, u16) {
@@ -229,6 +238,14 @@ pub struct Offers {
     pub awaiting_entry: usize,
     pub(crate) dd_structure: Option<crate::rtp::normalize::StreamFacts>,
     pub(crate) dd_sample: DecodeTargetSample,
+    pub(crate) admitted_endpoint: Option<(u64, usize)>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DecodeTargetRateContext {
+    pub(crate) structure_origin: u64,
+    pub(crate) active_targets: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -236,11 +253,15 @@ pub(crate) enum DecodeTargetSample {
     #[default]
     None,
     Unknown,
-    Bytes([u64; crate::rtp::monitor::MAX_LADDER_TARGETS]),
+    Measured {
+        context: DecodeTargetRateContext,
+        through: u64,
+        bytes: [u64; crate::rtp::monitor::MAX_LADDER_TARGETS],
+    },
 }
 
 impl DecodeTargetSample {
-    fn record(&mut self, qualified: Option<&Qualified>, payload_bytes: usize) {
+    fn record(&mut self, position: u64, qualified: Option<&Qualified>, payload_bytes: usize) {
         if *self == Self::Unknown {
             return;
         }
@@ -249,8 +270,16 @@ impl DecodeTargetSample {
             return;
         };
         let payload_bytes = u64::try_from(payload_bytes).unwrap_or(u64::MAX);
+        let context = DecodeTargetRateContext {
+            structure_origin: qualified.structure_origin,
+            active_targets: qualified.active_targets,
+        };
         let mut bytes = match *self {
-            Self::Bytes(bytes) => bytes,
+            Self::Measured {
+                context: previous,
+                bytes,
+                ..
+            } if previous == context => bytes,
             _ => [0; crate::rtp::monitor::MAX_LADDER_TARGETS],
         };
         for (target, total) in bytes.iter_mut().enumerate() {
@@ -260,7 +289,11 @@ impl DecodeTargetSample {
                 *total = total.saturating_add(payload_bytes);
             }
         }
-        *self = Self::Bytes(bytes);
+        *self = Self::Measured {
+            context,
+            through: position,
+            bytes,
+        };
     }
 }
 
@@ -324,16 +357,75 @@ impl SourceEvidence {
     }
 }
 
+// In LxT1 each picture has one frame at each retained spatial layer. The
+// source marker can be on an omitted frame, so terminate at the selected top.
+fn vp9_filtered_marker(
+    qualified: &Qualified,
+    structure: Option<&pulsebeam_core::dd::TemplateDependencyStructure>,
+    target: u8,
+) -> Option<bool> {
+    use pulsebeam_core::dd::DecodeTargetIndication::NotPresent;
+    let structure = structure?;
+    if structure
+        .templates
+        .iter()
+        .any(|template| template.temporal_id != 0)
+    {
+        return None;
+    }
+    let descriptor = &qualified.descriptor;
+    if !descriptor.end_of_frame {
+        return Some(false);
+    }
+    let spatial = structure
+        .templates
+        .iter()
+        .filter(|template| {
+            template
+                .dtis
+                .get(usize::from(target))
+                .is_some_and(|&dti| dti != NotPresent)
+        })
+        .map(|template| template.spatial_id)
+        .max()?;
+    Some(descriptor.frame_dependencies.spatial_id == spatial)
+}
+
 fn dd_structure(
+    emission: Emission,
     (qualified, frame): &(Qualified, FrameStatus),
 ) -> Option<crate::rtp::normalize::StreamFacts> {
+    use crate::rtp::{monitor::MAX_LADDER_TARGETS, normalize::StreamFacts};
     let descriptor = &qualified.descriptor;
     let structure = descriptor.attached_structure.as_ref()?;
-    (matches!(frame, FrameStatus::Resolved(_))
-        && descriptor.start_of_frame
-        && descriptor.frame_dependencies.frame_diffs.is_empty()
-        && structure.spatial_layer_count() == 1)
-        .then(|| crate::rtp::normalize::StreamFacts::from_structure(structure))
+    if !emission.selects_dd_encoding()
+        || !matches!(frame, FrameStatus::Resolved(_))
+        || !descriptor.start_of_frame
+        || !descriptor.frame_dependencies.frame_diffs.is_empty()
+        || (emission.profile() == Profile::H264 && structure.spatial_layer_count() != 1)
+    {
+        return None;
+    }
+    let facts = StreamFacts::from_structure(structure);
+    if emission.profile() == Profile::Vp9 {
+        let count = usize::from(structure.decode_target_count);
+        let heights = facts.decode_target_heights?;
+        if !(2..=MAX_LADDER_TARGETS).contains(&count)
+            || structure.spatial_layer_count() < 2
+            || structure
+                .templates
+                .iter()
+                .any(|template| template.temporal_id != 0)
+            || heights.get(..count)?.contains(&0)
+        {
+            return Some(StreamFacts {
+                decode_targets: Some(1),
+                decode_target_heights: Some([0; MAX_LADDER_TARGETS]),
+                temporal_only: Some(false),
+            });
+        }
+    }
+    Some(facts)
 }
 
 struct Frozen {
@@ -414,8 +506,9 @@ struct Branch {
     repairs: Option<Box<repair::Repairs>>,
     queue: VecDeque<Queued>,
     filter: Option<Box<FilteredBranch>>,
+    qualified_whole: bool,
     dd_reset: Option<u64>,
-    filtered_structure: Option<(u64, u64)>,
+    dd_structure: Option<(u64, u64)>,
     omitted: u64,
     last_omitted: Option<u64>,
 }
@@ -486,21 +579,26 @@ impl SourceFanout {
         if self.fenced || !self.emission.fits(receiver) || self.branches.len() >= MAX_BRANCHES {
             return None;
         }
+        let qualified_whole = filter.is_none()
+            && self.emission.profile() == Profile::Vp9
+            && self.emission.carries_video_dd()
+            && receiver.carries_video_dd();
         let mut existing = self
             .branches
             .values()
             .filter(|branch| branch.destination == destination);
-        if let Some(active) = existing.next()
-            && (existing.next().is_some()
-                || active
-                    .filter
-                    .as_ref()
-                    .zip(filter.as_ref())
-                    .is_none_or(|(active, staged)| {
-                        active.selected_target() == staged.selected_target()
-                    }))
-        {
-            return None;
+        if let Some(active) = existing.next() {
+            let compatible = match (active.filter.as_deref(), filter.as_deref()) {
+                (Some(active), Some(staged)) => {
+                    active.selected_target() != staged.selected_target()
+                }
+                (None, Some(_)) => active.qualified_whole,
+                (Some(_), None) => qualified_whole,
+                (None, None) => false,
+            };
+            if !compatible || existing.next().is_some() {
+                return None;
+            }
         }
         if self.emission.mask & bit(ExtensionKind::DependencyDescriptor) != 0 {
             self.evidence.get_or_insert_with(Box::default);
@@ -510,9 +608,10 @@ impl SourceFanout {
             admissions: LiveAdmissions::default(),
             repairs: None,
             queue: VecDeque::with_capacity(QUEUE_PACKETS),
+            qualified_whole,
             filter,
             dd_reset: None,
-            filtered_structure: None,
+            dd_structure: None,
             omitted: 0,
             last_omitted: None,
         }))
@@ -1333,6 +1432,22 @@ impl SourceFanout {
             .find_map(|(handle, branch)| (branch.destination == destination).then_some(handle))
     }
 
+    pub(crate) fn branch_for_target(
+        &self,
+        destination: ParticipantHandle,
+        target: Option<DecodeTarget>,
+    ) -> Option<FabricBranchHandle> {
+        self.branches.iter().find_map(|(handle, branch)| {
+            (branch.destination == destination
+                && branch
+                    .filter
+                    .as_deref()
+                    .map(FilteredBranch::selected_target)
+                    == target)
+                .then_some(handle)
+        })
+    }
+
     pub fn retain_destinations(&mut self, mut authorized: impl FnMut(ParticipantHandle) -> bool) {
         self.branches
             .retain(|_, branch| authorized(branch.destination));
@@ -1483,6 +1598,9 @@ impl SourceFanout {
         else {
             return Ok(None);
         };
+        let admitted_endpoint = original
+            .as_ref()
+            .map(|packet| (sequence, packet.payload().len()));
         let original = original.map(|packet| {
             let timestamp = assign_timestamp(Instant::from_std(arrival), packet.header().timestamp);
             let packet = packet.with_admitted_media_timestamp(timestamp);
@@ -1491,7 +1609,7 @@ impl SourceFanout {
                 None => packet,
             }
         });
-        let report = self.offer_from(
+        let mut report = self.offer_from(
             now,
             Instant::from_std(arrival),
             sequence,
@@ -1499,6 +1617,7 @@ impl SourceFanout {
             None,
             Some(input.ready_at),
         )?;
+        report.admitted_endpoint = admitted_endpoint;
         let hops = self
             .fates
             .get(&sequence)
@@ -1636,7 +1755,7 @@ impl SourceFanout {
         let ordered = self.evidence.is_some()
             && (self.emission.profile() == Profile::Av1
                 || (self.emission.selects_dd_encoding() || !self.branches.is_empty())
-                    && self.branches.values().all(|branch| branch.filter.is_some()));
+                    && self.branches.values().all(Branch::requires_dd));
         let qualified = if ordered {
             None
         } else if let Some(evidence) = &mut self.evidence {
@@ -1647,12 +1766,20 @@ impl SourceFanout {
         let dd_structure = self
             .high
             .is_none_or(|old| old < sequence)
-            .then(|| qualified.as_ref().and_then(dd_structure))
+            .then(|| {
+                qualified
+                    .as_ref()
+                    .and_then(|dd| dd_structure(self.emission, dd))
+            })
             .flatten();
         let new_live = original.is_none_or(|frozen| frozen.live_arrival.is_none());
         let mut dd_sample = DecodeTargetSample::None;
         if new_live && self.emission.selects_dd_encoding() && !ordered {
-            dd_sample.record(qualified.as_ref().map(|(dd, _)| dd), image.payload().len());
+            dd_sample.record(
+                sequence,
+                qualified.as_ref().map(|(dd, _)| dd),
+                image.payload().len(),
+            );
         }
         if new_live {
             self.retire_before(oldest);
@@ -1681,6 +1808,13 @@ impl SourceFanout {
             }
         }
         self.high = Some(high);
+        #[cfg(feature = "sim")]
+        if self.emission.profile() == Profile::Vp9 && new_live && ingress.is_some() {
+            crate::sim_metrics::wan_repair::dd_cursor_before_first_offer(
+                sequence,
+                self.evidence.as_ref().and_then(|dd| dd.ordered_through),
+            );
+        }
         if ordered {
             return Ok(self.offer_ordered_dd(now, high));
         }
@@ -1753,11 +1887,15 @@ impl SourceFanout {
                 .flatten();
             if self.emission.selects_dd_encoding() {
                 report.dd_sample.record(
+                    position,
                     qualified.as_ref().map(|(dd, _)| dd),
                     frozen.packet.payload().len(),
                 );
             }
-            if let Some(facts) = qualified.as_ref().and_then(dd_structure) {
+            if let Some(facts) = qualified
+                .as_ref()
+                .and_then(|dd| dd_structure(self.emission, dd))
+            {
                 report.dd_structure = Some(facts);
             }
             let Some(work) = LiveWork::new(high, position, arrival, frozen.packet.remaining_hops())
@@ -1935,8 +2073,23 @@ impl SourceFanout {
         let capture = frozen
             .capture
             .filter(|_| frozen.live_ingress == queued.ingress);
+        let marker = match (packet.header().profile, queued.selection, dd.as_ref()) {
+            (
+                Profile::Vp9,
+                pulsebeam_core::dd::output::Mode::Filtered(target),
+                Some((_, qualified)),
+            ) => {
+                let structure = self
+                    .evidence
+                    .as_ref()
+                    .and_then(|evidence| evidence.context.structure_for(qualified));
+                vp9_filtered_marker(qualified, structure, target).unwrap_or(packet.header().marker)
+            }
+            _ => packet.header().marker,
+        };
         let projected = OutputEvidence {
             mode: queued.selection,
+            marker,
             entry: queued.entry,
             reset_after: branch.dd_reset,
             dd,
@@ -2002,7 +2155,7 @@ impl Branch {
     ) {
         let LiveWork { sequence, hops, .. } = work;
         if self.last_omitted.is_some_and(|fence| sequence <= fence)
-            || self.filter.is_some() && self.dd_reset.is_some_and(|fence| sequence <= fence)
+            || self.requires_dd() && self.dd_reset.is_some_and(|fence| sequence <= fence)
         {
             return;
         }
@@ -2045,7 +2198,7 @@ impl Branch {
                 let (qualified, frame) =
                     evidence.map_or((None, FrameStatus::Unresolved), |(q, f)| (Some(q), *f));
                 let qualified = qualified.filter(|q| {
-                    self.filtered_structure
+                    self.dd_structure
                         .is_none_or(|(attachment, _)| q.structure_sequence >= attachment)
                 });
                 if qualified.is_none() && evidence.is_some() {
@@ -2053,14 +2206,14 @@ impl Branch {
                     return false;
                 }
                 let changed = qualified.is_some_and(|q| {
-                    self.filtered_structure.map(|(_, origin)| origin) != Some(q.structure_origin)
+                    self.dd_structure.map(|(_, origin)| origin) != Some(q.structure_origin)
                 });
                 let reset = changed && !filter.awaiting_entry();
                 if reset {
                     filter.lose_context();
                 }
                 if let Some(q) = qualified {
-                    self.filtered_structure = Some((q.structure_sequence, q.structure_origin));
+                    self.dd_structure = Some((q.structure_sequence, q.structure_origin));
                 }
                 let qualified = qualified.filter(|q| {
                     !filter.awaiting_entry() || q.descriptor.attached_structure.is_some()
@@ -2082,6 +2235,37 @@ impl Branch {
                 }
                 filtered = Some(decision);
                 matches!(decision, Decision::Admitted | Decision::Entered)
+            } else if self.qualified_whole {
+                let Some((qualified, _)) = evidence.filter(|_| frame.is_some()) else {
+                    filtered = Some(Decision::AwaitingEntry);
+                    return false;
+                };
+                let structure = (qualified.structure_sequence, qualified.structure_origin);
+                let entering = self
+                    .dd_structure
+                    .is_none_or(|(_, origin)| origin != structure.1);
+                if entering
+                    && !(qualified.descriptor.start_of_frame
+                        && qualified.descriptor.attached_structure.is_some()
+                        && qualified
+                            .descriptor
+                            .frame_dependencies
+                            .frame_diffs
+                            .is_empty())
+                {
+                    filtered = Some(Decision::AwaitingEntry);
+                    return false;
+                }
+                if enqueue(if entering {
+                    Enqueue::Enter
+                } else {
+                    Enqueue::Continue
+                }) {
+                    self.dd_structure = Some(structure);
+                    true
+                } else {
+                    false
+                }
             } else {
                 enqueue(Enqueue::Continue)
             }
@@ -2110,15 +2294,22 @@ impl Branch {
         *count = count.saturating_add(1);
     }
 
+    fn requires_dd(&self) -> bool {
+        self.filter.is_some() || self.qualified_whole
+    }
+
     fn reset_dd_output(&mut self, fence: Option<u64>) -> bool {
         self.dd_reset = self.dd_reset.max(fence);
+        if !self.requires_dd() {
+            return false;
+        }
         if let Some(filter) = &mut self.filter {
             filter.lose_context();
-            self.queue.clear();
-            true
         } else {
-            false
+            self.dd_structure = None;
         }
+        self.queue.clear();
+        true
     }
 
     fn discard_stale(
@@ -2142,7 +2333,7 @@ impl Branch {
         }) {
             metrics::counter!("fabric_branch_dropped_packets", "reason" => "stale_or_revoked")
                 .increment(1);
-            if self.filter.is_some() {
+            if self.requires_dd() {
                 let fence = self.queue.iter().map(|queued| queued.sequence).max();
                 self.reset_dd_output(fence);
                 return;

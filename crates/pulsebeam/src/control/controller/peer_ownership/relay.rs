@@ -3,15 +3,13 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use pulsebeam_core::fabric::MAJOR;
-use pulsebeam_link::{BindingId, NetworkId, NodeRouteKey};
+use pulsebeam_link::{NetworkId, NodeRouteKey};
 use pulsebeam_runtime::time::Instant;
 use serde::{Deserialize, Serialize};
 
 use super::ControllerActor;
 use crate::{
     entity::{ProjectId, ProjectRoomKey, PublicationId, PublicationKey, RoomId, TrackKind},
-    id::ShardId,
-    link::ReceiveRoute,
     route::NodeRouteAddress,
 };
 
@@ -136,18 +134,6 @@ mod tests {
     }
 }
 
-struct Receive {
-    destinations: Vec<NodeRouteAddress>,
-    route: ReceiveRoute,
-}
-
-#[derive(Default)]
-pub(super) struct Relays {
-    receives: BTreeMap<Key, Receive>,
-    sends: BTreeMap<(Key, ShardId), (NodeRouteKey, BindingId)>,
-    remote: Option<(Instant, Offers)>,
-}
-
 pub(super) fn reconcile_wan_receives(
     actor: &mut ControllerActor,
     peer: NetworkId,
@@ -240,7 +226,15 @@ pub(super) fn reconcile_wan_receives(
                         .eq(destinations.iter().copied())
             })
         {
-            desired.swap_remove(index);
+            let (source, _, _, _) = desired.swap_remove(index);
+            if canonical == peer
+                && regional_peer.is_none_or(|member| source.origin == Some(member))
+                && let Some(track) = actor
+                    .lifecycle
+                    .source_exact(source.room, source.publisher.publication)
+            {
+                source.refresh_track_ladder(track, expires, now);
+            }
             true
         } else {
             false
@@ -272,110 +266,5 @@ pub(super) fn reconcile_wan_receives(
                 timing: source.window_timing(),
             },
         );
-    }
-}
-
-impl Relays {
-    pub(super) fn offers(&self) -> Box<[Offer]> {
-        self.receives
-            .iter()
-            .map(|(key, receive)| Offer {
-                project: key.room.project,
-                room: key.room.room,
-                publication: key.publication,
-                kind: key.kind as u8,
-                reverse: key.reverse,
-                label: receive.route.address.to_bytes(),
-            })
-            .collect()
-    }
-
-    pub(super) fn install(&mut self, offers: Offers, deadline: Instant) {
-        self.remote = Some((deadline, offers));
-    }
-
-    pub(super) fn step(&mut self, actor: &mut ControllerActor, peer: NetworkId, now: Instant) {
-        let Some(links) = &mut actor.links else {
-            return;
-        };
-        let authority = actor
-            .receipt_trust
-            .as_ref()
-            .is_some_and(crate::control::controller::ownership::receipt::Authority::ready);
-        let mut available = if authority {
-            links.relay_targets(peer, LIMIT).unwrap_or_default()
-        } else {
-            BTreeMap::new()
-        };
-        self.receives.retain(|key, receive| {
-            if available.get(key) == Some(&receive.destinations) {
-                available.remove(key);
-                true
-            } else {
-                links.unbind_receive(receive.route.binding);
-                false
-            }
-        });
-        for (&key, destinations) in available.iter().filter(|(key, _)| key.reverse) {
-            if let Ok(route) = links.bind_receive(peer, destinations.clone()) {
-                self.receives.insert(
-                    key,
-                    Receive {
-                        destinations: destinations.clone(),
-                        route,
-                    },
-                );
-            }
-        }
-        let mut desired = BTreeMap::new();
-        if let Some((deadline, offers)) = &self.remote
-            && authority
-            && now < *deadline
-        {
-            for (&key, &label) in offers.iter().filter(|(key, _)| key.reverse) {
-                let forward = Key {
-                    reverse: false,
-                    ..key
-                };
-                if let Some(destinations) = available.get(&forward) {
-                    for dst in destinations {
-                        let shard = dst.shard();
-                        if actor.lifecycle.allows_ingress_reverse(
-                            key.room,
-                            key.publication(),
-                            shard,
-                            peer,
-                        ) {
-                            desired.insert((key, shard), label);
-                        }
-                    }
-                }
-            }
-        }
-        self.sends.retain(|key, (label, binding)| {
-            if desired.get(key) == Some(label)
-                && actor
-                    .links
-                    .as_ref()
-                    .is_some_and(|links| links.send_live(*binding))
-            {
-                desired.remove(key);
-                true
-            } else {
-                actor.retire_network_send(*binding);
-                false
-            }
-        });
-        for ((key, shard), label) in desired {
-            let Some(links) = &mut actor.links else {
-                break;
-            };
-            if let Ok((binding, plan)) = links.bind_reverse(shard, key.publication(), peer, label) {
-                self.sends.insert((key, shard), (label, binding));
-                let generation = actor.lifecycle.next_generation();
-                actor.stage_plans_at(shard, generation, vec![plan]);
-                actor.publish_staged();
-            }
-        }
     }
 }

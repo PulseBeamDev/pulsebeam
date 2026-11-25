@@ -48,6 +48,21 @@ fn server_page(id: u64) -> CatalogServerRecord {
 }
 
 #[test]
+fn catalog_rejects_superseded_open_and_page_tags() {
+    // Both directions use batch field 3. The superseded Open and Page used
+    // nested field 1, so neither can commit a watch under the current contract.
+    let legacy_record = [0x1a, 0x04, 0x0a, 0x02, 0x08, 0x07];
+    assert_eq!(
+        decode_client(&legacy_record),
+        Err(DecodeError::Validation(ValidationError::Catalog))
+    );
+    assert_eq!(
+        decode_server(&legacy_record),
+        Err(DecodeError::Validation(ValidationError::Catalog))
+    );
+}
+
+#[test]
 fn directional_catalog_open_close_page_and_typed_error_shapes_roundtrip() {
     let request = ClientStateBatch {
         catalog_records: vec![client_open(7)],

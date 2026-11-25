@@ -21,7 +21,7 @@ use super::{
         receipt::{Authority, Issuer, epoch::Trust, standby::wire::Frame as StandbyFrame},
         wire,
     },
-    relay::{Relays, wan_source::WanSourceWindow, wan_transit},
+    relay::{wan_source::WanSourceWindow, wan_transit},
     transfer::{self, Frame},
 };
 
@@ -69,7 +69,6 @@ pub(in crate::control) struct Peer {
 enum Transport {
     #[cfg(test)]
     CatalogFixture,
-    ReverseDtls(NetworkPeer),
     Wan(WanHost),
     Regional {
         port: mesh::Port,
@@ -95,14 +94,11 @@ impl Transport {
         &mut self,
         links: &mut crate::control::link::Links,
         remote: NodeId,
-    ) -> Result<(NetworkId, PeerControl, bool), pulsebeam_link::LinkError> {
+    ) -> Result<(NetworkId, PeerControl), pulsebeam_link::LinkError> {
         use pulsebeam_link::LinkError;
         match self {
             #[cfg(test)]
             Self::CatalogFixture => Err(LinkError::Closed),
-            Self::ReverseDtls(peer) => links
-                .open_reverse_control_peer(peer.clone(), remote)
-                .map(|(id, lane)| (id, lane, false)),
             Self::Wan(media) => {
                 let id = links.reserve_wan_peer()?;
                 let (commands, lane) = media.host.open(
@@ -115,7 +111,7 @@ impl Transport {
                     .attach_wan_host(commands, Carriage::Ownership)
                     .map_err(|_| LinkError::Capacity)?;
                 links.identify_peer(id, remote);
-                Ok((id, lane, true))
+                Ok((id, lane))
             }
             Self::Regional { port, media } => {
                 let lane = port.sessions.try_recv().map_err(|_| LinkError::Closed)?;
@@ -130,7 +126,7 @@ impl Transport {
                     .attach_wan_host(commands, Carriage::Ownership)
                     .map_err(|_| LinkError::Capacity)?;
                 links.identify_peer(id, remote);
-                Ok((id, lane, true))
+                Ok((id, lane))
             }
         }
     }
@@ -429,7 +425,6 @@ struct PendingImage {
 
 struct Association {
     network: NetworkId,
-    is_wan: bool,
     lane: PeerControl,
     declarations: Option<Exchange>,
     mesh_outbound: Option<mesh::Outbound>,
@@ -445,7 +440,6 @@ struct Association {
     data_expectations: Vec<PendingExpectation>,
     repair_lookups: RepairLookups,
     repair_interests: Vec<RepairInterest>,
-    relays: Relays,
     local_wan_receipts: Box<[super::relay::fabric::WanLiveRouteAck]>,
     local_wan_sources: Box<[WanSourceWindow]>,
     offer_cut: u64,
@@ -536,8 +530,7 @@ impl Peer {
         now: Instant,
     ) -> bool {
         self.association.as_ref().is_some_and(|association| {
-            association.is_wan
-                && association.lane.is_ready()
+            association.lane.is_ready()
                 && association
                     .wan_publishers
                     .allows_data_expectation(expectation, now)
@@ -608,7 +601,6 @@ impl Peer {
         now: Instant,
     ) {
         if let Some(assoc) = &mut self.association
-            && assoc.is_wan
             && assoc.network == interest.parent.ingress.association
             && assoc.lane.is_ready()
             && assoc.media_receives.enqueue(interest, now)
@@ -620,7 +612,7 @@ impl Peer {
     pub(in crate::control) fn request_repair(&mut self, interest: Interest, now: Instant) {
         let Some(association) = self.association.as_mut().filter(|association| {
             association.network == interest.parent.ingress.association
-                && association.is_wan == interest.parent.window.is_some()
+                && interest.parent.window.is_some()
                 && association.lane.is_ready()
         }) else {
             return;
@@ -681,7 +673,10 @@ impl Peer {
     ) -> Option<NetworkId> {
         (self.mesh_member() == member).then_some(())?;
         let association = self.association.as_ref()?;
-        (association.mesh_outbound.is_some() && association.is_wan).then_some(association.network)
+        association
+            .mesh_outbound
+            .is_some()
+            .then_some(association.network)
     }
 
     fn live_mesh_link(&self, now: Instant) -> Option<(mesh::Member, NonZeroU16)> {
@@ -725,10 +720,9 @@ impl Peer {
         } else if let Some(links) = &mut actor.links
             && let Some(stream) = self.last_stream.checked_add(1).and_then(NonZeroU64::new)
         {
-            if let Ok((network, lane, is_wan)) = self.transport.open(links, self.remote.0) {
+            if let Ok((network, lane)) = self.transport.open(links, self.remote.0) {
                 let mut association = Association::new(
                     network,
-                    is_wan,
                     lane,
                     self.transport.declarations(),
                     links.clock_origin(),
@@ -750,7 +744,6 @@ impl Peer {
 impl Association {
     fn new(
         network: NetworkId,
-        is_wan: bool,
         lane: PeerControl,
         declarations: Option<Exchange>,
         epoch: Instant,
@@ -758,7 +751,6 @@ impl Association {
     ) -> Self {
         Self {
             network,
-            is_wan,
             lane,
             declarations,
             mesh_outbound: None,
@@ -774,7 +766,6 @@ impl Association {
             data_expectations: Vec::new(),
             repair_lookups: RepairLookups::default(),
             repair_interests: Vec::new(),
-            relays: Relays::default(),
             local_wan_receipts: Box::default(),
             local_wan_sources: Box::default(),
             offer_cut: 0,
@@ -904,8 +895,7 @@ impl Association {
         now: Instant,
     ) {
         self.pending_image = None;
-        if self.is_wan
-            && let Ok(snapshot) = actor.local_endpoint_snapshot()
+        if let Ok(snapshot) = actor.local_endpoint_snapshot()
             && let Some(expires) = now.checked_add(FRAME_TTL)
         {
             let wan_samples = actor.sample_wan_publisher_anchors(&snapshot);
@@ -933,7 +923,8 @@ impl Association {
                     Ok(Some(sample)) => {
                         pending.wan_sources.push(
                             WanSourceWindow::from_sample(*room, *publisher, sample.sequence)
-                                .with_projection(sample.timing),
+                                .with_projection(sample.timing)
+                                .with_ladder(sample.ladder),
                         );
                         false
                     }
@@ -1035,28 +1026,22 @@ impl Association {
             revision,
             trust.checkpoint(),
             &snapshot,
-            if self.is_wan {
-                wire::RouteImage::Wan {
-                    offers: self
-                        .local_wan_receipts
-                        .iter()
-                        .copied()
-                        .map(Into::into)
-                        .collect(),
-                    sources: wan_sources.clone(),
-                    retired: self.wan_refresh.retired.clone(),
-                }
-            } else {
-                wire::RouteImage::Legacy(self.relays.offers())
+            wire::RouteImage::Wan {
+                offers: self
+                    .local_wan_receipts
+                    .iter()
+                    .copied()
+                    .map(Into::into)
+                    .collect(),
+                sources: wan_sources.clone(),
+                retired: self.wan_refresh.retired.clone(),
             },
         );
-        if self.is_wan {
-            tracing::debug!(
-                network = self.network.epoch(), revision, endpoints = snapshot.len(),
-                sources = wan_sources.len(), exports = self.exports.len(), acks = self.local_wan_receipts.len(),
-                bytes = ?image.as_ref().map(Vec::len), "WAN ownership image produced"
-            );
-        }
+        tracing::debug!(
+            network = self.network.epoch(), revision, endpoints = snapshot.len(),
+            sources = wan_sources.len(), exports = self.exports.len(), acks = self.local_wan_receipts.len(),
+            bytes = ?image.as_ref().map(Vec::len), "WAN ownership image produced"
+        );
         if let Ok(bytes) = image {
             self.local_wan_sources = wan_sources;
             self.sender.set_image(now, bytes);
@@ -1272,16 +1257,14 @@ impl Association {
         let Some(mut expires) = frame.lease().and_then(|lease| now.checked_add(lease)) else {
             return;
         };
-        if self.is_wan {
-            let Some(deadline) = actor
-                .links
-                .as_ref()
-                .and_then(|links| links.wan_data_receive_deadline(self.network, frame.scope, now))
-            else {
-                return;
-            };
-            expires = expires.min(deadline);
-        }
+        let Some(deadline) = actor
+            .links
+            .as_ref()
+            .and_then(|links| links.wan_data_receive_deadline(self.network, frame.scope, now))
+        else {
+            return;
+        };
+        expires = expires.min(deadline);
         if self.data_expectations.len() >= EXPECTATION_BUDGET
             || self.data_expectations.iter().any(|pending| {
                 pending.frame.scope == frame.scope && pending.frame.unit == frame.unit
@@ -1311,22 +1294,18 @@ impl Association {
             if now >= pending.expires {
                 return false;
             }
-            let expires_at = if self.is_wan {
-                let Some(deadline) = actor.links.as_ref().and_then(|links| {
-                    links.wan_data_receive_deadline(self.network, pending.frame.scope, now)
-                }) else {
-                    return false;
-                };
-                let ttl = pending
-                    .expires
-                    .min(deadline)
-                    .saturating_duration_since(self.epoch);
-                expires_at.min(LinkTime::from_nanos(
-                    u64::try_from(ttl.as_nanos()).unwrap_or(u64::MAX),
-                ))
-            } else {
-                expires_at
+            let Some(deadline) = actor.links.as_ref().and_then(|links| {
+                links.wan_data_receive_deadline(self.network, pending.frame.scope, now)
+            }) else {
+                return false;
             };
+            let ttl = pending
+                .expires
+                .min(deadline)
+                .saturating_duration_since(self.epoch);
+            let expires_at = expires_at.min(LinkTime::from_nanos(
+                u64::try_from(ttl.as_nanos()).unwrap_or(u64::MAX),
+            ));
             pending
                 .receipts
                 .retain_mut(|receipt| match receipt.try_recv() {
@@ -1381,15 +1360,11 @@ impl Association {
             let session = match actor.open_ownership_peer(remote.0, remote.1, Some(self.network)) {
                 Ok(session) => session,
                 Err(error) => {
-                    if self.is_wan {
-                        tracing::debug!(?remote, ?error, "WAN ownership open rejected");
-                    }
+                    tracing::debug!(?remote, ?error, "WAN ownership open rejected");
                     return;
                 }
             };
-            if self.is_wan {
-                tracing::debug!(?remote, "WAN ownership opened");
-            }
+            tracing::debug!(?remote, "WAN ownership opened");
             self.session = Some(session);
             session
         };
@@ -1407,7 +1382,7 @@ impl Association {
                 .links
                 .as_mut()
                 .map_or_else(Box::default, |links| links.wan_offers(self.network));
-        } else if self.is_wan {
+        } else {
             let sources = self
                 .remote_wan
                 .as_ref()
@@ -1489,8 +1464,6 @@ impl Association {
                 self.wan_refresh.announce_after =
                     now.checked_add(WAN_REFRESH_MIN_INTERVAL).unwrap_or(now);
             }
-        } else {
-            self.relays.step(actor, self.network, now);
         }
         self.flush_repair_lookups(now, expires_at);
         self.flush_data_expectations(actor, now, expires_at);
@@ -1498,7 +1471,7 @@ impl Association {
         self.flush_ownership_image(actor, now);
         // Schedule the local pull before responding to the peer's bulk window.
         // Both directions remain bounded even when media or the peer is stalled.
-        if self.is_wan && self.wan_refresh.pull && now >= self.wan_refresh.pull_after {
+        if self.wan_refresh.pull && now >= self.wan_refresh.pull_after {
             self.wan_refresh.pull = false;
             self.wan_refresh.pull_after = now.checked_add(WAN_REFRESH_MIN_INTERVAL).unwrap_or(now);
             // A replacement grant may have invalidated the image in the current round.
@@ -1589,7 +1562,7 @@ impl Association {
                 }
                 continue;
             }
-            if self.is_wan && actor.receipt_trust.as_ref().is_some_and(Authority::ready) {
+            if actor.receipt_trust.as_ref().is_some_and(Authority::ready) {
                 if let Some(demand) = media_repair::Demand::decode(&bytes) {
                     self.receive_media_repair_demand(actor, demand, now);
                     continue;
@@ -1599,21 +1572,15 @@ impl Association {
                     continue;
                 }
             }
-            if self.is_wan
-                && let Some(scope) = fabric_data::WanRepairReady::read_scope(&bytes)
-            {
+            if let Some(scope) = fabric_data::WanRepairReady::read_scope(&bytes) {
                 self.receive_wan_repair_ready(actor, scope, &bytes, now);
                 continue;
             }
-            if self.is_wan
-                && let Some(frame) = fabric_data::RepairFrame::decode(&bytes)
-            {
+            if let Some(frame) = fabric_data::RepairFrame::decode(&bytes) {
                 self.receive_repair_control(actor, frame, now);
                 continue;
             }
-            if self.is_wan
-                && let Some(frame) = fabric_data::Frame::decode(&bytes)
-            {
+            if let Some(frame) = fabric_data::Frame::decode(&bytes) {
                 match frame.action {
                     fabric_data::Action::Expect { .. } => {
                         self.receive_data_expectation(actor, frame, now);
@@ -1630,7 +1597,7 @@ impl Association {
                 continue;
             }
             match Frame::decode(&bytes) {
-                Some(Frame::WanImageChanged) => self.wan_refresh.pull |= self.is_wan,
+                Some(Frame::WanImageChanged) => self.wan_refresh.pull = true,
                 Some(Frame::Pull(pull)) => {
                     if !sampled
                         && self.sender.needs_image(pull)
@@ -1639,9 +1606,7 @@ impl Association {
                     {
                         sampled = true;
                         *last_revision = revision.get();
-                        if self.is_wan {
-                            tracing::debug!(?remote, revision, "WAN ownership pull received");
-                        }
+                        tracing::debug!(?remote, revision, "WAN ownership pull received");
                         self.start_ownership_image(actor, revision, now);
                     }
                     for frame in self.sender.respond(now, pull) {
@@ -1652,20 +1617,10 @@ impl Association {
                 }
                 Some(Frame::Chunk(chunk)) => {
                     if let Some((bytes, deadline)) = self.reader.receive(now, chunk)
-                        && let Ok(image) = if self.is_wan {
-                            let image = wire::decode_wan(&bytes);
-                            tracing::debug!(?remote, bytes = bytes.len(), error = ?image.as_ref().err(), "WAN ownership image received");
-                            image
-                        } else {
-                            wire::decode(&bytes, None)
-                        }
+                        && let Ok(image) = wire::decode_wan(&bytes)
+                        && let Some(wan) = image.wan
                         && self.lane.is_ready()
                         && actor.links.is_some()
-                        && (if self.is_wan {
-                            image.wan.is_some()
-                        } else {
-                            image.matches_carriage(false)
-                        })
                         && actor
                             .apply_ownership_snapshot(
                                 session,
@@ -1676,30 +1631,25 @@ impl Association {
                             )
                             .is_ok()
                     {
-                        if let Some(wan) = image.wan {
-                            if let Some(links) = &mut actor.links
-                                && links.accept_wan_retirements(self.network, &wan.retired)
-                            {
-                                self.sender.invalidate();
-                                self.wan_refresh.announce = true;
-                                self.local_wan_receipts = links.wan_offers(self.network);
-                            }
-                            tracing::debug!(
-                                ?remote,
-                                revision = image.revision,
-                                "WAN ownership image installed"
-                            );
-                            if now < deadline {
-                                for source in &wan.sources {
-                                    source.record_timing_quality();
-                                }
-                            }
-                            self.remote_wan = Some((deadline, wan));
-                            self.awaiting_wan_refresh = false;
-                        } else {
-                            self.relays.install(image.routes, deadline);
-                            self.relays.step(actor, self.network, now);
+                        if let Some(links) = &mut actor.links
+                            && links.accept_wan_retirements(self.network, &wan.retired)
+                        {
+                            self.sender.invalidate();
+                            self.wan_refresh.announce = true;
+                            self.local_wan_receipts = links.wan_offers(self.network);
                         }
+                        tracing::debug!(
+                            ?remote,
+                            revision = image.revision,
+                            "WAN ownership image installed"
+                        );
+                        if now < deadline {
+                            for source in &wan.sources {
+                                source.record_timing_quality();
+                            }
+                        }
+                        self.remote_wan = Some((deadline, wan));
+                        self.awaiting_wan_refresh = false;
                         self.refresh = now.checked_add(REFRESH).unwrap_or(now);
                         self.live_until = now.checked_add(LIVENESS).unwrap_or(now);
                     }
@@ -1769,7 +1719,6 @@ impl ControllerActor {
         let mut peer = Peer::new(remote, Transport::CatalogFixture, None, now);
         let mut association = Association::new(
             network,
-            true,
             lane,
             Some(Exchange::new(roles.0, roles.1)),
             now,
@@ -1786,40 +1735,28 @@ impl ControllerActor {
     pub(crate) fn add_provisioned_peer(
         &mut self,
         spec: ProvisionedPeer,
-        wan_host: Option<crate::link::wan_host::Provisioner>,
+        wan_host: crate::link::wan_host::Provisioner,
         regional: Option<mesh::Port>,
     ) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            spec.fabric_wan == wan_host.is_some(),
-            "provisioned ownership carrier must match its socket owner"
-        );
         let issuer = |(node, incarnation)| Issuer {
             trust_domain: spec.authority_epoch,
             node,
             incarnation,
         };
-        let transport = match (wan_host, regional) {
-            (Some(host), regional) => {
-                let media = WanHost {
-                    peer: spec.transport,
-                    generation: spec.local.1,
-                    host,
-                };
-                match regional {
-                    Some(port) => {
-                        anyhow::ensure!(
-                            port.roles.0.adjacent(port.roles.1),
-                            "invalid regional adjacency roles"
-                        );
-                        Transport::Regional { port, media }
-                    }
-                    None => Transport::Wan(media),
-                }
+        let media = WanHost {
+            peer: spec.transport,
+            generation: spec.local.1,
+            host: wan_host,
+        };
+        let transport = match regional {
+            Some(port) => {
+                anyhow::ensure!(
+                    port.roles.0.adjacent(port.roles.1),
+                    "invalid regional adjacency roles"
+                );
+                Transport::Regional { port, media }
             }
-            (None, None) => Transport::ReverseDtls(spec.transport),
-            (None, Some(_)) => {
-                anyhow::bail!("regional control requires a separate Fabric WAN socket")
-            }
+            None => Transport::Wan(media),
         };
         let mesh_identity = if let Transport::Regional { port, .. } = &transport {
             let role = port.roles.0;

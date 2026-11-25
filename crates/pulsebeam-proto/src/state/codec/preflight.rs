@@ -32,14 +32,14 @@ macro_rules! shapes {
 
 shapes! {
     ClientStateBatch { 1 => ClientStateRecord, 3 => CatalogClientRecord },
-    CatalogClientRecord { 1 => CatalogPageRequest, 2 => CatalogWatchClose },
+    CatalogClientRecord { 3 => CatalogPageRequest, 2 => CatalogWatchClose },
     CatalogPageRequest {},
     CatalogWatchClose {},
     ClientStateRecord { 2 => DesiredState, 3 => ExecutionReport },
     ExecutionReport { 3 => Failure, 4 => LogicalReceiverReport },
     LogicalReceiverReport { 2 => TrackBinding, 3 => Failure },
     ServerStateBatch { 1 => ServerStateRecord, 3 => CatalogServerRecord },
-    CatalogServerRecord { 1 => CatalogPageRecord, 2 => CatalogWatchError },
+    CatalogServerRecord { 3 => CatalogPageRecord, 2 => CatalogWatchError },
     CatalogWatchError { 2 => Failure },
     CatalogPageRecord { 8 => CatalogParticipantFragment },
     CatalogParticipantFragment {},

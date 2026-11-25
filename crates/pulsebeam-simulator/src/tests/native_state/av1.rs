@@ -18,18 +18,20 @@ enum Source {
 async fn connect(
     host: NativeHost,
     server: IpAddr,
+    subject: &str,
     publish: bool,
     dd: bool,
 ) -> anyhow::Result<(WirePeer, RtpTransceiver, Source, wire::RtpParameters)> {
     let input = (!dd)
         .then(|| EncodedVideoInput::new_for_format(VideoCodecFormat::new("AV1")))
         .transpose()?;
-    let bootstrap = input
-        .as_ref()
-        .map_or(Av1Bootstrap::Stock, |input| Av1Bootstrap::External {
-            input,
-            remap_payload_types: !publish,
-        });
+    let bootstrap =
+        input
+            .as_ref()
+            .map_or(VideoBootstrap::Stock, |input| VideoBootstrap::External {
+                input,
+                remap_payload_types: !publish,
+            });
     let mut created = None;
     let direction = if publish {
         RtpTransceiverDirection::SendOnly
@@ -38,8 +40,8 @@ async fn connect(
     };
     let (mut wire, _) = WirePeer::connect_with_peer(
         host,
-        server,
-        if publish { "av1-source" } else { "av1-viewer" },
+        (server, 7070).into(),
+        subject,
         ROOM,
         true,
         Some(bootstrap),
@@ -150,7 +152,15 @@ async fn connect(
             .lines()
             .any(|line| line.starts_with("a=extmap:") && line.contains(DD))
     );
-    let parameters = wire::RtpParameters {
+    let parameters = video_parameters(binding)?;
+    Ok((wire, transceiver, source, parameters))
+}
+
+pub(super) fn video_parameters(binding: &client::Binding) -> anyhow::Result<wire::RtpParameters> {
+    let [encoding] = binding.encodings.as_slice() else {
+        anyhow::bail!("expected one video encoding")
+    };
+    Ok(wire::RtpParameters {
         mid: binding.mid.clone(),
         extmap_allow_mixed: Some(binding.extmap_allow_mixed),
         codec: Some(wire::RtpCodecParameters {
@@ -162,7 +172,7 @@ async fn connect(
                 .map(|repair| u32::from(repair.payload_type)),
             feedback: binding.codec.parameters.feedback.iter().cloned().collect(),
             format: Some(wire::CodecFormat {
-                mime_type: "video/av1".into(),
+                mime_type: format!("video/{}", binding.codec.parameters.name),
                 clock_rate: binding.codec.parameters.clock_rate,
                 channels: None,
                 parameters: binding
@@ -192,11 +202,10 @@ async fn connect(
             scalability_mode: None,
         }],
         rtcp: Some(wire::RtcpParameters {
-            cname: binding.rtcp.cname.clone().context("AV1 CNAME")?,
+            cname: binding.rtcp.cname.clone().context("video CNAME")?,
             reduced_size: binding.rtcp.reduced_size,
         }),
-    };
-    Ok((wire, transceiver, source, parameters))
+    })
 }
 
 pub(super) fn remap_offer_payload_types(offer: &mut String) -> anyhow::Result<()> {
@@ -270,6 +279,7 @@ pub(super) fn remap_offer_payload_types(offer: &mut String) -> anyhow::Result<()
 
 async fn install(
     peer: &mut WirePeer,
+    reference: u64,
     declaration: wire::resource_spec::Declaration,
 ) -> anyhow::Result<wire::Track> {
     let receive = matches!(
@@ -286,9 +296,9 @@ async fn install(
     };
     validation::validate_spec(&spec)
         .map_err(|error| anyhow::anyhow!("AV1 binding spec: {error:?}"))?;
-    peer.desire(1, 1, Some(spec.clone()));
+    peer.desire(reference, reference, Some(spec.clone()));
     loop {
-        let state = peer.confirmed(1, 1).await?;
+        let state = peer.confirmed(reference, reference).await?;
         anyhow::ensure!(state.rejection.is_none(), "AV1 binding rejected: {state:?}");
         let Some(wire::confirmed_state::Value::Owned(live)) = state.value else {
             anyhow::bail!("AV1 binding absent: {state:?}");
@@ -334,30 +344,69 @@ async fn publisher_pli_count(peer: &PeerConnection, ssrc: u32) -> anyhow::Result
     .context("AV1 publisher stats request timed out")?
 }
 
+fn publication(parameters: wire::RtpParameters) -> wire::resource_spec::Declaration {
+    wire::resource_spec::Declaration::Publication(wire::PublicationSpec {
+        track_id: "camera".into(),
+        kind: Some(wire::publication_spec::Kind::Video(
+            wire::VideoPublication {
+                binding: Some(wire::TrackBinding {
+                    transport: Some(wire::track_binding::Transport::Rtp(parameters)),
+                }),
+            },
+        )),
+    })
+}
+
+fn subscription(
+    track: &wire::Track,
+    parameters: wire::RtpParameters,
+) -> wire::resource_spec::Declaration {
+    wire::resource_spec::Declaration::Subscription(wire::SubscriptionSpec {
+        publication_id: track.publication_id.clone(),
+        kind: wire::TrackKind::Video as i32,
+        source_room: ROOM.into(),
+        binding: Some(wire::TrackBinding {
+            transport: Some(wire::track_binding::Transport::Rtp(parameters)),
+        }),
+    })
+}
+
+fn push_stock(source: &VideoSource, frame: u32) -> anyhow::Result<()> {
+    const WIDTH: usize = 1280;
+    const HEIGHT: usize = 720;
+    let mut pixels = vec![128; WIDTH * HEIGHT * 3 / 2];
+    for (y, row) in pixels[..WIDTH * HEIGHT].chunks_exact_mut(WIDTH).enumerate() {
+        for (x, pixel) in row.iter_mut().enumerate() {
+            *pixel = if (x / 64 + y / 48 + frame as usize / 4) % 2 == 0 {
+                52
+            } else {
+                172
+            };
+        }
+    }
+    source.push_frame(&VideoFrame::i420(
+        1280,
+        720,
+        pixels,
+        super::super::common::native::now_us()?,
+        frame.wrapping_mul(3000),
+    )?)?;
+    Ok(())
+}
+
 async fn session(
     host: NativeHost,
     server: IpAddr,
     cross_shard: bool,
     dd: bool,
 ) -> anyhow::Result<()> {
-    let (mut publisher, _, source, parameters) = connect(host.clone(), server, true, dd).await?;
+    let (mut publisher, _, source, parameters) =
+        connect(host.clone(), server, "av1-source", true, dd).await?;
     let publisher_ssrc = parameters.encodings[0].ssrc.context("AV1 publisher SSRC")?;
     let publisher_codec = parameters.codec.clone().context("AV1 publisher codec")?;
-    let track = install(
-        &mut publisher,
-        wire::resource_spec::Declaration::Publication(wire::PublicationSpec {
-            track_id: "camera".into(),
-            kind: Some(wire::publication_spec::Kind::Video(
-                wire::VideoPublication {
-                    binding: Some(wire::TrackBinding {
-                        transport: Some(wire::track_binding::Transport::Rtp(parameters)),
-                    }),
-                },
-            )),
-        }),
-    )
-    .await?;
-    let (mut viewer, receiver, _, parameters) = connect(host.clone(), server, false, dd).await?;
+    let track = install(&mut publisher, 1, publication(parameters)).await?;
+    let (mut viewer, receiver, _, parameters) =
+        connect(host.clone(), server, "av1-viewer", false, dd).await?;
     let receiver_fid = [
         parameters.encodings[0].ssrc.context("AV1 receiver SSRC")?,
         parameters.encodings[0]
@@ -386,18 +435,7 @@ async fn session(
     let remote_track = receiver.receiver().track().context("AV1 video track")?;
     let sink = remote_track.attach_sink()?;
     assert_eq!(
-        install(
-            &mut viewer,
-            wire::resource_spec::Declaration::Subscription(wire::SubscriptionSpec {
-                publication_id: track.publication_id.clone(),
-                kind: wire::TrackKind::Video as i32,
-                source_room: ROOM.into(),
-                binding: Some(wire::TrackBinding {
-                    transport: Some(wire::track_binding::Transport::Rtp(parameters)),
-                }),
-            }),
-        )
-        .await?,
+        install(&mut viewer, 1, subscription(&track, parameters)).await?,
         track
     );
     let counter = pulsebeam::sim_metrics::routing_counter;
@@ -410,23 +448,7 @@ async fn session(
             let mut decoded = 0;
             let mut last_timestamp = None;
             for frame in 0..12_u32 {
-                let mut pixels = vec![128; 1280 * 720 * 3 / 2];
-                for (y, row) in pixels[..1280 * 720].chunks_exact_mut(1280).enumerate() {
-                    for (x, pixel) in row.iter_mut().enumerate() {
-                        *pixel = if (x / 64 + y / 48 + frame as usize / 4) % 2 == 0 {
-                            52
-                        } else {
-                            172
-                        };
-                    }
-                }
-                source.push_frame(&VideoFrame::i420(
-                    1280,
-                    720,
-                    pixels,
-                    super::super::common::native::now_us()?,
-                    frame * 3000,
-                )?)?;
+                push_stock(&source, frame)?;
                 tokio::time::sleep(Duration::from_millis(34)).await;
                 while let Some(picture) = sink.try_next_frame() {
                     assert_eq!((picture.width, picture.height), (1280, 720));
@@ -602,6 +624,116 @@ async fn session(
             .all(|packet| packet.bytes <= UDP_PAYLOAD_CAP)
     );
     Ok(())
+}
+
+pub(in crate::tests) async fn prove_warm_wan_av1(
+    host: NativeHost,
+    ingress: IpAddr,
+    egress: IpAddr,
+    dd: bool,
+) -> anyhow::Result<()> {
+    let (mut publisher, transceiver, source, parameters) =
+        connect(host.clone(), ingress, "av1-source", true, dd).await?;
+    let sender = transceiver.sender();
+    let track = install(&mut publisher, 1, publication(parameters)).await?;
+    // RTC media ingress is demand-gated. This case qualifies a live source,
+    // not a remote-only cold start before a publisher window exists.
+    let (mut local, _, _, parameters) =
+        connect(host.clone(), ingress, "av1-local-viewer", false, false).await?;
+    install(&mut local, 1, subscription(&track, parameters)).await?;
+    let keyframe = (!dd).then(|| host.av1_keyframe()).transpose()?;
+    let counter = pulsebeam::sim_metrics::routing_counter;
+    let wan_before = counter("fabric_rtp_av1_wan_enqueued");
+    let dd_before = counter("fabric_rtp_av1_dd_enqueued");
+    let replay = async {
+        for frame in 0.. {
+            match &source {
+                Source::Stock(source) => {
+                    // Periodic entry frames exercise late join without assuming
+                    // the WAN path already relays picture-loss feedback.
+                    if frame % 30 == 0 {
+                        sender.generate_keyframe(&[])?;
+                    }
+                    push_stock(source, frame)?;
+                }
+                Source::Encoded(source) => source.push_encoded(EncodedVideoAccessUnit {
+                    data: keyframe
+                        .as_ref()
+                        .context("missing encoded AV1 fixture")?
+                        .clone(),
+                    width: 1280,
+                    height: 720,
+                    timestamp_us: super::super::common::native::now_us()?,
+                    key_frame: true,
+                    qp: None,
+                    metadata: EncodedVideoMetadata {
+                        codec: EncodedVideoCodec::Av1,
+                        simulcast_index: None,
+                        spatial_index: None,
+                        temporal_index: None,
+                        end_of_picture: true,
+                    },
+                })?,
+            }
+            tokio::time::sleep(Duration::from_millis(if dd { 34 } else { 100 })).await;
+        }
+        Ok::<_, anyhow::Error>(())
+    };
+    let view = async {
+        let (mut viewer, receiver, _, parameters) =
+            connect(host, egress, "av1-viewer", false, dd).await?;
+        let remote = receiver.receiver().track().context("remote AV1 track")?;
+        let sink = remote.attach_sink()?;
+        viewer
+            .wait_for_video_publication(ROOM, "av1-source", "camera", &track.publication_id)
+            .await?;
+        let observed = install(&mut viewer, 2, subscription(&track, parameters)).await?;
+        anyhow::ensure!(
+            observed.publication_id == track.publication_id,
+            "wrong remote AV1 publication"
+        );
+        let mut previous = None;
+        for _ in 0..3 {
+            let picture = loop {
+                if let Some(picture) = sink.try_next_frame() {
+                    break picture;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            };
+            anyhow::ensure!(
+                (picture.width, picture.height) == (1280, 720),
+                "wrong remote AV1 dimensions"
+            );
+            anyhow::ensure!(
+                previous != Some(picture.rtp_timestamp),
+                "stale remote AV1 frame"
+            );
+            previous = Some(picture.rtp_timestamp);
+        }
+        anyhow::ensure!(
+            counter("fabric_rtp_av1_wan_enqueued") > wan_before,
+            "AV1 bypassed the WAN receive branch"
+        );
+        anyhow::ensure!(
+            (counter("fabric_rtp_av1_dd_enqueued") > dd_before) == dd,
+            "AV1 DD forwarding disagrees with negotiated mode"
+        );
+        Ok::<_, anyhow::Error>(())
+    };
+    tokio::time::timeout(Duration::from_secs(12), async {
+        pulsebeam_runtime::select! {
+            result = replay => result,
+            result = view => result,
+        }
+    })
+    .await
+    .with_context(|| {
+        format!(
+            "WAN AV1 did not sustain native decode; WAN packets enqueued={}, AV1 DD packets enqueued={}",
+            counter("fabric_rtp_av1_wan_enqueued") - wan_before,
+            counter("fabric_rtp_av1_dd_enqueued") - dd_before,
+        )
+    })?
 }
 
 #[test]

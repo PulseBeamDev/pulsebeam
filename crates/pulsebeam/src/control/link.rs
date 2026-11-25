@@ -176,16 +176,6 @@ impl Links {
         .map(|(id, ())| id)
     }
 
-    pub(super) fn open_reverse_control_peer(
-        &mut self,
-        peer: pulsebeam_link::NetworkPeer,
-        node: NodeId,
-    ) -> Result<(NetworkId, pulsebeam_link::PeerControl), pulsebeam_link::LinkError> {
-        self.open_association(peer.into(), Some(node), |control, peer| {
-            control.open_network_with_control(peer, crate::link::ReverseCodec)
-        })
-    }
-
     fn open_association<T>(
         &mut self,
         peer: pulsebeam_link::PeerConfig,

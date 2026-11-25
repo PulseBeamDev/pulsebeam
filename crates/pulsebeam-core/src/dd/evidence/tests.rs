@@ -261,23 +261,35 @@ fn filtered_entry_refusal_and_suspension_fence_are_transactional() {
 #[test]
 fn in_source_switch_requires_complete_transitive_frame_and_chain_ancestry() {
     use crate::dd::DecodeTargetIndication::{Required, Switch};
-    for (missing_fragment, bad_chain, wanted) in [
-        (false, false, Enqueue::Enter),
-        (true, false, Enqueue::Continue),
-        (false, true, Enqueue::Continue),
-    ] {
+    for (from, to) in [(0, 2), (2, 0)] {
+        for (missing_fragment, bad_chain, wanted) in [
+            (false, false, Enqueue::Enter),
+            (true, false, Enqueue::Continue),
+            (false, true, Enqueue::Continue),
+        ] {
+            prove_sparse_switch(from, to, missing_fragment, bad_chain, wanted);
+        }
+    }
+
+    fn prove_sparse_switch(
+        from: u8,
+        to: u8,
+        missing_fragment: bool,
+        bad_chain: bool,
+        wanted: Enqueue,
+    ) {
         let structure = structure_l1t3();
         let mut root = delta(&structure, 0, 10);
         root.frame_dependencies.dtis.fill(Required);
         root.frame_dependencies.frame_diffs.clear();
         let mut evidence = Qualified {
             descriptor: root,
-            active_targets: 7,
+            active_targets: 0b101,
             structure_sequence: 0,
             structure_origin: 0,
             target_chains: structure.decode_target_protected_by,
         };
-        let mut branch = FilteredBranch::new(DecodeTarget::new(0).unwrap(), true);
+        let mut branch = FilteredBranch::new(DecodeTarget::new(from).unwrap(), true);
         let offer = |branch: &mut FilteredBranch, seq, evidence: &Qualified, expected, accept| {
             branch.offer(
                 seq,
@@ -314,9 +326,9 @@ fn in_source_switch_requires_complete_transitive_frame_and_chain_ancestry() {
             offer(&mut branch, 103, &evidence, Enqueue::Continue, true),
             Decision::Admitted
         );
-        branch.select(DecodeTarget::new(1).unwrap());
+        branch.select(DecodeTarget::new(to).unwrap());
         evidence.descriptor.frame_number = 12;
-        evidence.descriptor.frame_dependencies.dtis[1] = Switch;
+        evidence.descriptor.frame_dependencies.dtis[usize::from(to)] = Switch;
         if bad_chain {
             evidence.descriptor.frame_dependencies.chain_diffs[0] = 3;
         }
@@ -330,6 +342,10 @@ fn in_source_switch_requires_complete_transitive_frame_and_chain_ancestry() {
             Decision::Admitted
         };
         assert_eq!(offer(&mut branch, 104, &evidence, wanted, true), expected);
+        assert_eq!(
+            branch.selected_target().index(),
+            if wanted == Enqueue::Enter { to } else { from }
+        );
     }
 }
 

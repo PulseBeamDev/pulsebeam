@@ -89,6 +89,69 @@ impl<'a> Cursor<'a> {
     }
 }
 
+pub struct DescriptorRtp<'a> {
+    pub sequence: u16,
+    pub timestamp: u32,
+    pub marker: bool,
+    pub payload: &'a [u8],
+    pub descriptor: &'a [u8],
+}
+
+/// Read the capture layout with no padding or CSRCs and DD at extension ID 9.
+pub fn descriptor_rtp(bytes: &[u8]) -> Option<DescriptorRtp<'_>> {
+    let (header, body) = bytes.split_at_checked(16)?;
+    let &[
+        0x90,
+        flags,
+        seq_hi,
+        seq_lo,
+        a,
+        b,
+        c,
+        d,
+        ..,
+        ext_hi,
+        ext_lo,
+        len_hi,
+        len_lo,
+    ] = header
+    else {
+        return None;
+    };
+    let two_byte = match [ext_hi, ext_lo] {
+        [0xbe, 0xde] => false,
+        [0x10, 0x00] => true,
+        _ => return None,
+    };
+    let ext_len = usize::from(u16::from_be_bytes([len_hi, len_lo])) * 4;
+    let (mut extensions, payload) = body.split_at_checked(ext_len)?;
+    while let Some((&first, tail)) = extensions.split_first() {
+        extensions = tail;
+        if first == 0 {
+            continue;
+        }
+        let (id, len) = if two_byte {
+            let (&len, tail) = extensions.split_first()?;
+            extensions = tail;
+            (first, usize::from(len))
+        } else {
+            (first >> 4, usize::from(first & 15) + 1)
+        };
+        let (extension, tail) = extensions.split_at_checked(len)?;
+        if id == 9 {
+            return Some(DescriptorRtp {
+                sequence: u16::from_be_bytes([seq_hi, seq_lo]),
+                timestamp: u32::from_be_bytes([a, b, c, d]),
+                marker: flags & 0x80 != 0,
+                payload,
+                descriptor: extension,
+            });
+        }
+        extensions = tail;
+    }
+    None
+}
+
 fn number<T: std::str::FromStr>(field: Option<&str>) -> Result<T, CaptureError> {
     field.ok_or(CaptureError)?.parse().map_err(|_| CaptureError)
 }

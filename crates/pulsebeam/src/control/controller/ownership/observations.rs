@@ -36,13 +36,17 @@ impl PublicationFact {
             }
             _ => Box::default(),
         };
-        Self {
+        let mut track = Self {
             descriptor: descriptor.clone(),
             fabric_data_source: (publisher.publication.kind() == TrackKind::Data)
                 .then_some(publisher.incarnation),
             layers,
         }
-        .media_track(endpoint, publisher.connection)
+        .media_track(endpoint, publisher.connection)?;
+        if publisher.emission.profile() == pulsebeam_core::fabric::Profile::Vp9 {
+            track.as_video_mut()?.guarantees_video_dd = publisher.emission.carries_video_dd();
+        }
+        Some(track)
     }
 
     pub(crate) fn from_track(track: &MediaTrack) -> Option<Self> {
@@ -103,6 +107,14 @@ impl PublicationFact {
             Profile::H264
         } else if format.mime_type.eq_ignore_ascii_case("video/av1") {
             Profile::Av1
+        } else if matches!(
+            format.known_codec(),
+            Some(wire::codec_format::Codec::Vp9(wire::Vp9Parameters {
+                profile_id: None | Some(0)
+            }))
+        ) && self.layers[0].1.is_none()
+        {
+            Profile::Vp9
         } else {
             return None;
         };

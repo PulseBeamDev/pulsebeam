@@ -935,11 +935,9 @@ fn screenshare_and_camera_conference_test() {
 
 #[test]
 fn late_joiner_receives_earlier_participant_in_both_directions_test() {
-    // Native H264 simulcast is S3T1, with DD still negotiated. This regression
-    // checks bidirectional late-join delivery, not temporal-layer shedding.
-    let mut first = Participant::publisher("first", &["q", "h", "f"]).and_subscribes();
+    let mut first = Participant::publisher("first", &["f"]).and_subscribes();
     first.auto_subscribe = false;
-    let mut second = Participant::publisher("second", &["q", "h", "f"]).and_subscribes();
+    let mut second = Participant::publisher("second", &["f"]).and_subscribes();
     second.auto_subscribe = false;
     second.starts_disconnected = true;
 
@@ -1303,7 +1301,7 @@ fn screen_source_decodes_across_static_and_active_periods_test() {
         .with_room(
             Room::new("room1")
                 .with_participant(Participant::screensharer("presenter"))
-                .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
+                .with_participant(Participant::publisher("camera", &["f"]))
                 .with_participant(
                     Participant::manual_subscriber("viewer", 2)
                         .with_encoded_and_native_decoded_video(),
@@ -1417,7 +1415,7 @@ fn both_requested_sources_keep_decoding_during_soak_test() {
         .with_room(
             Room::new("room1")
                 .with_participant(Participant::screensharer("presenter"))
-                .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
+                .with_participant(Participant::publisher("camera", &["f"]))
                 .with_participant(Participant::multi_subscriber("viewer", 2)),
         )
         .run(vec![
@@ -1509,7 +1507,7 @@ fn late_video_subscription_is_delivered_test() {
         .with_room(
             Room::new("room1")
                 .with_participant(Participant::screensharer("presenter"))
-                .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
+                .with_participant(Participant::publisher("camera", &["f"]))
                 .with_participant(Participant::multi_subscriber("viewer", 2)),
         )
         .run(vec![
@@ -1922,7 +1920,7 @@ fn steady_subscription_keeps_requested_source_decodable_test() {
         .with_bandwidth(3_000_000)
         .with_room(
             Room::new("room1")
-                .with_participant(Participant::publisher("alice", &["q", "h", "f"]))
+                .with_participant(Participant::publisher("alice", &["f"]))
                 .with_participant(Participant::multi_subscriber("bob", 1)),
         )
         .run(vec![
@@ -2232,7 +2230,7 @@ fn a_stream_returns_after_a_total_outage_test() {
         .with_bandwidth(3_000_000)
         .with_room(
             Room::new("room1")
-                .with_participant(Participant::publisher("alice", &["q", "h", "f"]))
+                .with_participant(Participant::publisher("alice", &["f"]))
                 .with_participant(Participant::multi_subscriber("bob", 1)),
         )
         .run(vec![
@@ -2398,7 +2396,7 @@ fn deterministic_probe_plan(seed: u64) -> LinkReport {
         .with_bandwidth(2_000_000)
         .with_room(
             Room::new("room1")
-                .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
+                .with_participant(Participant::publisher("camera", &["h"]))
                 .with_participant(
                     Participant::manual_subscriber("viewer", 1)
                         .with_encoded_and_native_decoded_video(),

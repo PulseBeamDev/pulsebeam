@@ -50,6 +50,15 @@ filegroup(
 )
 
 filegroup(
+    name = "vp9_spatial_replay",
+    srcs = [
+        "fixtures/vp9-v1/L3T1/wire.bin",
+        "fixtures/vp9-v1/L3T1/wire.tsv",
+    ],
+    visibility = ["//crates/pulsebeam-simulator:__pkg__"],
+)
+
+filegroup(
     name = "video_matrix_inputs",
     srcs = ["fixtures/codec-inventory-v1.tsv"] + glob([
         "fixtures/{}-v1/*/{}".format(codec, file)

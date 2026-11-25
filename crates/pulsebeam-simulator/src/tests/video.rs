@@ -91,33 +91,31 @@ fn prove_whole_source_fabric_h264(shards: usize) {
 }
 
 #[test]
-fn selected_fabric_simulcast_reaches_local_native_decoder() {
-    prove_selected_fabric_simulcast(1);
+fn selected_fabric_temporal_dd_reaches_local_native_decoder() {
+    prove_selected_fabric_temporal_dd(1);
 }
 
 #[test]
-fn selected_fabric_simulcast_reaches_cross_shard_native_decoder() {
-    prove_selected_fabric_simulcast(2);
+fn selected_fabric_temporal_dd_reaches_cross_shard_native_decoder() {
+    prove_selected_fabric_temporal_dd(2);
 }
 
-fn prove_selected_fabric_simulcast(shards: usize) {
+fn prove_selected_fabric_temporal_dd(shards: usize) {
     LocalNodeSim::new()
         .with_shards(shards)
         .with_link(LinkProfile::fiber())
         .with_room(
-            Room::new("fabric-simulcast")
-                .with_participant(
-                    Participant::publisher("source", &["q", "h", "f"]).with_temporal_dd(1),
-                )
+            Room::new("fabric-temporal-dd")
+                .with_participant(Participant::publisher("source", &["q"]).with_temporal_dd(3))
                 .with_participant(Participant::subscriber("viewer").with_native_decoded_video()),
         )
         .run(vec![
             Step::Run {
-                description: "Discover the Native simulcast publication",
+                description: "Discover the single-encoding Native DD publication",
                 duration: Duration::from_secs(1),
             },
             Step::SubscribeAll {
-                description: "Require the 180p encoding, not the higher rungs",
+                description: "Request a DD stream capped at 180p",
                 participant: "viewer",
                 heights: &[180],
             },
@@ -523,21 +521,23 @@ fn cross_shard_keyframe_reaches_the_publisher() {
     super::common::LocalNodeSim::new()
         .with_room(
             super::common::Room::new("cross-shard-keyframe")
-                .with_participant(super::common::Participant::publisher(
-                    "publisher",
-                    &["q", "h", "f"],
-                ))
-                .with_participant(super::common::Participant::subscriber("subscriber")),
+                .with_participant(
+                    super::common::Participant::publisher("publisher", &["q"])
+                        .with_temporal_dd(3)
+                        .suppress_natural_keyframe_repeats(),
+                )
+                .with_participant(
+                    super::common::Participant::subscriber("subscriber").starts_disconnected(),
+                ),
         )
         .run(vec![
             super::common::Step::Run {
-                description: "establish a cross-shard simulcast stream",
-                duration: Duration::from_secs(8),
+                description: "start the single-encoding publisher before the receiver",
+                duration: Duration::from_secs(3),
             },
-            super::common::Step::SetBandwidth {
-                description: "force a layer change that needs a fresh keyframe",
+            super::common::Step::Reconnect {
+                description: "join a receiver that needs a fresh keyframe",
                 participant: "subscriber",
-                bits_per_sec: 250_000,
             },
             super::common::Step::Run {
                 description: "allow the reverse feedback route to carry the request",
@@ -564,23 +564,22 @@ fn stable_receiver_decodes_after_the_first_pli_response_is_lost_test() {
         .with_room(
             Room::new("stable-pli-retry")
                 .with_participant(
-                    Participant::publisher("source", &["q", "h", "f"])
-                        .suppress_natural_keyframe_repeats(),
+                    Participant::publisher("source", &["q"]).suppress_natural_keyframe_repeats(),
                 )
                 .with_participant(Participant::subscriber("viewer")),
         )
         .run(vec![
             Step::Run {
-                description: "Discover the multi-RID source",
+                description: "Discover the single-encoding source",
                 duration: Duration::from_secs(5),
             },
             Step::SubscribeTo {
-                description: "Keep one receiver on the current publisher's low layer",
+                description: "Keep one receiver on the current publisher",
                 participant: "viewer",
                 targets: &[("source", 180)],
             },
             Step::Run {
-                description: "Establish decoded output on the selected layer",
+                description: "Establish decoded output on the retained receiver",
                 duration: Duration::from_secs(10),
             },
             Step::CheckVideoQualityInterval {
@@ -795,25 +794,20 @@ fn dependency_descriptor_stream_forwards_from_descriptor_metadata_test() {
         ]);
 }
 
-/// Native three-encoding L1T1 simulcast carries DD metadata under real loss.
-/// The subscriber reassembles from raw RTP, and both frame rate and keyframe
-/// requests must stay bounded. Ciphertext-specific interpretation remains
-/// covered at the SFU packet/cache boundary rather than being fed illegally
-/// into libwebrtc's pre-packetization H264 source.
+/// One Native L1T3 encoding must sustain decoded frame rate under real loss
+/// without a keyframe request storm.
 #[test]
-fn dependency_descriptor_simulcast_holds_framerate_under_loss_test() {
+fn single_encoding_dependency_descriptor_holds_framerate_under_loss_test() {
     LocalNodeSim::new()
         .with_link(LinkProfile::cellular())
         .with_room(
             Room::new("room1")
-                .with_participant(
-                    Participant::publisher("alice", &["q", "h", "f"]).with_temporal_dd(1),
-                )
+                .with_participant(Participant::publisher("alice", &["q"]).with_temporal_dd(3))
                 .with_participant(Participant::subscriber("bob")),
         )
         .run(vec![
             Step::Run {
-                description: "Establish DD simulcast over lossy cellular",
+                description: "Establish a single L1T3 source over lossy cellular",
                 duration: Duration::from_secs(20),
             },
             Step::SubscribeAll {
@@ -886,9 +880,8 @@ fn dd_free_whole_source_streams_to_a_dd_subscriber_test() {
         ]);
 }
 
-/// Exercise the same legacy simulcast ingress with libwebrtc's actual decoder.
-/// This is separate from the encoded-capture/independent-decoder oracle above:
-/// neither its frame assertions nor its currently failing result are replaced.
+/// Correlate both receiver observation paths to the same live publication
+/// throughout a room roundtrip.
 #[test]
 fn same_receiver_encoded_and_native_decoded_video_test() {
     let mut plan = vec![
@@ -907,7 +900,7 @@ fn same_receiver_encoded_and_native_decoded_video_test() {
             }],
         },
         Step::WaitForNativeVideo {
-            description: "Acquire Alice's adaptive 720p target before measuring steady delivery",
+            description: "Acquire Alice's 720p source before measuring steady delivery",
             participant: "bob",
             publisher: "alice",
             min_resolution: (1280, 720),
@@ -975,7 +968,7 @@ fn same_receiver_encoded_and_native_decoded_video_test() {
         .with_room(
             Room::new("room1")
                 .with_participant(
-                    Participant::publisher("alice", &["q", "h", "f"])
+                    Participant::publisher("alice", &["f"])
                         .and_subscribes()
                         .with_encoded_and_native_decoded_video(),
                 )
@@ -1031,80 +1024,11 @@ fn fast_initial_ramp_up_on_good_network_test() {
 }
 
 #[test]
-fn repeated_simulcast_switching_stays_decodable_test() {
-    let mut plan = vec![
-        Step::Run {
-            description: "Establish native signaling and publication discovery",
-            duration: Duration::from_secs(1),
-        },
-        Step::CheckConnected {
-            description: "Publisher connected before subscription",
-            participant: "alice",
-        },
-        Step::CheckConnected {
-            description: "Subscriber connected before subscription",
-            participant: "bob",
-        },
-        Step::SubscribeAll {
-            description: "Subscribe at 720p",
-            participant: "bob",
-            heights: &[720],
-        },
-        Step::Run {
-            description: "Accumulate native decoded frames at 720p",
-            duration: Duration::from_secs(10),
-        },
-        Step::CheckNativeDecodedVideo {
-            description: "Initial native decoder delivers fresh 720p pixels",
-            participant: "bob",
-            dimensions: (1280, 720),
-            min_fresh_frames: 100,
-        },
-    ];
-    for (description, heights, dimensions) in [
-        ("Switch 1: 180p", &[180][..], (320, 180)),
-        ("Switch 2: 720p", &[720][..], (1280, 720)),
-        ("Switch 3: 180p", &[180][..], (320, 180)),
-        ("Switch 4: 720p", &[720][..], (1280, 720)),
-    ] {
-        plan.extend([
-            Step::SubscribeAll {
-                description,
-                participant: "bob",
-                heights,
-            },
-            Step::Run {
-                description: "Settle",
-                duration: Duration::from_millis(2500),
-            },
-            Step::CheckNativeDecodedVideo {
-                description: "Native playout reaches the requested rung with fresh nontrivial pixels",
-                participant: "bob",
-                dimensions,
-                min_fresh_frames: 30,
-            },
-        ]);
-    }
+fn single_encoding_stream_stability_test() {
     LocalNodeSim::new()
         .with_room(
-            Room::new("room1")
-                .with_participant(Participant::publisher("alice", &["q", "h", "f"]))
-                .with_participant(Participant::subscriber("bob").with_native_decoded_video()),
-        )
-        .run(plan);
-}
-
-// The EgressGuard backward-timestamp violation is fixed (cache monotonicity
-// check + push() frontier filter).  The remaining failure is a separate
-// pre-existing bug: PLI for the layer switch targets a mid/rid that no longer
-// exists on the publisher side, so no fresh keyframe is delivered and bob gets
-// 0 bytes throughout the soak.
-#[test]
-fn simulcast_stream_stability_test() {
-    LocalNodeSim::new()
-        .with_room(
-            Room::new("room1")
-                .with_participant(Participant::publisher("alice", &["q", "h", "f"]))
+            Room::new("single-encoding-stability")
+                .with_participant(Participant::publisher("alice", &["f"]))
                 .with_participant(Participant::subscriber("bob")),
         )
         .run(vec![

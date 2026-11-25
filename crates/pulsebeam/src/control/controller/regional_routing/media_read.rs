@@ -259,13 +259,14 @@ impl OwnerReads {
                         pending.publisher,
                         sample.sequence,
                     )
-                    .with_projection(sample.timing);
+                    .with_projection(sample.timing)
+                    .with_ladder(sample.ladder);
                     let scope = source.scope();
                     if let Some((previous, until)) = self.anchors.get_mut(&scope) {
                         if previous.publisher == source.publisher
                             && previous.window_start == source.window_start
                         {
-                            source = *previous;
+                            source = previous.with_ladder(source.ladder);
                         } else {
                             *previous = source;
                         }

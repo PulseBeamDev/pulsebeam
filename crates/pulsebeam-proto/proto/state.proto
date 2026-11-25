@@ -99,8 +99,9 @@ message ClientStateBatch {
 
 // Directional catalog control, separate from owned resource proposals.
 message CatalogClientRecord {
+  reserved 1; // Open without the coverage-aware page contract.
   oneof command {
-    CatalogPageRequest open = 1;
+    CatalogPageRequest open = 3;
     CatalogWatchClose close = 2;
   }
 }
@@ -204,8 +205,9 @@ message NativeClockReply {
 
 // Directional catalog response. An error is not a page fragment.
 message CatalogServerRecord {
+  reserved 1; // Page without the coverage-aware contract.
   oneof response {
-    CatalogPageRecord page = 1;
+    CatalogPageRecord page = 3;
     CatalogWatchError error = 2;
   }
 }

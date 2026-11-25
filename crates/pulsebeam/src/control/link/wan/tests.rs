@@ -264,6 +264,7 @@ async fn wan_host_receives_only_controller_scoped_commits_and_fences_on_peer_clo
         sequence_anchor: 0,
         window_start: start,
         timing: None,
+        ladder: None,
         origin: None,
         offer_cut: None,
     };

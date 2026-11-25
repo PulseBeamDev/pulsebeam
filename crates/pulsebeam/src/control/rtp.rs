@@ -109,6 +109,16 @@ pub(crate) fn capabilities() -> wire::RtpCapabilities {
                 ],
             },
             stock_av1_capability(wire::RtcpFeedback::TransportCc.as_str()),
+            wire::RtpCodecCapability {
+                format: wire::CodecFormat::native_quic_baseline("video/vp9"),
+                feedback: vec![
+                    wire::RtcpFeedback::TransportCc.as_str().into(),
+                    wire::RtcpFeedback::Nack.as_str().into(),
+                    wire::RtcpFeedback::NackPli.as_str().into(),
+                ],
+                rtx_supported: true,
+                scalability_modes: vec![],
+            },
         ],
         header_extensions: vec![
             wire::RtpHeaderExtensionType::RtpHeaderExtensionMid

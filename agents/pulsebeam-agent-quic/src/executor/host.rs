@@ -501,6 +501,12 @@ impl Agent {
         self.core.enable_quic_h264_dd(track_id)
     }
 
+    /// Publish one VP9 RTP encoding carrying encoder-supplied Dependency Descriptors.
+    /// Configure the track before connecting and publish packets with `send_rtp`.
+    pub fn enable_vp9_dependency_descriptors(&mut self, track_id: &str) -> Result<(), AgentError> {
+        self.core.configure_quic_vp9_dd(track_id)
+    }
+
     /// Select the codec for a raw, unlayered video publication before connecting.
     pub fn configure_video_codec(
         &mut self,

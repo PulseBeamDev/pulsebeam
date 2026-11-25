@@ -184,6 +184,27 @@ impl Io for HostIo {
             ecn: None,
         })
     }
+    fn submit_from(
+        &mut self,
+        entry: &SendDatagram<'_>,
+        source: std::net::IpAddr,
+    ) -> io::Result<()> {
+        // Turmoil chooses loopback for loopback destinations and otherwise
+        // uses the host interface for wildcard binds. It cannot override that.
+        let destination = entry.destination.ip();
+        let selected = if destination.is_loopback() {
+            destination
+        } else if self.local_addr.ip().is_unspecified() {
+            turmoil::current_ip()
+        } else {
+            self.local_addr.ip()
+        };
+        if selected != source {
+            return Err(io::ErrorKind::Unsupported.into());
+        }
+        self.submit(entry)
+    }
+
     fn submit(&mut self, entry: &SendDatagram<'_>) -> io::Result<()> {
         if entry.destination.is_ipv4() != self.local_addr.is_ipv4() {
             return Err(io::Error::new(

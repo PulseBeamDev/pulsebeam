@@ -376,6 +376,15 @@ impl Receives {
             }
             if let Some(window) = window {
                 if let Some(links) = actor.links.as_ref() {
+                    if links
+                        .routed_wan_ack(upstream.network, window, now)
+                        .is_some()
+                        && let Some(track) = actor
+                            .lifecycle
+                            .source_exact(source.room, source.publisher.publication)
+                    {
+                        source.refresh_track_ladder(track, offer.expires, now);
+                    }
                     if (now >= installed.next_renew
                         || installed.last_sent_permit != Some(offer.issued_ms))
                         && let Some(ack) = links.routed_wan_ack(upstream.network, window, now)

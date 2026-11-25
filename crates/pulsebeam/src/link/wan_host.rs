@@ -598,7 +598,7 @@ impl WanHost {
             return Some(bytes);
         };
         match window.profile() {
-            Profile::Opus if media_probe => {
+            Profile::Opus | Profile::Vp9 if media_probe => {
                 let timestamp = u32::from_be_bytes([*t0, *t1, *t2, *t3]);
                 wan_repair::filter(self.id, bytes, ecn, window, position, timestamp, repair)
             }
@@ -711,9 +711,7 @@ impl WanHost {
             );
         }
         #[cfg(feature = "sim")]
-        if image.route.descriptor().profile() == pulsebeam_core::fabric::Profile::Opus
-            && crate::sim_metrics::wan_repair::active(self.binding().peer, self.socket.local_addr())
-        {
+        if crate::sim_metrics::wan_repair::active(self.binding().peer, self.socket.local_addr()) {
             crate::sim_metrics::wan_repair::authenticated(
                 self.id,
                 image.route.descriptor(),

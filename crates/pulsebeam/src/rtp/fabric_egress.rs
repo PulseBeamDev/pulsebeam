@@ -82,6 +82,7 @@ struct WriteLayout<'a> {
     leg: OutputLeg,
     scope: pulsebeam_rtc::MediaScope,
     dd: Option<&'a [u8]>,
+    marker: bool,
     answer_fid: Option<[u32; 2]>,
 }
 
@@ -197,7 +198,10 @@ impl SenderLeg<crate::shard::router::FabricLocalBranch> {
             return Err(AdmissionError::Rtc(pulsebeam_rtc::WriteError::InvalidRtp));
         }
         let leg = self.output;
-        if self.strict_dd && (evidence.mode == Mode::Whole || evidence.dd.is_none()) {
+        if self.strict_dd
+            && (evidence.dd.is_none()
+                || evidence.mode == Mode::Whole && packet.header().profile != Profile::Vp9)
+        {
             return Err(AdmissionError::DependencyDescriptor(
                 output::Rejected::Bootstrap,
             ));
@@ -210,6 +214,7 @@ impl SenderLeg<crate::shard::router::FabricLocalBranch> {
                     leg,
                     scope,
                     dd,
+                    marker: evidence.marker,
                     answer_fid: self.answer_fid,
                 },
                 source,
@@ -246,6 +251,9 @@ impl SenderLeg<crate::shard::router::FabricLocalBranch> {
             // RTC pending and repair lifetimes do not share a definitive expiry.
             let retention = Retention::SenderLifetime;
             let result = mapper.offer(at, retention, input, |dd| {
+                if self.strict_dd && dd.is_none() {
+                    return false;
+                }
                 write = enqueue(dd);
                 write.is_ok()
             });
@@ -257,9 +265,11 @@ impl SenderLeg<crate::shard::router::FabricLocalBranch> {
                         pulsebeam_rtc::WriteError::InvalidRtp
                         | pulsebeam_rtc::WriteError::RtpTooLarge,
                     ),
-                ) if evidence.mode == Mode::Whole && evidence.dd.is_some() => true,
+                ) if !self.strict_dd && evidence.mode == Mode::Whole && evidence.dd.is_some() => {
+                    true
+                }
                 (_, Err(e)) => return Err(AdmissionError::Rtc(e)),
-                (Err(_), Ok(())) if evidence.mode == Mode::Whole => true,
+                (Err(_), Ok(())) if !self.strict_dd && evidence.mode == Mode::Whole => true,
                 (Err(e), Ok(())) => return Err(AdmissionError::DependencyDescriptor(e)),
             };
             if may_omit {
@@ -285,7 +295,7 @@ impl SenderLeg<crate::shard::router::FabricLocalBranch> {
                             .map_or(AdmissionError::DependencyDescriptor(e), AdmissionError::Rtc)
                     })?;
             }
-        } else if evidence.mode == Mode::Whole || self.strict_dd {
+        } else if evidence.mode == Mode::Whole && !self.strict_dd {
             enqueue(None).map_err(AdmissionError::Rtc)?;
         } else {
             return Err(AdmissionError::DependencyDescriptor(
@@ -424,6 +434,7 @@ impl EndpointHints {
             leg,
             scope,
             dd,
+            marker,
             answer_fid,
         }: WriteLayout<'_>,
         source: SourceMetadata,
@@ -486,7 +497,7 @@ impl EndpointHints {
         let write = RtpWrite {
             sequence: output.sequence,
             timestamp: output.timestamp,
-            marker: packet.header().marker,
+            marker,
             payload: bytes::Bytes::copy_from_slice(packet.payload()),
             extensions,
         };

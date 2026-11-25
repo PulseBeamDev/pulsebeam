@@ -376,6 +376,7 @@ impl Installed {
             }
             track
         };
+        core.attach_quic_spatial_monitor(source, &track);
         events.push_back(ShardEvent::TrackPublished(track.clone()));
         events.push_back(ShardEvent::LocalFabricRtpSourceReady {
             meta,
@@ -441,7 +442,7 @@ impl Installed {
             (publisher.source == source
                 && !publisher.retiring
                 && publisher.execution.enabled
-                && ingress.profile() == pulsebeam_core::fabric::Profile::H264
+                && matches!(ingress.profile(), Profile::H264 | Profile::Vp9)
                 && parameters.primary_ssrc == ssrc)
                 .then_some(id)
         }) else {

@@ -238,9 +238,11 @@ impl ShardCore {
         }
         let track = runtime.install_track(publication, None, Some(publisher), None);
         let result = (|| {
-            let refresh = (emission.profile() == pulsebeam_core::fabric::Profile::H264)
-                .then(|| std::num::NonZeroU32::new(*encoding.primary))
-                .flatten();
+            use pulsebeam_core::fabric::Profile;
+            let refresh = (emission.profile() == Profile::H264
+                || emission.profile() == Profile::Vp9 && emission.carries_video_dd())
+            .then(|| std::num::NonZeroU32::new(primary))
+            .flatten();
             let source = runtime.install_fabric_source(
                 track,
                 publisher,
@@ -258,6 +260,16 @@ impl ShardCore {
             runtime.retire_track(publication);
         }
         result
+    }
+
+    pub(super) fn attach_quic_spatial_monitor(
+        &mut self,
+        source: FabricSourceHandle,
+        track: &crate::track::Track,
+    ) {
+        self.execution
+            .runtime
+            .attach_quic_spatial_monitor(source, track);
     }
 
     pub(super) fn set_quic_media_enabled(
@@ -774,6 +786,16 @@ impl ShardCore {
         if let Ok(report) = result
             && let Some(source) = self.execution.runtime.network_fabric_source(address)
         {
+            #[cfg(feature = "sim")]
+            if profile == pulsebeam_core::fabric::Profile::Vp9 {
+                crate::sim_metrics::record_routing_counter("fabric_network_vp9_receive");
+                if report.dd_structure.is_some() {
+                    crate::sim_metrics::record_routing_counter("fabric_network_vp9_dd_structure");
+                }
+                if report.enqueued != 0 {
+                    crate::sim_metrics::record_routing_counter("fabric_network_vp9_branch_offer");
+                }
+            }
             if !data {
                 if let Some(capture) = capture
                     && report.enqueued != 0
@@ -793,8 +815,12 @@ impl ShardCore {
                     }
                 }
                 #[cfg(feature = "sim")]
-                if profile == pulsebeam_core::fabric::Profile::Opus {
+                if matches!(
+                    profile,
+                    pulsebeam_core::fabric::Profile::Opus | pulsebeam_core::fabric::Profile::Vp9
+                ) {
                     crate::sim_metrics::wan_repair::admitted(
+                        profile,
                         ingress.association,
                         position,
                         repair,
@@ -1281,20 +1307,32 @@ impl ShardExecution {
             return Some(crate::shard_update::PublisherPosition {
                 sequence: self.data_publisher_anchor(data)?,
                 timing: None,
+                ladder: None,
             });
         }
         let (participant, source) = self.rtp_publisher_source(publisher)?;
         if !self.fabric_publisher_authorized(participant, source) {
             return None;
         }
-        self.runtime.fabric_sequence_anchor(source, now)
+        let mut position = self.runtime.fabric_sequence_anchor(source, now)?;
+        if publisher.emission.profile() == pulsebeam_core::fabric::Profile::Vp9
+            && position.ladder.is_none()
+            && let Some((_, encoding)) = self.runtime.fabric_dd_source(source)
+            && let Some(owner) = self.registry.resolve_mut(participant)
+        {
+            position.ladder = owner.measured_fabric_ladder(source, encoding);
+        }
+        position.ladder = position
+            .ladder
+            .filter(|ladder| ladder.through <= position.sequence);
+        Some(position)
     }
 
     fn rtp_publisher_source(
         &self,
         publisher: crate::shard_update::PublisherAnchor,
     ) -> Option<(ParticipantHandle, FabricSourceHandle)> {
-        if publisher.emission.profile() == pulsebeam_core::fabric::Profile::Data {
+        if !publisher.emission.supports_wan_rtp() {
             return None;
         }
         let participant = self.registry.resolve_connection(publisher.connection)?;
@@ -1334,17 +1372,14 @@ impl ShardExecution {
             PublisherSendChange::Install { route, lifetime } => {
                 let identity = route.publisher;
                 let now = Instant::now();
-                let binding = match identity.emission.profile() {
-                    pulsebeam_core::fabric::Profile::Data => identity
-                        .data_publisher()
-                        .and_then(|publisher| self.data_publisher_source(publisher)),
-                    pulsebeam_core::fabric::Profile::Opus
-                    | pulsebeam_core::fabric::Profile::H264
-                    | pulsebeam_core::fabric::Profile::Av1 => self.rtp_publisher_source(identity),
-                    pulsebeam_core::fabric::Profile::Vp8 | pulsebeam_core::fabric::Profile::Vp9 => {
-                        None
-                    }
-                };
+                let binding =
+                    if identity.emission.profile() == pulsebeam_core::fabric::Profile::Data {
+                        identity
+                            .data_publisher()
+                            .and_then(|publisher| self.data_publisher_source(publisher))
+                    } else {
+                        self.rtp_publisher_source(identity)
+                    };
                 let Some((publisher, source)) = binding else {
                     return false;
                 };
@@ -1969,8 +2004,8 @@ impl ShardExecution {
         let whole_profile = self
             .runtime
             .fabric_source_for_track(track)
+            .filter(|&source| self.runtime.fabric_dd_source(source).is_none())
             .and_then(|source| self.runtime.fabric_emission(source))
-            .filter(|emission| !emission.selects_dd_encoding())
             .map(Emission::profile);
         let Some(plan) = self.plans.get(track) else {
             return;
@@ -1982,12 +2017,12 @@ impl ShardExecution {
             if let Some(profile) = whole_profile
                 && let Some((mid, primary)) = receiver.whep_rtp_output(publication, profile)
             {
-                self.bind_ready_fabric_rtp(destination, track, mid, primary, profile);
+                self.bind_ready_fabric_rtp(destination, track, mid, primary, profile, false);
                 continue;
             }
             let bindings = receiver.ready_rtp_bindings_for(track).collect::<Vec<_>>();
             for (mid, primary, negotiated) in bindings {
-                self.bind_ready_fabric_rtp(destination, track, mid, primary, negotiated);
+                self.bind_ready_fabric_rtp(destination, track, mid, primary, negotiated, true);
             }
         }
     }
@@ -2836,7 +2871,7 @@ impl ShardExecution {
         let Some((track, mid, primary, profile)) = receiver.local_rtp_receiver(reference) else {
             return;
         };
-        self.bind_ready_fabric_rtp(destination, track, mid, primary, profile);
+        self.bind_ready_fabric_rtp(destination, track, mid, primary, profile, true);
     }
 
     fn bind_ready_fabric_rtp(
@@ -2846,6 +2881,7 @@ impl ShardExecution {
         mid: crate::media::Mid,
         primary: u32,
         profile: pulsebeam_core::fabric::Profile,
+        managed: bool,
     ) {
         if !Self::local_rtp_profile_enabled(profile) {
             return;
@@ -2856,11 +2892,7 @@ impl ShardExecution {
         let whole = self
             .runtime
             .fabric_source_for_track(track)
-            .filter(|&source| {
-                self.runtime
-                    .fabric_emission(source)
-                    .is_some_and(|emission| !emission.selects_dd_encoding())
-            });
+            .filter(|&source| self.runtime.fabric_dd_source(source).is_none());
         let selected = whole
             .is_none()
             .then(|| receiver.selected_fabric_video_encoding(mid, track))
@@ -2915,8 +2947,15 @@ impl ShardExecution {
         else {
             return;
         };
-        let requires_dd = emission.selects_dd_encoding();
-        if requires_dd && selected.is_none() {
+        let requires_dd = self.runtime.fabric_dd_source(source).is_some();
+        let vp9_dd = profile == pulsebeam_core::fabric::Profile::Vp9 && emission.carries_video_dd();
+        // Network ingress has no local encoding selector. Preserve qualified DD
+        // for the entire admitted WAN stream instead of guessing a target.
+        let wan_whole_dd =
+            managed && vp9_dd && self.runtime.is_windowed_network_fabric_source(source);
+        if (requires_dd && selected.is_none())
+            || (managed && vp9_dd && !requires_dd && !wan_whole_dd)
+        {
             return;
         }
         let install_branch = self.runtime.source_origin(track).is_some()
@@ -2960,18 +2999,18 @@ impl ShardExecution {
             None
         };
         let Some(branch) = branch else { return };
-        if !self
-            .registry
-            .resolve_mut(destination)
-            .is_some_and(|owner| owner.bind_local_rtp_output(branch, mid, primary, emission))
-        {
+        if !self.registry.resolve_mut(destination).is_some_and(|owner| {
+            owner.bind_local_rtp_output(branch, mid, primary, emission, requires_dd || wan_whole_dd)
+        }) {
             if install_branch && reuse.is_none() {
                 self.runtime.retire_fabric_branch(branch, destination);
             }
-        } else if matches!(
-            profile,
-            pulsebeam_core::fabric::Profile::H264 | pulsebeam_core::fabric::Profile::Av1
-        ) {
+        } else if requires_dd
+            || matches!(
+                profile,
+                pulsebeam_core::fabric::Profile::H264 | pulsebeam_core::fabric::Profile::Av1
+            )
+        {
             self.pipeline.request_fabric_refresh(destination, branch);
         }
     }
@@ -3025,14 +3064,24 @@ impl ShardExecution {
                     destination,
                     now,
                     |receiver, sequence, packet, evidence| {
-                        receiver
-                            .queue_bound_fabric_rtp(
-                                branch,
-                                (sequence, &packet, evidence),
-                                video_source,
-                                now,
-                            )
-                            .map(|replaced| (packet.header().profile, replaced))
+                        let replaced = receiver.queue_bound_fabric_rtp(
+                            branch,
+                            (sequence, &packet, evidence),
+                            video_source,
+                            now,
+                        )?;
+                        let header = packet.header();
+                        #[cfg(feature = "sim")]
+                        if header.profile == pulsebeam_core::fabric::Profile::Vp9 {
+                            crate::sim_metrics::wan_repair::vp9_rtc_enqueued(
+                                sequence,
+                                header.timestamp,
+                            );
+                        }
+                        Ok::<_, crate::rtp::fabric_egress::AdmissionError>((
+                            header.profile,
+                            replaced,
+                        ))
                     },
                 ) {
                     Ok(Some((_profile, replaced))) => {
@@ -3044,6 +3093,16 @@ impl ShardExecution {
                             #[cfg(feature = "sim")]
                             {
                                 crate::sim_metrics::record_routing_counter("fabric_rtp_enqueued");
+                                if self.runtime.is_windowed_network_fabric_source(source) {
+                                    use pulsebeam_core::fabric::Profile;
+                                    if let Some(counter) = match _profile {
+                                        Profile::Vp9 => Some("fabric_rtp_vp9_wan_enqueued"),
+                                        Profile::Av1 => Some("fabric_rtp_av1_wan_enqueued"),
+                                        _ => None,
+                                    } {
+                                        crate::sim_metrics::record_routing_counter(counter);
+                                    }
+                                }
                                 if receiver.has_whep_output() {
                                     crate::sim_metrics::record_routing_counter(
                                         "fabric_whep_rtp_enqueued",
@@ -4061,7 +4120,7 @@ impl ShardExecution {
         self.timers
             .next_deadline()
             .into_iter()
-            .chain(self.runtime.next_endpoint_data_expiry())
+            .chain(self.runtime.next_endpoint_deadline())
             .chain(
                 self.runtime
                     .next_fabric_data_propagation()
@@ -4460,7 +4519,7 @@ impl ShardExecution {
                 dirty.mark(key, participant);
             }
         });
-        self.runtime.expire_endpoint_data(now);
+        self.runtime.poll_endpoints(now);
         self.advance_fabric_control(now, send);
     }
 

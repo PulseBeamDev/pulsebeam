@@ -1128,6 +1128,7 @@ impl Connection {
         mid: Mid,
         primary: u32,
         emission: crate::route::fabric::local::Emission,
+        requires_dd: bool,
     ) -> bool {
         use crate::rtp::fabric_egress::{
             CaptureClock, EndpointHints, Mapping, OutputLeg, Vad, timeline,
@@ -1135,7 +1136,6 @@ impl Connection {
         use crate::rtp::fabric_ingress::AUDIO_LEVEL_URI;
         use pulsebeam_core::fabric::ExtensionKind;
         let profile = emission.profile();
-        let requires_dd = emission.selects_dd_encoding();
         if let Some(output) = self.media_egress.get_mut(&mid) {
             if output.leg.output().primary != Some(primary) {
                 return false;
@@ -1168,6 +1168,9 @@ impl Connection {
                 uri: pulsebeam_core::dd::URI,
                 attributes: None,
             });
+        }
+        if requires_dd && mappings.is_empty() {
+            return false;
         }
         let Ok(hints) = EndpointHints::new(profile, form, &mappings) else {
             return false;
@@ -1815,6 +1818,22 @@ impl Connection {
 
     pub(crate) fn fabric_source_authorized(&self, source: FabricSourceHandle) -> bool {
         !self.fenced_fabric_sources.contains(&source) && self.fabric_io_authorized()
+    }
+
+    pub(crate) fn measured_fabric_ladder(
+        &mut self,
+        source: FabricSourceHandle,
+        encoding: crate::route::fabric::RtpSourceEncoding,
+    ) -> Option<crate::rtp::monitor::MeasuredTargetLadder> {
+        let primary = *encoding.primary;
+        if self.media_ingress.get(&primary)?.publisher_source != Some(source) {
+            return None;
+        }
+        let slot = self.native_rtp.fabric_measurement_slot(primary)?;
+        self.upstream
+            .track_mut(slot)?
+            .monitor
+            .measured_fabric_ladder(encoding.primary, encoding.rid)
     }
 
     pub(crate) fn measure_fabric_dd(

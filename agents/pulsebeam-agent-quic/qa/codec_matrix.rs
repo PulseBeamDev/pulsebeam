@@ -141,33 +141,8 @@ fn exact_video_scope() {
 }
 
 fn captured_payload(bytes: &[u8]) -> (&[u8], &[u8]) {
-    assert_eq!(bytes[0], 0x90, "RTP with extensions, no CSRCs or padding");
-    let two_byte = match &bytes[12..14] {
-        [0xbe, 0xde] => false,
-        [0x10, 0x00] => true,
-        profile => panic!("unknown extension profile: {profile:?}"),
-    };
-    let extension_bytes = usize::from(u16::from_be_bytes([bytes[14], bytes[15]])) * 4;
-    let (mut extensions, payload) = bytes[16..].split_at(extension_bytes);
-    while let Some((&header, tail)) = extensions.split_first() {
-        extensions = tail;
-        if header == 0 {
-            continue;
-        }
-        let (id, len) = if two_byte {
-            let (&len, tail) = extensions.split_first().unwrap();
-            extensions = tail;
-            (header, usize::from(len))
-        } else {
-            (header >> 4, usize::from(header & 15) + 1)
-        };
-        let (extension, tail) = extensions.split_at(len);
-        if id == 9 {
-            return (payload, extension);
-        }
-        extensions = tail;
-    }
-    panic!("capture did not include the dependency descriptor");
+    let packet = wire_capture::descriptor_rtp(bytes).expect("captured RTP with DD");
+    (packet.payload, packet.descriptor)
 }
 
 fn av1_wire_obu_hashes(mut data: &[u8]) -> Vec<String> {

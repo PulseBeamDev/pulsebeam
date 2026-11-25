@@ -808,9 +808,6 @@ impl TrackLifecycle {
         publication: PublicationKey,
         registry: &RoomRegistry,
     ) -> Option<(ShardId, crate::shard_update::PublisherAnchor)> {
-        use crate::entity::TrackKind;
-        use pulsebeam_core::fabric::Profile;
-
         let shard = self.network_source(room, publication, registry)?;
         let track = self.source_exact(room, publication)?;
         let (incarnation, emission) = match track {
@@ -823,10 +820,10 @@ impl TrackLifecycle {
                 else {
                     return None;
                 };
-                match (track.kind(), source.emission.profile()) {
-                    (TrackKind::Audio, Profile::Opus)
-                    | (TrackKind::Video, Profile::H264 | Profile::Av1) => {}
-                    _ => return None,
+                if !source.emission.supports_wan_rtp()
+                    || source.emission.profile().is_video() != matches!(track, Track::Video(_))
+                {
+                    return None;
                 }
                 (source.incarnation, source.emission)
             }

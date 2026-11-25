@@ -201,6 +201,7 @@ fn wan_child_receipt_requires_the_installed_plan_and_exact_window() {
         Some(crate::shard_update::PublisherPosition {
             sequence: position,
             timing: None,
+            ladder: None,
         })
     );
     assert_eq!(
@@ -268,6 +269,7 @@ fn wan_child_receipt_requires_the_installed_plan_and_exact_window() {
         Some(crate::shard_update::PublisherPosition {
             sequence: next_start,
             timing: None,
+            ladder: None,
         })
     );
     lifetime().fence();

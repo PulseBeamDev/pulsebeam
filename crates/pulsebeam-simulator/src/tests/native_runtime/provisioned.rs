@@ -23,6 +23,7 @@ mod regional;
 
 enum RoutingFixture<'a> {
     Direct,
+    DirectQuic(pulsebeam_agent_quic::transport::ServerConfig),
     StaticTransit,
     Regional(&'a mut regional::Fixture),
 }
@@ -60,6 +61,156 @@ fn fabric_wan_diamond_converges() -> anyhow::Result<()> {
 #[test]
 fn provisioned_wan_opus_repairs_exact_position_on_fresh_window() -> anyhow::Result<()> {
     prove_provisioned_cluster(3, &[(0, 1), (1, 2)], core_ffi::TopicMode::Latest, true)
+}
+
+#[test]
+fn provisioned_av1_warm_whole_without_dd_decodes_over_low_latency_wan_link() -> anyhow::Result<()> {
+    prove_provisioned_av1(false, Duration::from_millis(1))
+}
+
+#[test]
+fn provisioned_av1_warm_whole_with_dd_decodes_over_wan() -> anyhow::Result<()> {
+    prove_provisioned_av1(true, Duration::from_millis(5))
+}
+
+fn provisioned_video_pair(
+    seed: u64,
+    latency: Duration,
+    duration: Duration,
+    root: &std::path::Path,
+    routing: RoutingFixture<'_>,
+) -> anyhow::Result<(turmoil::Sim<'static>, [IpAddr; 3])> {
+    let subnet = reserve_subnet();
+    let [publisher, viewer, client] = [1, 2, 3].map(|host| subnet_ip(subnet, host));
+    let mut sim = turmoil::Builder::new()
+        .min_message_latency(latency)
+        .max_message_latency(latency)
+        .simulation_duration(duration)
+        .rng_seed(seed)
+        .build();
+    install_nodes(
+        &mut sim,
+        root,
+        &[publisher, viewer],
+        &[(0, 1)],
+        seed,
+        None,
+        routing,
+    )?;
+    Ok((sim, [publisher, viewer, client]))
+}
+
+fn prove_provisioned_av1(dd: bool, latency: Duration) -> anyhow::Result<()> {
+    let seed = std::env::var("PULSEBEAM_SIM_SEED")
+        .map(|value| value.parse::<u64>())
+        .unwrap_or(Ok(NATIVE_RUNTIME_SEED))?;
+    let _clocks = crate::sim_clock::SimClocksGuard::init();
+    crate::sim_rand::set_thread_rng(seed);
+    fastrand::seed(seed);
+    let root = tempfile::tempdir()?;
+    let (mut sim, [publisher, viewer, client]) = provisioned_video_pair(
+        seed,
+        latency,
+        Duration::from_secs(20),
+        root.path(),
+        RoutingFixture::Direct,
+    )?;
+    sim.client(client, async move {
+        crate::tests::native_state::av1::prove_warm_wan_av1(
+            NativeHost::bind(client)?,
+            publisher,
+            viewer,
+            dd,
+        )
+        .await?;
+        Ok(())
+    });
+    run_sim_or_timeout(&mut sim, Duration::from_secs(25))
+        .map_err(|error| anyhow::anyhow!("two-node AV1 (DD={dd}) failed: {error:#}"))
+}
+
+#[test]
+fn provisioned_wan_vp9_dd_decodes_and_recovers_after_loss() -> anyhow::Result<()> {
+    use crate::tests::{
+        common::native::NativeHost,
+        native_state::spatial_vp9::{Check, receive},
+        quic_data::{
+            sim_quic_tls,
+            spatial_vp9::{connect_publisher, replay},
+        },
+    };
+
+    let seed = std::env::var("PULSEBEAM_SIM_SEED")
+        .map(|value| value.parse::<u64>())
+        .unwrap_or(Ok(NATIVE_RUNTIME_SEED))?;
+    let _sim_clocks = crate::sim_clock::SimClocksGuard::init();
+    crate::sim_rand::set_thread_rng(seed);
+    fastrand::seed(seed);
+    let root = tempfile::tempdir()?;
+    let (tls, roots) = sim_quic_tls()?;
+    let (mut sim, [ingress, egress, client]) = provisioned_video_pair(
+        seed,
+        Duration::from_millis(5),
+        Duration::from_secs(32),
+        root.path(),
+        RoutingFixture::DirectQuic(tls),
+    )?;
+    let counter = pulsebeam::sim_metrics::routing_counter;
+    let ladder_before = counter("wan_vp9_ladder_installed");
+    sim.client(client, async move {
+        let key = pulsebeam_server::insecure_dev_api_key()?;
+        let expires = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() + 60;
+        let token = pulsebeam_server::sign_participant_token(
+            &key,
+            &serde_json::from_value(json!([
+                {"rooms":["stage"],"allow":["join","publish","discover"]}
+            ]))?,
+            "vp9-source",
+            expires,
+        )?;
+        let (mut publisher, source) = connect_publisher(
+            (ingress, 7070).into(),
+            client,
+            (ingress, 3478).into(),
+            roots,
+            &token.token,
+        ).await?;
+        let id = source.publication_id().to_owned();
+        let host = NativeHost::bind(client)?;
+        let receive_and_observe = async {
+            receive((egress, 7070).into(), host, &id, Check::WanRepair {
+                publisher: "vp9-source", track: "spatial-camera", edge: ((ingress, 7443).into(), (egress, 7443).into()),
+            }, || Ok(())).await?;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while counter("wan_vp9_ladder_installed") <= ladder_before {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }).await.map_err(|_| anyhow::anyhow!("receiving edge never installed a measured VP9 ladder"))?;
+            Ok::<_, anyhow::Error>(())
+        };
+        pulsebeam_runtime::select! {
+            result = receive_and_observe => result?,
+            result = replay(&mut publisher, &source, pulsebeam_runtime::time::Instant::now(), true) => result?,
+        }
+        Ok(())
+    });
+    let before = counter("fabric_rtp_vp9_wan_enqueued");
+    run_sim_or_timeout(&mut sim, Duration::from_secs(25)).map_err(|error| {
+        anyhow::anyhow!(
+            "two-node VP9 WAN simulation failed: {error:#}; WAN receives={}, DD structure reports={}, branch offers={}, RTC RTP enqueued={}",
+            counter("fabric_network_vp9_receive"),
+            counter("fabric_network_vp9_dd_structure"),
+            counter("fabric_network_vp9_branch_offer"),
+            counter("fabric_rtp_vp9_wan_enqueued") - before,
+        )
+    })?;
+    anyhow::ensure!(
+        counter("fabric_rtp_vp9_wan_enqueued") > before,
+        "no VP9 RTP took the windowed WAN path to the RTC sender"
+    );
+    Ok(())
 }
 
 #[test]
@@ -641,7 +792,6 @@ fn install_nodes(
                         role,
                         class: NetworkClass::Wan,
                     },
-                    fabric_wan: true,
                     regional_control: None,
                     relay_from: (relay_images
                         && index != 0
@@ -665,11 +815,16 @@ fn install_nodes(
             region_tree: region_tree.clone(),
         };
         let standby = standby.cloned();
+        let quic = match &routing {
+            RoutingFixture::DirectQuic(tls) if index == 0 => Some(tls.clone()),
+            _ => None,
+        };
         let ports = std::cell::RefCell::new(std::mem::take(&mut regional_ports[index]));
         let identities: Vec<_> = nodes.iter().map(|entry| entry.2.0).collect();
         sim.host(ip, move || {
             let options = options.clone();
             let standby = standby.clone();
+            let quic = quic.clone();
             let ports = std::mem::take(&mut *ports.borrow_mut())
                 .into_iter()
                 .map(|(remote, roles, cost, lane)| (identities[remote], roles, cost, lane))
@@ -677,6 +832,9 @@ fn install_nodes(
             async move {
                 let mut node = sfu_node_builder(ip, pulsebeam_runtime::rand::seeded_rng(seed), 1)
                     .with_cluster(options);
+                if let Some(tls) = quic {
+                    node = node.with_native_quic("edge.example".into(), tls);
+                }
                 for (peer, roles, cost, lane) in ports {
                     node = node.with_sim_regional_port(peer, roles, cost, lane);
                 }

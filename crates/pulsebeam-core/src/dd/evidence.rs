@@ -150,6 +150,27 @@ impl SourceContext {
         }))
     }
 
+    /// Resolve the exact template structure used to qualify this packet.
+    pub fn structure_for<'a>(
+        &'a self,
+        packet: &'a Qualified,
+    ) -> Option<&'a super::TemplateDependencyStructure> {
+        let attachment = packet.structure_sequence;
+        packet.descriptor.attached_structure.as_deref().or_else(|| {
+            if self
+                .structure
+                .is_some_and(|version| version.attachment == attachment)
+            {
+                return self.reader.structure();
+            }
+            self.history
+                .iter()
+                .rev()
+                .find(|interval| interval.structure.attachment == attachment)
+                .and_then(|interval| interval.reader.structure())
+        })
+    }
+
     /// Observe a source position after its identity and metadata are frozen.
     /// Missing DD breaks continuity; late observations never change context.
     pub fn observe(

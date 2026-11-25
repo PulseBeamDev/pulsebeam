@@ -134,6 +134,7 @@ struct FabricSource {
         pulsebeam_clock::domain::Projection,
     )>,
     quic_media: Option<(NonZeroU64, bool)>,
+    spatial_monitor: Option<Box<crate::track::FabricVideoMonitor>>,
 }
 
 impl FabricSource {
@@ -610,6 +611,7 @@ impl ShardRuntime {
             publisher_clock: None,
             publisher_timing: None,
             quic_media: None,
+            spatial_monitor: None,
         });
         bound.media.insert_fabric(source);
         Some(source)
@@ -769,6 +771,7 @@ impl ShardRuntime {
             publisher_clock: None,
             publisher_timing: None,
             quic_media: None,
+            spatial_monitor: None,
         });
         bound.media.insert_fabric(source);
         Some(source)
@@ -933,6 +936,7 @@ impl ShardRuntime {
                 publisher_clock: None,
                 publisher_timing: None,
                 quic_media: None,
+                spatial_monitor: None,
             });
             track.media.insert_fabric(source);
         }
@@ -951,6 +955,13 @@ impl ShardRuntime {
         matches!(&bound.ingress, FabricIngress::Network { .. }).then_some(source)
     }
 
+    pub(super) fn is_windowed_network_fabric_source(&self, source: FabricSourceHandle) -> bool {
+        self.fabric_sources.get(source).is_some_and(|bound| {
+            matches!(&bound.ingress, FabricIngress::Network { children, .. }
+                if children.iter().any(|child| child.spec.window.is_some() && child.lifetime.is_live()))
+        })
+    }
+
     pub(super) fn is_shard_fabric_source(&self, source: FabricSourceHandle) -> bool {
         self.fabric_sources
             .get(source)
@@ -966,7 +977,7 @@ impl ShardRuntime {
         if matches!(bound.ingress.owner(), FabricOwner::Local(_)) {
             return None;
         }
-        let branch = bound.fanout.branch_for(member)?;
+        let branch = bound.fanout.branch_for_target(member, None)?;
         let handle = FabricLocalBranch { source, branch };
         self.fabric_handoff_owner(handle, member)?;
         Some(handle)
@@ -1617,7 +1628,15 @@ impl ShardRuntime {
                     < crate::route::fabric::network_repair::MAX_REPAIR_LIFETIME)
                 .then_some(timing)
         });
-        Some(crate::shard_update::PublisherPosition { sequence, timing })
+        let ladder = source
+            .spatial_monitor
+            .as_ref()
+            .and_then(|monitor| monitor.measured_ladder());
+        Some(crate::shard_update::PublisherPosition {
+            sequence,
+            timing,
+            ladder,
+        })
     }
 
     pub(super) fn fabric_emission(&self, source: FabricSourceHandle) -> Option<Emission> {
@@ -1651,7 +1670,7 @@ impl ShardRuntime {
             .fanout
             .emission()
             .selects_dd_encoding()
-            .then(|| Some((source.track, source.encoding?)))?
+            .then_some((source.track, source.encoding?))
     }
 
     pub(super) fn fabric_source_for_encoding(
@@ -1813,20 +1832,34 @@ impl ShardRuntime {
         true
     }
 
-    pub(super) fn next_endpoint_data_expiry(&self) -> Option<pulsebeam_runtime::time::Instant> {
+    pub(super) fn next_endpoint_deadline(&self) -> Option<pulsebeam_runtime::time::Instant> {
         self.fabric_sources
             .values()
-            .filter_map(|bound| match &bound.ingress {
-                FabricIngress::Publisher {
-                    data: Some(data), ..
-                } => data.expiry(),
-                _ => None,
+            .filter_map(|bound| {
+                let data_expiry = match &bound.ingress {
+                    FabricIngress::Publisher {
+                        data: Some(data), ..
+                    } => data.expiry(),
+                    _ => None,
+                };
+                data_expiry
+                    .into_iter()
+                    .chain(
+                        bound
+                            .spatial_monitor
+                            .as_ref()
+                            .and_then(|monitor| monitor.deadline()),
+                    )
+                    .min()
             })
             .min()
     }
 
-    pub(super) fn expire_endpoint_data(&mut self, now: pulsebeam_runtime::time::Instant) {
+    pub(super) fn poll_endpoints(&mut self, now: pulsebeam_runtime::time::Instant) {
         for bound in self.fabric_sources.values_mut() {
+            if let Some(monitor) = bound.spatial_monitor.as_mut() {
+                monitor.poll(now);
+            }
             if let FabricIngress::Publisher {
                 data: Some(data), ..
             } = &mut bound.ingress
@@ -1864,6 +1897,27 @@ impl ShardRuntime {
         data.is_some()
     }
 
+    pub(super) fn attach_quic_spatial_monitor(
+        &mut self,
+        source: FabricSourceHandle,
+        track: &crate::track::Track,
+    ) {
+        let Some(bound) = self.fabric_sources.get_mut(source) else {
+            return;
+        };
+        if self
+            .tracks
+            .get(bound.track)
+            .is_some_and(|local| local.id == track.id())
+            && bound.quic_media.is_some()
+            && bound.fanout.emission().profile() == pulsebeam_core::fabric::Profile::Vp9
+            && bound.fanout.emission().carries_video_dd()
+            && bound.spatial_monitor.is_none()
+        {
+            bound.spatial_monitor = crate::track::FabricVideoMonitor::new(track).map(Box::new);
+        }
+    }
+
     pub(super) fn set_quic_media_binding(
         &mut self,
         source: FabricSourceHandle,
@@ -1880,6 +1934,9 @@ impl ShardRuntime {
             return false;
         }
         bound.quic_media = Some((association, enabled));
+        if !enabled && let Some(monitor) = bound.spatial_monitor.as_mut() {
+            monitor.reset();
+        }
         true
     }
 
@@ -2208,6 +2265,9 @@ impl ShardRuntime {
                     .projection
                     .map(|(at, projection)| (sequence, at, projection));
             }
+        }
+        if let Some(monitor) = bound.spatial_monitor.as_mut() {
+            monitor.observe(now, &report);
         }
         Self::forward_publisher_branches(bound, now, sequence, hops, None, &mut report);
         Ok(report)

@@ -972,12 +972,12 @@ fn quic_rtp_binding(
                 .then_some(format)?
         }
         None => match profile {
-            Some(PublicationProfile::UnlayeredVideo(mime)) if video => {
+            Some(PublicationProfile::Video { mime, .. }) if video => {
                 supported().find(|format| {
                     format.mime_type == mime && state::VideoMode::for_format(format, "L1T1").is_ok()
                 })?
             }
-            Some(PublicationProfile::UnlayeredVideo(_)) => return None,
+            Some(PublicationProfile::Video { .. }) => return None,
             None | Some(PublicationProfile::LegacyH264Dd) => supported().find(|format| {
                 matches!(
                     (video, format.known_codec()),
@@ -991,11 +991,17 @@ fn quic_rtp_binding(
         "audio/opus" | "video/h264" => None,
         "video/vp8" | "video/vp9" | "video/av1" if session.quic_directional_video_dd => {
             state::VideoMode::for_format(format, "L1T1").ok()?;
-            Some(if source.is_some() {
+            let direction = if source.is_some() {
                 state::QuicVideoDd::Accept
+            } else if matches!(
+                profile,
+                Some(PublicationProfile::Video { emits_dd: true, .. })
+            ) {
+                state::QuicVideoDd::Emit
             } else {
                 state::QuicVideoDd::Absent
-            } as i32)
+            };
+            Some(direction as i32)
         }
         _ => return None,
     };

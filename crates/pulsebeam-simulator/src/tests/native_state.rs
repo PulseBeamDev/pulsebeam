@@ -21,8 +21,9 @@ use super::common::{
 };
 
 mod audio;
-mod av1;
+pub(super) mod av1;
 mod sdp;
+pub(super) mod spatial_vp9;
 
 struct WirePeer {
     media: Option<pulsebeam_agent_core::client_sdp::Context>,
@@ -39,12 +40,13 @@ struct WirePeer {
 
 const DATA_ROOM: &str = "native-state-wire";
 
-enum Av1Bootstrap<'a> {
+enum VideoBootstrap<'a> {
     External {
         input: &'a pulsebeam_rtc_simulation::EncodedVideoInput,
         remap_payload_types: bool,
     },
     Stock,
+    Vp9Receiver,
 }
 
 impl WirePeer {
@@ -73,22 +75,31 @@ impl WirePeer {
         audio: bool,
         room: &str,
     ) -> anyhow::Result<(Self, String)> {
-        Self::connect_with_peer(host, server, subject, room, audio, None, |_, _| Ok(())).await
+        Self::connect_with_peer(
+            host,
+            (server, 7070).into(),
+            subject,
+            room,
+            audio,
+            None,
+            |_, _| Ok(()),
+        )
+        .await
     }
 
     async fn connect_with_peer(
         host: NativeHost,
-        server: IpAddr,
+        server: std::net::SocketAddr,
         subject: &str,
         room: &str,
         media: bool,
-        av1: Option<Av1Bootstrap<'_>>,
+        bootstrap: Option<VideoBootstrap<'_>>,
         prepare: impl FnOnce(&PeerConnectionFactory, &PeerConnection) -> anyhow::Result<()>,
     ) -> anyhow::Result<(Self, String)> {
         let (_runtime, lease) = host.runtime()?;
-        let factory = host.raw_peer_factory(match &av1 {
-            Some(Av1Bootstrap::External { input, .. }) => Some(input.encoder_factory()),
-            Some(Av1Bootstrap::Stock) => {
+        let factory = host.raw_peer_factory(match &bootstrap {
+            Some(VideoBootstrap::External { input, .. }) => Some(input.encoder_factory()),
+            Some(VideoBootstrap::Stock | VideoBootstrap::Vp9Receiver) => {
                 Some(pulsebeam_rtc_simulation::VideoEncoderFactoryHandle::builtin()?)
             }
             None => None,
@@ -103,12 +114,13 @@ impl WirePeer {
                 pulsebeam_rtc_simulation::CryptoOptions::prefer_gcm();
         }
         let mut dependencies = pulsebeam_rtc_simulation::PeerConnectionDependencies::default();
-        if let Some(av1) = &av1 {
-            let trials = match av1 {
-                Av1Bootstrap::External { .. } => {
+        if let Some(bootstrap) = &bootstrap {
+            let trials = match bootstrap {
+                VideoBootstrap::Vp9Receiver => "WebRTC-DependencyDescriptorAdvertised/Enabled/",
+                VideoBootstrap::External { .. } => {
                     "WebRTC-RFC8888CongestionControlFeedback/Enabled,offer:true/"
                 }
-                Av1Bootstrap::Stock => concat!(
+                VideoBootstrap::Stock => concat!(
                     "WebRTC-RFC8888CongestionControlFeedback/Enabled,offer:true/",
                     "WebRTC-DependencyDescriptorAdvertised/Enabled/",
                 ),
@@ -157,8 +169,8 @@ impl WirePeer {
             .await?
             .context("native offer")?;
         if matches!(
-            av1,
-            Some(Av1Bootstrap::External {
+            bootstrap,
+            Some(VideoBootstrap::External {
                 remap_payload_types: true,
                 ..
             })
@@ -201,16 +213,27 @@ impl WirePeer {
             expiry,
         )?
         .token;
-        let admission = http::Request::builder()
-            .method("POST")
-            .uri(format!("http://{server}:7070/api/v1/native/admissions"))
-            .header("Authorization", format!("Bearer {token}"))
-            .header("Content-Type", "application/json")
-            .body(serde_json::to_vec(&serde_json::json!({"room":room}))?)?;
-        let admission = create_http_client()
-            .execute(admission)
-            .await
-            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let admission = tokio::time::timeout(Duration::from_secs(5), async {
+            let client = create_http_client();
+            loop {
+                let request = http::Request::builder()
+                    .method("POST")
+                    .uri(format!("http://{server}/api/v1/native/admissions"))
+                    .header("Authorization", format!("Bearer {token}"))
+                    .header("Content-Type", "application/json")
+                    .body(serde_json::to_vec(&serde_json::json!({"room":room}))?)?;
+                let admission = client
+                    .execute(request)
+                    .await
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                if admission.status() != http::StatusCode::SERVICE_UNAVAILABLE {
+                    break Ok::<_, anyhow::Error>(admission);
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .context("native ownership admission never became available")??;
         anyhow::ensure!(
             admission.status() == http::StatusCode::OK,
             "native ownership admission: {}",
@@ -222,7 +245,7 @@ impl WirePeer {
             .context("opaque native ownership capability")?;
         let request = http::Request::builder()
             .method("POST")
-            .uri(format!("http://{server}:7070/api/v1/native"))
+            .uri(format!("http://{server}/api/v1/native"))
             .header("Authorization", format!("Bearer {token}"))
             .header("Content-Type", "application/json")
             .header("pulsebeam-owner", owner)
@@ -324,6 +347,15 @@ impl WirePeer {
     }
 
     fn prepare_receiver(&self, source_revision: u64, revision: u64, channel: u32) {
+        self.report_prepared_receiver(source_revision, revision, payload_binding(channel));
+    }
+
+    fn report_prepared_receiver(
+        &self,
+        source_revision: u64,
+        revision: u64,
+        binding: wire::TrackBinding,
+    ) {
         self.send_state(wire::ClientStateRecord {
             owned: 1,
             desired: None,
@@ -332,9 +364,7 @@ impl WirePeer {
                 outcome: Some(wire::execution_report::Outcome::LogicalReceiver(
                     wire::LogicalReceiverReport {
                         source_revision,
-                        outcome: Some(wire::logical_receiver_report::Outcome::Prepared(
-                            payload_binding(channel),
-                        )),
+                        outcome: Some(wire::logical_receiver_report::Outcome::Prepared(binding)),
                     },
                 )),
             }),
@@ -437,6 +467,52 @@ impl WirePeer {
             "control channel closed"
         );
         Ok(None)
+    }
+
+    async fn wait_for_video_publication(
+        &mut self,
+        room: &str,
+        publisher: &str,
+        track: &str,
+        publication: &str,
+    ) -> anyhow::Result<()> {
+        self.desire(
+            1,
+            1,
+            Some(wire::ResourceSpec {
+                declaration: Some(wire::resource_spec::Declaration::SourceLookup(
+                    wire::SourceLookupSpec {
+                        source: Some(wire::LogicalSourceAddress {
+                            room: room.into(),
+                            participant_id: publisher.into(),
+                            kind: wire::TrackKind::Video as i32,
+                            track_id: track.into(),
+                        }),
+                    },
+                )),
+                settings: Some(wire::ResourceSettings {
+                    enabled: Some(true),
+                    receive: None,
+                }),
+            }),
+        );
+        loop {
+            let state = self.confirmed(1, 1).await?;
+            anyhow::ensure!(
+                state.rejection.is_none(),
+                "video source lookup rejected: {state:?}"
+            );
+            let Some(wire::confirmed_state::Value::SourceLookup(lookup)) = state.value else {
+                anyhow::bail!("video source lookup absent: {state:?}");
+            };
+            if let Some(track) = lookup.track {
+                anyhow::ensure!(
+                    track.publication_id == publication,
+                    "unexpected video publication: {track:?}"
+                );
+                return Ok(());
+            }
+        }
     }
 
     fn desire(&self, reference: u64, revision: u64, spec: Option<wire::ResourceSpec>) {

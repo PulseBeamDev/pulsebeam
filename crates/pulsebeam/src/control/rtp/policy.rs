@@ -46,9 +46,10 @@ pub(crate) fn publication(
     use pulsebeam_core::fabric::Profile;
     let profile =
         fabric_profile(&binding.codec.parameters).ok_or(wire::FailureCode::Unsupported)?;
-    if (profile.is_video()
-        && binding.encodings.len() != 1
-        && (profile != Profile::H264 || !dependency_descriptor))
+    if profile == Profile::Vp9
+        || (profile.is_video()
+            && binding.encodings.len() != 1
+            && (profile != Profile::H264 || !dependency_descriptor))
         || kind == wire::TrackKind::Audio
             && (binding.encodings.len() != 1
                 || binding
@@ -121,6 +122,16 @@ pub(crate) fn receiver(
         _ => return Err(wire::FailureCode::Unsupported),
     };
     if source_format.is_none_or(|source| !wire::validation::formats_equivalent(source, format)) {
+        return Err(wire::FailureCode::Incompatible);
+    }
+    if binding.codec.parameters.name == "vp9"
+        && matches!(source, Track::Video(video) if video.guarantees_video_dd)
+        && (encoding.repair.is_none()
+            || !binding
+                .extensions
+                .iter()
+                .any(|extension| extension.uri == pulsebeam_core::dd::URI))
+    {
         return Err(wire::FailureCode::Incompatible);
     }
     let video = receiver_settings(binding.kind, spec)?;

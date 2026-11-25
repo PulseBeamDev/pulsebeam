@@ -152,6 +152,35 @@ pub struct StreamStats {
     pub full_fps: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MeasuredTargetLadder {
+    pub(crate) context: crate::route::fabric::local::DecodeTargetRateContext,
+    pub(crate) through: u64,
+    pub(crate) heights: [u16; MAX_LADDER_TARGETS],
+    pub(crate) payload_bps: [u32; MAX_LADDER_TARGETS],
+}
+
+impl MeasuredTargetLadder {
+    pub(crate) fn valid(self) -> bool {
+        self.context.structure_origin <= self.through
+            && self.context.active_targets != 0
+            && self.context.active_targets >> MAX_LADDER_TARGETS == 0
+            && self
+                .heights
+                .into_iter()
+                .zip(self.payload_bps)
+                .enumerate()
+                .all(|(target, (height, bps))| {
+                    if self.context.active_targets & (1 << target) != 0 {
+                        height != 0 && bps != 0
+                    } else {
+                        height == 0 && bps == 0
+                    }
+                })
+    }
+}
+
 impl Default for StreamStats {
     fn default() -> Self {
         Self::new(true, 0, 0)
@@ -341,6 +370,7 @@ pub struct StreamMonitor {
     cost_filter: RateFilter,
     stable_filter: RateFilter,
     target_rates: TargetRates,
+    fabric_target_context: Option<(crate::route::fabric::local::DecodeTargetRateContext, u64)>,
 
     current_quality: StreamQuality,
     quality_transition_since: Option<Instant>,
@@ -379,6 +409,7 @@ impl StreamMonitor {
             bwe: BitrateEstimate::new(),
             cost_filter: RateFilter::new(),
             target_rates: TargetRates::new(),
+            fabric_target_context: None,
             stable_filter: RateFilter::with_taus(
                 RATE_RISE_TIME_CONSTANT,
                 STABLE_RATE_FALL_TIME_CONSTANT,
@@ -396,9 +427,13 @@ impl StreamMonitor {
     }
 
     pub(crate) fn process_transport_packet(&mut self, packet: &RtpPacket) {
+        self.observe_primary(packet.arrival_ts, *packet.seq_no, packet.payload.len());
+    }
+
+    pub(crate) fn observe_primary(&mut self, arrival: Instant, seq: u64, payload_len: usize) {
         let was_inactive = self.stats.is_inactive();
         let may_activate = !self.vla_inactive;
-        self.last_packet_at = packet.arrival_ts;
+        self.last_packet_at = arrival;
         if may_activate {
             if was_inactive {
                 let activation_bitrate = if self.declared_target_bps > 0 {
@@ -416,20 +451,19 @@ impl StreamMonitor {
             self.stats.inactive = false;
             self.publish_health();
         }
-        self.bwe.record(packet);
+        self.bwe.record(arrival, payload_len);
 
         if was_inactive && may_activate {
             self.window_highest_seq = None;
             self.window_start_seq = 0;
             self.window_actual_packets = 0;
-            self.window_start_ts = packet.arrival_ts;
+            self.window_start_ts = arrival;
         }
 
-        let seq = *packet.seq_no;
         if self.window_highest_seq.is_none() {
             self.window_highest_seq = Some(seq);
             self.window_start_seq = seq;
-            self.window_start_ts = packet.arrival_ts;
+            self.window_start_ts = arrival;
         } else if seq > self.window_highest_seq.unwrap_or(0) {
             self.window_highest_seq = Some(seq);
         }
@@ -477,24 +511,91 @@ impl StreamMonitor {
         &mut self,
         now: Instant,
         sample: crate::route::fabric::local::DecodeTargetSample,
-    ) {
+    ) -> bool {
         use crate::route::fabric::local::DecodeTargetSample;
         if self.vla_inactive || self.stats.decode_target_count() < 2 {
-            return;
+            return false;
         }
         match sample {
-            DecodeTargetSample::None => (),
-            DecodeTargetSample::Unknown => self.reset_target_rates(),
-            DecodeTargetSample::Bytes(bytes) => {
+            DecodeTargetSample::None => false,
+            DecodeTargetSample::Unknown => {
+                self.reset_target_rates();
+                true
+            }
+            DecodeTargetSample::Measured {
+                context,
+                through,
+                bytes,
+            } => {
+                let changed = self
+                    .fabric_target_context
+                    .is_none_or(|(previous, _)| previous != context);
+                if self
+                    .fabric_target_context
+                    .is_none_or(|(_, previous)| through > previous)
+                {
+                    if changed {
+                        self.reset_target_rates();
+                    }
+                    self.fabric_target_context = Some((context, through));
+                } else if changed {
+                    return false;
+                }
                 self.target_rates.record_bytes(now, bytes);
                 self.stats.measured_decode_target_bps = self.target_rates.costs;
+                changed
             }
         }
+    }
+
+    pub(crate) fn measured_spatial_ladder(&self) -> Option<MeasuredTargetLadder> {
+        let (context, through) = self.fabric_target_context?;
+        let stats = self.stats;
+        let count = usize::from(stats.decode_target_count());
+        if stats.inactive
+            || !stats.healthy
+            || stats.temporal_only
+            || !(2..=MAX_LADDER_TARGETS).contains(&count)
+            || context.active_targets == 0
+            || context.active_targets >> count != 0
+        {
+            return None;
+        }
+        let mut heights = [0; MAX_LADDER_TARGETS];
+        let mut payload_bps = [0; MAX_LADDER_TARGETS];
+        for target in 0..count {
+            if context.active_targets & (1 << target) == 0 {
+                continue;
+            }
+            heights[target] = stats.decode_target_heights[target];
+            payload_bps[target] = stats.measured_decode_target_bps[target];
+            if heights[target] == 0 || payload_bps[target] == 0 {
+                return None;
+            }
+        }
+        Some(MeasuredTargetLadder {
+            context,
+            through,
+            heights,
+            payload_bps,
+        })
     }
 
     /// This encoding's measurements, as one coherent value.
     pub fn stats(&self) -> StreamStats {
         self.stats
+    }
+
+    pub(crate) fn apply_stream_facts(&mut self, facts: crate::rtp::normalize::StreamFacts) {
+        if let Some(count) = facts.decode_targets {
+            self.set_decode_target_count(count);
+        }
+        if let Some(heights) = facts.decode_target_heights {
+            self.set_decode_target_heights(heights);
+        }
+        if let Some(temporal_only) = facts.temporal_only {
+            self.set_temporal_only(temporal_only);
+        }
     }
 
     /// Record the decode-target count a scalable keyframe's structure taught.
@@ -870,9 +971,9 @@ impl BitrateEstimate {
         }
     }
 
-    pub fn record(&mut self, pkt: &RtpPacket) {
-        self.advance_time(pkt.arrival_ts);
-        self.accumulated_bytes = self.accumulated_bytes.saturating_add(pkt.payload.len());
+    pub fn record(&mut self, now: Instant, payload_len: usize) {
+        self.advance_time(now);
+        self.accumulated_bytes = self.accumulated_bytes.saturating_add(payload_len);
     }
 
     pub fn poll(&mut self, now: Instant) {
@@ -1452,7 +1553,7 @@ mod test {
             bps * tick_dur.as_secs_f64() / 8.0,
         ))
         .unwrap_or(usize::MAX);
-        bwe.record(&make_packet(*now, bytes));
+        bwe.record(*now, bytes);
         bwe.poll(*now);
     }
 
@@ -1663,6 +1764,70 @@ mod test {
                 [0; MAX_LADDER_TARGETS]
             );
         }
+    }
+
+    #[test]
+    fn fabric_costs_do_not_cross_structure_or_active_mask_changes() {
+        use crate::route::fabric::local::{DecodeTargetRateContext, DecodeTargetSample};
+
+        let mut monitor = StreamMonitor::new(
+            TrackKind::Video,
+            "targets".into(),
+            StreamStats::new(false, 0, 720),
+        );
+        monitor.set_decode_target_count(3);
+        monitor.set_decode_target_heights([180, 360, 720]);
+        monitor.set_temporal_ladder(&[900, 1800, 2700], 30);
+        let start = Instant::now();
+        assert!(monitor.measured_spatial_ladder().is_none());
+        let sample =
+            |structure_origin, active_targets, through, bytes| DecodeTargetSample::Measured {
+                context: DecodeTargetRateContext {
+                    structure_origin,
+                    active_targets,
+                },
+                through,
+                bytes,
+            };
+        assert!(monitor.measure_fabric_targets(start, sample(10, 0b111, 10, [100, 200, 300])));
+        let next = start + RATE_FALL_TIME_CONSTANT;
+        assert!(!monitor.measure_fabric_targets(next, sample(10, 0b111, 11, [100, 200, 300])));
+        assert!(
+            monitor
+                .stats()
+                .measured_decode_target_bps
+                .iter()
+                .all(|&bps| bps > 0)
+        );
+        let measured = monitor.measured_spatial_ladder().unwrap();
+        assert_eq!(measured.through, 11);
+        assert_eq!(measured.heights, [180, 360, 720]);
+        assert_eq!(
+            measured.payload_bps,
+            monitor.stats().measured_decode_target_bps
+        );
+        assert!(monitor.measure_fabric_targets(next, sample(12, 0b111, 12, [100, 200, 300])));
+        assert!(monitor.measured_spatial_ladder().is_none());
+        let next = next + RATE_FALL_TIME_CONSTANT;
+        assert!(!monitor.measure_fabric_targets(next, sample(12, 0b111, 13, [100, 200, 300])));
+        assert!(
+            monitor
+                .stats()
+                .measured_decode_target_bps
+                .iter()
+                .all(|&bps| bps > 0)
+        );
+        assert!(monitor.measure_fabric_targets(next, sample(12, 0b001, 14, [100, 0, 0])));
+        assert!(!monitor.measure_fabric_targets(next, sample(12, 0b111, 13, [100, 200, 300])));
+        assert_eq!(monitor.stats().measured_decode_target_bps, [0; 3]);
+        let next = next + RATE_FALL_TIME_CONSTANT;
+        assert!(!monitor.measure_fabric_targets(next, sample(12, 0b001, 15, [100, 0, 0])));
+        assert!(monitor.stats().measured_decode_target_bps[0] > 0);
+        assert_eq!(monitor.stats().measured_decode_target_bps[1..], [0, 0]);
+        let measured = monitor.measured_spatial_ladder().unwrap();
+        assert_eq!(measured.context.active_targets, 0b001);
+        assert_eq!(measured.heights, [180, 0, 0]);
+        assert_eq!(measured.payload_bps[1..], [0, 0]);
     }
 
     #[test]

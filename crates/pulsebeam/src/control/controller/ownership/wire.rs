@@ -797,6 +797,67 @@ mod tests {
             encode(&endpoints, source(Profile::H264, unknown)),
             Err(Error::Invalid)
         ));
+
+        let bare_vp9 = source(Profile::Vp9, publication);
+        let mut vp9 = bare_vp9;
+        vp9.publisher.emission = Emission::new(
+            Profile::Vp9,
+            &[pulsebeam_core::fabric::ExtensionKind::DependencyDescriptor],
+        )
+        .unwrap();
+        assert!(matches!(encode(&endpoints, vp9), Err(Error::Invalid)));
+        let fact = &mut endpoints[0].1.publications[0];
+        let Some(track::Kind::Video(video)) = fact.descriptor.kind.as_mut() else {
+            panic!("expected video");
+        };
+        video.format = CodecFormat::native_quic_baseline("video/vp9");
+        assert!(matches!(encode(&endpoints, bare_vp9), Err(Error::Invalid)));
+        let ladder = crate::rtp::monitor::MeasuredTargetLadder {
+            context: crate::route::fabric::local::DecodeTargetRateContext {
+                structure_origin: vp9.sequence_anchor,
+                active_targets: 0b101,
+            },
+            through: vp9.sequence_anchor + 1,
+            heights: [180, 0, 720],
+            payload_bps: [100_000, 0, 1_000_000],
+        };
+        assert!(h264.with_ladder(Some(ladder)).ladder.is_none());
+        assert!(
+            vp9.with_ladder(Some(crate::rtp::monitor::MeasuredTargetLadder {
+                heights: [180, 360, 720],
+                ..ladder
+            }))
+            .ladder
+            .is_none()
+        );
+        let offered = vp9.with_ladder(Some(ladder));
+        assert!(offered.same_window(vp9));
+        assert_eq!(offered.ladder, Some(ladder));
+        let planned = crate::control::controller::peer_ownership::relay::wan_source::plan_windows(
+            vec![offered],
+            &[vp9],
+            2,
+        );
+        assert_eq!(planned[0], offered);
+        assert!(planned[1].ladder.is_none());
+        let withdrawn = crate::control::controller::peer_ownership::relay::wan_source::plan_windows(
+            vec![vp9],
+            &planned,
+            2,
+        );
+        assert_eq!(withdrawn[0], vp9);
+        let vp9 = offered;
+        let decoded = decode_wan(&encode(&endpoints, vp9).unwrap()).unwrap();
+        let sources = decoded.wan.unwrap().sources;
+        assert_eq!(sources.as_ref(), &[vp9]);
+        let (endpoint, observed) = &decoded.endpoints[0];
+        let routed = PublicationFact::routed_track(
+            *endpoint,
+            sources[0].publisher,
+            &observed.publications[0].descriptor,
+        )
+        .unwrap();
+        assert!(routed.as_video().unwrap().guarantees_video_dd);
     }
 
     #[test]

@@ -877,9 +877,14 @@ fn quic_reserves_nonreused_payload_ids_without_rtc_effects() {
         kind: state::TrackKind::Video,
         track_id: "camera".into(),
     };
-    let vp8 = Some(super::super::quic::PublicationProfile::UnlayeredVideo(
-        "video/vp8",
-    ));
+    let vp8 = Some(super::super::quic::PublicationProfile::Video {
+        mime: "video/vp8",
+        emits_dd: false,
+    });
+    let vp9_dd = Some(super::super::quic::PublicationProfile::Video {
+        mime: "video/vp9",
+        emits_dd: true,
+    });
     session
         .capabilities
         .rtp
@@ -890,7 +895,16 @@ fn quic_reserves_nonreused_payload_ids_without_rtc_effects() {
             ))),
             ..Default::default()
         });
+    session
+        .capabilities
+        .rtp
+        .codecs
+        .push(state::RtpCodecCapability {
+            format: state::CodecFormat::native_quic_baseline("video/vp9"),
+            ..Default::default()
+        });
     assert!(quic_rtp_binding(session, &video, None, vp8, None, &mut ids).is_none());
+    assert!(quic_rtp_binding(session, &video, None, vp9_dd, None, &mut ids).is_none());
     session.quic_directional_video_dd = true;
     let selected = quic_rtp_binding(session, &video, None, vp8, None, &mut ids).unwrap();
     let Some(state::track_binding::Transport::QuicRtp(parameters)) = selected.transport else {
@@ -901,6 +915,16 @@ fn quic_reserves_nonreused_payload_ids_without_rtc_effects() {
     assert_eq!(
         parameters.codec.unwrap().format.unwrap().mime_type,
         "video/vp8"
+    );
+    let selected = quic_rtp_binding(session, &video, None, vp9_dd, None, &mut ids).unwrap();
+    let Some(state::track_binding::Transport::QuicRtp(parameters)) = selected.transport else {
+        panic!("QUIC VP9 video binding");
+    };
+    assert_eq!(parameters.video_dd, Some(state::QuicVideoDd::Emit as i32));
+    assert!(!parameters.publishes_h264_dd);
+    assert_eq!(
+        parameters.codec.unwrap().format.unwrap().mime_type,
+        "video/vp9"
     );
     assert!(effects.is_empty());
 }

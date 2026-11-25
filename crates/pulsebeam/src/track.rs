@@ -332,15 +332,7 @@ impl UpstreamTrackLayer {
     }
 
     fn apply_stream_facts(&mut self, facts: StreamFacts) {
-        if let Some(count) = facts.decode_targets {
-            self.monitor.set_decode_target_count(count);
-        }
-        if let Some(heights) = facts.decode_target_heights {
-            self.monitor.set_decode_target_heights(heights);
-        }
-        if let Some(temporal_only) = facts.temporal_only {
-            self.monitor.set_temporal_only(temporal_only);
-        }
+        self.monitor.apply_stream_facts(facts);
     }
 
     #[cfg(test)]
@@ -576,6 +568,18 @@ impl TrackMonitor {
         }
     }
 
+    pub(crate) fn measured_fabric_ladder(
+        &self,
+        ssrc: Ssrc,
+        rid: Option<Rid>,
+    ) -> Option<crate::rtp::monitor::MeasuredTargetLadder> {
+        self.encodings
+            .iter()
+            .find(|layer| layer.encoding.matches(ssrc, rid))?
+            .monitor
+            .measured_spatial_ladder()
+    }
+
     pub(crate) fn measure_fabric_dd(
         &mut self,
         ssrc: Ssrc,
@@ -662,6 +666,7 @@ impl TrackMonitor {
     fn snapshot(&self) -> VideoStatsSnapshot {
         VideoStatsSnapshot {
             layers: self.layer_states(),
+            wan_ladder: None,
         }
     }
 
@@ -738,6 +743,68 @@ pub struct DataTrack {
 #[derive(Debug, Clone, Default)]
 struct VideoStatsSnapshot {
     layers: TrackStates,
+    wan_ladder: Option<WanLadderLease>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WanLadderLease {
+    publisher: crate::shard_update::PublisherAnchor,
+    ladder: crate::rtp::monitor::MeasuredTargetLadder,
+    expires: Instant,
+}
+
+impl VideoTrack {
+    pub(crate) fn wan_ladder(
+        &self,
+        now: Instant,
+    ) -> Option<crate::rtp::monitor::MeasuredTargetLadder> {
+        self.stats
+            .0
+            .load()
+            .wan_ladder
+            .filter(|lease| now < lease.expires)
+            .map(|lease| lease.ladder)
+    }
+
+    pub(crate) fn refresh_wan_ladder(
+        &self,
+        publisher: crate::shard_update::PublisherAnchor,
+        ladder: Option<crate::rtp::monitor::MeasuredTargetLadder>,
+        expires: Instant,
+        now: Instant,
+    ) -> bool {
+        if now >= expires
+            || self.meta.id != publisher.publication
+            || self.meta.connection_id != publisher.connection
+            || ladder.is_some_and(|ladder| !ladder.valid())
+            || self.layers.len() != 1
+            || !self
+                .format
+                .as_ref()
+                .is_some_and(|format| format.mime_type.eq_ignore_ascii_case("video/vp9"))
+        {
+            return false;
+        }
+        let next = ladder.map(|ladder| WanLadderLease {
+            publisher,
+            ladder,
+            expires,
+        });
+        let current = self.stats.0.load();
+        if let (Some(old), Some(new)) = (current.wan_ladder, next)
+            && old.publisher == new.publisher
+            && new.ladder.through < old.ladder.through
+        {
+            return false;
+        }
+        if current.wan_ladder != next {
+            self.stats.0.store(Arc::new(VideoStatsSnapshot {
+                layers: current.layers.clone(),
+                wan_ladder: next,
+            }));
+        }
+        true
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -759,6 +826,7 @@ impl VideoStats {
                     )
                 })
                 .collect(),
+            wan_ladder: None,
         };
         Self(Arc::new(ArcSwap::from_pointee(snapshot)))
     }
@@ -784,6 +852,252 @@ impl VideoStats {
 
     pub(crate) fn layer_states(&self) -> TrackStates {
         self.0.load().layers.clone()
+    }
+}
+
+/// Measurement for one Fabric-native spatial encoding. It publishes the same
+/// snapshot consumed by RTC subscriptions; only the owning shard mutates it.
+pub(crate) struct FabricVideoMonitor {
+    encoding: SourceEncoding,
+    publication: PublicationKey,
+    monitor: StreamMonitor,
+    stats: VideoStats,
+    published: StreamStats,
+    fallback_height: u32,
+    due: Option<Instant>,
+}
+
+impl FabricVideoMonitor {
+    const POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+    pub(crate) fn new(track: &Track) -> Option<Self> {
+        let Track::Video(track) = track else {
+            return None;
+        };
+        let [layer] = track.layers.as_slice() else {
+            return None;
+        };
+        if !track.guarantees_video_dd
+            || !track
+                .format
+                .as_ref()
+                .is_some_and(|format| format.mime_type == "video/vp9")
+        {
+            return None;
+        }
+        let seed = StreamStats::new(true, 0, layer.quality.fallback_height());
+        let mut monitor = Self {
+            encoding: layer.encoding,
+            publication: track.meta.id,
+            monitor: StreamMonitor::new(TrackKind::Video, track.meta.id.to_string(), seed),
+            stats: track.stats.clone(),
+            published: seed,
+            fallback_height: seed.height,
+            due: None,
+        };
+        monitor.store(seed);
+        Some(monitor)
+    }
+
+    pub(crate) fn observe(&mut self, now: Instant, report: &crate::route::fabric::local::Offers) {
+        if let Some((seq, len)) = report.admitted_endpoint {
+            self.monitor.observe_primary(now, seq, len);
+            self.due.get_or_insert(now + Self::POLL_INTERVAL);
+        }
+        if let Some(facts) = report.dd_structure {
+            self.monitor.apply_stream_facts(facts);
+        }
+        let context_changed = self.monitor.measure_fabric_targets(now, report.dd_sample);
+        if report.dd_structure.is_some() || context_changed {
+            self.publish();
+        }
+    }
+
+    pub(crate) fn measured_ladder(&self) -> Option<crate::rtp::monitor::MeasuredTargetLadder> {
+        self.monitor.measured_spatial_ladder()
+    }
+
+    pub(crate) fn deadline(&self) -> Option<Instant> {
+        self.due
+    }
+
+    pub(crate) fn poll(&mut self, now: Instant) {
+        if !self.due.is_some_and(|due| now >= due) {
+            return;
+        }
+        self.monitor.poll(now, false);
+        self.publish();
+        self.due = (!self.published.inactive).then_some(now + Self::POLL_INTERVAL);
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.monitor = StreamMonitor::new(
+            TrackKind::Video,
+            self.publication.to_string(),
+            StreamStats::new(true, 0, self.fallback_height),
+        );
+        self.due = None;
+        self.publish();
+    }
+
+    fn publish(&mut self) {
+        let mut stats = self.monitor.stats();
+        stats.observed_height =
+            u32::from(stats.decode_target_heights.into_iter().max().unwrap_or(0));
+        stats.height = if stats.observed_height == 0 {
+            self.fallback_height
+        } else {
+            stats.observed_height
+        };
+        if self.published != stats {
+            self.store(stats);
+        }
+    }
+
+    fn store(&mut self, stats: StreamStats) {
+        self.stats.0.store(Arc::new(VideoStatsSnapshot {
+            layers: vec![(self.encoding, stats)],
+            wan_ladder: None,
+        }));
+        self.published = stats;
+    }
+}
+
+#[cfg(test)]
+mod fabric_video_monitor_tests {
+    use super::*;
+    use crate::route::fabric::local::{DecodeTargetRateContext, DecodeTargetSample, Offers};
+
+    #[test]
+    fn wan_ladder_refresh_is_shared_and_lease_bounded() {
+        use crate::{
+            route::fabric::local::Emission, rtp::monitor::MeasuredTargetLadder,
+            shard_update::PublisherAnchor,
+        };
+        use pulsebeam_core::fabric::{ExtensionKind, Profile};
+        let (_, mut track) = test_utils::make_video_track(
+            crate::entity::fixture_participant_id(),
+            crate::entity::ConnectionId::new(),
+            Mid::from("v"),
+            Vec::new(),
+        );
+        let Track::Video(video) = &mut track else {
+            panic!("expected video")
+        };
+        video.format = pulsebeam_proto::state::CodecFormat::native_quic_baseline("video/vp9");
+        let reader = video.clone();
+        let publisher = PublisherAnchor {
+            publication: video.meta.id,
+            connection: video.meta.connection_id,
+            incarnation: std::num::NonZeroU64::MIN,
+            emission: Emission::new(Profile::Vp9, &[ExtensionKind::DependencyDescriptor]).unwrap(),
+        };
+        let ladder = MeasuredTargetLadder {
+            context: DecodeTargetRateContext {
+                structure_origin: 100,
+                active_targets: 0b101,
+            },
+            through: 120,
+            heights: [180, 0, 720],
+            payload_bps: [100_000, 0, 800_000],
+        };
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(1);
+        assert!(video.refresh_wan_ladder(publisher, Some(ladder), deadline, now));
+        assert!(!video.refresh_wan_ladder(
+            publisher,
+            Some(MeasuredTargetLadder {
+                through: 119,
+                ..ladder
+            }),
+            deadline,
+            now
+        ));
+        assert_eq!(reader.wan_ladder(now), Some(ladder));
+        assert_eq!(reader.wan_ladder(deadline), None);
+        assert!(video.refresh_wan_ladder(publisher, None, deadline, now));
+        assert_eq!(reader.wan_ladder(now), None);
+    }
+
+    #[test]
+    fn spatial_snapshot_tracks_costs_and_clears_unqualified_evidence() {
+        let (_, mut track) = test_utils::make_video_track(
+            crate::entity::fixture_participant_id(),
+            crate::entity::ConnectionId::new(),
+            Mid::from("v"),
+            Vec::new(),
+        );
+        let Track::Video(video) = &mut track else {
+            panic!("expected video")
+        };
+        video.guarantees_video_dd = true;
+        video.format = Some(pulsebeam_proto::state::CodecFormat {
+            mime_type: "video/vp9".into(),
+            ..Default::default()
+        });
+        let encoding = video.layers[0].encoding;
+        let stats = video.stats.clone();
+        let snapshot = || {
+            let entries = stats.layer_states();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].0, encoding);
+            entries[0].1
+        };
+        let mut monitor = FabricVideoMonitor::new(&track).unwrap();
+        let initial = snapshot();
+        assert!(initial.is_inactive());
+        assert_ne!(initial.height, 0);
+        assert_eq!(initial.observed_height, 0);
+        let start = Instant::now();
+        for seq in 0..81_u64 {
+            let now = start + Duration::from_millis(seq * 50);
+            monitor.observe(
+                now,
+                &Offers {
+                    admitted_endpoint: Some((seq, 1000)),
+                    dd_structure: (seq == 0).then_some(StreamFacts {
+                        decode_targets: Some(3),
+                        decode_target_heights: Some([180, 360, 720]),
+                        temporal_only: Some(false),
+                    }),
+                    dd_sample: DecodeTargetSample::Measured {
+                        context: DecodeTargetRateContext {
+                            structure_origin: 0,
+                            active_targets: 0b111,
+                        },
+                        through: seq,
+                        bytes: [250, 500, 1000],
+                    },
+                    ..Offers::default()
+                },
+            );
+            monitor.poll(now);
+        }
+        let live = snapshot();
+        assert!(live.is_healthy());
+        assert_eq!(live.decode_target_heights, [180, 360, 720]);
+        assert_eq!(live.observed_height, 720);
+        assert!(0 < live.decode_target_bps(0));
+        assert!(live.decode_target_bps(0) < live.decode_target_bps(1));
+        assert!(live.decode_target_bps(1) < u64::from(live.bitrate_bps));
+        let ladder = monitor.measured_ladder().unwrap();
+        assert_eq!(ladder.through, 80);
+        assert_eq!(ladder.heights, [180, 360, 720]);
+        assert_eq!(ladder.payload_bps, live.measured_decode_target_bps);
+        monitor.observe(
+            start + Duration::from_millis(4050),
+            &Offers {
+                dd_sample: DecodeTargetSample::Unknown,
+                ..Offers::default()
+            },
+        );
+        assert_eq!(snapshot().decode_target_bps(0), 0);
+        assert!(monitor.measured_ladder().is_none());
+        monitor.poll(start + Duration::from_secs(8));
+        assert!(snapshot().is_inactive());
+        assert!(monitor.deadline().is_none());
+        monitor.reset();
+        assert_eq!(snapshot(), initial);
     }
 }
 

@@ -182,12 +182,12 @@ fn one_slot_track_replacement_keeps_media_flow_test() {
 }
 
 #[test]
-fn slots_prioritization_test() {
+fn slots_preserve_independent_height_requests_test() {
     LocalNodeSim::new()
         .with_room(
             Room::new("room1")
-                .with_participant(Participant::publisher("pub1", &["q", "h", "f"]))
-                .with_participant(Participant::publisher("pub2", &["q", "h", "f"]))
+                .with_participant(Participant::publisher("pub1", &["f"]))
+                .with_participant(Participant::publisher("pub2", &["q"]))
                 .with_participant(Participant::multi_subscriber("sub", 2)),
         )
         .run(vec![
@@ -195,19 +195,28 @@ fn slots_prioritization_test() {
                 description: "Publishers establish flow and signal track discovery",
                 duration: Duration::from_secs(5),
             },
-            Step::SubscribeAll {
-                description: "Subscribe: slot 0 at 720p (high), slot 1 at 180p (low)",
+            Step::SubscribeTo {
+                description: "Request one 720p source and one 180p source",
                 participant: "sub",
-                heights: &[720, 180],
+                targets: &[("pub1", 720), ("pub2", 180)],
             },
             Step::Run {
                 description: "Let differentiated subscriptions take effect",
                 duration: Duration::from_secs(10),
             },
-            Step::CheckRxBytes {
-                description: "Sub receives video across both priority slots",
+            Step::CheckVideoDecodedFromInterval {
+                description: "Sub decodes the high-resolution source",
                 participant: "sub",
-                min_bytes: 1,
+                publisher: "pub1",
+                min_frames: 1,
+                min_resolution: (1280, 720),
+            },
+            Step::CheckVideoDecodedFromInterval {
+                description: "Sub also decodes the low-resolution source",
+                participant: "sub",
+                publisher: "pub2",
+                min_frames: 1,
+                min_resolution: (320, 180),
             },
         ]);
 }

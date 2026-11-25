@@ -218,6 +218,7 @@ impl From<crate::route::fabric::DataPublisher> for PublisherAnchor {
 pub(crate) struct PublisherPosition {
     pub sequence: u64,
     pub timing: Option<pulsebeam_clock::domain::Projection>,
+    pub ladder: Option<crate::rtp::monitor::MeasuredTargetLadder>,
 }
 
 #[derive(Debug)]
