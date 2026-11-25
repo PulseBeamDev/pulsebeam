@@ -1,0 +1,113 @@
+{
+  "cases": [
+    {
+      "delivery": "Latest",
+      "publisher_loss": null,
+      "quic_to_sctp": [
+        81,
+        85,
+        73,
+        67,
+        32,
+        116,
+        111,
+        32,
+        83,
+        67,
+        84,
+        80
+      ],
+      "sctp_to_quic": [
+        83,
+        67,
+        84,
+        80,
+        32,
+        116,
+        111,
+        32,
+        81,
+        85,
+        73,
+        67
+      ],
+      "subscriber_loss": null
+    },
+    {
+      "delivery": "Reliable",
+      "publisher_loss": {
+        "repaired": true,
+        "unit_seq": 0
+      },
+      "quic_to_sctp": [
+        81,
+        85,
+        73,
+        67,
+        32,
+        116,
+        111,
+        32,
+        83,
+        67,
+        84,
+        80
+      ],
+      "sctp_to_quic": [
+        83,
+        67,
+        84,
+        80,
+        32,
+        116,
+        111,
+        32,
+        81,
+        85,
+        73,
+        67
+      ],
+      "subscriber_loss": {
+        "repaired": true,
+        "unit_seq": 0
+      }
+    },
+    {
+      "delivery": "Unreliable",
+      "publisher_loss": {
+        "repaired": false,
+        "unit_seq": 0
+      },
+      "quic_to_sctp": [
+        81,
+        85,
+        73,
+        67,
+        32,
+        116,
+        111,
+        32,
+        83,
+        67,
+        84,
+        80
+      ],
+      "sctp_to_quic": [
+        83,
+        67,
+        84,
+        80,
+        32,
+        116,
+        111,
+        32,
+        81,
+        85,
+        73,
+        67
+      ],
+      "subscriber_loss": null
+    }
+  ],
+  "version": 1
+}

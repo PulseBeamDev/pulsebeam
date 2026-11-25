@@ -41,6 +41,7 @@ pub struct QuicDataSend {
     pub generation: Generation,
     pub channel: ChannelId,
     pub binding: core::num::NonZeroU16,
+    pub record_dd: bool,
     pub operation: OperationId,
     pub payload: Vec<u8>,
 }

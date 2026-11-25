@@ -1,4 +1,3 @@
-#include <array>
 #include <cstdint>
 #include <fstream>
 #include <iostream>
@@ -24,10 +23,18 @@
 #include "call/rtp_transport_controller_send.h"
 #include "call/rtp_video_sender_interface.h"
 #include "modules/rtp_rtcp/include/rtp_rtcp_defines.h"
+#include "modules/rtp_rtcp/source/rtp_rtcp_impl2.h"
+#include "modules/rtp_rtcp/source/rtp_sender_audio.h"
+#include "modules/video_coding/codecs/av1/libaom_av1_encoder.h"
+#include "modules/video_coding/codecs/h264/include/h264.h"
+#include "modules/video_coding/codecs/vp8/include/vp8.h"
 #include "modules/video_coding/codecs/vp9/include/vp9.h"
 #include "modules/video_coding/fec_controller_default.h"
 #include "modules/video_coding/include/video_codec_interface.h"
+#include "modules/video_coding/svc/create_scalability_structure.h"
+#include "modules/video_coding/svc/scalability_mode_util.h"
 #include "rtc_base/checks.h"
+#include "rtc_base/logging.h"
 #include "rtc_base/thread.h"
 #include "system_wrappers/include/clock.h"
 #include "test/time_controller/simulated_time_controller.h"
@@ -35,11 +42,7 @@
 namespace {
 using namespace webrtc;
 
-constexpr int kWidth = 640;
-constexpr int kHeight = 360;
 constexpr int kFps = 30;
-constexpr int kPictures = 12;
-constexpr int kRestartPicture = 8;
 constexpr uint32_t kSsrc = 0x506c7362;
 constexpr int kPayloadType = 98;
 constexpr int kDdId = 9;
@@ -95,16 +98,17 @@ class EncoderCapture final : public EncodedImageCallback {
   Result OnEncodedImage(const EncodedImage& image,
                         const CodecSpecificInfo* info) override {
     RTC_CHECK(info && info->generic_frame_info && info->scalability_mode);
-    RTC_CHECK_EQ(info->codecType, kVideoCodecVP9);
     RTC_CHECK(!image.SimulcastIndex().value_or(0));
     const auto& generic = *info->generic_frame_info;
-    const auto& vp9 = info->codecSpecific.VP9;
-    RTC_CHECK_EQ(image.SpatialIndex().value_or(-1), generic.spatial_id);
+    RTC_CHECK_EQ(image.SpatialIndex().value_or(0), generic.spatial_id);
     index_ << unit_++ << '\t' << image.RtpTimestamp() << '\t'
            << generic.spatial_id << '\t' << generic.temporal_id << '\t'
            << image._encodedWidth << '\t' << image._encodedHeight << '\t'
-           << image.IsKey() << '\t' << vp9.inter_layer_predicted << '\t'
-           << info->end_of_picture << '\t'
+           << image.IsKey() << '\t';
+    if (info->codecType == kVideoCodecVP9) {
+      index_ << info->codecSpecific.VP9.inter_layer_predicted;
+    }
+    index_ << '\t' << info->end_of_picture << '\t'
            << ScalabilityModeToString(*info->scalability_mode) << '\t'
            << bytes_.tellp() << '\t' << image.size() << '\t';
     const char* separator = "";
@@ -122,7 +126,7 @@ class EncoderCapture final : public EncodedImageCallback {
   }
 
   void OnFrameDropped(uint32_t, int, bool) override {
-    RTC_CHECK(false) << "VP9 pilot unexpectedly dropped a coded frame";
+    RTC_CHECK(false) << "Capture unexpectedly dropped a coded frame";
   }
 
   int units() const { return unit_; }
@@ -134,21 +138,83 @@ class EncoderCapture final : public EncodedImageCallback {
   int unit_ = 0;
 };
 
+void CaptureOpus(std::istream& source, const std::string& dir) {
+  constexpr int kOpusPt = 111;
+  constexpr int kClockRate = 48000;
+  constexpr int kSamplesPerPacket = 960;
+  constexpr int kPackets = 300;
+  GlobalSimulatedTimeController time(kStart);
+  auto env = CreateEnvironment(time.GetClock(), time.GetTaskQueueFactory());
+  WireCapture wire(env.clock(), dir);
+  RtpRtcpInterface::Configuration config;
+  config.audio = true;
+  config.outgoing_transport = &wire;
+  config.rtcp_report_interval_ms = 200;
+  config.local_media_ssrc = kSsrc;
+  config.rtp_state = RtpState{.sequence_number = 65510, .start_timestamp = kRtpOffset};
+  config.rtcp_mode = RtcpMode::kCompound;
+  auto rtp = ModuleRtpRtcpImpl2::CreateSendModule(env, config);
+  rtp->RegisterSendPayloadFrequency(kOpusPt, kClockRate);
+  RTPSenderAudio audio(&env.clock(), rtp->RtpSender());
+  RTC_CHECK_EQ(audio.RegisterAudioPayload("opus", kOpusPt, kClockRate, 1, 48000), 0);
+  RTC_CHECK_EQ(rtp->SetSendingStatus(true), 0);
+  rtp->SetSendingMediaStatus(true);
+  std::ofstream context(dir + "/context.tsv");
+  context << "format\topus/48000/1\npt\t" << kOpusPt << "\nssrc\t" << kSsrc
+          << "\nrtp_offset\t" << rtp->StartTimestamp() << '\n';
+  RTC_CHECK(context.good());
+  for (int i = 0; i < kPackets; ++i) {
+    const int low = source.get();
+    const int high = source.get();
+    RTC_CHECK(low >= 0 && high >= 0);
+    const size_t size = low + 256 * high;
+    RTC_CHECK(size > 0 && size <= 1275);
+    std::vector<uint8_t> payload(size);
+    source.read(reinterpret_cast<char*>(payload.data()), size);
+    RTC_CHECK(source.good());
+    const uint32_t timestamp = i * kSamplesPerPacket;
+    const Timestamp now = env.clock().CurrentTime();
+    RTC_CHECK(rtp->OnSendingRtpFrame(timestamp, now.ms(), kOpusPt, false));
+    RTC_CHECK(audio.SendAudio({.payload = payload, .payload_id = kOpusPt,
+                              .rtp_timestamp = timestamp + rtp->StartTimestamp(),
+                              .capture_time = now}));
+    time.AdvanceTime(TimeDelta::Millis(20));
+  }
+  RTC_CHECK(source.peek() == std::istream::traits_type::eof());
+}
+
 void Capture(std::istream& source, std::string_view requested,
-             ScalabilityMode mode, const std::string& dir) {
+             ScalabilityMode mode, VideoCodecType codec_type,
+             const std::string& dir) {
+  const bool vp9 = codec_type == kVideoCodecVP9;
+  const bool pilot = vp9 && (mode == ScalabilityMode::kS2T1 ||
+                            mode == ScalabilityMode::kL2T1);
+  const int width = pilot ? 640 : 1152;
+  const int height = pilot ? 360 : 720;
+  const int pictures = pilot ? 12 : 36;
+  const int restart_picture = pilot ? 8 : 24;
+  const auto config = ScalabilityStructureConfig(mode);
+  RTC_CHECK(config);
   GlobalSimulatedTimeController time(kStart);
   auto env = CreateEnvironment(time.GetClock(), time.GetTaskQueueFactory());
   WireCapture wire(env.clock(), dir);
   RtpTransportControllerSend transport({
       .env = env,
-      .bitrate_config = {.start_bitrate_bps = 3'000'000},
+      // This lane records intact sender output, not pacer congestion drops.
+      .bitrate_config = {.start_bitrate_bps = vp9 ? 3'000'000 : 30'000'000},
       .network_thread = time.GetMainThread(),
   });
   transport.EnsureStarted();
 
   RtpConfig rtp;
   rtp.ssrcs = {kSsrc};
-  rtp.payload_name = "VP9";
+  switch (codec_type) {
+    case kVideoCodecVP8: rtp.payload_name = "VP8"; break;
+    case kVideoCodecVP9: rtp.payload_name = "VP9"; break;
+    case kVideoCodecH264: rtp.payload_name = "H264"; break;
+    case kVideoCodecAV1: rtp.payload_name = "AV1"; break;
+    default: RTC_CHECK(false);
+  }
   rtp.payload_type = kPayloadType;
   rtp.max_packet_size = kPacketBytes;
   rtp.extmap_allow_mixed = true;
@@ -163,64 +229,103 @@ void Capture(std::istream& source, std::string_view requested,
   transport.OnNetworkAvailability(true);
 
   std::ofstream context(dir + "/context.tsv");
-  context << "requested_mode\t" << requested << "\nformat\tVP9/90000\n"
-          << "profile_id\t0\nssrc\t" << kSsrc << "\npt\t" << kPayloadType
+  context << "requested_mode\t" << requested << "\nformat\t"
+          << rtp.payload_name << "/90000\n";
+  if (codec_type == kVideoCodecH264) {
+    context << "packetization_mode\t1\n";
+  } else {
+    context << "profile_id\t0\n";
+  }
+  context << "ssrc\t" << kSsrc
+          << "\npt\t" << kPayloadType
           << "\ndd_id\t" << kDdId << "\ndd_uri\t"
           << RtpExtension::kDependencyDescriptorUri << "\nrtp_offset\t"
           << kRtpOffset << "\nmax_packet_bytes\t" << kPacketBytes << '\n';
   RTC_CHECK(context.good());
 
   EncoderCapture observe(*sender, dir);
-  auto encoder = CreateVp9Encoder(env);
+  std::unique_ptr<VideoEncoder> encoder;
+  switch (codec_type) {
+    case kVideoCodecVP8: encoder = CreateVp8Encoder(env); break;
+    case kVideoCodecVP9: encoder = CreateVp9Encoder(env); break;
+    case kVideoCodecH264: encoder = CreateH264Encoder(env); break;
+    case kVideoCodecAV1: encoder = CreateLibaomAv1Encoder(env); break;
+    default: RTC_CHECK(false);
+  }
   VideoCodec codec;
-  codec.codecType = kVideoCodecVP9;
-  *codec.VP9() = VideoEncoder::GetDefaultVp9Settings();
-  codec.VP9()->numberOfSpatialLayers = 2;
-  codec.width = kWidth;
-  codec.height = kHeight;
+  codec.codecType = codec_type;
+  if (vp9) {
+    *codec.VP9() = VideoEncoder::GetDefaultVp9Settings();
+    codec.VP9()->numberOfSpatialLayers = config->num_spatial_layers;
+    codec.VP9()->numberOfTemporalLayers = config->num_temporal_layers;
+  } else if (codec_type == kVideoCodecVP8) {
+    *codec.VP8() = VideoEncoder::GetDefaultVp8Settings();
+    codec.VP8()->numberOfTemporalLayers = config->num_temporal_layers;
+  } else if (codec_type == kVideoCodecH264) {
+    *codec.H264() = VideoEncoder::GetDefaultH264Settings();
+    codec.H264()->numberOfTemporalLayers = config->num_temporal_layers;
+  } else {
+    codec.qpMax = 63;
+  }
+  codec.width = width;
+  codec.height = height;
   codec.maxFramerate = kFps;
   codec.startBitrate = 1200;
   codec.maxBitrate = 2000;
   codec.active = true;
   codec.SetScalabilityMode(mode);
   VideoBitrateAllocation rates;
-  for (int sid = 0; sid < 2; ++sid) {
-    auto& layer = codec.spatialLayers[sid];
-    layer.width = kWidth >> (1 - sid);
-    layer.height = kHeight >> (1 - sid);
+  auto spatial_layers = std::span(codec.spatialLayers);
+  auto numerators = std::span(config->scaling_factor_num);
+  auto denominators = std::span(config->scaling_factor_den);
+  for (int sid = 0; sid < config->num_spatial_layers; ++sid) {
+    auto& layer = spatial_layers[sid];
+    layer.width = width * numerators[sid] / denominators[sid];
+    layer.height = height * numerators[sid] / denominators[sid];
+    RTC_CHECK_EQ(layer.width * denominators[sid], width * numerators[sid]);
+    RTC_CHECK_EQ(layer.height * denominators[sid], height * numerators[sid]);
     layer.maxFramerate = kFps;
-    layer.numberOfTemporalLayers = 1;
+    layer.numberOfTemporalLayers = config->num_temporal_layers;
     layer.minBitrate = 100;
     layer.targetBitrate = sid == 0 ? 300 : 900;
     layer.maxBitrate = layer.targetBitrate;
     layer.active = true;
-    RTC_CHECK(rates.SetBitrate(sid, 0, layer.targetBitrate * 1000));
+    for (int tid = 0; tid < config->num_temporal_layers; ++tid) {
+      RTC_CHECK(rates.SetBitrate(
+          sid, tid, layer.targetBitrate * 1000 / config->num_temporal_layers));
+    }
   }
   RTC_CHECK_EQ(encoder->InitEncode(&codec, {1, kPacketBytes}), 0);
   RTC_CHECK_EQ(encoder->RegisterEncodeCompleteCallback(&observe), 0);
   encoder->SetRates({rates, kFps});
 
-  std::array<uint8_t, kWidth * kHeight * 3 / 2> raw;
-  for (int i = 0; i < kPictures; ++i) {
+  const size_t luma = width * height;
+  std::vector<uint8_t> raw(luma * 3 / 2);
+  for (int i = 0; i < pictures; ++i) {
+    const int units_before = observe.units();
     const int64_t elapsed_us = i * 1'000'000 / kFps;
     time.AdvanceTime(kStart + TimeDelta::Micros(elapsed_us) -
                      env.clock().CurrentTime());
     source.read(reinterpret_cast<char*>(raw.data()), raw.size());
     RTC_CHECK(source.good());
-    const auto* y = raw.data();
-    const auto* u = y + kWidth * kHeight;
-    const auto* v = u + kWidth * kHeight / 4;
+    const auto planes = std::span(raw);
+    const auto* y = planes.data();
+    const auto* u = planes.subspan(luma, luma / 4).data();
+    const auto* v = planes.last(luma / 4).data();
     auto frame = VideoFrame::Builder()
                      .set_video_frame_buffer(I420Buffer::Copy(
-                         kWidth, kHeight, y, kWidth, u, kWidth / 2, v, kWidth / 2))
+                         width, height, y, width, u, width / 2, v, width / 2))
                      .set_timestamp_us(env.clock().CurrentTime().us())
                      .set_timestamp_rtp(i * (90000 / kFps))
                      .build();
     const std::vector<VideoFrameType> type = {
-        i == 0 || i == kRestartPicture ? VideoFrameType::kVideoFrameKey
+        i == 0 || i == restart_picture ? VideoFrameType::kVideoFrameKey
                                        : VideoFrameType::kVideoFrameDelta};
-    RTC_CHECK_EQ(encoder->Encode(frame, &type), 0);
-    RTC_CHECK_EQ(observe.units(), 2 * (i + 1));
+    RTC_CHECK_EQ(encoder->Encode(frame, &type), 0)
+        << "mode=" << requested << " input_picture=" << i;
+    if (pilot) {
+      RTC_CHECK_EQ(observe.units() - units_before, config->num_spatial_layers);
+    }
   }
   RTC_CHECK(source.peek() == std::istream::traits_type::eof());
   RTC_CHECK_EQ(encoder->Release(), 0);
@@ -230,15 +335,37 @@ void Capture(std::istream& source, std::string_view requested,
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (argc != 4 || (std::string_view(argv[1]) != "S2T1" &&
-                    std::string_view(argv[1]) != "L2T1")) {
-    std::cerr << "usage: vp9_capture S2T1|L2T1 INPUT_I420 OUTPUT_DIRECTORY\n";
+  webrtc::LogMessage::LogToDebug(webrtc::LS_WARNING);
+  using namespace webrtc;
+  if (argc != 4 && argc != 5) {
+    std::cerr << "usage: vp9_capture [--av1|--vp8|--h264] MODE INPUT_I420 OUTPUT_DIRECTORY\n";
     return 2;
   }
-  std::ifstream source(argv[2], std::ios::binary);
+  VideoCodecType codec = kVideoCodecVP9;
+  if (argc == 5) {
+    const std::string_view flag(argv[1]);
+    if (flag == "--av1") codec = kVideoCodecAV1;
+    else if (flag == "--vp8") codec = kVideoCodecVP8;
+    else if (flag == "--h264") codec = kVideoCodecH264;
+    else return 2;
+  }
+  if (argc == 4 && std::string_view(argv[1]) == "--opus") {
+    std::ifstream source(argv[2], std::ios::binary);
+    RTC_CHECK(source.good());
+    CaptureOpus(source, argv[3]);
+    return 0;
+  }
+  const int arg = argc - 3;
+  const std::string_view requested(argv[arg]);
+  const auto mode = ScalabilityModeFromString(requested);
+  if (!mode || !ScalabilityStructureConfig(*mode) ||
+      (codec == kVideoCodecVP9 && !VP9Encoder::SupportsScalabilityMode(*mode)) ||
+      (codec == kVideoCodecH264 && !H264Encoder::SupportsScalabilityMode(*mode)) ||
+      (codec == kVideoCodecVP8 && !requested.starts_with("L1T"))) {
+    std::cerr << "unsupported upstream scalability mode: " << requested << '\n';
+    return 2;
+  }
+  std::ifstream source(argv[arg + 1], std::ios::binary);
   RTC_CHECK(source.good());
-  const std::string_view requested(argv[1]);
-  const auto mode = requested == "S2T1" ? webrtc::ScalabilityMode::kS2T1
-                                       : webrtc::ScalabilityMode::kL2T1;
-  Capture(source, requested, mode, argv[3]);
+  Capture(source, requested, *mode, codec, argv[arg + 2]);
 }

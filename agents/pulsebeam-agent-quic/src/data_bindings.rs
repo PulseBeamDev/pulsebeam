@@ -5,14 +5,19 @@ use std::{
 
 use pulsebeam_core::fabric::{
     ExtensionKind, Profile, WireError,
-    packet::{Agreement, Offer},
+    packet::{Agreement, Offer, VideoDdEmission, VideoDdReception},
 };
 use pulsebeam_proto::{
     data_endpoint::Format,
-    state::{QuicDataV1Parameters, validation::QuicRtpBinding},
+    state::{QuicDataV1Parameters, QuicVideoDd, validation::QuicRtpBinding},
 };
 
 use crate::records::PacketFraming;
+
+// Association capability, not a packet extension ID. Legacy registries ignore
+// this supported-only bit when intersecting packet extensions.
+const DIRECTIONAL_VIDEO_DD: u16 = 1 << 15;
+const DATA_RECORD_DD: u16 = 1 << 14;
 
 /// Wire capabilities advertised over authenticated control. The binding owner
 /// supplies the profile and required features from the authorized source.
@@ -33,7 +38,8 @@ impl FabricOffer {
         max_revision: pulsebeam_core::fabric::REGISTRY_REVISION,
         supported: Offer::current(Profile::Opus, 0).supported
             | Offer::current(Profile::H264, 0).supported
-            | Offer::current(Profile::Data, 0).supported,
+            | Offer::current(Profile::Data, 0).supported
+            | DIRECTIONAL_VIDEO_DD,
     };
 
     pub const fn decode([framing, major, min_revision, max_revision, a, b]: [u8; 6]) -> Self {
@@ -56,6 +62,41 @@ impl FabricOffer {
             a,
             b,
         ]
+    }
+
+    pub const fn supports_directional_video_dd(self, peer: Self) -> bool {
+        self.framing == peer.framing
+            && self.major == peer.major
+            && self.supported & peer.supported & DIRECTIONAL_VIDEO_DD != 0
+    }
+
+    /// Enable the association capability only when the endpoint implements
+    /// the DATA_V1 record and extension projection in both directions.
+    pub const fn with_data_record_dd(mut self) -> Self {
+        self.supported |= DATA_RECORD_DD;
+        self
+    }
+
+    pub const fn supports_data_record_dd(self, peer: Self) -> bool {
+        self.framing == peer.framing
+            && self.major == peer.major
+            && self.supported & peer.supported & DATA_RECORD_DD != 0
+    }
+
+    /// Bind a logical DATA_V1 resource. A descriptor-capable resource may
+    /// carry descriptor-free records too; legacy resources cannot carry DD.
+    pub fn bind_data(mut self, peer: Self, record_dd: bool) -> Result<FabricBinding, WireError> {
+        let required = if record_dd {
+            if !self.supports_data_record_dd(peer) {
+                return Err(WireError::RequiredFeature);
+            }
+            ExtensionKind::DependencyDescriptor.bit()
+        } else {
+            0
+        };
+        // Capture time and delivery coordinates remain fields of the record.
+        self.supported &= required;
+        self.bind(peer, Profile::Data, required)
     }
 
     const fn packet_offer(self, required: u16) -> Offer {
@@ -84,15 +125,90 @@ impl FabricOffer {
                 self.supported &= !dd;
                 0
             }
-            (Profile::Data, false) => {
-                // Logical DATA publications promise the SCTP-compatible record
-                // shape. Capture time within the record is not an extension.
-                self.supported = 0;
-                0
-            }
+            (Profile::Data, false) => return self.bind_data(peer, false),
             _ => 0,
         };
         self.bind(peer, profile, required)
+    }
+
+    pub fn bind_rtp_publisher(
+        self,
+        peer: Self,
+        profile: Profile,
+        legacy_h264_dd: bool,
+        emits_video_dd: Option<bool>,
+    ) -> Result<FabricBinding, WireError> {
+        match (legacy_h264_dd, emits_video_dd) {
+            (legacy, None) => self.bind_publisher(peer, profile, legacy),
+            (false, Some(emission)) => {
+                let emission = if emission {
+                    QuicVideoDd::Emit
+                } else {
+                    QuicVideoDd::Absent
+                };
+                self.bind_video_direction(peer, profile, emission, QuicVideoDd::Accept)
+            }
+            (true, Some(_)) => Err(WireError::RequiredFeature),
+        }
+    }
+
+    /// Select the receiver's wire contract. `Require` is installed by the
+    /// publisher only after checking that the source guarantees DD.
+    pub fn bind_rtp_receiver(
+        self,
+        peer: Self,
+        profile: Profile,
+        reception: Option<QuicVideoDd>,
+    ) -> Result<FabricBinding, WireError> {
+        match reception {
+            None => self.bind(peer, profile, 0),
+            Some(QuicVideoDd::Absent) => {
+                self.bind_video_direction(peer, profile, QuicVideoDd::Absent, QuicVideoDd::Absent)
+            }
+            Some(QuicVideoDd::Accept)
+                if profile.is_video() && self.supports_directional_video_dd(peer) =>
+            {
+                self.bind(peer, profile, 0)
+            }
+            Some(QuicVideoDd::Require) => {
+                self.bind_video_direction(peer, profile, QuicVideoDd::Emit, QuicVideoDd::Require)
+            }
+            _ => Err(WireError::RequiredFeature),
+        }
+    }
+
+    /// `self` describes the publisher and `peer` the receiver for this direction.
+    pub fn bind_video_direction(
+        self,
+        peer: Self,
+        profile: Profile,
+        emission: QuicVideoDd,
+        reception: QuicVideoDd,
+    ) -> Result<FabricBinding, WireError> {
+        if !self.supports_directional_video_dd(peer) {
+            return Err(WireError::RequiredFeature);
+        }
+        let emission = match emission {
+            QuicVideoDd::Absent => VideoDdEmission::None,
+            QuicVideoDd::Emit => VideoDdEmission::EveryPacket,
+            _ => return Err(WireError::RequiredFeature),
+        };
+        let reception = match reception {
+            QuicVideoDd::Absent => VideoDdReception::None,
+            QuicVideoDd::Accept => VideoDdReception::Accepted,
+            QuicVideoDd::Require => VideoDdReception::Required,
+            _ => return Err(WireError::RequiredFeature),
+        };
+        Ok(FabricBinding {
+            framing: PacketFraming::negotiate(peer.framing).map_err(|_| WireError::Version)?,
+            agreement: Agreement::negotiate_video(
+                profile,
+                self.packet_offer(0),
+                emission,
+                peer.packet_offer(0),
+                reception,
+            )?,
+        })
     }
 
     pub fn bind(
@@ -115,6 +231,18 @@ impl FabricOffer {
     }
 }
 
+/// Maps a negotiated codec format, never its session-local RTP payload type.
+pub fn rtp_profile(mime_type: &str) -> Option<Profile> {
+    match mime_type {
+        "audio/opus" => Some(Profile::Opus),
+        "video/h264" => Some(Profile::H264),
+        "video/av1" => Some(Profile::Av1),
+        "video/vp8" => Some(Profile::Vp8),
+        "video/vp9" => Some(Profile::Vp9),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FabricBinding {
     pub framing: PacketFraming,
@@ -126,6 +254,7 @@ pub struct DataBinding {
     pub id: NonZeroU16,
     pub incarnation: NonZeroU64,
     pub format: Format,
+    pub record_dd: bool,
 }
 
 impl DataBinding {
@@ -134,6 +263,7 @@ impl DataBinding {
             id: NonZeroU16::new(u16::try_from(parameters.binding_id).ok()?)?,
             incarnation: NonZeroU64::new(parameters.incarnation)?,
             format: parameters.format()?,
+            record_dd: parameters.record_dd,
         })
     }
 }
@@ -242,15 +372,68 @@ mod tests {
             incarnation,
             version: 1,
             delivery: DataV1Delivery::Reliable as i32,
+            record_dd: false,
         })
         .unwrap()
+    }
+
+    #[test]
+    fn directional_dd_requires_both_associations_to_advertise_the_contract() {
+        let legacy = FabricOffer::decode([1, 1, 0, 1, 0x03, 0xfc]);
+        let directional = FabricOffer {
+            supported: legacy.supported | DIRECTIONAL_VIDEO_DD,
+            ..legacy
+        };
+        assert_eq!(directional.encode(), [1, 1, 0, 1, 0x83, 0xfc]);
+        for (publisher, receiver) in [(legacy, directional), (directional, legacy)] {
+            assert_eq!(
+                publisher.bind_video_direction(
+                    receiver,
+                    Profile::Vp9,
+                    QuicVideoDd::Emit,
+                    QuicVideoDd::Require
+                ),
+                Err(WireError::RequiredFeature),
+            );
+            assert_eq!(
+                publisher.bind_rtp_receiver(receiver, Profile::H264, Some(QuicVideoDd::Require)),
+                Err(WireError::RequiredFeature),
+            );
+            assert_eq!(
+                publisher.bind_rtp_publisher(receiver, Profile::H264, false, Some(true)),
+                Err(WireError::RequiredFeature),
+            );
+            assert_eq!(
+                publisher.bind_publisher(receiver, Profile::H264, true),
+                legacy.bind_publisher(legacy, Profile::H264, true),
+            );
+        }
+        let binding = directional
+            .bind_video_direction(
+                directional,
+                Profile::Vp9,
+                QuicVideoDd::Emit,
+                QuicVideoDd::Require,
+            )
+            .unwrap();
+        assert_eq!(binding.agreement.extension_mask() & DIRECTIONAL_VIDEO_DD, 0);
+        assert_eq!(binding.agreement.profile(), Profile::Vp9);
+        assert_eq!(
+            directional.bind_video_direction(
+                directional,
+                Profile::Vp9,
+                QuicVideoDd::Require,
+                QuicVideoDd::Emit
+            ),
+            Err(WireError::RequiredFeature),
+        );
     }
 
     #[test]
     fn fabric_capabilities_bind_using_the_installed_profile_and_requirements() {
         let old = FabricOffer::decode([1, 1, 0, 0, 0, 12]);
         let current = FabricOffer::CURRENT;
-        assert_eq!(current.encode(), [1, 1, 0, 1, 3, 252]);
+        assert_eq!(current.encode(), [1, 1, 0, 1, 131, 252]);
         let old_data = current.bind(old, Profile::Data, 0x000c).unwrap();
         assert_eq!(old_data.agreement.profile(), Profile::Data);
         assert_eq!(old_data.agreement.revision(), 0);
@@ -271,6 +454,86 @@ mod tests {
         assert_eq!(
             current.bind(FabricOffer { framing: 2, ..old }, Profile::Data, 0),
             Err(WireError::Version)
+        );
+    }
+
+    #[test]
+    fn data_dd_agreement_does_not_strip_record_dependencies_or_require_them_per_packet() {
+        use pulsebeam_core::fabric::{Extension, FabricPacket, Header, packet::MAX_PACKET_BYTES};
+        use pulsebeam_proto::data_record::{self, Record};
+
+        let current = FabricOffer::CURRENT;
+        let capable = current.with_data_record_dd();
+        assert_eq!(capable.encode(), [1, 1, 0, 1, 195, 252]);
+        assert_eq!(
+            capable.bind_data(current, true),
+            Err(WireError::RequiredFeature)
+        );
+        assert_eq!(
+            current.bind_data(capable, true),
+            Err(WireError::RequiredFeature)
+        );
+        let legacy = capable.bind_data(capable, false).unwrap().agreement;
+        let capable = capable.bind_data(capable, true).unwrap().agreement;
+        let dd = ExtensionKind::DependencyDescriptor;
+        assert_eq!(legacy.extension_mask(), 0);
+        assert_eq!(capable.extension_mask(), dd.bit());
+
+        let hint = [0xc0, 0, 7];
+        let record = Record::new(
+            data_record::Header {
+                unit_seq: 42,
+                index: 0,
+                count: 1,
+                unit_len: 1,
+                capture: None,
+            },
+            &[0xab],
+            None,
+        )
+        .unwrap();
+        let mut payload = [0; data_record::MAX_RECORD_BYTES];
+        let len = record.write(&mut payload).unwrap();
+        let header = Header {
+            profile: Profile::Data,
+            marker: true,
+            sequence: 19,
+            timestamp: 770,
+        };
+        let packet = FabricPacket::new(
+            header,
+            &[Extension {
+                kind: dd,
+                value: &hint,
+            }],
+            &payload[..len],
+        )
+        .unwrap();
+        let mut wire = [0; MAX_PACKET_BYTES];
+        assert_eq!(
+            legacy.write(&packet, &mut wire),
+            Err(WireError::RequiredFeature)
+        );
+        let size = capable.write(&packet, &mut wire).unwrap();
+        let restored = capable.decode(&wire[..size]).unwrap();
+        assert_eq!(restored.extensions().next().unwrap().value, &hint);
+        assert_eq!(
+            Record::decode_without_descriptor(restored.payload(), None).unwrap(),
+            record
+        );
+        assert_eq!(
+            legacy.decode(&wire[..size]).err(),
+            Some(WireError::UnnegotiatedExtension)
+        );
+        let packet = FabricPacket::new(header, &[], &payload[..len]).unwrap();
+        let size = capable.write(&packet, &mut wire).unwrap();
+        assert!(
+            legacy
+                .decode(&wire[..size])
+                .unwrap()
+                .extensions()
+                .next()
+                .is_none()
         );
     }
 

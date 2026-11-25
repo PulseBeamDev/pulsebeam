@@ -1,5 +1,6 @@
 use super::{
-    failure_code, is_stock_av1, publication_binding, receiving_binding, transport_capabilities,
+    fabric_profile, failure_code, is_stock_av1, publication_binding, receiving_binding,
+    transport_capabilities,
 };
 use crate::entity::TrackId;
 use crate::media::{Mid, Rid};
@@ -42,9 +43,12 @@ pub(crate) fn publication(
         extension.uri
             == wire::RtpHeaderExtensionType::RtpHeaderExtensionDependencyDescriptor.as_str()
     });
-    let av1_whole_source = is_stock_av1(&binding.codec.parameters) && binding.encodings.len() == 1;
-    if !(av1_whole_source || matches!(binding.codec.parameters.name.as_str(), "opus" | "h264"))
-        || kind == wire::TrackKind::Video && binding.encodings.len() > 1 && !dependency_descriptor
+    use pulsebeam_core::fabric::Profile;
+    let profile =
+        fabric_profile(&binding.codec.parameters).ok_or(wire::FailureCode::Unsupported)?;
+    if (profile.is_video()
+        && binding.encodings.len() != 1
+        && (profile != Profile::H264 || !dependency_descriptor))
         || kind == wire::TrackKind::Audio
             && (binding.encodings.len() != 1
                 || binding
@@ -90,6 +94,7 @@ pub(crate) fn receiver(
     let kind = wire::TrackKind::try_from(subscription.kind)
         .map_err(|_| wire::FailureCode::InvalidConfiguration)?;
     let binding = receiving_binding(parameters, kind, capabilities)?;
+    fabric_profile(&binding.codec.parameters).ok_or(wire::FailureCode::Unsupported)?;
     let [encoding] = binding.encodings.as_slice() else {
         return Err(wire::FailureCode::InvalidConfiguration);
     };

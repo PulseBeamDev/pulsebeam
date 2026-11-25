@@ -91,12 +91,16 @@ platform(
     srcs = [":test_binary" if variant == "control" else ":test_binary_" + variant],
     target_platform = ":sim_platform",
     tags = ["manual"],
+    visibility = ["//agents/pulsebeam-agent-quic:__pkg__"] if variant == "control" else None,
 ) for variant in ["control"] + VARIANTS]
 
 # Reserve one CPU per isolated child, from the same budget used by the runner.
 SIMULATION_JOBS = 4
 
-simulation_provenance(name = "candidate")
+simulation_provenance(
+    name = "candidate",
+    visibility = ["//agents/pulsebeam-agent-quic:__pkg__", "//tools:__pkg__"],
+)
 
 CANDIDATE_ARGS = ["--candidate", "$(rootpath :candidate)"]
 INCIDENT_DATA = ["//crates/pulsebeam-cli:pulsebeam-cli"]
@@ -121,6 +125,20 @@ py_binary(
     main = "//tools:run-simulations.py",
     args = REPLAY_ARGS,
     data = [":sim_binary", ":candidate"] + INCIDENT_DATA,
+)
+
+py_binary(
+    name = "author_data_v1",
+    testonly = True,
+    srcs = ["scripts/author_data_v1.py"],
+    main = "scripts/author_data_v1.py",
+    args = [
+        "--runner", "$(rootpath //tools:run-simulations.py)",
+        "--sim-binary", "$(rootpath :sim_binary)",
+    ] + CANDIDATE_ARGS,
+    data = [":sim_binary", ":candidate", "//tools:run-simulations.py"] + INCIDENT_DATA,
+    tags = ["manual"],
+    visibility = ["//agents/pulsebeam-agent-quic:__pkg__"],
 )
 
 py_binary(

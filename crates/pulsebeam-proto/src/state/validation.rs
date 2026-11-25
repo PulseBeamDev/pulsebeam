@@ -343,7 +343,17 @@ pub fn validate_track(track: &Track) -> Result {
     }
     match track.kind.as_ref().ok_or(ValidationError::Format)? {
         track::Kind::Audio(audio) => validate_discovery_format(audio.format.as_ref(), true),
-        track::Kind::Video(video) => validate_discovery_format(video.format.as_ref(), false),
+        track::Kind::Video(video) => {
+            let format = video.format.as_ref().ok_or(ValidationError::Format)?;
+            validate_discovery_format(Some(format), false)?;
+            if video.av1_whole_source {
+                if format.mime_type != "video/av1" {
+                    return Err(ValidationError::Format);
+                }
+                super::VideoMode::for_format(format, "L1T1")?;
+            }
+            Ok(())
+        }
         track::Kind::Data(data)
             if known::<DataDelivery>(data.delivery)
                 && data
@@ -620,6 +630,7 @@ fn validate_video(options: &VideoReceiveOptions) -> Result {
         || !range(options.min_height, 1, 16384)
         || !range(options.min_fps, 1, 240)
         || !range(options.priority, 1, 255)
+        || !range(options.decode_target, 0, 31)
         || matches!((options.min_height, options.max_height), (Some(min), Some(max)) if min > max)
     {
         return Err(ValidationError::Settings);
@@ -700,7 +711,7 @@ fn validate_binding(
         Some(track_binding::Transport::QuicRtp(parameters))
             if publication || !parameters.publishes_h264_dd =>
         {
-            QuicRtpBinding::compile(parameters, kind).map(|_| ())
+            QuicRtpBinding::compile(parameters, kind)?.validate_video_dd_direction(publication)
         }
         Some(track_binding::Transport::Sctp(sctp))
             if kind == TrackKind::Data && matches!(sctp.stream_id, Some(1..=65534)) =>
@@ -732,6 +743,7 @@ pub struct QuicRtpBinding<'a> {
     format: &'a CodecFormat,
     feedback: &'a [String],
     publishes_h264_dd: bool,
+    video_dd: Option<QuicVideoDd>,
 }
 
 impl<'a> QuicRtpBinding<'a> {
@@ -753,11 +765,22 @@ impl<'a> QuicRtpBinding<'a> {
         }
         let format = codec.format.as_ref().ok_or(ValidationError::Format)?;
         validate_format(format)?;
-        match (kind, format.known_codec()) {
-            (TrackKind::Audio, Some(codec_format::Codec::Opus(_)))
-                if !rtp.publishes_h264_dd && !video_feedback(&codec.feedback) => {}
-            (TrackKind::Video, Some(codec_format::Codec::H264(_))) => {}
-            _ => return Err(ValidationError::Format),
+        let video_dd = rtp
+            .video_dd
+            .map(|value| QuicVideoDd::try_from(value).map_err(|_| ValidationError::Binding))
+            .transpose()?;
+        if let Some(dd) = video_dd {
+            if kind != TrackKind::Video || rtp.publishes_h264_dd || dd == QuicVideoDd::Unspecified {
+                return Err(ValidationError::Binding);
+            }
+            VideoMode::for_format(format, RtpScalabilityMode::L1t1.as_str())?;
+        } else {
+            match (kind, format.known_codec()) {
+                (TrackKind::Audio, Some(codec_format::Codec::Opus(_)))
+                    if !rtp.publishes_h264_dd && !video_feedback(&codec.feedback) => {}
+                (TrackKind::Video, Some(codec_format::Codec::H264(_))) => {}
+                _ => return Err(ValidationError::Format),
+            }
         }
         Ok(Self {
             id,
@@ -767,6 +790,7 @@ impl<'a> QuicRtpBinding<'a> {
             format,
             feedback: &codec.feedback,
             publishes_h264_dd: rtp.publishes_h264_dd,
+            video_dd,
         })
     }
 
@@ -788,6 +812,19 @@ impl<'a> QuicRtpBinding<'a> {
     pub const fn feedback(self) -> &'a [String] {
         self.feedback
     }
+    pub const fn video_dd(self) -> Option<QuicVideoDd> {
+        self.video_dd
+    }
+
+    pub fn validate_video_dd_direction(self, publication: bool) -> Result {
+        match (publication, self.video_dd) {
+            (_, None | Some(QuicVideoDd::Absent))
+            | (true, Some(QuicVideoDd::Emit))
+            | (false, Some(QuicVideoDd::Accept | QuicVideoDd::Require)) => Ok(()),
+            _ => Err(ValidationError::Binding),
+        }
+    }
+
     pub const fn publishes_h264_dd(self) -> bool {
         self.publishes_h264_dd
     }
@@ -932,6 +969,7 @@ pub fn settings_equivalent(left: &ResourceSettings, right: &ResourceSettings) ->
                     && left.min_height == right.min_height
                     && left.min_fps == right.min_fps
                     && left.priority.unwrap_or(1) == right.priority.unwrap_or(1)
+                    && left.decode_target == right.decode_target
             }
             _ => left.receive == right.receive,
         }
@@ -980,6 +1018,26 @@ pub fn formats_equivalent(left: &CodecFormat, right: &CodecFormat) -> bool {
         && left.clock_rate == right.clock_rate
         && left.channels == right.channels
         && super::format::normalized_parameters(left) == super::format::normalized_parameters(right)
+}
+
+/// Check an explicit video request against the negotiated format and its advertised modes.
+pub fn negotiated_video_mode(
+    format: &CodecFormat,
+    capability: &RtpCodecCapability,
+    requested: &str,
+) -> core::result::Result<VideoMode, ValidationError> {
+    if !capability
+        .format
+        .as_ref()
+        .is_some_and(|supported| formats_equivalent(format, supported))
+        || !capability
+            .scalability_modes
+            .iter()
+            .any(|mode| mode == requested)
+    {
+        return Err(ValidationError::Capability);
+    }
+    VideoMode::for_format(format, requested)
 }
 
 /// Validates a description without granting codec support. True means audio.
@@ -1048,7 +1106,7 @@ pub fn validate_capabilities(caps: &RtpCapabilities) -> Result {
         let format = codec.format.as_ref().ok_or(ValidationError::Capability)?;
         let audio = validate_format(format)?;
         if !unique_text(&codec.feedback, 32, 128)
-            || !unique_text(&codec.scalability_modes, 32, 64)
+            || !unique_text(&codec.scalability_modes, 40, 64)
             || audio && !codec.scalability_modes.is_empty()
             || audio && video_feedback(&codec.feedback)
             || caps

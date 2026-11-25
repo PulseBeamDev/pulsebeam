@@ -46,6 +46,7 @@ impl LocalDataTrack {
             let (owner, observer) = self.agent.runtime.claim_data_publication(
                 track_spec(self.label.clone(), options.delivery.unwrap_or_default()),
                 options.capture_clock,
+                options.record_dd.unwrap_or(false),
             )?;
             Ok(Arc::new(DataPublication {
                 agent: self.agent.clone(),

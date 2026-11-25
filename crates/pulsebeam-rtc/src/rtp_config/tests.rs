@@ -2234,6 +2234,8 @@ fn codec_parameter_model_accepts_opus_vp8_h264_and_representative_vp9_without_en
         assert_eq!(
             codec.profile,
             match parameters.name.as_str() {
+                "vp8" => Some(crate::CodecProfile::Vp8),
+                "vp9" => Some(crate::CodecProfile::Vp9 { profile_id: 0 }),
                 "opus" => Some(crate::CodecProfile::Opus),
                 "h264" => Some(crate::CodecProfile::H264 {
                     profile_level_id: Some(0x42e01f),
@@ -2249,6 +2251,35 @@ fn codec_parameter_model_accepts_opus_vp8_h264_and_representative_vp9_without_en
             }
         );
     }
+}
+
+#[test]
+fn av1_binding_does_not_borrow_advertisement_from_another_profile() {
+    let mut caps = capabilities();
+    let mut stock = codec();
+    stock.name = "av1".into();
+    stock.fmtp.extend([
+        ("profile".into(), "0".into()),
+        ("level-idx".into(), "5".into()),
+        ("tier".into(), "0".into()),
+    ]);
+    caps.codecs.push(RtpCodecCapability {
+        parameters: stock.clone(),
+        repair: true,
+    });
+    let compiler = RtpBindingCompiler::new(caps).unwrap();
+    let mut requested = binding("v", 100);
+    requested.codec.parameters = stock;
+    assert!(compiler.compile(requested.clone()).is_ok());
+    requested
+        .codec
+        .parameters
+        .fmtp
+        .insert("profile".into(), "1".into());
+    assert!(matches!(
+        compiler.compile(requested),
+        Err(RtpConfigurationError::Unsupported)
+    ));
 }
 
 #[test]

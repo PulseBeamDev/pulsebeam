@@ -7,6 +7,7 @@ use super::{DdReadError, DependencyDescriptor, DependencyDescriptorReader, MAX_D
 mod ancestry;
 mod frames;
 mod selection;
+pub use ancestry::dependencies_satisfied;
 pub use frames::{FRAME_HISTORY, FrameStatus, Frames};
 pub use selection::{Decision, DecodeTarget, Enqueue, FilteredBranch};
 
@@ -36,13 +37,21 @@ pub struct Qualified {
     pub active_targets: u32,
     /// Exact source position that installed the applicable template structure.
     pub structure_sequence: u64,
+    /// First attachment in this contiguous run of identical template structures.
+    pub structure_origin: u64,
     pub target_chains: arrayvec::ArrayVec<u8, MAX_DECODE_TARGETS>,
+}
+
+#[derive(Clone, Copy)]
+struct StructureVersion {
+    attachment: u64,
+    origin: u64,
 }
 
 struct Interval {
     first: u64,
     last: u64,
-    structure_sequence: u64,
+    structure: StructureVersion,
     reader: DependencyDescriptorReader,
 }
 
@@ -53,7 +62,7 @@ pub struct SourceContext {
     frontier: Option<u64>,
     reader: DependencyDescriptorReader,
     context_start: Option<u64>,
-    structure_sequence: Option<u64>,
+    structure: Option<StructureVersion>,
     history: VecDeque<Interval>,
 }
 
@@ -92,14 +101,13 @@ impl SourceContext {
         let context = if contiguous
             || (!newer && self.context_start.is_some_and(|start| sequence >= start))
         {
-            self.structure_sequence
-                .map(|structure| (&self.reader, structure))
+            self.structure.map(|structure| (&self.reader, structure))
         } else {
             self.history
                 .iter()
                 .rev()
                 .find(|interval| (interval.first..=interval.last).contains(&sequence))
-                .map(|interval| (&interval.reader, interval.structure_sequence))
+                .map(|interval| (&interval.reader, interval.structure))
         };
         let parsed = match (context, raw) {
             (Some((reader, _)), Some(raw)) => parse(reader, raw)?,
@@ -110,8 +118,17 @@ impl SourceContext {
             let attached = descriptor.attached_structure.as_deref();
             let structure =
                 attached.or_else(|| context.and_then(|(reader, _)| reader.structure()))?;
-            let structure_sequence = if attached.is_some() {
-                sequence
+            let version = if let Some(attached) = attached {
+                let origin = context
+                    .filter(|(reader, version)| {
+                        (contiguous || version.attachment == sequence)
+                            && reader.structure() == Some(attached)
+                    })
+                    .map_or(sequence, |(_, version)| version.origin);
+                StructureVersion {
+                    attachment: sequence,
+                    origin,
+                }
             } else {
                 context?.1
             };
@@ -126,7 +143,8 @@ impl SourceContext {
             Some(Qualified {
                 descriptor,
                 active_targets,
-                structure_sequence,
+                structure_sequence: version.attachment,
+                structure_origin: version.origin,
                 target_chains,
             })
         }))
@@ -151,11 +169,9 @@ impl SourceContext {
                 .as_ref()
                 .is_some_and(|q| q.active_targets != self.reader.active_decode_targets());
             if reset || replaced || mask_changed {
-                if let (Some(first), Some(last), Some(structure_sequence)) = (
-                    self.context_start.take(),
-                    self.frontier,
-                    self.structure_sequence,
-                ) {
+                if let (Some(first), Some(last), Some(structure)) =
+                    (self.context_start.take(), self.frontier, self.structure)
+                {
                     let reader = if reset || replaced {
                         std::mem::take(&mut self.reader)
                     } else {
@@ -167,13 +183,13 @@ impl SourceContext {
                     self.history.push_back(Interval {
                         first,
                         last,
-                        structure_sequence,
+                        structure,
                         reader,
                     });
                 }
                 if reset {
                     self.reader.reset();
-                    self.structure_sequence = None;
+                    self.structure = None;
                 }
             }
             self.frontier = Some(sequence);
@@ -186,7 +202,10 @@ impl SourceContext {
             }
             if let Some(qualified) = &qualified {
                 self.context_start.get_or_insert(sequence);
-                self.structure_sequence = Some(qualified.structure_sequence);
+                self.structure = Some(StructureVersion {
+                    attachment: qualified.structure_sequence,
+                    origin: qualified.structure_origin,
+                });
                 if reset || replaced || mask_changed {
                     self.reader.commit(&qualified.descriptor);
                 }

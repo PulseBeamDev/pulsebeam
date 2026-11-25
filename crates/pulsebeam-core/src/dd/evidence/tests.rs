@@ -67,6 +67,31 @@ fn reused_templates_after_a_gap_need_new_context() {
 }
 
 #[test]
+fn repeated_structure_retains_origin_only_with_contiguous_evidence() {
+    let structure = structure_minimal();
+    let mut writer = DependencyDescriptorWriter::new();
+    let repeated = encode(&mut writer, &keyframe(&structure));
+    let mut changed = structure;
+    changed.template_id_offset = 4;
+    let changed = encode(&mut writer, &keyframe(&changed));
+    let mut source = SourceContext::default();
+    for (sequence, bytes, origin) in [
+        (100, &repeated, 100),
+        (101, &repeated, 100),
+        (102, &changed, 102),
+        (104, &changed, 104),
+    ] {
+        let qualified = source.observe(sequence, Some(bytes)).unwrap().unwrap();
+        assert_eq!(
+            (qualified.structure_sequence, qualified.structure_origin),
+            (sequence, origin)
+        );
+    }
+    let late = source.qualify(101, Some(&repeated)).unwrap().unwrap();
+    assert_eq!((late.structure_sequence, late.structure_origin), (101, 100));
+}
+
+#[test]
 fn authenticated_padding_preserves_context_but_does_not_bridge_an_unknown_position() {
     let structure = structure_minimal();
     let mut writer = DependencyDescriptorWriter::new();
@@ -133,6 +158,7 @@ fn frame_conflict_is_sticky_and_history_is_bounded_across_wrap() {
         descriptor,
         active_targets: 1,
         structure_sequence: 0,
+        structure_origin: 0,
         target_chains: structure.decode_target_protected_by,
     };
     assert_eq!(frames.observe(20, &evidence), FrameStatus::Resolved(65_535));
@@ -167,6 +193,7 @@ fn filtered_entry_refusal_and_suspension_fence_are_transactional() {
         descriptor: delta(&structure, 0, 0),
         active_targets: 7,
         structure_sequence: 0,
+        structure_origin: 0,
         target_chains: structure.decode_target_protected_by,
     };
     let mut branch = FilteredBranch::new(DecodeTarget::new(0).unwrap(), true);
@@ -247,6 +274,7 @@ fn in_source_switch_requires_complete_transitive_frame_and_chain_ancestry() {
             descriptor: root,
             active_targets: 7,
             structure_sequence: 0,
+            structure_origin: 0,
             target_chains: structure.decode_target_protected_by,
         };
         let mut branch = FilteredBranch::new(DecodeTarget::new(0).unwrap(), true);

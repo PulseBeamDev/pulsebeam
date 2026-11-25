@@ -63,9 +63,30 @@ impl DependencyDescriptorWriter {
         Ok(len)
     }
 
+    /// Commit a structure update only after the sink accepts the encoded bytes.
+    /// Returning false must leave the sink unchanged so the caller can retry.
+    pub fn write_if(
+        &mut self,
+        dd: &DependencyDescriptor,
+        out: &mut [u8],
+        accept: impl FnOnce(&[u8]) -> bool,
+    ) -> Result<Option<usize>, DdWriteError> {
+        let len = self.encode(dd, out)?;
+        let bytes = out.get(..len).ok_or(DdWriteError::Overflow)?;
+        if !accept(bytes) {
+            return Ok(None);
+        }
+        self.commit(dd);
+        Ok(Some(len))
+    }
+
     pub(super) fn commit(&mut self, dd: &DependencyDescriptor) {
-        if let Some(s) = dd.attached_structure.as_deref() {
-            self.structure = Some(Box::new(s.clone()));
+        self.commit_structure(dd.attached_structure.clone());
+    }
+
+    pub(super) fn commit_structure(&mut self, structure: Option<Box<TemplateDependencyStructure>>) {
+        if let Some(structure) = structure {
+            self.structure = Some(structure);
         }
     }
 
@@ -81,7 +102,8 @@ impl DependencyDescriptorWriter {
 
         validate(dd, active)?;
 
-        let mut w = BitWriter::new(out);
+        let capacity = out.len().min(MAX_DD_LEN);
+        let mut w = BitWriter::new(out.get_mut(..capacity).ok_or(DdWriteError::Overflow)?);
         w.write_bit(dd.start_of_frame)?;
         w.write_bit(dd.end_of_frame)?;
         w.write_bits(u32::from(dd.template_id), 6)?;
@@ -122,13 +144,18 @@ fn validate(
     if dd.template_id >= 64 || usize::from(active.decode_target_count) > MAX_DECODE_TARGETS {
         return Err(DdWriteError::OutOfRange);
     }
-    if active.template(dd.template_id).is_none() {
-        return Err(DdWriteError::UnknownTemplateId(dd.template_id));
-    }
-    if dd.frame_dependencies.dtis.len() != usize::from(active.decode_target_count) {
-        return Err(DdWriteError::Inconsistent);
-    }
-    if dd.frame_dependencies.chain_diffs.len() != usize::from(active.chain_count) {
+    let template = active
+        .template(dd.template_id)
+        .ok_or(DdWriteError::UnknownTemplateId(dd.template_id))?;
+    let facts = &dd.frame_dependencies;
+    if facts.spatial_id != template.spatial_id
+        || facts.temporal_id != template.temporal_id
+        || facts.dtis.len() != usize::from(active.decode_target_count)
+        || facts.chain_diffs.len() != usize::from(active.chain_count)
+        || (!dd.fields.custom_dtis() && facts.dtis != template.dtis)
+        || (!dd.fields.custom_fdiffs() && facts.frame_diffs != template.frame_diffs)
+        || (!dd.fields.custom_chains() && facts.chain_diffs != template.chain_diffs)
+    {
         return Err(DdWriteError::Inconsistent);
     }
     if let Some(mask) = dd.active_decode_targets {

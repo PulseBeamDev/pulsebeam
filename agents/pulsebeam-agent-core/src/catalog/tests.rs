@@ -52,6 +52,7 @@ fn records(
                 kind: Some(wire::track::Kind::Data(wire::DataTrack {
                     capture_clock: None,
                     delivery: wire::DataDelivery::Latest as i32,
+                    record_dd: false,
                 })),
             })
             .collect(),

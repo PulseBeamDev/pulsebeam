@@ -10,11 +10,14 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use pulsebeam_core::dd::DecodeTargetIndication;
+
 use super::{rtp::Binding, timed::Receive};
-use crate::media::units::{Codec, Event, SenderTime};
+use crate::media::units::{Codec, Dependency, Event, Framing, SenderTime, Unit};
 
 const INDEX: &str = "index.tsv";
-const HEADER: &str = "event\tepoch\tpublication_id\tfile\tclock_hz\trtp_time\tfirst_seq\tlast_seq\tsender_rtp\tsender_ntp\tdetail\tbytes\n";
+const HEADER: &str = "event\tepoch\tpublication_id\tfile\tclock_hz\trtp_time\tfirst_seq\tlast_seq\tsender_rtp\tsender_ntp\tdetail\tbytes\tdd_frame\tspatial_id\ttemporal_id\tactive_targets\tframe_targets\n";
+const NO_VIDEO_COORDINATES: &str = "\t-\t-\t-\t-\t-\n";
 
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
@@ -41,6 +44,7 @@ pub struct Recorder {
     units: u32,
     bytes: u64,
     binding: Option<Binding>,
+    active_targets: Option<u32>,
     epoch: u64,
     stopped: bool,
 }
@@ -79,6 +83,7 @@ impl Recorder {
             units: 0,
             bytes,
             binding: None,
+            active_targets: None,
             epoch: 0,
             stopped: false,
         })
@@ -92,11 +97,15 @@ impl Recorder {
         let epoch = self.epoch.saturating_add(u64::from(changed));
         let id = &self.publication;
         let hz = self.codec.clock_rate();
+        let mut active_targets = if changed { None } else { self.active_targets };
         let (row, file) = match received {
             Receive::Media(Event::Unit(unit)) => {
                 let (extension, limit) = match self.codec {
                     Codec::Opus => ("opus", pulsebeam_core::fabric::MAX_WAN_RTP_BYTES),
                     Codec::H264 => ("h264", pulsebeam_core::h264::MAX_ACCESS_UNIT_SIZE),
+                    Codec::Vp8 => ("vp8", pulsebeam_core::h264::MAX_ACCESS_UNIT_SIZE),
+                    Codec::Vp9 => ("vp9", pulsebeam_core::h264::MAX_ACCESS_UNIT_SIZE),
+                    Codec::Av1 => ("obu", pulsebeam_core::h264::MAX_ACCESS_UNIT_SIZE),
                 };
                 let payload = unit.data.as_slice();
                 if unit.codec != self.codec
@@ -121,8 +130,9 @@ impl Recorder {
                     unit.access,
                     payload.len(),
                 );
+                let video = video_coordinates(unit, &mut active_targets);
                 let line = format!(
-                    "unit\t{epoch}\t{id}\t{file}\t{hz}\t{timestamp}\t{first}\t{last}\t{sender_rtp}\t{sender_ntp}\t{access:?}\t{size}\n"
+                    "unit\t{epoch}\t{id}\t{file}\t{hz}\t{timestamp}\t{first}\t{last}\t{sender_rtp}\t{sender_ntp}\t{access:?}\t{size}{video}"
                 );
                 (line, Some((file, payload)))
             }
@@ -132,9 +142,10 @@ impl Recorder {
                 let first = gap.sequence.start;
                 let last = gap.sequence.end.saturating_sub(1);
                 let cause = gap.cause;
+                active_targets = None;
                 (
                     format!(
-                        "gap\t{epoch}\t{id}\t-\t{hz}\t-\t{first}\t{last}\t-\t-\t{cause:?}\t0\n"
+                        "gap\t{epoch}\t{id}\t-\t{hz}\t-\t{first}\t{last}\t-\t-\t{cause:?}\t0{NO_VIDEO_COORDINATES}"
                     ),
                     None,
                 )
@@ -143,9 +154,10 @@ impl Recorder {
                 let (first, last) = (loss.first_sequence, loss.last_sequence);
                 let (overflow, expired, invalidated) =
                     (loss.overflow, loss.expired, loss.invalidated);
+                active_targets = None;
                 (
                     format!(
-                        "loss\t{epoch}\t{id}\t-\t{hz}\t-\t{first}\t{last}\t-\t-\toverflow={overflow};expired={expired};invalidated={invalidated}\t0\n"
+                        "loss\t{epoch}\t{id}\t-\t{hz}\t-\t{first}\t{last}\t-\t-\toverflow={overflow};expired={expired};invalidated={invalidated}\t0{NO_VIDEO_COORDINATES}"
                     ),
                     None,
                 )
@@ -155,7 +167,9 @@ impl Recorder {
             }
         };
         let reset = if changed {
-            format!("reset\t{epoch}\t{id}\t-\t{hz}\t-\t-\t-\t-\t-\tbinding\t0\n")
+            format!(
+                "reset\t{epoch}\t{id}\t-\t{hz}\t-\t-\t-\t-\t-\tbinding\t0{NO_VIDEO_COORDINATES}"
+            )
         } else {
             String::new()
         };
@@ -181,10 +195,71 @@ impl Recorder {
         }
         self.units = self.units.saturating_add(u32::from(file.is_some()));
         self.binding = Some(binding);
+        self.active_targets = active_targets;
         self.epoch = epoch;
         self.bytes = used;
         Ok(())
     }
+}
+
+fn video_coordinates(unit: &Unit<Binding>, active: &mut Option<u32>) -> String {
+    if unit.codec == Codec::Opus {
+        return NO_VIDEO_COORDINATES.into();
+    }
+    let (spatial, temporal) = match &unit.framing {
+        Framing::Vp9 { descriptor, .. } => descriptor.layer.map_or((None, None), |layer| {
+            (Some(layer.spatial_id), Some(layer.temporal_id))
+        }),
+        Framing::Av1 { layer, .. } => (Some(layer.spatial_id), Some(layer.temporal_id)),
+        Framing::Vp8 { descriptor, .. } => (Some(0), descriptor.temporal.map(|layer| layer.id)),
+        Framing::Whole => (None, None),
+    };
+    let (frame, spatial, temporal, targets) = match &unit.dependency {
+        Dependency::Parsed(dd) => {
+            *active = dd
+                .active_decode_targets
+                .or_else(|| {
+                    dd.attached_structure
+                        .as_ref()
+                        .map(|structure| structure.all_decode_targets_bitmask())
+                })
+                .or(*active);
+            let present =
+                dd.frame_dependencies
+                    .dtis
+                    .iter()
+                    .enumerate()
+                    .fold(0, |mask, (i, dti)| {
+                        if *dti == DecodeTargetIndication::NotPresent {
+                            mask
+                        } else {
+                            mask | (1_u32 << i)
+                        }
+                    });
+            (
+                Some(dd.frame_number),
+                Some(dd.spatial_id()),
+                Some(dd.temporal_id()),
+                active.map(|mask| mask & present),
+            )
+        }
+        other => {
+            *active = None;
+            let frame = match other {
+                Dependency::MissingContext(mandatory) => Some(mandatory.frame_number),
+                _ => None,
+            };
+            (frame, spatial, temporal, None)
+        }
+    };
+    format!(
+        "\t{}\t{}\t{}\t{}\t{}\n",
+        coordinate(frame.map(u64::from)),
+        coordinate(spatial.map(u64::from)),
+        coordinate(temporal.map(u64::from)),
+        coordinate(active.map(u64::from)),
+        coordinate(targets.map(u64::from))
+    )
 }
 
 fn coordinate(value: Option<u64>) -> String {
@@ -196,7 +271,7 @@ mod tests {
     use super::*;
     use crate::media::{
         jitter::GapReason,
-        units::{Access, Cause, Dependency, Discontinuity, Unit},
+        units::{Access, Cause, Discontinuity},
     };
     use std::num::NonZeroU16;
 
@@ -240,6 +315,7 @@ mod tests {
             arrived_at: std::time::Instant::now(),
             access: Access::Audio,
             dependency: Dependency::Absent,
+            framing: crate::media::units::Framing::Whole,
             data: vec![0xf8, 0xff, 0xfe],
         }))
     }
@@ -299,6 +375,76 @@ mod tests {
         );
         assert!(index.contains("reset\t2\tpub_audio"));
         assert!(index.contains("unit\t2\tpub_audio\t0000000001.opus\t48000\t-\t0\t0"));
+    }
+
+    #[test]
+    fn records_same_timestamp_spatial_units_and_does_not_carry_target_masks_over_gaps() {
+        use pulsebeam_core::dd::{
+            DecodeTargetIndication::{NotPresent, Required},
+            DependencyDescriptor, FrameDependencyTemplate,
+        };
+        let scratch = Scratch::create("spatial");
+        let directory = scratch.0.join("capture");
+        let mut recorder = Recorder::create(
+            &directory,
+            "pub_video".into(),
+            Codec::Vp9,
+            Limits {
+                units: 3,
+                bytes: 4_096,
+            },
+        )
+        .unwrap();
+        let source = binding(1);
+        let video = |sequence, number, spatial, active, lower| {
+            let Receive::Media(Event::Unit(mut unit)) = unit(source, sequence, Some(3_000)) else {
+                unreachable!();
+            };
+            unit.codec = Codec::Vp9;
+            unit.access = Access::DependentVideo;
+            unit.dependency = Dependency::Parsed(Box::new(DependencyDescriptor {
+                frame_number: number,
+                start_of_frame: true,
+                end_of_frame: true,
+                active_decode_targets: active,
+                frame_dependencies: FrameDependencyTemplate {
+                    spatial_id: spatial,
+                    dtis: [lower, Required].into_iter().collect(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }));
+            Receive::Media(Event::Unit(unit))
+        };
+        recorder
+            .record(source, &video(100, 65_535, 0, Some(3), Required))
+            .unwrap();
+        recorder
+            .record(source, &video(101, 0, 1, None, NotPresent))
+            .unwrap();
+        recorder
+            .record(
+                source,
+                &Receive::Media(Event::Discontinuity(Discontinuity {
+                    source,
+                    sequence: 102..103,
+                    cause: Cause::Gap(GapReason::Deadline),
+                })),
+            )
+            .unwrap();
+        recorder
+            .record(source, &video(103, 2, 1, None, NotPresent))
+            .unwrap();
+        let index = fs::read_to_string(directory.join(INDEX)).unwrap();
+        let rows = index
+            .lines()
+            .filter(|row| row.starts_with("unit\t"))
+            .map(|row| row.split('\t').collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        assert!(rows.iter().all(|row| row[5] == "3000"));
+        assert_eq!(&rows[0][12..], ["65535", "0", "0", "3", "3"]);
+        assert_eq!(&rows[1][12..], ["0", "1", "0", "3", "2"]);
+        assert_eq!(&rows[2][12..], ["2", "1", "0", "-", "-"]);
     }
 
     #[test]

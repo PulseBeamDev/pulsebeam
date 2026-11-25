@@ -105,7 +105,7 @@ impl WindowTiming {
         use pulsebeam_core::fabric::Profile;
         let rate = match image.window.profile() {
             Profile::Opus => ClockRate::OPUS,
-            Profile::Av1 | Profile::H264 => ClockRate::VIDEO,
+            Profile::Av1 | Profile::H264 | Profile::Vp8 | Profile::Vp9 => ClockRate::VIDEO,
             Profile::Data => return None,
         };
         (self.position == image.position

@@ -101,6 +101,7 @@ impl PublicationFact {
                     return None;
                 };
                 track.format = Some(video.format.clone()?);
+                track.av1_whole_source = video.av1_whole_source;
                 MediaTrack::Video(track)
             }
             track::Kind::Data(data) => {
@@ -115,6 +116,7 @@ impl PublicationFact {
                     lane,
                     self.fabric_data_source,
                     data.capture_clock.clone(),
+                    data.record_dd,
                 )
             }
         })
@@ -624,6 +626,7 @@ mod tests {
             kind: Some(track::Kind::Data(pulsebeam_proto::state::DataTrack {
                 capture_clock: None,
                 delivery: pulsebeam_proto::state::DataDelivery::Lossy as i32,
+                record_dd: false,
             })),
         };
         let publication_fact = |descriptor| PublicationFact {
@@ -899,6 +902,7 @@ mod tests {
                     kind: Some(track::Kind::Data(pulsebeam_proto::state::DataTrack {
                         capture_clock: None,
                         delivery: pulsebeam_proto::state::DataDelivery::Latest as i32,
+                        record_dd: false,
                     })),
                 },
                 fabric_data_source: None,

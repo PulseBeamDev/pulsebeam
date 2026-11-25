@@ -637,16 +637,18 @@ impl IngressOwner {
         if facts.ssrcs.as_ref() != [primary] || self.terminal_ssrcs.contains(&primary) {
             return None;
         }
+        let repair_payload_type = facts
+            .repairs
+            .iter()
+            .find_map(|&(repair, target)| (target == codec.payload_type).then_some(repair));
         Some(crate::RtpReceiveBinding {
             mid: &facts.mid,
             rid,
             primary_ssrc: primary,
             primary_codec: codec,
-            repair_payload_type: facts
-                .repairs
-                .iter()
-                .find_map(|&(repair, target)| (target == codec.payload_type).then_some(repair)),
-            declared_repair_ssrc: facts.declared_repair_ssrc(primary),
+            repair_payload_type,
+            declared_repair_ssrc: repair_payload_type
+                .and_then(|_| facts.declared_repair_ssrc(primary)),
             receive_extensions: &facts.extensions,
             allow_mixed_extensions: facts.allow_mixed_extensions,
         })
@@ -860,17 +862,19 @@ impl IngressOwner {
         }
         let event_rid = state.and_then(|state| state.rid.as_deref()).or(rid);
         if let Some(observe) = observer {
+            let repair_payload_type = facts
+                .repairs
+                .iter()
+                .find_map(|&(repair, primary)| (primary == primary_type).then_some(repair));
             observe(AuthenticatedRtp {
                 arrival,
                 mid: &facts.mid,
                 rid: event_rid,
                 primary_ssrc: packet.ssrc(),
                 primary_codec,
-                repair_payload_type: facts
-                    .repairs
-                    .iter()
-                    .find_map(|&(repair, primary)| (primary == primary_type).then_some(repair)),
-                declared_repair_ssrc: facts.declared_repair_ssrc(packet.ssrc()),
+                repair_payload_type,
+                declared_repair_ssrc: repair_payload_type
+                    .and_then(|_| facts.declared_repair_ssrc(packet.ssrc())),
                 is_repair: false,
                 receive_extensions: &facts.extensions,
                 allow_mixed_extensions: facts.allow_mixed_extensions,

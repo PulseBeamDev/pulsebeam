@@ -112,6 +112,7 @@ fn quic_confirmation_matches_exact_binding_without_sctp_preparation() {
         version: u32::from(data_endpoint::DATA_V1),
         incarnation: tx.binding.channel.incarnation.get(),
         delivery: DataV1Delivery::Unreliable as i32,
+        record_dd: false,
     };
     let quic = |parameters| TrackBinding {
         transport: Some(Transport::QuicDataV1(parameters)),
@@ -483,6 +484,7 @@ fn exact_host_completions_advance_only_one_record_at_a_time() {
             unit_seq: 40,
             captured_at: None,
             bytes: vec![0x37; 1_025],
+            fragment_descriptors: vec![],
         }))
     );
     assert_eq!(send.handle(&complete, now), Progress::Ignored);

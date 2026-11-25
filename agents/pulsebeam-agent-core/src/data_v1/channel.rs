@@ -1,6 +1,6 @@
 use super::{
     AdmittedUnit, AssembledUnit, Error, LIFETIME, OutgoingUnit, Publisher, ReliablePublisher,
-    Subscriber,
+    Subscriber, record_capacity,
 };
 use crate::{
     ChannelId, DataChannelEffect, DataChannelEvent, DataChannelReliability, Generation,
@@ -9,9 +9,10 @@ use crate::{
 };
 use alloc::{vec, vec::Vec};
 use core::{num::NonZeroU64, time::Duration};
+#[cfg(test)]
+use pulsebeam_proto::data_record::MAX_RECORD_BYTES;
 use pulsebeam_proto::{
     data_endpoint::{Binding, Delivery, Endpoint},
-    data_record::MAX_RECORD_BYTES,
     state::{DataV1Binding, TrackBinding},
 };
 
@@ -24,6 +25,7 @@ pub use control::{PublisherControl, ReceiverControl, ReceiverReceipt};
 pub struct Channel {
     id: ChannelId,
     binding: Binding<Generation>,
+    record_dd: bool,
 }
 
 impl Channel {
@@ -60,7 +62,12 @@ impl Channel {
         {
             return Err(Error::Binding);
         }
-        Ok(Self { id, binding })
+        let record_dd = matches!(accepted, DataV1Binding::Quic(parameters) if parameters.record_dd);
+        Ok(Self {
+            id,
+            binding,
+            record_dd,
+        })
     }
 
     fn matches(self, generation: Generation, id: ChannelId) -> bool {
@@ -131,7 +138,9 @@ pub struct SendChannel {
 
 impl SendChannel {
     pub fn new(channel: Channel, clock: Option<CaptureClock>, first: u64) -> Result<Self, Error> {
-        let publisher = PublisherMode::BestEffort(Publisher::new(channel.binding, clock, first)?);
+        let publisher = PublisherMode::BestEffort(
+            Publisher::new(channel.binding, clock, first)?.with_record_dd(channel.record_dd),
+        );
         Ok(Self::for_publisher(channel, publisher))
     }
 
@@ -146,7 +155,10 @@ impl SendChannel {
             return Err(Error::Binding);
         }
         let publisher = PublisherMode::Reliable {
-            publisher: Box::new(ReliablePublisher::new(channel.binding, clock, first)?),
+            publisher: Box::new(
+                ReliablePublisher::new(channel.binding, clock, first)?
+                    .with_record_dd(channel.record_dd),
+            ),
             control: ControlLease { owned, signaling },
         };
         Ok(Self::for_publisher(channel, publisher))
@@ -219,7 +231,7 @@ impl SendChannel {
             return Ok(None);
         }
         let (payload, kind) = if let Some(transmission) = &self.transmission {
-            let mut payload = vec![0; MAX_RECORD_BYTES];
+            let mut payload = vec![0; record_capacity(self.channel.record_dd)];
             let size = match (&transmission.unit, &mut self.publisher) {
                 (TransmissionUnit::BestEffort(unit), _) => {
                     unit.write(transmission.index, &mut payload)?
@@ -411,7 +423,7 @@ impl ReceiveChannel {
     ) -> Result<Self, Error> {
         Ok(Self {
             channel,
-            subscriber: Subscriber::new(channel.binding, clock)?,
+            subscriber: Subscriber::new(channel.binding, clock)?.with_record_dd(channel.record_dd),
             control,
             closed: false,
         })

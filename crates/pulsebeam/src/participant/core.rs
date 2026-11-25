@@ -1254,6 +1254,8 @@ impl Connection {
                 Profile::Opus => Some("opus"),
                 Profile::H264 => Some("h264"),
                 Profile::Av1 => Some("av1"),
+                Profile::Vp8 => Some("vp8"),
+                Profile::Vp9 => Some("vp9"),
                 Profile::Data => None,
             };
             if let Some(profile) = profile {

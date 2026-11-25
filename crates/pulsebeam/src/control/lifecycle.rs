@@ -362,13 +362,14 @@ impl TrackLifecycle {
             publication_id: meta.id,
         };
         let track = self.topology.track(identity)?;
+        let compatible = match track.kind() {
+            TrackKind::Audio => emission.profile() == Profile::Opus,
+            TrackKind::Video => emission.profile().is_video(),
+            TrackKind::Data => false,
+        };
         if track.meta().connection_id != meta.connection_id
             || self.ingress.contains_key(&identity)
-            || !matches!(
-                (track.kind(), emission.profile()),
-                (TrackKind::Audio, Profile::Opus)
-                    | (TrackKind::Video, Profile::H264 | Profile::Av1)
-            )
+            || !compatible
         {
             return None;
         }
@@ -642,13 +643,12 @@ impl TrackLifecycle {
         publication: PublicationKey,
         registry: &RoomRegistry,
     ) -> Option<(ShardId, crate::shard_update::PublisherAnchor)> {
-        use crate::route::fabric::local::Emission;
         use pulsebeam_core::fabric::Profile;
 
         let shard = self.network_source(room, publication, registry)?;
         let track = self.source_exact(room, publication)?;
         let (incarnation, emission) = match track {
-            Track::Data(_) => (track.fabric_data_source()?, Emission::DATA),
+            Track::Data(data) => (data.fabric_source?, Emission::data(data.record_dd)),
             Track::Audio(_) => {
                 let [source] = self
                     .local_rtp_sources
@@ -1461,10 +1461,12 @@ impl TrackLifecycle {
             self.stage_origin_view(identity, desired, origin, stager);
         }
         let active = desired.active_remote_shards();
-        let data = desired
-            .track
-            .fabric_data_source()
-            .map(|incarnation| (incarnation, None, Emission::DATA));
+        let data = match &desired.track {
+            Track::Data(data) => data
+                .fabric_source
+                .map(|incarnation| (incarnation, None, Emission::data(data.record_dd))),
+            _ => None,
+        };
         let sources = self
             .local_rtp_sources
             .get(&identity)

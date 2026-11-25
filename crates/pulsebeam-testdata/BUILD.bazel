@@ -1,18 +1,97 @@
 load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
-load("@rules_python//python:defs.bzl", "py_test")
+load("@rules_python//python:defs.bzl", "py_binary", "py_test")
 load("@rules_rust//cargo:defs.bzl", "cargo_toml_env_vars", "extract_cargo_lints")
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test", "rust_clippy_test", "rustfmt_test")
 
 package(default_visibility = ["//visibility:public"])
 filegroup(name = "workflow_inputs", srcs = glob(["*.md", "docs/**/*.md", "Justfile", "scripts/*.sh"], allow_empty = True))
 exports_files(["Cargo.toml", "scripts/codec-tools.nix"])
+exports_files(
+    ["fixtures/codec-inventory-v1.tsv", "scripts/codec_interop.py"],
+    visibility = ["//agents/pulsebeam-agent-quic:__pkg__"],
+)
+
+filegroup(
+    name = "codec_interop_scripts",
+    srcs = [
+        "scripts/corpus_inventory_test.py",
+        "scripts/observe_opus_rtp.py",
+        "scripts/observe_single_video.py",
+        "scripts/observe_vp9_corpus.py",
+        "scripts/observe_vp9_pilot.py",
+    ],
+    visibility = ["//agents/pulsebeam-agent-quic:__pkg__"],
+)
+
+filegroup(
+    name = "worker_video_inputs",
+    srcs = [
+        "fixtures/" + codec + "-v1/L1T1/wire." + suffix
+        for codec in ["av1", "vp8", "vp9"]
+        for suffix in ["bin", "tsv"]
+    ],
+    visibility = ["//crates/pulsebeam:__pkg__"],
+)
+
+filegroup(
+    name = "codec_interop_audio_record_inputs",
+    srcs = glob(["fixtures/opus-v1/**"]) + [
+        "fixtures/data-v1/receipts.json",
+        "src/quality_a0_48k_mono.opus",
+        "src/quality_a1_48k_mono.opus",
+    ],
+    visibility = ["//agents/pulsebeam-agent-quic:__pkg__"],
+)
+
+filegroup(
+    name = "layered_pilot_inputs",
+    srcs = glob(["fixtures/vp9-pilot/**"]),
+    visibility = ["//agents/pulsebeam-agent-quic:__pkg__"],
+)
+
+filegroup(
+    name = "video_matrix_inputs",
+    srcs = ["fixtures/codec-inventory-v1.tsv"] + glob([
+        "fixtures/{}-v1/*/{}".format(codec, file)
+        for codec in ["av1", "h264", "vp8", "vp9"]
+        for file in ["encoded.tsv", "wire.bin", "wire.tsv", "observations.json", "faults.json"]
+    ]),
+    visibility = ["//agents/pulsebeam-agent-quic:__pkg__"],
+)
+
+py_binary(
+    name = "embed_video_cases",
+    srcs = ["scripts/embed_video_cases.py"],
+    main = "scripts/embed_video_cases.py",
+    testonly = True,
+    visibility = ["//visibility:private"],
+)
+
+genrule(
+    name = "video_matrix_cases",
+    srcs = ["fixtures/codec-inventory-v1.tsv"],
+    outs = ["video_matrix_cases.rs"],
+    cmd = "$(location :embed_video_cases) $(location fixtures/codec-inventory-v1.tsv) $@",
+    tools = [":embed_video_cases"],
+    testonly = True,
+    visibility = ["//agents/pulsebeam-agent-quic:__pkg__"],
+)
+
+rust_library(
+    name = "wire_capture",
+    srcs = ["src/wire_capture.rs"],
+    edition = crate_edition(),
+    lint_config = ":lints",
+    testonly = True,
+    visibility = ["//agents/pulsebeam-agent-quic:__pkg__"],
+)
 
 py_test(
     name = "layered_pilot",
     srcs = ["scripts/layered_pilot_test.py", "scripts/observe_vp9_pilot.py"],
     main = "scripts/layered_pilot_test.py",
     imports = ["scripts"],
-    data = glob(["fixtures/vp9-pilot/**"]),
+    data = [":layered_pilot_inputs"],
 )
 
 genrule(
@@ -42,6 +121,137 @@ genrule(
         "@webrtc_host//:bin/python3",
     ],
 )
+[
+    py_test(
+        name = "{}_corpus".format(codec.lower()),
+        size = "small",
+        srcs = [
+            "scripts/layered_corpus_test.py",
+            "scripts/observe_av1_corpus.py",
+            "scripts/observe_single_video.py",
+            "scripts/observe_vp9_corpus.py",
+            "scripts/observe_video_faults.py",
+            "scripts/observe_vp9_pilot.py",
+        ],
+        main = "scripts/layered_corpus_test.py",
+        args = [
+            codec,
+            "$(rootpath fixtures/codec-inventory-v1.tsv)",
+            "crates/pulsebeam-testdata/fixtures/{}-v1".format(codec.lower()),
+        ],
+        data = ["fixtures/codec-inventory-v1.tsv"] + glob(["fixtures/{}-v1/**".format(codec.lower())]),
+        imports = ["scripts"],
+    )
+    for codec in ["AV1", "H264", "VP8", "VP9"]
+]
+
+[
+    genrule(
+        name = "author_{}_corpus".format(codec.lower()),
+        srcs = [
+            "fixtures/codec-inventory-v1.tsv",
+            "scripts/author_layered_corpus.py",
+            "scripts/capture-vp9-pilot.py",
+            "scripts/observe_av1_corpus.py",
+            "scripts/observe_single_video.py",
+            "scripts/observe_vp9_corpus.py",
+            "scripts/observe_video_faults.py",
+            "scripts/observe_vp9_pilot.py",
+            "src/quality_s0_720p.yuv420p.zst",
+        ],
+        outs = ["{}-corpus-candidate.tar".format(codec.lower())],
+        cmd = """
+            $(location @codec_authoring_tools//:bin/python3) $(location scripts/author_layered_corpus.py) \\
+              --codec %s --prepare $(location scripts/capture-vp9-pilot.py) \\
+              --capture $(location //crates/pulsebeam-libwebrtc-sys:vp9_capture) \\
+              --source $(location src/quality_s0_720p.yuv420p.zst) \\
+              --zstd $(location @codec_authoring_tools//:bin/zstd) \\
+              --inventory $(location fixtures/codec-inventory-v1.tsv) --out "$@"
+        """ % codec,
+        tags = ["manual", "no-remote-exec"],
+        testonly = True,
+        tools = [
+            "//crates/pulsebeam-libwebrtc-sys:vp9_capture",
+            "@codec_authoring_tools//:bin/python3",
+            "@codec_authoring_tools//:bin/zstd",
+        ],
+    )
+    for codec in ["AV1", "H264", "VP8", "VP9"]
+]
+
+py_test(
+    name = "opus_rtp",
+    size = "small",
+    srcs = [
+        "scripts/observe_opus_rtp.py",
+        "scripts/observe_vp9_pilot.py",
+        "scripts/opus_rtp_test.py",
+    ],
+    args = ["crates/pulsebeam-testdata/fixtures/opus-v1"],
+    data = glob(["fixtures/opus-v1/**"]),
+    imports = ["scripts"],
+    main = "scripts/opus_rtp_test.py",
+)
+
+genrule(
+    name = "author_opus_rtp",
+    srcs = [
+        ":author_opus_observations",
+        "scripts/observe_opus_rtp.py",
+        "scripts/observe_vp9_pilot.py",
+        "src/quality_a0_48k_mono.opus",
+        "src/quality_a1_48k_mono.opus",
+    ],
+    outs = ["opus-rtp-candidate.tar"],
+    cmd = """
+        $(location @codec_authoring_tools//:bin/python3) $(location scripts/observe_opus_rtp.py) \\
+          --capture $(location //crates/pulsebeam-libwebrtc-sys:vp9_capture) \\
+          --observations $(location :author_opus_observations) --out "$@" \\
+          $(location src/quality_a0_48k_mono.opus) $(location src/quality_a1_48k_mono.opus)
+    """,
+    tags = ["manual", "no-remote-exec"],
+    testonly = True,
+    tools = [
+        "//crates/pulsebeam-libwebrtc-sys:vp9_capture",
+        "@codec_authoring_tools//:bin/python3",
+    ],
+)
+
+genrule(
+    name = "author_opus_observations",
+    srcs = [
+        "scripts/observe_opus.py",
+        "src/quality_a0_48k_mono.opus",
+        "src/quality_a0_48k_mono.s16le.zst",
+        "src/quality_a1_48k_mono.opus",
+        "src/quality_a1_48k_mono.s16le.zst",
+    ],
+    outs = ["opus-observations-candidate.json"],
+    cmd = """
+        $(location @codec_authoring_tools//:bin/python3) $(location scripts/observe_opus.py) \\
+          --zstd $(location @codec_authoring_tools//:bin/zstd) \\
+          $(location src/quality_a0_48k_mono.opus) $(location src/quality_a1_48k_mono.opus) > "$@"
+    """,
+    tags = ["manual", "no-remote-exec"],
+    testonly = True,
+    tools = ["@codec_authoring_tools//:bin/python3", "@codec_authoring_tools//:bin/zstd"],
+)
+
+py_test(
+    name = "corpus_inventory",
+    size = "small",
+    srcs = ["scripts/corpus_inventory_test.py"],
+    args = [
+        "$(rootpath fixtures/codec-inventory-v1.tsv)",
+        "crates/pulsebeam-testdata/src",
+    ],
+    data = glob(["fixtures/**"]) + [
+        "src/quality_a0_48k_mono.opus",
+        "src/quality_a1_48k_mono.opus",
+    ],
+    main = "scripts/corpus_inventory_test.py",
+)
+
 filegroup(
     name = "quality_zero_video_inputs",
     srcs = ["src/quality_s0_180p.h264", "src/quality_s0_360p.h264", "src/quality_s0_720p.h264"],
@@ -75,5 +285,5 @@ rust_test(
     
 )
 
-rustfmt_test(name = "format", targets = [":pulsebeam-testdata"])
+rustfmt_test(name = "format", targets = [":pulsebeam-testdata", ":wire_capture"])
 rust_clippy_test(name = "clippy", targets = [":pulsebeam-testdata", ":unit_tests"])

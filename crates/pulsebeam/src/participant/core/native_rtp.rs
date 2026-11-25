@@ -181,14 +181,8 @@ impl RtpPublication {
         let [_] = description.encodings.as_slice() else {
             return None;
         };
-        match description.codec.parameters.name.as_str() {
-            "opus" => Some(Profile::Opus),
-            "av1" if crate::control::rtp::is_stock_av1(&description.codec.parameters) => {
-                Some(Profile::Av1)
-            }
-            "h264" if !self.fabric_dd_video => Some(Profile::H264),
-            _ => None,
-        }
+        let profile = crate::control::rtp::fabric_profile(&description.codec.parameters)?;
+        (profile != Profile::H264 || !self.fabric_dd_video).then_some(profile)
     }
 }
 

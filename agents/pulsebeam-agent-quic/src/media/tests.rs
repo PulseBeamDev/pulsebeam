@@ -111,6 +111,130 @@ fn h264_and_descriptor_stages_use_logical_boundaries_across_frames() {
 }
 
 #[test]
+fn publisher_retries_same_time_layer_updates_without_advancing_state() {
+    use super::{Packet, descriptor::Publisher};
+    let mut base = keyframe();
+    base.frame_number = u16::MAX;
+    let upper_dependencies = FrameDependencyTemplate {
+        spatial_id: 1,
+        frame_diffs: [1].into_iter().collect(),
+        ..base.frame_dependencies.clone()
+    };
+    base.attached_structure
+        .as_mut()
+        .unwrap()
+        .templates
+        .push(upper_dependencies.clone());
+    let upper = DependencyDescriptor {
+        frame_number: 0,
+        template_id: 1,
+        frame_dependencies: upper_dependencies,
+        ..Default::default()
+    };
+    let mut publisher = Publisher::new(u16::MAX);
+    let packet = |sequence, first, last, marker| Packet {
+        sequence,
+        timestamp: 41,
+        first,
+        last,
+        marker,
+        payload: [0x82],
+    };
+    let start = packet(u32::MAX, true, false, false);
+    let mut retained = Vec::new();
+    assert!(
+        !publisher
+            .write_if(&start, Some(&base), |ext| {
+                retained.extend_from_slice(ext.value);
+                false
+            })
+            .unwrap()
+    );
+    assert_eq!(publisher.next_frame(), u16::MAX);
+    let mut no_structure = base.clone();
+    no_structure.attached_structure = None;
+    assert_eq!(
+        publisher.write_if(&start, Some(&no_structure), |_| panic!("missing structure")),
+        Err(WriteError::Encode(DdWriteError::NoStructure))
+    );
+    let mut reader = Reader::new();
+    assert!(
+        publisher
+            .write_if(&start, Some(&base), |ext| {
+                assert_eq!(ext.value, retained);
+                assert_eq!(reader.read(ext.value).unwrap().spatial_id(), 0);
+                true
+            })
+            .unwrap()
+    );
+    let end = packet(0, false, true, false);
+    assert!(
+        !publisher
+            .write_if(&end, None, |ext| {
+                assert_eq!(ext.value, &[0x40, 0xff, 0xff]);
+                false
+            })
+            .unwrap()
+    );
+    assert_eq!(publisher.next_frame(), u16::MAX);
+    assert!(
+        publisher
+            .write_if(&end, None, |ext| {
+                assert_eq!(ext.value, &[0x40, 0xff, 0xff]);
+                assert!(reader.read(ext.value).unwrap().end_of_frame);
+                true
+            })
+            .unwrap()
+    );
+    assert_eq!(publisher.next_frame(), 0);
+    let upper_packet = packet(1, true, true, true);
+    let mut missing = upper.clone();
+    missing.frame_dependencies.frame_diffs[0] = 2;
+    missing.fields.set_custom_fdiffs(true);
+    assert_eq!(
+        publisher.write_if(&upper_packet, Some(&missing), |_| panic!(
+            "unseen reference"
+        )),
+        Err(WriteError::MissingReference)
+    );
+    assert!(
+        publisher
+            .write_if(&upper_packet, Some(&upper), |ext| {
+                assert_eq!(ext.value, &[0xc1, 0, 0]);
+                let parsed = reader.read(ext.value).unwrap();
+                assert_eq!(parsed.spatial_id(), 1);
+                assert_eq!(parsed.frame_dependencies.frame_diffs.as_slice(), &[1]);
+                true
+            })
+            .unwrap()
+    );
+    assert_eq!(publisher.next_frame(), 1);
+
+    // The next phase uses the same template but references the frame before
+    // the previous one. The custom fdiff follows the five presence bits.
+    let mut shifted = upper;
+    shifted.frame_number = 1;
+    shifted.frame_dependencies.frame_diffs[0] = 2;
+    assert_eq!(
+        publisher.write_if(&packet(2, true, true, true), Some(&shifted), |_| {
+            panic!("a new reference distance needs an override")
+        }),
+        Err(WriteError::Encode(DdWriteError::Inconsistent))
+    );
+    shifted.fields.set_custom_fdiffs(true);
+    assert!(
+        publisher
+            .write_if(&packet(2, true, true, true), Some(&shifted), |ext| {
+                assert_eq!(ext.value, &[0xc1, 0, 1, 0x12, 0x20]);
+                let parsed = reader.read(ext.value).unwrap();
+                assert_eq!(parsed.frame_dependencies.frame_diffs.as_slice(), &[2]);
+                true
+            })
+            .unwrap()
+    );
+}
+
+#[test]
 fn source_reset_and_malformed_encoder_facts_do_not_guess_a_template() {
     let opus = Opus::new(PacketBudget::new(16, 0).unwrap());
     let packet = opus.packetize(0, 960, false, &[0xf8, 1]).unwrap();

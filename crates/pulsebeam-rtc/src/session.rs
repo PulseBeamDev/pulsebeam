@@ -63,6 +63,10 @@ pub enum MediaKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CodecProfile {
     Opus,
+    Vp8,
+    Vp9 {
+        profile_id: u8,
+    },
     H264 {
         /// None means the offer omitted profile-level-id.
         profile_level_id: Option<u32>,
@@ -80,7 +84,7 @@ impl CodecProfile {
     pub const fn kind(self) -> MediaKind {
         match self {
             Self::Opus => MediaKind::Audio,
-            Self::H264 { .. } | Self::Av1 { .. } => MediaKind::Video,
+            Self::Vp8 | Self::Vp9 { .. } | Self::H264 { .. } | Self::Av1 { .. } => MediaKind::Video,
         }
     }
 }

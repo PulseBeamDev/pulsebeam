@@ -2695,9 +2695,11 @@ pub(crate) fn track_descriptor(track: &crate::track::Track) -> Option<wire::Trac
         }),
         Track::Video(video) => wire::track::Kind::Video(wire::VideoTrack {
             format: Some(video.format.clone()?),
+            av1_whole_source: video.av1_whole_source,
         }),
         Track::Data(data) => wire::track::Kind::Data(wire::DataTrack {
             capture_clock: data.capture_clock.clone(),
+            record_dd: data.record_dd,
             delivery: match data.lane {
                 DataLane::Latest => wire::DataDelivery::Latest,
                 DataLane::Lossy => wire::DataDelivery::Lossy,

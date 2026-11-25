@@ -31,6 +31,146 @@ fn ordered<'a>(
 }
 
 #[test]
+fn vp8_assembles_partitions_and_rejects_gap_and_dd_conflicts() {
+    let at = origin();
+    let mut decoder =
+        Depacketizer::new(1, Codec::Vp8).with_video_limit(NonZeroUsize::new(5).unwrap());
+    let first = [0x10, 0x11, 0x00, 0x00];
+    let second = [0x11, 0xab, 0xcd];
+    let mut packet = ordered(at, 65_535, u64::from(u32::MAX), false, &first);
+    packet.descriptor = Some(&[0x80, 0, 7]);
+    assert!(decoder.push(1, packet).unwrap().is_none());
+    let mut packet = ordered(at, 65_536, u64::from(u32::MAX), true, &second);
+    packet.descriptor = Some(&[0x40, 0, 7]);
+    let Some(Event::Unit(unit)) = decoder.push(1, packet).unwrap() else {
+        panic!("complete partitioned VP8 frame");
+    };
+    assert_eq!(unit.data, [0x11, 0, 0, 0xab, 0xcd]);
+    assert_eq!(unit.access, Access::DependentVideo);
+    assert!(matches!(unit.framing, Framing::Vp8 { partitions, .. } if partitions == [0..3, 3..5]));
+
+    let timestamp = u64::from(u32::MAX) + 1;
+    let mut packet = ordered(at, 65_537, timestamp, true, &first);
+    packet.descriptor = Some(&[0x80, 0, 8]);
+    assert!(
+        matches!(decoder.push(1, packet), Ok(Some(Event::Discontinuity(gap))) if gap.cause == Cause::MissingBoundary)
+    );
+    assert!(
+        decoder
+            .push(1, ordered(at, 65_538, timestamp, false, &first))
+            .unwrap()
+            .is_none()
+    );
+    decoder
+        .gap(1, 65_539..65_540, GapReason::ReorderLimit)
+        .unwrap();
+    assert!(
+        matches!(decoder.push(1, ordered(at, 65_540, timestamp, true, &second)), Ok(Some(Event::Discontinuity(gap))) if gap.cause == Cause::MissingBoundary)
+    );
+    assert!(
+        decoder
+            .push(1, ordered(at, 65_541, timestamp, false, &first))
+            .unwrap()
+            .is_none()
+    );
+    let overflow = [0, 1, 2, 3];
+    assert!(
+        matches!(decoder.push(1, ordered(at, 65_542, timestamp, true, &overflow)), Ok(Some(Event::Discontinuity(gap))) if gap.cause == Cause::UnitLimit)
+    );
+}
+
+#[test]
+fn vp9_delivers_distinct_spatial_frames_at_one_timestamp() {
+    let at = origin();
+    let mut decoder = Depacketizer::new(1, Codec::Vp9);
+    let mut push = |seq, marker, payload, dd| {
+        let mut packet = ordered(at, seq, 9000, marker, payload);
+        packet.descriptor = Some(dd);
+        decoder.push(1, packet).unwrap()
+    };
+    assert!(push(30, false, &[0xa8, 7, 0x10, 4, 0x82], &[0x80, 0, 9]).is_none());
+    let Some(Event::Unit(base)) = push(31, false, &[0xa4, 7, 0x10, 4, 0x49], &[0x40, 0, 9]) else {
+        panic!("spatial frame must finish before picture marker");
+    };
+    let Some(Event::Unit(upper)) = push(32, true, &[0xac, 7, 0x13, 4, 0x83], &[0xc0, 0, 10]) else {
+        panic!("upper frame shares the base RTP timestamp");
+    };
+    assert_eq!(base.rtp_time, upper.rtp_time);
+    assert_eq!(base.data, [0x82, 0x49]);
+    assert_eq!(upper.data, [0x83]);
+    assert_eq!(base.access, Access::IndependentVideo);
+    assert_eq!(upper.access, Access::DependentVideo);
+    assert!(
+        matches!(base.framing, Framing::Vp9 { descriptor, end_of_picture: false }
+        if descriptor.layer.unwrap().spatial_id == 0)
+    );
+    assert!(
+        matches!(upper.framing, Framing::Vp9 { descriptor, end_of_picture: true }
+        if descriptor.layer.unwrap().spatial_id == 1)
+    );
+    assert!(push(33, false, &[0xa8, 8, 0x10, 5, 0x82], &[0x80, 0, 11]).is_none());
+    assert!(
+        matches!(push(34, true, &[0xa4, 8, 0x13, 5, 0x49], &[0x40, 0, 11]),
+        Some(Event::Discontinuity(gap)) if gap.cause == Cause::MissingBoundary && gap.sequence == (33..35))
+    );
+}
+
+#[test]
+fn av1_uses_dd_for_frame_boundaries_and_requires_explicit_whole_source_mode() {
+    let at = origin();
+    let timestamp = 9000;
+    let base = [0x28, 2, 0x08, 0xab, 0x30, 0xcd];
+    let higher = [0x10, 0x34, 0x08, 0xef];
+    let mut decoder = Depacketizer::new(1, Codec::Av1);
+    assert!(
+        matches!(decoder.push(1, ordered(at, 10, timestamp, true, &base)),
+        Ok(Some(Event::Discontinuity(gap))) if gap.cause == Cause::MissingBoundary)
+    );
+    let mut first = ordered(at, 11, timestamp, false, &base);
+    first.descriptor = Some(&[0xc0, 0, 1]);
+    let Some(Event::Unit(first)) = decoder.push(1, first).unwrap() else {
+        panic!("DD end without a picture marker");
+    };
+    let mut second = ordered(at, 12, timestamp, true, &higher);
+    second.descriptor = Some(&[0xc0, 0, 2]);
+    let Some(Event::Unit(second)) = decoder.push(1, second).unwrap() else {
+        panic!("spatial frame at the same RTP time");
+    };
+    assert_eq!(first.data, [0x0a, 1, 0xab, 0x32, 1, 0xcd]);
+    assert_eq!(first.access, Access::IndependentVideo);
+    assert!(
+        matches!(first.framing, Framing::Av1 { sequence_header: Some(range), end_of_picture: false, .. } if range == (0..3))
+    );
+    assert_eq!(second.rtp_time, first.rtp_time);
+    assert!(matches!(
+        second.framing,
+        Framing::Av1 {
+            layer: av1::Layer { spatial_id: 1, .. },
+            end_of_picture: true,
+            ..
+        }
+    ));
+
+    let mut whole = Depacketizer::new(1, Codec::Av1).with_av1_whole_source();
+    assert!(matches!(
+        whole.push(1, ordered(at, 20, timestamp, true, &base)),
+        Ok(Some(Event::Unit(_)))
+    ));
+    let continued = [0x50, 0x30, 0xcd];
+    assert!(
+        whole
+            .push(1, ordered(at, 21, timestamp + 1, false, &continued))
+            .unwrap()
+            .is_none()
+    );
+    whole.gap(1, 22..23, GapReason::ReorderLimit).unwrap();
+    assert!(
+        matches!(whole.push(1, ordered(at, 23, timestamp + 1, true, &[0x90, 0xef])),
+        Ok(Some(Event::Discontinuity(gap))) if gap.cause == Cause::MissingBoundary)
+    );
+}
+
+#[test]
 fn opus_keeps_rtp_time_and_gaps_separate_from_sender_report_time() {
     let at = origin();
     let mut opus = Depacketizer::new(1, Codec::Opus);

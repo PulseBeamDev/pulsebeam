@@ -976,6 +976,7 @@ fn qualification_rejects_missing_payload_sequential_peers_and_unretired_graphs()
         participant_id: "v4".into(),
         data: A_TO_B.to_vec(),
         captured_at: None,
+        fragment_descriptors: None,
     };
     recipient_payload(&message, "v4", A_TO_B)?;
     ensure!(

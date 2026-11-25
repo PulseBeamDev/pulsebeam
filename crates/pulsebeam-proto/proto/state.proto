@@ -391,6 +391,10 @@ message AudioTrack {
 message VideoTrack {
   // Required admitted video codec envelope; excludes publisher demux coordinates.
   CodecFormat format = 1;
+
+  // The admitted AV1 source uses DD-free L1T1 framing: the RTP marker ends
+  // the only spatial frame at each timestamp. False does not assert framing.
+  bool av1_whole_source = 2;
 }
 
 message DataTrack {
@@ -398,6 +402,8 @@ message DataTrack {
   DataDelivery delivery = 1;
   // The immutable source clock for timestamped DATA records, when declared.
   DataV1CaptureClock capture_clock = 2;
+  // This source may emit DATA_V1 record dependency descriptors.
+  bool record_dd = 3;
 }
 
 enum DataDelivery {
@@ -624,7 +630,7 @@ message AudioReceiveOptions {
 
 // Mutable video subscription policy; omission restores each documented default.
 // These preferences do not confer admission, reserve bandwidth or request transcoding.
-// Present values MUST be positive and within the documented limits. When both heights
+// Present values MUST be within the documented limits. When both heights
 // are present, min_height<=max_height. Omission resets each field independently.
 //
 // Per receiving connection, preserve admitted audio's budget first, then allocate
@@ -649,6 +655,11 @@ message VideoReceiveOptions {
   optional uint32 priority = 4;
   reserved 5;
   reserved "playout_delay";
+
+  // Exact dependency-descriptor decode-target index, 0..31. Omission leaves
+  // target choice to the receiver policy. Never fall back to whole-source
+  // forwarding when an explicitly selected target lacks evidence.
+  optional uint32 decode_target = 6;
 }
 
 
@@ -676,6 +687,8 @@ message QuicDataV1Parameters {
   uint32 version = 2;
   fixed64 incarnation = 3;
   DataV1Delivery delivery = 4;
+  // Opt in only after both peers advertise DATA_V1 record DD carriage.
+  bool record_dd = 5;
 }
 
 message QuicRtpParameters {
@@ -684,6 +697,16 @@ message QuicRtpParameters {
   RtpCodecParameters codec = 3;
   fixed32 primary_ssrc = 4;
   bool publishes_h264_dd = 5; // H.264 publication only; requires Dependency Descriptor.
+  // Only when both peers advertise the directional video DD contract.
+  optional QuicVideoDd video_dd = 6;
+}
+
+enum QuicVideoDd {
+  QUIC_VIDEO_DD_UNSPECIFIED = 0;
+  QUIC_VIDEO_DD_ABSENT = 1;
+  QUIC_VIDEO_DD_EMIT = 2;
+  QUIC_VIDEO_DD_ACCEPT = 3;
+  QUIC_VIDEO_DD_REQUIRE = 4;
 }
 
 // Explicit DATA_V1 payload negotiation, never an opt-in flag on a legacy

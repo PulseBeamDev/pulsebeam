@@ -128,11 +128,20 @@ fn proves_dependencies(
     target: usize,
     credited: &BTreeSet<u64>,
 ) -> bool {
-    let has = |difference: u16| {
+    dependencies_satisfied(dependencies, chains, target, |difference| {
         number
             .checked_sub(u64::from(difference))
             .is_some_and(|parent| credited.contains(&parent))
-    };
+    })
+}
+
+/// Frame and protecting-chain references must all be backed by credited ancestors.
+pub fn dependencies_satisfied(
+    dependencies: &FrameDependencyTemplate,
+    chains: &[u8],
+    target: usize,
+    mut has: impl FnMut(u16) -> bool,
+) -> bool {
     let chain_proven = if dependencies.chain_diffs.is_empty() {
         true
     } else {

@@ -57,6 +57,7 @@ fn named_resources_project_their_own_prejoin_configuration() {
         ResourceCommand::DeclareDataPublication {
             spec: data.clone(),
             capture_clock: None,
+            record_dd: false,
         },
     );
     let subscription = owner(
@@ -253,6 +254,7 @@ fn queued_owned_data_send_cannot_outlive_its_owner_or_join() {
         let ResourceResult::Owned { owner } = handle
             .resource_now(ResourceCommand::DeclareDataPublication {
                 capture_clock: None,
+                record_dd: false,
                 spec: TrackSpec::Data {
                     track_id: "chat".into(),
                     delivery: TopicMode::Ordered,

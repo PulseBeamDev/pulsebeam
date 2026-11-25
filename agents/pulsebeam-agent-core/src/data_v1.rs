@@ -54,6 +54,7 @@ fn bound_clock(clock: Option<&CaptureClock>) -> Option<Clock<'_>> {
 
 pub struct Publisher<A> {
     binding: Binding<A>,
+    record_dd: bool,
     next: Option<u64>,
     clock: Option<CaptureClock>,
 }
@@ -80,9 +81,15 @@ impl<A: Copy + Eq> Publisher<A> {
         }
         Ok(Self {
             binding,
+            record_dd: false,
             next: Some(first),
             clock,
         })
+    }
+
+    fn with_record_dd(mut self, record_dd: bool) -> Self {
+        self.record_dd = record_dd;
+        self
     }
 
     /// Transfer ownership of one unit after the caller reserves its queue credit.
@@ -105,12 +112,34 @@ impl<A: Copy + Eq> Publisher<A> {
         {
             return Err(Error::Record(data_record::Error::Clock));
         }
+        let descriptors = options.fragment_descriptors.unwrap_or_default();
+        if !descriptors.is_empty() && !self.record_dd {
+            return Err(Error::Binding);
+        }
+        if descriptors.len() > usize::from(count)
+            || descriptors
+                .iter()
+                .any(|entry| entry.fragment_index >= count)
+            || descriptors.windows(2).any(|pair| match pair {
+                [left, right] => left.fragment_index >= right.fragment_index,
+                _ => false,
+            })
+        {
+            return Err(Error::Record(data_record::Error::FragmentIndex));
+        }
+        if descriptors
+            .iter()
+            .any(|entry| !(3..=data_record::MAX_DESCRIPTOR_BYTES).contains(&entry.bytes.len()))
+        {
+            return Err(Error::Record(data_record::Error::DescriptorLength));
+        }
         self.next = seq.checked_add(1);
         Ok(OutgoingUnit {
             seq,
             count,
             bytes,
             captured_at: options.captured_at,
+            descriptors,
         })
     }
 }
@@ -120,6 +149,7 @@ pub struct OutgoingUnit {
     count: u16,
     bytes: Vec<u8>,
     captured_at: Option<CaptureTimestamp>,
+    descriptors: Vec<DataFragmentDescriptor>,
 }
 
 impl OutgoingUnit {
@@ -162,8 +192,42 @@ impl OutgoingUnit {
             bytes,
             capture.map(|value| value.clock),
         )
-        .and_then(|record| record.write(out))
+        .and_then(|record| {
+            let descriptor = self
+                .descriptors
+                .binary_search_by_key(&index, |entry| entry.fragment_index)
+                .ok()
+                .and_then(|slot| self.descriptors.get(slot));
+            match descriptor {
+                Some(entry) => record.with_dependency_descriptor(&entry.bytes)?.write(out),
+                None => record.write(out),
+            }
+        })
         .map_err(Error::Record)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct DataFragmentDescriptor {
+    pub fragment_index: u16,
+    pub bytes: Vec<u8>,
+}
+
+fn descriptor_budget(record_dd: bool, count: u16) -> usize {
+    if record_dd {
+        const PER_FRAGMENT: usize =
+            data_record::MAX_DESCRIPTOR_BYTES + core::mem::size_of::<DataFragmentDescriptor>();
+        usize::from(count).saturating_mul(PER_FRAGMENT)
+    } else {
+        0
+    }
+}
+
+fn record_capacity(record_dd: bool) -> usize {
+    if record_dd {
+        data_record::MAX_ENDPOINT_RECORD_BYTES
+    } else {
+        data_record::MAX_RECORD_BYTES
     }
 }
 
@@ -172,6 +236,7 @@ pub struct AssembledUnit {
     pub unit_seq: u64,
     pub captured_at: Option<CaptureTimestamp>,
     pub bytes: Vec<u8>,
+    pub fragment_descriptors: Vec<DataFragmentDescriptor>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -184,6 +249,8 @@ struct Shape {
 struct Partial {
     shape: Shape,
     bytes: Vec<u8>,
+    descriptors: Vec<DataFragmentDescriptor>,
+    reserved_bytes: usize,
     received: u64,
 }
 
@@ -197,7 +264,9 @@ struct OpenUnit {
 
 impl OpenUnit {
     fn bytes(&self) -> usize {
-        self.partial.as_ref().map_or(0, |partial| partial.shape.len)
+        self.partial
+            .as_ref()
+            .map_or(0, |partial| partial.reserved_bytes)
     }
 
     fn missing_fragments(&self) -> Option<u64> {
@@ -239,6 +308,7 @@ pub enum ReceiptAction {
 pub struct Subscriber<A> {
     binding: Binding<A>,
     clock: Option<CaptureClock>,
+    record_dd: bool,
     now: Duration,
     max_seen: Option<u64>,
     latest: Option<u64>,
@@ -259,6 +329,7 @@ impl<A: Copy + Eq> Subscriber<A> {
         Ok(Self {
             binding,
             clock,
+            record_dd: false,
             now: Duration::ZERO,
             max_seen: None,
             latest: None,
@@ -270,6 +341,11 @@ impl<A: Copy + Eq> Subscriber<A> {
             active: 0,
             bytes: 0,
         })
+    }
+
+    pub(super) fn with_record_dd(mut self, record_dd: bool) -> Self {
+        self.record_dd = record_dd;
+        self
     }
 
     pub fn next_expiry(&self) -> Option<Duration> {
@@ -497,8 +573,13 @@ impl<A: Copy + Eq> Subscriber<A> {
         if binding != self.binding {
             return Err(Error::Binding);
         }
-        let record = Record::decode_without_descriptor(raw, bound_clock(self.clock.as_ref()))
-            .map_err(Error::Record)?;
+        let clock = bound_clock(self.clock.as_ref());
+        let record = if self.record_dd {
+            Record::decode(raw, clock)
+        } else {
+            Record::decode_without_descriptor(raw, clock)
+        }
+        .map_err(Error::Record)?;
         let header = record.header();
         let seq = header.unit_seq;
         let index = header.index;
@@ -511,10 +592,12 @@ impl<A: Copy + Eq> Subscriber<A> {
                 .capture
                 .map(|capture| (capture.nanos, capture.uncertainty_ns)),
         };
-        let fragment_len = record.bytes().len();
-        let fragment = raw
-            .get(raw.len().saturating_sub(fragment_len)..)
-            .ok_or(Error::Record(data_record::Error::Length))?;
+        let fragment = record.bytes();
+        let descriptor = record.dependency_descriptor();
+        let reserved_bytes = shape
+            .len
+            .checked_add(descriptor_budget(self.record_dd, shape.count))
+            .ok_or(Error::Capacity)?;
         self.expire(now);
         if self.latest.is_some_and(|delivered| seq <= delivered) || self.outside_window(seq) {
             return Ok(None);
@@ -531,20 +614,23 @@ impl<A: Copy + Eq> Subscriber<A> {
                     self.finish(seq, Slot::Closed);
                     return Err(Error::Conflict);
                 }
-                if unit.partial.is_none() && self.bytes.saturating_add(shape.len) > BYTE_LIMIT {
+                if unit.partial.is_none() && self.bytes.saturating_add(reserved_bytes) > BYTE_LIMIT
+                {
                     return Err(Error::Capacity);
                 }
             }
-            None => self.begin(seq, shape.len)?,
+            None => self.begin(seq, reserved_bytes)?,
         }
         let Some(Slot::Open(unit)) = self.slots.get_mut(&seq) else {
             return Ok(None);
         };
         let partial = unit.partial.get_or_insert_with(|| {
-            self.bytes = self.bytes.saturating_add(shape.len);
+            self.bytes = self.bytes.saturating_add(reserved_bytes);
             Partial {
                 shape,
                 bytes: vec![0; shape.len],
+                descriptors: Vec::new(),
+                reserved_bytes,
                 received: 0,
             }
         });
@@ -556,12 +642,31 @@ impl<A: Copy + Eq> Subscriber<A> {
         let mask = 1_u64
             .checked_shl(u32::from(index))
             .ok_or(Error::Record(data_record::Error::FragmentIndex))?;
+        let descriptor_slot = partial
+            .descriptors
+            .binary_search_by_key(&index, |entry| entry.fragment_index);
         if partial.received & mask != 0 {
-            if target != fragment {
+            let previous = descriptor_slot
+                .ok()
+                .and_then(|slot| partial.descriptors.get(slot))
+                .map(|entry| entry.bytes.as_slice());
+            if target != fragment || previous != descriptor {
                 self.finish(seq, Slot::Closed);
                 return Err(Error::Conflict);
             }
             return Ok(None);
+        }
+        if let (Some(bytes), Err(slot)) = (descriptor, descriptor_slot) {
+            if partial.descriptors.is_empty() {
+                partial.descriptors.reserve_exact(usize::from(shape.count));
+            }
+            partial.descriptors.insert(
+                slot,
+                DataFragmentDescriptor {
+                    fragment_index: index,
+                    bytes: bytes.to_vec(),
+                },
+            );
         }
         target.copy_from_slice(fragment);
         partial.received |= mask;
@@ -616,6 +721,7 @@ impl<A: Copy + Eq> Subscriber<A> {
             unit_seq: seq,
             captured_at,
             bytes: partial.bytes,
+            fragment_descriptors: partial.descriptors,
         })
     }
 

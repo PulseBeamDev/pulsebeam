@@ -30,18 +30,21 @@ def indexed_bytes(directory, name):
 
 
 def vp9_payload(payload):
-    # RFC 9628 sections 4.2 and 4.3. The pilot always sends I and L.
+    # RFC 9628 sections 4.2 and 4.3. WebRTC sends picture IDs;
+    # single-layer pictures can omit layer indices.
     flags, pic = payload[:2]
-    require(flags & 0xA0 == 0xA0, "VP9 packet missing I or L")
+    require(flags & 0x80, "VP9 packet missing its picture ID")
     pos = 2
     if pic & 0x80:
         pic = ((pic & 0x7F) << 8) | payload[pos]
         pos += 1
-    layer = payload[pos]
-    pos += 1
-    if not flags & 0x10:
-        pos += 1  # TL0PICIDX
-    elif flags & 0x40:
+    layer = 0
+    if flags & 0x20:
+        layer = payload[pos]
+        pos += 1
+        if not flags & 0x10:
+            pos += 1  # TL0PICIDX
+    if flags & 0x10 and flags & 0x40:
         for _ in range(3):
             ref = payload[pos]
             pos += 1
@@ -96,12 +99,18 @@ def rtp_fields(packet, dd_id):
     return pt, seq, ts, ssrc, dd, packet[end:]
 
 
-def correlate(directory):
+def correlate(directory, *, pre_packetization_sha256=None):
     context = dict(line.split("\t", 1) for line in
                    (directory / "context.tsv").read_text().splitlines())
     require(context["format"] == "VP9/90000" and context["profile_id"] == "0",
             "unexpected payload format")
-    units = list(indexed_bytes(directory, "encoded"))
+    if pre_packetization_sha256 is None:
+        units = list(indexed_bytes(directory, "encoded"))
+    else:
+        with (directory / "encoded.tsv").open() as index:
+            units = [(row, None) for row in csv.DictReader(index, delimiter="\t")]
+        require(len(units) == len(pre_packetization_sha256), "missing pre-packetization digests")
+    encoded_offset = 0
     active = None
     last_seq = last_dd = None
     by_unit = []
@@ -137,24 +146,53 @@ def correlate(directory):
         active[4].append(index)
         if end:
             require(len(by_unit) < len(units), "unobserved RTP unit")
-            meta, expected = units[len(by_unit)]
-            require(int(meta["unit"]) == len(by_unit) and int(meta["spatial"]) == vp9_id[1]
-                    and ts == (int(meta["input_rtp"]) + int(context["rtp_offset"])) % 2**32
-                    and active[3] == expected, "wire-to-encoder unit mismatch")
-            by_unit.append({"unit": len(by_unit), "dd": dd_id, "picture": vp9_id[0],
+            unit = len(by_unit)
+            meta, expected = units[unit]
+            payload = bytes(active[3])
+            require(int(meta["unit"]) == unit and int(meta["spatial"]) == vp9_id[1]
+                    and int(meta["offset"]) == encoded_offset and int(meta["size"]) == len(payload)
+                    and ts == (int(meta["input_rtp"]) + int(context["rtp_offset"])) % 2**32,
+                    "wire-to-encoder unit mismatch")
+            encoded_offset += len(payload)
+            if pre_packetization_sha256 is None:
+                require(payload == expected, "wire payload differs from original encoded bytes")
+            else:
+                require(hashlib.sha256(payload).hexdigest() == pre_packetization_sha256[unit],
+                        "wire payload differs from recorded pre-packetization digest")
+                units[unit] = (meta, payload)
+            by_unit.append({"unit": unit, "dd": dd_id, "picture": vp9_id[0],
                             "rtp_timestamp": ts, "packets": active[4]})
-            wire_units.append(bytes(active[3]))
+            wire_units.append(payload)
             active = None
-    require(active is None and len(by_unit) == len(units) == 24, "missing complete units")
+    require(active is None and len(by_unit) == len(units) and units, "missing complete units")
     require(sr and any(len(unit["packets"]) > 1 for unit in by_unit),
             "capture needs a sender report and fragmented media")
     return context, units, by_unit, wire_units
 
 
-def inspect_encoder(units, mapping, requested):
+def resolve_dependencies(units):
     dependencies = []
     buffers = {}
-    for index, ((row, _), wire) in enumerate(zip(units, mapping, strict=True)):
+    for index, (row, _) in enumerate(units):
+        edges = []
+        updates = []
+        for fact in filter(None, row["buffers_id_ref_update"].split(",")):
+            slot, ref, update = map(int, fact.split(":"))
+            if ref:
+                require(slot in buffers, "uninitialized encoder buffer reference")
+                edges.append(buffers[slot])
+            if update:
+                updates.append(slot)
+        dependencies.append(sorted(set(edges)))
+        for slot in updates:
+            buffers[slot] = index
+    return dependencies
+
+
+def inspect_encoder(units, mapping, requested):
+    require(len(units) == 24, "pilot must contain twelve spatial pairs")
+    dependencies = resolve_dependencies(units)
+    for index, ((row, _), wire, edges) in enumerate(zip(units, mapping, dependencies, strict=True)):
         sid = index % 2
         require((int(row["spatial"]), int(row["temporal"]), row["mode"]) == (sid, 0, requested),
                 "unexpected callback topology")
@@ -166,15 +204,6 @@ def inspect_encoder(units, mapping, requested):
             require(wire["picture"] == prior["picture"]
                     and wire["rtp_timestamp"] == prior["rtp_timestamp"],
                     "spatial units are not at the same presentation instant")
-        edges = []
-        updates = []
-        for fact in filter(None, row["buffers_id_ref_update"].split(",")):
-            slot, ref, update = map(int, fact.split(":"))
-            if ref:
-                require(slot in buffers, "uninitialized encoder buffer reference")
-                edges.append(buffers[slot])
-            if update:
-                updates.append(slot)
         same_picture = sid and index - 1 in edges
         require(bool(same_picture) == (row["inter_layer_predicted"] == "1"),
                 "VP9 inter-layer flag contradicts encoder buffer observations")
@@ -182,9 +211,6 @@ def inspect_encoder(units, mapping, requested):
                 "independence/dependence was not witnessed")
         if requested == "S2T1":
             require(all(edge % 2 == sid for edge in edges), "independent stream crossed layers")
-        dependencies.append(sorted(set(edges)))
-        for slot in updates:
-            buffers[slot] = index
     return dependencies
 
 
@@ -197,15 +223,26 @@ def superframe(parts):
     return b"".join(parts) + marker + sizes + marker
 
 
-def elementary(units, dependencies, *, absent_packets=(), corrupt=None):
-    # Fixed upper target spanning the whole capture. Select only the transitive
-    # closure of upper units using encoder buffer events, never wire DD.
-    selected = set(range(1, len(units), 2))
-    for unit in reversed(range(len(units))):
+def target_units(rows, dependencies, target):
+    # Use encoder buffer events, never wire DD, for the reference closure.
+    spatial, temporal = target
+    selected = {i for i, row in enumerate(rows)
+                if int(row["spatial"]) == spatial and int(row["temporal"]) <= temporal}
+    for unit in reversed(range(len(rows))):
         if unit in selected:
             selected.update(dependencies[unit])
+    return sorted(selected)
+
+
+def elementary(units, dependencies, *, target=(1, 0), dimensions=(640, 360),
+               absent_packets=(), corrupt=None):
+    selected = target_units([row for row, _, _ in units], dependencies, target)
+    return vp9_ivf(units, selected, dimensions, absent_packets, corrupt)
+
+
+def vp9_ivf(units, selected, dimensions, absent_packets=(), corrupt=None):
     packets = {}
-    for unit in sorted(selected):
+    for unit in selected:
         row, data, wire = units[unit]
         if set(wire["packets"]).intersection(absent_packets):
             continue  # Never offer a partial coded unit to the decoder.
@@ -213,11 +250,14 @@ def elementary(units, dependencies, *, absent_packets=(), corrupt=None):
             data = b"\x00" * len(data)
         pts = int(row["input_rtp"])
         packets.setdefault(pts, []).append(data)
+    return write_ivf(b"VP90", dimensions, {pts: superframe(parts) for pts, parts in packets.items()})
+
+
+def write_ivf(fourcc, dimensions, packets):
     out = io.BytesIO()
-    out.write(struct.pack("<4sHH4sHHIIII", b"DKIF", 0, 32, b"VP90",
-                          640, 360, 90000, 1, len(packets), 0))
-    for pts, parts in packets.items():
-        payload = superframe(parts)
+    out.write(struct.pack("<4sHH4sHHIIII", b"DKIF", 0, 32, fourcc,
+                          *dimensions, 90000, 1, len(packets), 0))
+    for pts, payload in packets.items():
         out.write(struct.pack("<IQ", len(payload), pts))
         out.write(payload)
     return out.getvalue()
@@ -237,7 +277,7 @@ def picture(frame):
             "width": frame.width, "height": frame.height, "planes_sha256": digests}
 
 
-def decode(av, ivf):
+def decode(av, ivf, decoder=None):
     # Observe AVFrames before any scaler or fixed-resolution output encoder.
     # Both spatial pictures can be displayed at one PTS.
     options = {"threads": "1", "err_detect": "explode"}
@@ -245,16 +285,34 @@ def decode(av, ivf):
     error = None
     with av.logging.Capture() as log, av.open(io.BytesIO(ivf), format="ivf") as source:
         stream = source.streams.video[0]
-        require(stream.codec_context.name == "vp9", "unexpected decoder")
-        stream.codec_context.options = options.copy()
+        context = av.CodecContext.create(decoder, "r") if decoder else stream.codec_context
+        require(decoder is not None or context.name == "vp9", "unexpected decoder")
+        context.options = options.copy()
         try:
             for packet in source.demux(stream):
-                frames.extend(picture(frame) for frame in packet.decode())
+                frames.extend(picture(frame) for frame in context.decode(packet if packet.size else None))
         except av.error.InvalidDataError as exc:
             error = exc.errno
     errors = [message.strip() for level, component, message in log
-              if level <= av.logging.ERROR and component == "vp9"]
+              if level <= av.logging.ERROR and component in ("vp9", "av1", "libdav1d")]
     return {"error": error, "decoder_errors": errors, "frames": frames, "options": options}
+
+
+def restart_switch(units, dependencies):
+    rows = [row for row, _, _ in units]
+    restart, = [int(row["input_rtp"]) for row in rows if row["spatial"] == "0"
+                and row["key"] == "1" and int(row["input_rtp"]) > 0]
+    before = [i for i in target_units(rows, dependencies, (0, 0)) if int(rows[i]["input_rtp"]) < restart]
+    after = [i for i in target_units(rows, dependencies, (1, 0)) if int(rows[i]["input_rtp"]) >= restart]
+    selected = before + after
+    require(set(selected) and all(set(dependencies[i]).issubset(selected) for i in selected),
+            "restart switch would lose an encoder reference")
+    return restart, selected, vp9_ivf(units, selected, (640, 360))
+
+
+def switch_presentation(lower, upper, restart):
+    return [f for f in lower if f["width"] == 320 and f["pts"] < restart] + [
+        f for f in upper if f["width"] == 640 and f["pts"] >= restart]
 
 
 def main():
@@ -285,6 +343,16 @@ def main():
                   "corrupt_unit": 1}
         for name, ivf in streams.items():
             result[name] = {"ivf_sha256": hashlib.sha256(ivf).hexdigest(), **decode(av, ivf)}
+        restart, selected, switched_ivf = restart_switch(wire_input, references)
+        lower = decode(av, elementary(wire_input, references, target=(0, 0), dimensions=(320, 180)))
+        switched = decode(av, switched_ivf)
+        for proof in (lower, switched):
+            require(proof["error"] is None and not proof["decoder_errors"], "restart switch decode failed")
+        presentation = [f for f in switched["frames"] if (f["width"] == 320) == (f["pts"] < restart)]
+        require(presentation == switch_presentation(lower["frames"], result["intact"]["frames"], restart)
+                and len(presentation) == len(units) // 2, "restart switch changed presentation")
+        result["restart_switch"] = {"input_rtp": restart, "units": selected, "pictures": presentation,
+                                    "ivf_sha256": hashlib.sha256(switched_ivf).hexdigest()}
         (folder / "observations.json").write_text(json.dumps(result, indent=2) + "\n")
         intact = result["intact"]
         lost = result["lost_lower"]
@@ -306,12 +374,17 @@ def main():
                             for frame in lost["frames"]), "dependent upper was presented despite loss")
 
     if args.archive:
-        with tarfile.open(args.archive, "w", format=tarfile.USTAR_FORMAT) as archive:
-            for path in sorted(args.capture.glob("*/*")):
-                data = path.read_bytes()
-                entry = tarfile.TarInfo(path.relative_to(args.capture).as_posix())
-                entry.size = len(data)
-                archive.addfile(entry, io.BytesIO(data))
+        write_archive(args.archive, args.capture)
+
+
+def write_archive(output, capture, *, exclude=()):
+    with tarfile.open(output, "w", format=tarfile.USTAR_FORMAT) as archive:
+        for path in sorted(capture.rglob("*")):
+            if path.is_file() and path.name not in exclude:
+                entry = tarfile.TarInfo(path.relative_to(capture).as_posix())
+                entry.size = path.stat().st_size
+                with path.open("rb") as data:
+                    archive.addfile(entry, data)
 
 
 if __name__ == "__main__":

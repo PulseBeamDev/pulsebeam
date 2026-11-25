@@ -24,6 +24,38 @@ pub struct RtpCodecParameters {
     pub feedback: BTreeSet<String>,
 }
 
+impl RtpCodecParameters {
+    /// Format facts after validating the clock, channels and codec parameters.
+    pub fn profile(&self) -> Option<crate::CodecProfile> {
+        use crate::CodecProfile;
+        validate_codec(self).ok()?;
+        if self.name.eq_ignore_ascii_case("opus") {
+            Some(CodecProfile::Opus)
+        } else if self.name.eq_ignore_ascii_case("vp8") {
+            Some(CodecProfile::Vp8)
+        } else if self.name.eq_ignore_ascii_case("vp9") {
+            let profile_id = self.fmtp.get("profile-id").map_or("0", String::as_str);
+            Some(CodecProfile::Vp9 {
+                profile_id: profile_id.parse().ok()?,
+            })
+        } else if self.name.eq_ignore_ascii_case("h264") {
+            Some(CodecProfile::H264 {
+                profile_level_id: self
+                    .fmtp
+                    .get("profile-level-id")
+                    .and_then(|value| u32::from_str_radix(value, 16).ok()),
+                packetization_mode: 1,
+                level_asymmetry_allowed: self
+                    .fmtp
+                    .get("level-asymmetry-allowed")
+                    .is_some_and(|value| value == "1"),
+            })
+        } else {
+            av1_profile(&self.fmtp)
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RtpCodec {
     pub payload_type: u8,
@@ -288,24 +320,7 @@ impl PhysicalBinding {
         let codec = &binding.codec;
         let encoding = self.encoding();
         let name = codec.parameters.name.to_ascii_lowercase().into_boxed_str();
-        let profile = match name.as_ref() {
-            "opus" => Some(crate::CodecProfile::Opus),
-            "h264" => Some(crate::CodecProfile::H264 {
-                profile_level_id: codec
-                    .parameters
-                    .fmtp
-                    .get("profile-level-id")
-                    .and_then(|value| u32::from_str_radix(value, 16).ok()),
-                packetization_mode: 1,
-                level_asymmetry_allowed: codec
-                    .parameters
-                    .fmtp
-                    .get("level-asymmetry-allowed")
-                    .is_some_and(|value| value == "1"),
-            }),
-            "av1" => av1_profile(&codec.parameters.fmtp),
-            _ => None,
-        };
+        let profile = codec.parameters.profile();
         crate::negotiation::IngressMediaFacts {
             kind: binding.kind,
             rtcp: Some(binding.rtcp.clone()),
@@ -1104,18 +1119,10 @@ fn validate_binding(
     }
     validate_codec(&binding.codec.parameters)?;
     if !caps.codecs.iter().any(|supported| {
-        let parameters = &supported.parameters;
-        parameters
-            .name
-            .eq_ignore_ascii_case(&binding.codec.parameters.name)
-            && parameters.clock_rate == binding.codec.parameters.clock_rate
-            && parameters.channels == binding.codec.parameters.channels
-            && parameters.fmtp == binding.codec.parameters.fmtp
-            && binding
-                .codec
-                .parameters
-                .feedback
-                .is_subset(&parameters.feedback)
+        let admitted = &supported.parameters;
+        let requested = &binding.codec.parameters;
+        same_codec_format(admitted, requested)
+            && requested.feedback.is_subset(&admitted.feedback)
             && (binding.codec.repair_payload_type.is_none() || supported.repair)
     }) {
         return Err(Error::Unsupported);
@@ -1179,6 +1186,13 @@ fn validate_binding(
         }
     }
     Ok(())
+}
+
+fn same_codec_format(left: &RtpCodecParameters, right: &RtpCodecParameters) -> bool {
+    left.name.eq_ignore_ascii_case(&right.name)
+        && left.clock_rate == right.clock_rate
+        && left.channels == right.channels
+        && left.fmtp == right.fmtp
 }
 
 fn identifier(value: &str) -> bool {

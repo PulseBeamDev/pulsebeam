@@ -124,13 +124,17 @@ rust_test(
         "--test-threads=1",
         "--nocapture",
     ],
-    compile_data = _COMPILE_DATA + ["//crates/pulsebeam-rtc:controlled_peer_fixture_source"],
+    compile_data = _COMPILE_DATA + [
+        "//crates/pulsebeam-rtc:controlled_peer_fixture_source",
+        "//crates/pulsebeam-testdata:worker_video_inputs",
+    ],
     lint_config = ":lints",
     aliases = aliases(normal = True, normal_dev = True, proc_macro_dev = True),
     deps = _DEPS + all_crate_deps(normal_dev = True) + [
         "//agents/pulsebeam-agent-native:pulsebeam-agent-native-transport",
         "//agents/pulsebeam-agent-quic:executor-edge-test",
         "//crates/pulsebeam-rtc/simulation:pulsebeam-rtc-simulation",
+        "//crates/pulsebeam-testdata:pulsebeam-testdata",
         "//server/rust:pulsebeam-server",
     ],
     proc_macro_deps = all_crate_deps(proc_macro = True, proc_macro_dev = True),

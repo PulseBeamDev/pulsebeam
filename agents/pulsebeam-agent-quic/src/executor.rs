@@ -14,11 +14,12 @@ use pulsebeam_agent_core::{
 };
 use pulsebeam_core::{
     fabric::{
-        FabricPacket, Header, Profile,
+        Extension, ExtensionKind, FabricPacket, Header, Profile,
         packet::{Agreement, MAX_PACKET_BYTES},
     },
     identity::ConnectionId,
 };
+use pulsebeam_proto::data_record;
 use pulsebeam_udp::ReceivedDatagram;
 
 use crate::{
@@ -98,9 +99,12 @@ pub struct Association {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReceiveBinding {
-    Data,
+    Data {
+        record_dd: bool,
+    },
     Media {
         profile: Profile,
+        video_dd: Option<i32>,
         ssrc: u32,
         payload_type: u8,
     },
@@ -114,6 +118,7 @@ struct PacketReceiver {
 
 struct DataSender {
     channel: ChannelId,
+    record_dd: bool,
     agreement: Agreement,
     framer: Sender,
 }
@@ -195,7 +200,7 @@ impl Association {
             .ok_or_else(|| failed(protocol("invalid QUIC generation")))?;
         let admission = ClientAdmission::new(
             &Admit {
-                fabric: crate::data_bindings::FabricOffer::CURRENT,
+                fabric: FabricOffer::CURRENT.with_data_record_dd(),
                 attempt,
                 room: admit.room.as_deref(),
                 owner: &admit.placement.owner,
@@ -279,14 +284,17 @@ impl Association {
             QuicEffect::SendData(send) if send.generation == self.generation => {
                 const MAX_PENDING_DATA: usize = 64;
                 let peer = self.peer_fabric().ok_or(SubmitError::NotAdmitted)?;
-                if pulsebeam_proto::data_record::wire_identity(&send.payload).is_err() {
-                    return Err(SubmitError::Data(DatagramAdmission::Size));
+                let mut scratch = [0; data_record::MAX_RECORD_BYTES];
+                let record = data_record::split_endpoint_record(&send.payload, &mut scratch)
+                    .map_err(|_| SubmitError::Data(DatagramAdmission::Size))?;
+                if record.descriptor.is_some() && !send.record_dd {
+                    return Err(SubmitError::Data(DatagramAdmission::Unsupported));
                 }
                 if self.pending_data.len() >= MAX_PENDING_DATA {
                     return Err(SubmitError::Data(DatagramAdmission::Full));
                 }
                 if let Some(sender) = self.data_senders.get(&send.binding) {
-                    if sender.channel != send.channel {
+                    if sender.channel != send.channel || sender.record_dd != send.record_dd {
                         return Err(SubmitError::Stale);
                     }
                 } else {
@@ -294,12 +302,14 @@ impl Association {
                         return Err(SubmitError::Data(DatagramAdmission::Full));
                     }
                     let selected = FabricOffer::CURRENT
-                        .bind_publisher(peer, Profile::Data, false)
+                        .with_data_record_dd()
+                        .bind_data(peer, send.record_dd)
                         .map_err(|_| SubmitError::Data(DatagramAdmission::Unsupported))?;
                     self.data_senders.insert(
                         send.binding,
                         DataSender {
                             channel: send.channel,
+                            record_dd: send.record_dd,
                             agreement: selected.agreement,
                             framer: Sender::new(selected.framing, send.binding),
                         },
@@ -402,6 +412,11 @@ impl Association {
                         participant_id: accepted.participant,
                         room: accepted.room,
                         capabilities: accepted.capabilities,
+                        directional_video_dd: FabricOffer::CURRENT
+                            .supports_directional_video_dd(accepted.fabric),
+                        data_record_dd: FabricOffer::CURRENT
+                            .with_data_record_dd()
+                            .supports_data_record_dd(accepted.fabric),
                     }));
                 }
                 Err(error) => {
@@ -609,11 +624,21 @@ fn receive_packet(
     let receiver = match receivers.entry(id) {
         std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
         std::collections::btree_map::Entry::Vacant(entry) if room => {
-            let profile = match binding {
-                ReceiveBinding::Data => Profile::Data,
-                ReceiveBinding::Media { profile, .. } => profile,
-            };
-            let selected = FabricOffer::CURRENT.bind(offer, profile, 0).ok()?;
+            let selected = match binding {
+                ReceiveBinding::Data { record_dd } => FabricOffer::CURRENT
+                    .with_data_record_dd()
+                    .bind_data(offer, record_dd),
+                ReceiveBinding::Media {
+                    profile, video_dd, ..
+                } => {
+                    let reception = match video_dd {
+                        Some(dd) => Some(pulsebeam_proto::state::QuicVideoDd::try_from(dd).ok()?),
+                        None => None,
+                    };
+                    offer.bind_rtp_receiver(FabricOffer::CURRENT, profile, reception)
+                }
+            }
+            .ok()?;
             entry.insert(PacketReceiver {
                 binding,
                 agreement: selected.agreement,
@@ -629,15 +654,24 @@ fn receive_packet(
     let packet = receiver.agreement.decode(packet.as_ref()).ok()?;
     let header = packet.header();
     match binding {
-        ReceiveBinding::Data => {
-            let identity = pulsebeam_proto::data_record::wire_identity(packet.payload()).ok()?;
-            (header.marker == identity.final_fragment()).then(|| {
-                Event::Core(QuicEvent::Data {
-                    generation,
-                    binding: id,
-                    payload: packet.payload().to_vec(),
-                })
-            })
+        ReceiveBinding::Data { .. } => {
+            let identity = data_record::wire_identity(packet.payload()).ok()?;
+            if header.marker != identity.final_fragment() {
+                return None;
+            }
+            let descriptor = packet
+                .extensions()
+                .find(|ext| ext.kind == ExtensionKind::DependencyDescriptor)
+                .map(|ext| ext.value);
+            let mut scratch = [0; data_record::MAX_ENDPOINT_RECORD_BYTES];
+            let payload =
+                data_record::restore_endpoint_record(packet.payload(), descriptor, &mut scratch)
+                    .ok()?;
+            Some(Event::Core(QuicEvent::Data {
+                generation,
+                binding: id,
+                payload: payload.to_vec(),
+            }))
         }
         ReceiveBinding::Media {
             ssrc, payload_type, ..
@@ -653,19 +687,24 @@ fn receive_packet(
 }
 
 fn encode_data(agreement: Agreement, record: &[u8]) -> Result<Box<[u8]>, SendError> {
-    let identity =
-        pulsebeam_proto::data_record::wire_identity(record).map_err(|_| SendError::Size)?;
+    let mut scratch = [0; data_record::MAX_RECORD_BYTES];
+    let record =
+        data_record::split_endpoint_record(record, &mut scratch).map_err(|_| SendError::Size)?;
+    let descriptor = record.descriptor.map(|value| Extension {
+        kind: ExtensionKind::DependencyDescriptor,
+        value,
+    });
     // The edge allocates DATA packet sequence and canonical timestamp on
     // admission. The independent unit and fragment coordinates stay in DATA.
     let packet = FabricPacket::new(
         Header {
             profile: Profile::Data,
-            marker: identity.final_fragment(),
+            marker: record.identity.final_fragment(),
             sequence: 0,
             timestamp: 0,
         },
-        &[],
-        record,
+        descriptor.as_slice(),
+        record.payload,
     )
     .map_err(|_| SendError::Size)?;
     let mut bytes = [0; MAX_PACKET_BYTES];

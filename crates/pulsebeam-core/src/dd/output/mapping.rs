@@ -1,7 +1,9 @@
 use std::time::Instant;
 
-use super::{Retention, TemplateInterval, TemplateIntervals};
-use crate::dd::{DependencyDescriptorWriter, MAX_DD_LEN, evidence::Qualified};
+use super::{Retention, TemplateInterval, TemplateIntervals, templates::Reservation};
+use crate::dd::{
+    DependencyDescriptorWriter, MAX_DD_LEN, TemplateDependencyStructure, evidence::Qualified,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Mode {
@@ -43,10 +45,38 @@ struct Epoch<S> {
 struct Mapping {
     first: u64,
     structure_sequence: u64,
+    structure_origin: u64,
     interval: TemplateInterval,
     source_offset: u8,
     mode: Mode,
     active_mask: u32,
+}
+
+struct PreparedMapping<S> {
+    epoch: Option<Epoch<S>>,
+    mapping: Mapping,
+    structure: Option<Box<TemplateDependencyStructure>>,
+    reservation: Reservation,
+    frame: u64,
+}
+
+/// A staged rewrite. Dropping it does not advance the writer or template leases.
+pub struct Prepared<S> {
+    revision: u64,
+    sequence: u64,
+    bytes: [u8; MAX_DD_LEN],
+    len: usize,
+    mapping: Option<PreparedMapping<S>>,
+}
+
+impl<S> Prepared<S> {
+    pub fn descriptor(&self) -> Option<&[u8]> {
+        if self.len == 0 {
+            None
+        } else {
+            self.bytes.get(..self.len)
+        }
+    }
 }
 
 /// DD wire state for one receiving SSRC. The caller owns RTP indexes and path
@@ -59,6 +89,7 @@ pub struct OutputMapper<S> {
     packet_high: Option<u64>,
     writer: DependencyDescriptorWriter,
     intervals: TemplateIntervals,
+    revision: u64,
 }
 
 impl<S: Copy + Eq> OutputMapper<S> {
@@ -71,11 +102,13 @@ impl<S: Copy + Eq> OutputMapper<S> {
             packet_high: None,
             writer: DependencyDescriptorWriter::new(),
             intervals: TemplateIntervals::default(),
+            revision: 0,
         }
     }
 
     /// Invalidate receiver context without releasing still-live template IDs.
     pub fn lose_context(&mut self) {
+        self.revision = self.revision.saturating_add(1);
         self.mapping = None;
         self.writer.reset();
     }
@@ -89,6 +122,24 @@ impl<S: Copy + Eq> OutputMapper<S> {
         packet: Packet<'_, S>,
         admit: impl FnOnce(Option<&[u8]>) -> bool,
     ) -> Result<(), Rejected> {
+        let proposal = self.prepare(now, retention, packet)?;
+        if !admit(proposal.descriptor()) {
+            return Err(Rejected::Admission);
+        }
+        self.commit(proposal)
+    }
+
+    /// Prepare without publishing. Hold the proposal until final admission,
+    /// or discard it if the source is fenced.
+    pub fn prepare(
+        &self,
+        now: Instant,
+        retention: impl Into<Retention>,
+        packet: Packet<'_, S>,
+    ) -> Result<Prepared<S>, Rejected> {
+        if self.revision == u64::MAX {
+            return Err(Rejected::Stale);
+        }
         let Packet {
             source,
             output_sequence,
@@ -102,10 +153,12 @@ impl<S: Copy + Eq> OutputMapper<S> {
             .as_ref()
             .is_some_and(|epoch| epoch.source == source);
         let applicable = |mapping: &Mapping, dd: &Evidence<'_>| {
-            same_source && mapping.structure_sequence == dd.qualified.structure_sequence
+            same_source
+                && mapping.structure_origin == dd.qualified.structure_origin
+                && mapping.structure_sequence <= dd.qualified.structure_sequence
         };
         let Some(dd) = dd else {
-            return self.without_dd(mode, output_sequence, admit);
+            return self.without_dd(mode, output_sequence);
         };
         let qualified = dd.qualified;
         let descriptor = &qualified.descriptor;
@@ -130,7 +183,7 @@ impl<S: Copy + Eq> OutputMapper<S> {
             return Err(Rejected::Bootstrap);
         }
         if new_mapping && descriptor.attached_structure.is_none() {
-            return self.without_dd(mode, output_sequence, admit);
+            return self.without_dd(mode, output_sequence);
         }
         let new_epoch = !same_source;
         let (anchor_in, anchor_out) = match self.epoch.as_ref().filter(|_| same_source) {
@@ -171,84 +224,105 @@ impl<S: Copy + Eq> OutputMapper<S> {
             .map(|structure| structure.template_id_offset)
             .or_else(|| current.map(|mapping| mapping.source_offset))
             .ok_or(Rejected::Bootstrap)?;
-        let mut result = Err(Rejected::TemplateSpace);
-        let writer = &self.writer;
-        let encode = |interval: TemplateInterval| {
-            result = (|| {
-                rewritten.template_id = interval
-                    .map(source_offset, descriptor.template_id)
-                    .ok_or(Rejected::Unrepresentable)?;
-                if let Some(structure) = &mut rewritten.attached_structure {
-                    structure.template_id_offset = interval.offset();
-                }
-                let mut bytes = [0; MAX_DD_LEN];
-                let len = writer
-                    .encode(&rewritten, &mut bytes)
-                    .map_err(|_| Rejected::Unrepresentable)?;
-                if !admit(bytes.get(..len)) {
-                    return Err(Rejected::Admission);
-                }
-                Ok(())
-            })();
-            result.is_ok()
-        };
         let retention = retention.into();
-        let interval = if let Some(structure) = descriptor.attached_structure.as_deref() {
-            self.intervals.offer(now, retention, structure, encode)
-        } else if let Some(mapping) = current {
-            self.intervals
-                .extend(mapping.interval, now, retention, || {
-                    encode(mapping.interval)
-                })
-                .then_some(mapping.interval)
+        let reservation = if let Some(structure) = descriptor.attached_structure.as_deref() {
+            self.intervals.prepare(now, retention, structure)
         } else {
-            None
-        };
-        result?;
-        let interval = interval.ok_or(Rejected::TemplateSpace)?;
-        self.writer.commit(&rewritten);
-        if new_epoch {
-            self.epoch = Some(Epoch {
-                source,
-                input: anchor_in,
-                output: anchor_out,
-            });
+            current.and_then(|mapping| {
+                self.intervals
+                    .prepare_extend(mapping.interval, now, retention)
+            })
         }
+        .ok_or(Rejected::TemplateSpace)?;
+        let interval = reservation.interval;
+        rewritten.template_id = interval
+            .map(source_offset, descriptor.template_id)
+            .ok_or(Rejected::Unrepresentable)?;
+        if let Some(structure) = &mut rewritten.attached_structure {
+            structure.template_id_offset = interval.offset();
+        }
+        let mut bytes = [0; MAX_DD_LEN];
+        let len = self
+            .writer
+            .encode(&rewritten, &mut bytes)
+            .map_err(|_| Rejected::Unrepresentable)?;
         let first = if new_mapping || mode_change {
             output_sequence
         } else {
             current.map_or(output_sequence, |mapping| mapping.first)
         };
-        self.mapping = Some(Mapping {
-            first,
-            structure_sequence: qualified.structure_sequence,
-            interval,
-            source_offset,
-            mode,
-            active_mask: mask,
-        });
-        self.note_packet(output_sequence);
-        self.frame_high = Some(self.frame_high.map_or(frame, |high| high.max(frame)));
+        Ok(Prepared {
+            revision: self.revision,
+            sequence: output_sequence,
+            bytes,
+            len,
+            mapping: Some(PreparedMapping {
+                epoch: new_epoch.then_some(Epoch {
+                    source,
+                    input: anchor_in,
+                    output: anchor_out,
+                }),
+                mapping: Mapping {
+                    first,
+                    structure_sequence: if descriptor.attached_structure.is_some() {
+                        qualified.structure_sequence
+                    } else {
+                        current.ok_or(Rejected::Bootstrap)?.structure_sequence
+                    },
+                    structure_origin: qualified.structure_origin,
+                    interval,
+                    source_offset,
+                    mode,
+                    active_mask: mask,
+                },
+                structure: rewritten.attached_structure,
+                reservation,
+                frame,
+            }),
+        })
+    }
+
+    pub fn is_current(&self, proposal: &Prepared<S>) -> bool {
+        self.revision == proposal.revision
+    }
+
+    pub fn commit(&mut self, proposal: Prepared<S>) -> Result<(), Rejected> {
+        if !self.is_current(&proposal) {
+            return Err(Rejected::Stale);
+        }
+        if let Some(next) = proposal.mapping {
+            if !self.intervals.commit(next.reservation) {
+                return Err(Rejected::TemplateSpace);
+            }
+            if let Some(epoch) = next.epoch {
+                self.epoch = Some(epoch);
+            }
+            self.writer.commit_structure(next.structure);
+            self.mapping = Some(next.mapping);
+            self.frame_high = Some(
+                self.frame_high
+                    .map_or(next.frame, |high| high.max(next.frame)),
+            );
+        } else if self.packet_high.is_none_or(|high| proposal.sequence > high) {
+            self.mapping = None;
+            self.writer.reset();
+        }
+        self.note_packet(proposal.sequence);
+        self.revision = self.revision.saturating_add(1);
         Ok(())
     }
 
-    fn without_dd(
-        &mut self,
-        mode: Mode,
-        sequence: u64,
-        admit: impl FnOnce(Option<&[u8]>) -> bool,
-    ) -> Result<(), Rejected> {
+    fn without_dd(&self, mode: Mode, sequence: u64) -> Result<Prepared<S>, Rejected> {
         if mode != Mode::Whole {
             return Err(Rejected::Bootstrap);
         }
-        if !admit(None) {
-            return Err(Rejected::Admission);
-        }
-        if self.packet_high.is_none_or(|high| sequence > high) {
-            self.lose_context();
-        }
-        self.note_packet(sequence);
-        Ok(())
+        Ok(Prepared {
+            revision: self.revision,
+            sequence,
+            bytes: [0; MAX_DD_LEN],
+            len: 0,
+            mapping: None,
+        })
     }
 
     fn note_packet(&mut self, sequence: u64) {

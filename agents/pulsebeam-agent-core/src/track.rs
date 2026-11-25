@@ -159,6 +159,8 @@ pub enum DataEvent {
         data: Vec<u8>,
         #[uniffi(default = None)]
         captured_at: Option<crate::ffi::CaptureTimestamp>,
+        #[uniffi(default = None)]
+        fragment_descriptors: Option<Vec<crate::data_v1::DataFragmentDescriptor>>,
     },
     Discontinuity {
         participant_id: String,
@@ -436,6 +438,7 @@ pub enum ResourceCommand {
     DeclareDataPublication {
         spec: TrackSpec,
         capture_clock: Option<crate::ffi::CaptureClock>,
+        record_dd: bool,
     },
     UpdatePublication {
         owner: u64,
@@ -562,6 +565,7 @@ struct OwnedDataPublication {
     owner: TrackOwner,
     delivery: TopicMode,
     capture_clock: Option<pulsebeam_proto::state::DataV1CaptureClock>,
+    record_dd: bool,
 }
 
 impl TrackResources {
@@ -609,6 +613,12 @@ impl TrackResources {
         track_id: &str,
     ) -> Option<&pulsebeam_proto::state::DataV1CaptureClock> {
         self.data_publications.get(track_id)?.capture_clock.as_ref()
+    }
+
+    pub(crate) fn data_record_dd(&self, track_id: &str) -> bool {
+        self.data_publications
+            .get(track_id)
+            .is_some_and(|publication| publication.record_dd)
     }
 
     pub(crate) fn data_receiver(
@@ -714,6 +724,7 @@ impl TrackResources {
         owner: TrackOwner,
         spec: &TrackSpec,
         capture_clock: Option<crate::ffi::CaptureClock>,
+        record_dd: bool,
     ) -> Result<(), TrackResourceError> {
         spec.validate()?;
         let TrackSpec::Data { track_id, delivery } = spec else {
@@ -735,6 +746,7 @@ impl TrackResources {
             return if current.owner == owner
                 && current.delivery == *delivery
                 && current.capture_clock == capture_clock
+                && current.record_dd == record_dd
             {
                 Ok(())
             } else {
@@ -757,6 +769,7 @@ impl TrackResources {
                 owner,
                 delivery: *delivery,
                 capture_clock,
+                record_dd,
             },
         );
         Ok(())
@@ -1410,6 +1423,7 @@ impl TrackResources {
             occupied.insert(slot);
             self.video_slots.insert(selector.clone(), slot);
             projection.push(VideoSubscription {
+                decode_target: None,
                 slot,
                 publication_id: String::new(),
                 selector: Some(selector),
@@ -1556,6 +1570,8 @@ impl TrackResources {
             sequence: unit.unit_seq,
             data: unit.bytes,
             captured_at: unit.captured_at,
+            fragment_descriptors: (!unit.fragment_descriptors.is_empty())
+                .then_some(unit.fragment_descriptors),
         };
         self.receivers
             .iter_mut()
@@ -1588,6 +1604,7 @@ impl TrackResources {
                         sequence: message.sequence,
                         data: message.payload.clone(),
                         captured_at: None,
+                        fragment_descriptors: None,
                     });
                 }
                 TopicNotification::RecoveryGap { subscriber, .. }

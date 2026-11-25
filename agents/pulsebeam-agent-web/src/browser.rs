@@ -552,6 +552,7 @@ impl BrowserRuntime {
         &self,
         spec: agent_core::TrackSpec,
         capture_clock: Option<agent_core::ffi::CaptureClock>,
+        record_dd: bool,
     ) -> Result<
         (u64, Rc<agent_core::observer::DataPublicationStateObserver>),
         agent_core::ffi::ErrorInfo,
@@ -560,6 +561,7 @@ impl BrowserRuntime {
             agent_core::ResourceCommand::DeclareDataPublication {
                 spec,
                 capture_clock,
+                record_dd,
             },
             |owner| self.data_publication_state_observer(owner),
         )

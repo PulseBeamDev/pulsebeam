@@ -11,7 +11,7 @@ use std::{
 
 use pulsebeam_agent_core::{
     AgentCommand, AgentConfig, AudioSubscription, ConnectionState, DesiredState, MediaKind,
-    VideoSubscription,
+    RtpSource, VideoSubscription,
 };
 use pulsebeam_agent_quic::{
     executor::{
@@ -28,8 +28,8 @@ use rustls::{
 };
 use tokio::sync::{mpsc, oneshot};
 
-const USAGE: &str = "encoded_worker ENDPOINT ROOM opus|h264 PUBLICATION_ID QUIC_CA_PEM fresh\n\
-encoded_worker ENDPOINT ROOM opus|h264 PUBLICATION_ID QUIC_CA_PEM record NEW_DIRECTORY\n\
+const USAGE: &str = "encoded_worker ENDPOINT ROOM opus|h264|vp8|vp9|av1 PUBLICATION_ID QUIC_CA_PEM fresh\n\
+encoded_worker ENDPOINT ROOM opus|h264|vp8|vp9|av1 PUBLICATION_ID QUIC_CA_PEM record NEW_DIRECTORY\n\
 Set PULSEBEAM_TOKEN and PULSEBEAM_LOCAL_IP. Optional: PULSEBEAM_PLACEMENT_CA_DER.";
 const DRAIN_GRACE: Duration = Duration::from_secs(3);
 const RECORD_LIMITS: Limits = Limits {
@@ -57,6 +57,9 @@ impl Settings {
         let codec = match codec.as_str() {
             "opus" => Codec::Opus,
             "h264" => Codec::H264,
+            "vp8" => Codec::Vp8,
+            "vp9" => Codec::Vp9,
+            "av1" => Codec::Av1,
             _ => return Err(USAGE.into()),
         };
         let record = match (mode.as_str(), output) {
@@ -136,6 +139,7 @@ impl Processed {
 async fn drive(
     agent: &mut Agent,
     mut reader: Reader,
+    codec: Codec,
     storage: Option<&mpsc::Sender<Work>>,
 ) -> Result<Processed> {
     let stop = tokio::signal::ctrl_c();
@@ -176,7 +180,15 @@ async fn drive(
                     break;
                 };
                 match event {
-                    Receive::Media(Event::Unit(unit)) => processed.process(&unit),
+                    Receive::Media(Event::Unit(unit)) => {
+                        if unit.codec != codec {
+                            return Err(format!(
+                                "expected {codec:?} publication, received {:?}",
+                                unit.codec
+                            ));
+                        }
+                        processed.process(&unit);
+                    }
                     Receive::Media(Event::Discontinuity(_)) | Receive::Loss(_) => {
                         processed.discontinuities = processed.discontinuities.saturating_add(1);
                     }
@@ -248,8 +260,19 @@ async fn run(settings: Settings) -> Result<()> {
             .with_placement_root(&der)
             .map_err(|error| format!("install placement CA: {error:?}"))?;
     }
+    let mime = match settings.codec {
+        Codec::Opus => "audio/opus",
+        Codec::H264 => "video/h264",
+        Codec::Vp8 => "video/vp8",
+        Codec::Vp9 => "video/vp9",
+        Codec::Av1 => "video/av1",
+    };
+    let source =
+        RtpSource::native_quic_baseline(settings.publication.clone(), settings.room.clone(), mime)
+            .ok_or("unknown source format")?;
     let mut desired = DesiredState {
         revision: 1,
+        rtp_sources: vec![source],
         ..Default::default()
     };
     let kind = match settings.codec {
@@ -260,8 +283,9 @@ async fn run(settings: Settings) -> Result<()> {
             };
             MediaKind::Audio
         }
-        Codec::H264 => {
+        Codec::H264 | Codec::Vp8 | Codec::Vp9 | Codec::Av1 => {
             desired.video = vec![VideoSubscription {
+                decode_target: None,
                 slot: 0,
                 publication_id: settings.publication.clone(),
                 selector: None,
@@ -304,6 +328,7 @@ async fn run(settings: Settings) -> Result<()> {
     let drive = drive(
         &mut agent,
         reader,
+        settings.codec,
         storage.as_ref().map(|storage| &storage.input),
     )
     .await;

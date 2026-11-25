@@ -130,6 +130,8 @@ fn quic_placement_fences_late_http_and_transport_outcomes() {
     let accepted = |generation| {
         HostEvent::Quic(crate::QuicEvent::Accepted {
             generation,
+            directional_video_dd: false,
+            data_record_dd: false,
             connection_id: "conn_00000000001R010000000000004".into(),
             participant_id: "alice".into(),
             room: None,
@@ -239,6 +241,8 @@ fn quic_transport_loss_recovers_joined_session_only_with_current_continuation() 
     let accepted = |generation, connection: &str| {
         HostEvent::Quic(QuicEvent::Accepted {
             generation,
+            directional_video_dd: false,
+            data_record_dd: false,
             connection_id: connection.into(),
             participant_id: "alice".into(),
             room: Some("stage".into()),
@@ -509,6 +513,7 @@ fn desired(revision: u64) -> DesiredState {
             active: true,
         }],
         video: vec![VideoSubscription {
+            decode_target: None,
             slot: 0,
             publication_id: "video-track".to_string(),
             selector: None,
@@ -521,6 +526,7 @@ fn desired(revision: u64) -> DesiredState {
             pinned: vec!["audio-track".to_string()],
             selected: Vec::new(),
         },
+        rtp_sources: Vec::new(),
         topics: TopicRegistrations::default(),
     }
 }
@@ -689,6 +695,7 @@ fn assert_data_read(
                 sequence,
                 data: bytes.to_vec(),
                 captured_at: None,
+                fragment_descriptors: None,
             }),
         }
     );
@@ -3210,6 +3217,7 @@ fn native_state_received_before_activation_is_replayed_at_the_host_boundary() {
                             room_id: "room".into(),
                             track_id: "camera".into(),
                             kind: Some(state::track::Kind::Video(state::VideoTrack {
+                                av1_whole_source: false,
                                 format: Some(state::CodecFormat::from(
                                     state::codec_format::Codec::Vp8(state::Vp8Parameters {}),
                                 )),
@@ -3901,6 +3909,7 @@ fn malformed_native_state_is_transactional_and_cancels_a_pending_renewal() {
                     room_id: "room".into(),
                     track_id: "camera".into(),
                     kind: Some(state::track::Kind::Video(state::VideoTrack {
+                        av1_whole_source: false,
                         format: Some(state::CodecFormat::from(state::codec_format::Codec::Vp8(
                             state::Vp8Parameters {},
                         ))),
@@ -5503,6 +5512,7 @@ fn owned_data_declaration_rejects_duplicate_modes_before_allocating_an_owner() {
     assert_eq!(
         agent.resource(ResourceCommand::DeclareDataPublication {
             capture_clock: None,
+            record_dd: false,
             spec: TrackSpec::Video {
                 track_id: "not-data".into(),
             },
@@ -5517,6 +5527,7 @@ fn owned_data_declaration_rejects_duplicate_modes_before_allocating_an_owner() {
         .resource(ResourceCommand::DeclareDataPublication {
             spec: first,
             capture_clock: None,
+            record_dd: false,
         })
         .unwrap()
     else {
@@ -5529,7 +5540,8 @@ fn owned_data_declaration_rejects_duplicate_modes_before_allocating_an_owner() {
             spec: TrackSpec::Data {
                 track_id: "same-label".into(),
                 delivery: TopicMode::Latest,
-            }
+            },
+            record_dd: false,
         }),
         Err(AgentError::InvalidResource(
             TrackResourceError::AlreadyOwned
@@ -5538,6 +5550,7 @@ fn owned_data_declaration_rejects_duplicate_modes_before_allocating_an_owner() {
     let ResourceResult::Owned { owner: next } = agent
         .resource(ResourceCommand::DeclareDataPublication {
             capture_clock: None,
+            record_dd: false,
             spec: TrackSpec::Data {
                 track_id: "another-label".into(),
                 delivery: TopicMode::Latest,
@@ -5582,6 +5595,7 @@ fn owned_publication_budget_is_shared_and_rejections_do_not_allocate_owners() {
             .resource(ResourceCommand::DeclareDataPublication {
                 spec,
                 capture_clock: None,
+                record_dd: false,
             })
             .unwrap()
         else {
@@ -5606,7 +5620,8 @@ fn owned_publication_budget_is_shared_and_rejections_do_not_allocate_owners() {
     assert_eq!(
         agent.resource(ResourceCommand::DeclareDataPublication {
             capture_clock: None,
-            spec: rejected.clone()
+            spec: rejected.clone(),
+            record_dd: false,
         }),
         Err(AgentError::InvalidResource(
             TrackResourceError::PublicationCapacityExceeded
@@ -5621,6 +5636,7 @@ fn owned_publication_budget_is_shared_and_rejections_do_not_allocate_owners() {
         .resource(ResourceCommand::DeclareDataPublication {
             spec: rejected,
             capture_clock: None,
+            record_dd: false,
         })
         .unwrap()
     else {
@@ -5640,6 +5656,7 @@ fn owned_publication_budget_is_shared_and_rejections_do_not_allocate_owners() {
     let ResourceResult::Owned { owner: next } = agent
         .resource(ResourceCommand::DeclareDataPublication {
             capture_clock: None,
+            record_dd: false,
             spec: TrackSpec::Data {
                 track_id: "after-stale-release".into(),
                 delivery: TopicMode::Lossy,
@@ -5734,6 +5751,7 @@ fn owned_receive_uses_transport_deduplication_and_last_owner_registration_lifeti
                     sequence: 0,
                     data: vec![255, 0],
                     captured_at: None,
+                    fragment_descriptors: None,
                 })
             }
         );
@@ -5971,6 +5989,7 @@ fn logical_payload_replacement_preserves_receivers_and_waits_for_reset_to_reuse_
                         kind: Some(state::track::Kind::Data(state::DataTrack {
                             capture_clock: None,
                             delivery: TopicMode::Lossy.delivery() as i32,
+                            record_dd: false,
                         })),
                     }),
                     execution: None,

@@ -116,7 +116,7 @@ fn owned_data_declarations_are_label_unique_mode_sensitive_and_reclaimable() {
     let spec = data(TopicMode::Ordered);
     assert!(resources.is_empty());
     resources
-        .declare_data_publication(owner, &spec, None)
+        .declare_data_publication(owner, &spec, None, false)
         .unwrap();
     assert!(!resources.is_empty());
     let capture_clock = crate::ffi::CaptureClock {
@@ -124,7 +124,7 @@ fn owned_data_declarations_are_label_unique_mode_sensitive_and_reclaimable() {
         epoch: 1,
     };
     assert_eq!(
-        resources.declare_data_publication(owner, &spec, Some(capture_clock.clone())),
+        resources.declare_data_publication(owner, &spec, Some(capture_clock.clone()), false),
         Err(TrackResourceError::AlreadyOwned)
     );
     let media_owner = resources.new_owner().unwrap();
@@ -138,10 +138,10 @@ fn owned_data_declarations_are_label_unique_mode_sensitive_and_reclaimable() {
         Err(TrackResourceError::AlreadyOwned)
     );
     resources
-        .declare_data_publication(owner, &spec, None)
+        .declare_data_publication(owner, &spec, None, false)
         .unwrap();
     assert_eq!(
-        resources.declare_data_publication(owner, &data(TopicMode::Latest), None),
+        resources.declare_data_publication(owner, &data(TopicMode::Latest), None, false),
         Err(TrackResourceError::AlreadyOwned)
     );
     assert_eq!(
@@ -153,7 +153,7 @@ fn owned_data_declarations_are_label_unique_mode_sensitive_and_reclaimable() {
     );
     let other = resources.new_owner().unwrap();
     assert_eq!(
-        resources.declare_data_publication(other, &data(TopicMode::Latest), None),
+        resources.declare_data_publication(other, &data(TopicMode::Latest), None, false),
         Err(TrackResourceError::AlreadyOwned)
     );
     resources.release(owner);
@@ -161,7 +161,7 @@ fn owned_data_declarations_are_label_unique_mode_sensitive_and_reclaimable() {
     resources.release(media_owner);
     assert!(resources.is_empty());
     resources
-        .declare_data_publication(other, &data(TopicMode::Latest), Some(capture_clock))
+        .declare_data_publication(other, &data(TopicMode::Latest), Some(capture_clock), false)
         .unwrap();
     assert_eq!(
         resources
@@ -701,6 +701,7 @@ fn video_views_share_capacity_aggregate_visible_demand_and_preserve_incumbents()
     assert_eq!(
         projection,
         vec![VideoSubscription {
+            decode_target: None,
             slot: 0,
             publication_id: String::new(),
             selector: Some(selector.clone()),
@@ -1094,6 +1095,7 @@ fn unreliable_receive_owners_filter_participants_rebind_and_keep_independent_byt
                 sequence: 1,
                 data: vec![255, 0],
                 captured_at: None,
+                fragment_descriptors: None,
             })
         );
     }
@@ -1147,6 +1149,7 @@ fn exact_receive_references_share_until_the_last_owner_and_rooms_stay_distinct()
             sequence: 0,
             data: b"a".to_vec(),
             captured_at: None,
+            fragment_descriptors: None,
         })
     );
     resources.release_receiver(second);

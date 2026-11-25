@@ -90,7 +90,71 @@ pub struct DesiredState {
     pub publications: Vec<PublicationIntent>,
     pub video: Vec<VideoSubscription>,
     pub audio: AudioSubscription,
+    pub rtp_sources: Vec<RtpSource>,
     pub topics: TopicRegistrations,
+}
+
+/// Out-of-band source facts for a pinned RTP subscription without discovery.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct RtpSource {
+    pub publication_id: String,
+    pub room: String,
+    pub mime_type: String,
+    pub clock_rate: u32,
+    pub channels: Option<u32>,
+    pub parameters: Vec<RtpSourceParameter>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct RtpSourceParameter {
+    pub name: String,
+    pub value: String,
+}
+
+impl RtpSource {
+    /// Describe a stock source by its out-of-band publication ID, room and MIME type.
+    pub fn native_quic_baseline(publication_id: String, room: String, mime: &str) -> Option<Self> {
+        let format = pulsebeam_proto::state::CodecFormat::native_quic_baseline(mime)?;
+        Some(Self::new(publication_id, room, format))
+    }
+
+    pub fn new(
+        publication_id: String,
+        room: String,
+        format: pulsebeam_proto::state::CodecFormat,
+    ) -> Self {
+        Self {
+            publication_id,
+            room,
+            mime_type: format.mime_type,
+            clock_rate: format.clock_rate,
+            channels: format.channels,
+            parameters: format
+                .parameters
+                .into_iter()
+                .map(|parameter| RtpSourceParameter {
+                    name: parameter.name,
+                    value: parameter.value,
+                })
+                .collect(),
+        }
+    }
+
+    pub(crate) fn format(&self) -> pulsebeam_proto::state::CodecFormat {
+        pulsebeam_proto::state::CodecFormat {
+            mime_type: self.mime_type.clone(),
+            clock_rate: self.clock_rate,
+            channels: self.channels,
+            parameters: self
+                .parameters
+                .iter()
+                .map(|parameter| pulsebeam_proto::state::CodecParameter {
+                    name: parameter.name.clone(),
+                    value: parameter.value.clone(),
+                })
+                .collect(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
@@ -104,6 +168,7 @@ pub struct PublicationIntent {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VideoSubscription {
+    pub decode_target: Option<u32>,
     pub slot: u32,
     pub publication_id: String,
     pub selector: Option<TrackSelector>,
@@ -459,6 +524,27 @@ impl DesiredState {
                 return Err(ValidationError::Duplicate {
                     field: "audio selector",
                     value: alloc::format!("{}:{}", selector.participant_id, selector.track_id),
+                });
+            }
+        }
+        let mut sources = BTreeSet::new();
+        for source in &self.rtp_sources {
+            validate_identifier(
+                "RTP source publication ID",
+                &source.publication_id,
+                256,
+                false,
+            )?;
+            validate_identifier("RTP source room", &source.room, 256, false)?;
+            if !sources.insert(&source.publication_id) {
+                return Err(ValidationError::Duplicate {
+                    field: "RTP source publication ID",
+                    value: source.publication_id.clone(),
+                });
+            }
+            if pulsebeam_proto::state::validation::validate_format(&source.format()).is_err() {
+                return Err(ValidationError::Identifier {
+                    field: "RTP source codec",
                 });
             }
         }

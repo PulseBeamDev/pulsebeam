@@ -4217,6 +4217,7 @@ impl ClientContext {
             };
             if visible {
                 resolved.push(VideoSubscription {
+                    decode_target: None,
                     slot: u32::try_from(resolved.len())?,
                     publication_id: publication.id.clone(),
                     selector: None,
@@ -4401,6 +4402,7 @@ impl ClientContext {
                                 sequence,
                                 data,
                                 captured_at,
+                                ..
                             },
                     }) => log.topics.push(TopicNotification::Message(TopicMessage {
                         room: registration.room.clone(),

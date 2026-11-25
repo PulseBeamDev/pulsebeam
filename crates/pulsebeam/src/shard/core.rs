@@ -306,37 +306,8 @@ impl ShardCore {
         packet: &pulsebeam_core::fabric::BorrowedPacket<'_>,
         now: Instant,
     ) {
-        if !self
-            .execution
-            .fabric_publisher_authorized(publisher, source)
-        {
-            return;
-        }
-        let Ok(input) = ingress.prepare_packet(now.into_std(), packet) else {
-            return;
-        };
-        self.offer_quic_media(source, publisher, now, &input);
-    }
-
-    fn offer_quic_media(
-        &mut self,
-        source: FabricSourceHandle,
-        publisher: ParticipantHandle,
-        now: Instant,
-        input: &crate::rtp::fabric_ingress::MediaIngress,
-    ) {
-        let execution = &mut self.execution;
-        let reference = execution
-            .global_clock
-            .as_mut()
-            .and_then(|clock| clock.now(now));
-        if execution
-            .runtime
-            .offer_fabric_media(source, publisher, now, input, reference.as_ref())
-            .is_ok()
-        {
-            execution.drain_fabric_rtp(source, now);
-        }
+        self.execution
+            .ingest_quic_media_packet(source, publisher, ingress, packet, now);
     }
 
     pub(super) fn retire_quic_publication(&mut self, publication: crate::entity::PublicationKey) {
@@ -490,25 +461,10 @@ impl ShardCore {
         receiver: ParticipantHandle,
         publication: crate::entity::PublicationKey,
         emission: Emission,
+        target: Option<pulsebeam_core::dd::evidence::DecodeTarget>,
     ) -> Option<FabricLocalBranch> {
-        let execution = &mut self.execution;
-        let track = execution.runtime.track_handle(publication)?;
-        let source = execution.runtime.fabric_source_for_track(track)?;
-        if let Some(publisher) = execution.runtime.source_origin(track) {
-            if !execution.fabric_publisher_authorized(publisher, source) {
-                return None;
-            }
-        } else if !execution.runtime.is_shard_fabric_source(source) {
-            return None;
-        }
-        execution.runtime.install_fabric_branch(
-            track,
-            source,
-            receiver,
-            emission,
-            execution.plans.get(track)?,
-            None,
-        )
+        self.execution
+            .install_quic_rtp_branch(receiver, publication, emission, target)
     }
 
     pub(super) fn request_quic_receiver_refresh(
@@ -526,23 +482,7 @@ impl ShardCore {
         branch: FabricLocalBranch,
         receiver: ParticipantHandle,
     ) -> bool {
-        use crate::shard::router::FabricOwner;
-        let execution = &mut self.execution;
-        let publication = match execution.runtime.fabric_handoff_owner(branch, receiver) {
-            Some(FabricOwner::Local(publisher))
-                if execution.fabric_publisher_authorized(publisher, branch.source()) =>
-            {
-                execution
-                    .runtime
-                    .local_fabric_publication(branch.source(), publisher)
-            }
-            Some(FabricOwner::Shard(binding)) => Some(binding.publication),
-            _ => None,
-        };
-        publication
-            .and_then(|id| execution.runtime.track_handle(id))
-            .and_then(|track| execution.plans.get(track))
-            .is_some_and(|plan| plan.local.contains(&receiver))
+        self.execution.quic_rtp_branch_live(branch, receiver)
     }
 
     pub(super) fn admit_quic_rtp(
@@ -551,19 +491,22 @@ impl ShardCore {
         receiver: ParticipantHandle,
         now: Instant,
         write: impl FnOnce(
-            crate::route::fabric::local::PacketView<'_>,
             u64,
-            Option<u64>,
+            crate::route::fabric::local::PacketView<'_>,
+            crate::route::fabric::local::OutputEvidence,
         ) -> Result<(), ()>,
     ) -> Result<Option<()>, ()> {
-        if !self.quic_rtp_branch_live(branch, receiver) {
-            return Ok(None);
-        }
-        self.execution
-            .runtime
-            .admit_fabric(branch, receiver, now, |_, packet, evidence| {
-                write(packet, evidence.output_position, evidence.sender_ntp)
-            })
+        self.execution.admit_quic_rtp(branch, receiver, now, write)
+    }
+
+    pub(super) fn reject_filtered_quic_rtp(
+        &mut self,
+        branch: FabricLocalBranch,
+        receiver: ParticipantHandle,
+        now: Instant,
+    ) {
+        self.execution.reset_fabric_output(receiver, branch);
+        self.execution.request_fabric_refresh(receiver, branch, now);
     }
 
     pub(super) fn install_quic_data_branch(
@@ -998,6 +941,95 @@ impl ShardCore {
 }
 
 impl ShardExecution {
+    fn install_quic_rtp_branch(
+        &mut self,
+        receiver: ParticipantHandle,
+        publication: crate::entity::PublicationKey,
+        emission: Emission,
+        target: Option<pulsebeam_core::dd::evidence::DecodeTarget>,
+    ) -> Option<FabricLocalBranch> {
+        let track = self.runtime.track_handle(publication)?;
+        let source = self.runtime.fabric_source_for_track(track)?;
+        if let Some(publisher) = self.runtime.source_origin(track) {
+            if !self.fabric_publisher_authorized(publisher, source) {
+                return None;
+            }
+        } else if !self.runtime.is_shard_fabric_source(source) {
+            return None;
+        }
+        self.runtime.install_fabric_branch(
+            track,
+            source,
+            receiver,
+            emission,
+            self.plans.get(track)?,
+            target,
+        )
+    }
+
+    fn quic_rtp_branch_live(
+        &mut self,
+        branch: FabricLocalBranch,
+        receiver: ParticipantHandle,
+    ) -> bool {
+        use crate::shard::router::FabricOwner;
+        let publication = match self.runtime.fabric_handoff_owner(branch, receiver) {
+            Some(FabricOwner::Local(publisher))
+                if self.fabric_publisher_authorized(publisher, branch.source()) =>
+            {
+                self.runtime
+                    .local_fabric_publication(branch.source(), publisher)
+            }
+            Some(FabricOwner::Shard(binding)) => Some(binding.publication),
+            _ => None,
+        };
+        publication
+            .and_then(|id| self.runtime.track_handle(id))
+            .and_then(|track| self.plans.get(track))
+            .is_some_and(|plan| plan.local.contains(&receiver))
+    }
+
+    fn admit_quic_rtp(
+        &mut self,
+        branch: FabricLocalBranch,
+        receiver: ParticipantHandle,
+        now: Instant,
+        write: impl FnOnce(
+            u64,
+            crate::route::fabric::local::PacketView<'_>,
+            crate::route::fabric::local::OutputEvidence,
+        ) -> Result<(), ()>,
+    ) -> Result<Option<()>, ()> {
+        if !self.quic_rtp_branch_live(branch, receiver) {
+            return Ok(None);
+        }
+        self.runtime.admit_fabric(branch, receiver, now, write)
+    }
+
+    fn ingest_quic_media_packet(
+        &mut self,
+        source: FabricSourceHandle,
+        publisher: ParticipantHandle,
+        ingress: crate::rtp::fabric_ingress::QuicRtpIngress,
+        packet: &pulsebeam_core::fabric::BorrowedPacket<'_>,
+        now: Instant,
+    ) {
+        if !self.fabric_publisher_authorized(publisher, source) {
+            return;
+        }
+        let Ok(input) = ingress.prepare_packet(now.into_std(), packet) else {
+            return;
+        };
+        let reference = self.global_clock.as_mut().and_then(|clock| clock.now(now));
+        if let Ok(report) =
+            self.runtime
+                .offer_fabric_media(source, publisher, now, &input, reference.as_ref())
+        {
+            self.drain_fabric_rtp(source, now);
+            self.refresh_after_fabric_offer(source, now, &report);
+        }
+    }
+
     fn new(
         shard_id: crate::id::ShardId,
         max_gso_segments: usize,
@@ -2748,11 +2780,14 @@ impl ShardExecution {
         if report.awaiting_entry == 0 && report.suspended == 0 {
             return None;
         }
+        let unix_now = self.fabric_unix_time();
         let registry = &mut self.registry;
         self.runtime.awaiting_fabric_refresh(source, |destination| {
             registry
                 .resolve_mut(destination)
                 .is_some_and(|owner| owner.fabric_io_authorized())
+                || unix_now
+                    .is_some_and(|now| registry.current_quic_owner_authorized(destination, now))
         })
     }
 
@@ -2792,7 +2827,7 @@ impl ShardExecution {
 
     fn local_rtp_profile_enabled(profile: pulsebeam_core::fabric::Profile) -> bool {
         use pulsebeam_core::fabric::Profile;
-        matches!(profile, Profile::Opus | Profile::H264 | Profile::Av1)
+        profile == Profile::Opus || profile.is_video()
     }
 
     fn stage_local_rtp_receiver(&mut self, destination: ParticipantHandle, reference: u64) {

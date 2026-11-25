@@ -34,6 +34,22 @@ fn live_packet_matches_literal_layout_and_uses_installed_position() {
 }
 
 #[test]
+fn vp_wan_window_ids_preserve_the_hop_payload_type() {
+    for (profile, id) in [(Profile::Vp8, 5), (Profile::Vp9, 6)] {
+        let mut tuple = H264;
+        tuple[3] = id;
+        let window = Window::from_tuple(tuple, 0).unwrap();
+        assert_eq!(window.to_tuple(), tuple);
+        let (_, packet) = window.decode(&LIVE).unwrap();
+        assert_eq!(packet.header().profile, profile);
+        let fresh = FabricPacket::new(packet.header(), &[], packet.payload()).unwrap();
+        let mut bytes = [0; LIVE.len()];
+        assert_eq!(window.write(0x18000, &fresh, &mut bytes), Ok(LIVE.len()));
+        assert_eq!(bytes, LIVE);
+    }
+}
+
+#[test]
 fn historical_core_extension_is_not_admitted() {
     let window = Window::from_tuple(H264, 1 << 2).unwrap();
     let legacy = [

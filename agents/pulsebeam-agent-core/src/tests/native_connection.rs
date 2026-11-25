@@ -114,6 +114,7 @@ fn lookup_record(
     };
     let track_kind = match state::TrackKind::try_from(address.kind).unwrap() {
         state::TrackKind::Video => state::track::Kind::Video(state::VideoTrack {
+            av1_whole_source: false,
             format: Some(state::CodecFormat::from(state::codec_format::Codec::Vp8(
                 state::Vp8Parameters {},
             ))),
@@ -128,6 +129,7 @@ fn lookup_record(
                 .as_ref()
                 .and_then(|offer| offer.capture_clock.clone()),
             delivery: mode.unwrap_or(TopicMode::Ordered).delivery() as i32,
+            record_dd: false,
         }),
         _ => panic!("unsupported lookup kind"),
     };
@@ -639,6 +641,7 @@ fn reliable_receiver_uses_active_native_signaling_for_expectations_and_receipts(
                 sequence: 2,
                 data: b"x".to_vec(),
                 captured_at: None,
+                fragment_descriptors: None,
             })
         }
     );
@@ -871,6 +874,7 @@ fn explicit_fabric_offer_delivers_only_on_the_exact_installed_data_v1_channel() 
                 sequence: 2,
                 data: b"B".to_vec(),
                 captured_at: Some(stamp),
+                fragment_descriptors: None,
             })
         }
     );
@@ -1419,6 +1423,7 @@ pub(crate) fn confirm_publication(
                     kind: Some(state::track::Kind::Data(state::DataTrack {
                         capture_clock: data.capture_clock.clone(),
                         delivery: data.delivery,
+                        record_dd: false,
                     })),
                 }),
                 execution: state::ExecutionStatus::Installed as i32,

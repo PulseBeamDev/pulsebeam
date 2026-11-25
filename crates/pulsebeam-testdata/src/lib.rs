@@ -21,6 +21,7 @@
 )]
 
 mod quality_source;
+pub mod wire_capture;
 pub use quality_source::{
     QUALITY_COMMON_VIEW_POLICY, QualityCaptureIdentity, QualitySourceCapture,
     QualitySourceSequence, quality_common_view,

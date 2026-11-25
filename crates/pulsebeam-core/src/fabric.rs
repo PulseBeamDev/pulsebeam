@@ -24,13 +24,15 @@ pub enum Profile {
     H264 = 97,
     Av1 = 98,
     Data = 99,
+    Vp8 = 100,
+    Vp9 = 101,
 }
 
 impl Profile {
     pub const fn clock_rate(self) -> u32 {
         match self {
             Self::Opus => 48_000,
-            Self::H264 | Self::Av1 | Self::Data => 90_000,
+            Self::H264 | Self::Av1 | Self::Data | Self::Vp8 | Self::Vp9 => 90_000,
         }
     }
 
@@ -40,8 +42,14 @@ impl Profile {
             97 => Ok(Self::H264),
             98 => Ok(Self::Av1),
             99 => Ok(Self::Data),
+            100 => Ok(Self::Vp8),
+            101 => Ok(Self::Vp9),
             _ => Err(WireError::PayloadType),
         }
+    }
+
+    pub const fn is_video(self) -> bool {
+        matches!(self, Self::H264 | Self::Av1 | Self::Vp8 | Self::Vp9)
     }
 
     fn validate_payload(self, len: usize) -> Result<(), WireError> {
@@ -93,7 +101,7 @@ impl ExtensionKind {
         match self {
             Self::DependencyDescriptor | Self::AbsoluteCaptureTime => true,
             Self::AudioLevel => matches!(profile, Profile::Opus),
-            _ => matches!(profile, Profile::H264 | Profile::Av1),
+            _ => profile.is_video(),
         }
     }
 

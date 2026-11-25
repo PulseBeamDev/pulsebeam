@@ -59,6 +59,56 @@ fn appendix_filtered_h264_and_av1_rewrite_masks_without_changing_dependencies() 
 }
 
 #[test]
+fn prepared_output_commits_once_and_cannot_survive_context_loss() {
+    let now = Instant::now();
+    let mut context = SourceContext::default();
+    let entry = context.observe(10, Some(AF[0])).unwrap().unwrap();
+    let continuation = context.observe(11, Some(AF[1])).unwrap().unwrap();
+    let mut mapper = OutputMapper::new(77);
+    let prepare_entry = |mapper: &OutputMapper<_>| {
+        mapper
+            .prepare(
+                now,
+                Retention::SenderLifetime,
+                packet(1, 100, Mode::Filtered(0), true, &entry),
+            )
+            .unwrap()
+    };
+    let prepare_tail = |mapper: &OutputMapper<_>| {
+        mapper.prepare(
+            now,
+            Retention::SenderLifetime,
+            packet(1, 101, Mode::Filtered(0), false, &continuation),
+        )
+    };
+    let staged = prepare_entry(&mapper);
+    let superseded = prepare_entry(&mapper);
+    assert!(matches!(prepare_tail(&mapper), Err(Rejected::Bootstrap)));
+    let mut receiver = DependencyDescriptorReader::new();
+    assert_eq!(
+        receiver
+            .read(staged.descriptor().unwrap())
+            .unwrap()
+            .frame_number,
+        77
+    );
+    mapper.commit(staged).unwrap();
+    assert_eq!(mapper.commit(superseded), Err(Rejected::Stale));
+    let tail = prepare_tail(&mapper).unwrap();
+    assert_eq!(
+        receiver
+            .read(tail.descriptor().unwrap())
+            .unwrap()
+            .frame_number,
+        77
+    );
+    mapper.lose_context();
+    assert!(!mapper.is_current(&tail));
+    assert_eq!(mapper.commit(tail), Err(Rejected::Stale));
+    assert!(matches!(prepare_tail(&mapper), Err(Rejected::Bootstrap)));
+}
+
+#[test]
 fn old_structure_reservations_cannot_cross_a_new_mapping() {
     let now = Instant::now();
     let until = now + Duration::from_millis(120);
@@ -124,6 +174,46 @@ fn old_structure_reservations_cannot_cross_a_new_mapping() {
             until,
             packet(2, 105, Mode::Whole, true, &initial),
             |b| check(b, 0),
+        )
+        .unwrap();
+}
+
+#[test]
+fn current_templates_remain_usable_after_repair_expiry() {
+    let now = Instant::now();
+    let mut source = SourceContext::default();
+    let initial = source.observe(10, Some(AF[0])).unwrap().unwrap();
+    let continuation = source.observe(11, Some(AF[1])).unwrap().unwrap();
+    let mut mapper = OutputMapper::new(0);
+    let mut reader = DependencyDescriptorReader::new();
+    let interval = Duration::from_millis(100);
+    mapper
+        .offer(
+            now,
+            now + interval,
+            packet(1, 100, Mode::Whole, true, &initial),
+            |bytes| {
+                reader.read(bytes.unwrap()).unwrap();
+                true
+            },
+        )
+        .unwrap();
+    let resumed = now + interval * 2;
+    mapper
+        .offer(
+            resumed,
+            resumed + interval,
+            packet(1, 101, Mode::Whole, false, &continuation),
+            |bytes| {
+                assert!(
+                    reader
+                        .read(bytes.unwrap())
+                        .unwrap()
+                        .attached_structure
+                        .is_none()
+                );
+                true
+            },
         )
         .unwrap();
 }

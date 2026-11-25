@@ -60,6 +60,13 @@ struct Lease {
     retention: Retention,
 }
 
+pub(super) struct Reservation {
+    pub(super) interval: TemplateInterval,
+    prepared_at: Instant,
+    retention: Retention,
+    structure: Option<Box<TemplateDependencyStructure>>,
+}
+
 /// Owns the disjoint live template intervals in a receiver's six-bit space.
 /// Each admission must cover the full reorder and repair lifetime of the
 /// work it publishes, not just the lifetime of the current mapping.
@@ -69,28 +76,21 @@ pub struct TemplateIntervals {
 }
 
 impl TemplateIntervals {
-    pub(super) fn extend(
-        &mut self,
+    pub(super) fn prepare_extend(
+        &self,
         interval: TemplateInterval,
         now: Instant,
         retention: Retention,
-        admit: impl FnOnce() -> bool,
-    ) -> bool {
-        if !retention.live(now) {
-            return false;
+    ) -> Option<Reservation> {
+        if !retention.live(now) || !self.live.iter().any(|lease| lease.interval == interval) {
+            return None;
         }
-        let Some(lease) = self
-            .live
-            .iter_mut()
-            .find(|lease| lease.interval == interval && lease.retention.live(now))
-        else {
-            return false;
-        };
-        if !admit() {
-            return false;
-        }
-        lease.retention = lease.retention.merge(retention);
-        true
+        Some(Reservation {
+            interval,
+            prepared_at: now,
+            retention,
+            structure: None,
+        })
     }
 
     /// Reserve and publish in one transaction. False from `admit` leaves
@@ -102,43 +102,79 @@ impl TemplateIntervals {
         structure: &TemplateDependencyStructure,
         admit: impl FnOnce(TemplateInterval) -> bool,
     ) -> Option<TemplateInterval> {
+        let reservation = self.prepare(now, retention.into(), structure)?;
+        let interval = reservation.interval;
+        if !admit(interval) {
+            return None;
+        }
+        self.commit(reservation).then_some(interval)
+    }
+
+    pub(super) fn prepare(
+        &self,
+        now: Instant,
+        retention: Retention,
+        structure: &TemplateDependencyStructure,
+    ) -> Option<Reservation> {
         const _: () = assert!(MAX_TEMPLATES == 64);
         let len = u8::try_from(structure.templates.len()).ok()?;
-        let retention = retention.into();
         if len == 0 || len > 64 || structure.template_id_offset >= 64 || !retention.live(now) {
             return None;
         }
-        self.live.retain(|lease| lease.retention.live(now));
-        if let Some(lease) = self
-            .live
-            .iter_mut()
-            .find(|lease| same_semantics(&lease.structure, structure))
-        {
-            if !admit(lease.interval) {
-                return None;
-            }
-            lease.retention = lease.retention.merge(retention);
-            return Some(lease.interval);
+        let live = || self.live.iter().filter(|lease| lease.retention.live(now));
+        if let Some(lease) = live().find(|lease| same_semantics(&lease.structure, structure)) {
+            return self.prepare_extend(lease.interval, now, retention);
         }
-        let occupied = self
-            .live
-            .iter()
-            .fold(0, |mask, lease| mask | lease.interval.occupied());
+        let occupied = live().fold(0, |mask, lease| mask | lease.interval.occupied());
         let interval = (0_u8..64)
             .map(|offset| TemplateInterval {
                 offset: structure.template_id_offset.wrapping_add(offset) & 63,
                 len,
             })
             .find(|candidate| candidate.occupied() & occupied == 0)?;
-        if !admit(interval) {
-            return None;
-        }
-        self.live.push(Lease {
+        Some(Reservation {
             interval,
-            structure: Box::new(structure.clone()),
+            prepared_at: now,
             retention,
+            structure: Some(Box::new(structure.clone())),
+        })
+    }
+
+    pub(super) fn commit(&mut self, reservation: Reservation) -> bool {
+        let Reservation {
+            interval,
+            prepared_at,
+            retention,
+            structure,
+        } = reservation;
+        // An expired repair lease can still be the current wire mapping.
+        // Only a fresh allocation can retire or reuse that interval.
+        self.live.retain(|lease| {
+            lease.retention.live(prepared_at) || (structure.is_none() && lease.interval == interval)
         });
-        Some(interval)
+        if let Some(structure) = structure {
+            if self
+                .live
+                .iter()
+                .any(|lease| lease.interval.occupied() & interval.occupied() != 0)
+            {
+                return false;
+            }
+            self.live.push(Lease {
+                interval,
+                structure,
+                retention,
+            });
+        } else if let Some(lease) = self
+            .live
+            .iter_mut()
+            .find(|lease| lease.interval == interval)
+        {
+            lease.retention = lease.retention.merge(retention);
+        } else {
+            return false;
+        }
+        true
     }
 }
 

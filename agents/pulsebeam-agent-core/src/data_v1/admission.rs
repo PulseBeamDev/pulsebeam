@@ -4,7 +4,7 @@ use core::{num::NonZeroU64, time::Duration};
 use pulsebeam_proto::{
     data_control::{self, PublisherObservation, Record as _, publisher_observation},
     data_endpoint::{Binding, Delivery, Endpoint},
-    data_record::MAX_RECORD_BYTES,
+    data_record,
 };
 
 use crate::ffi::{CaptureClock, DataSendOptions};
@@ -37,6 +37,7 @@ struct DeliveryHistory {
 
 struct RetainedUnit {
     unit: OutgoingUnit,
+    charge: usize,
     expires: Duration,
     retry_at: Option<Duration>,
 }
@@ -88,6 +89,11 @@ impl<A: Copy + Eq> ReliablePublisher<A> {
         })
     }
 
+    pub(super) fn with_record_dd(mut self, record_dd: bool) -> Self {
+        self.publisher = self.publisher.with_record_dd(record_dd);
+        self
+    }
+
     /// Retain the original before granting a sequence for initial transmission.
     /// The caller services due timer actions before admitting new work.
     pub fn admit(
@@ -101,8 +107,13 @@ impl<A: Copy + Eq> ReliablePublisher<A> {
             return Err(Error::Binding);
         }
         self.now = self.now.max(now);
-        let charge = self.bytes.saturating_add(bytes.len());
-        if self.retained.len() >= UNIT_LIMIT || charge > BYTE_LIMIT {
+        let count = data_record::fragment_count(bytes.len()).map_err(Error::Record)?;
+        let charge = bytes
+            .len()
+            .checked_add(super::descriptor_budget(self.publisher.record_dd, count))
+            .ok_or(Error::Capacity)?;
+        let total = self.bytes.saturating_add(charge);
+        if self.retained.len() >= UNIT_LIMIT || total > BYTE_LIMIT {
             return Err(Error::Capacity);
         }
         while self
@@ -129,6 +140,7 @@ impl<A: Copy + Eq> ReliablePublisher<A> {
             admitted.unit_seq,
             RetainedUnit {
                 unit,
+                charge,
                 expires,
                 retry_at: Some(self.now.saturating_add(CONTROL_RETRY)),
             },
@@ -141,7 +153,7 @@ impl<A: Copy + Eq> ReliablePublisher<A> {
                 reported: BTreeMap::new(),
             },
         );
-        self.bytes = charge;
+        self.bytes = total;
         Ok(admitted)
     }
 
@@ -224,7 +236,7 @@ impl<A: Copy + Eq> ReliablePublisher<A> {
         self.now = self.now.max(now);
         while retiring || self.expiry().is_some_and(|expires| expires <= self.now) {
             let (seq, entry) = self.retained.pop_first()?;
-            self.bytes = self.bytes.saturating_sub(entry.unit.bytes.len());
+            self.bytes = self.bytes.saturating_sub(entry.charge);
             if entry.retry_at.is_some() {
                 return Some(seq);
             }
@@ -247,7 +259,7 @@ impl<A: Copy + Eq> ReliablePublisher<A> {
         else {
             return Ok(None);
         };
-        let mut record = vec![0; MAX_RECORD_BYTES];
+        let mut record = vec![0; super::record_capacity(self.publisher.record_dd)];
         let len = entry.unit.write(0, &mut record)?;
         record.truncate(len);
         entry.retry_at = Some(self.now.saturating_add(CONTROL_RETRY));

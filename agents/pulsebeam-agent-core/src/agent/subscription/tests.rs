@@ -29,6 +29,7 @@ fn publication() -> (
         .resource(ResourceCommand::DeclareDataPublication {
             spec: data_spec(),
             capture_clock: None,
+            record_dd: false,
         })
         .unwrap()
     else {

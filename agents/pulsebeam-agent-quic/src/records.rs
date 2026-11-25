@@ -507,7 +507,7 @@ mod tests {
     #[test]
     fn bootstrap_is_exact_and_rejects_trailing_and_oversize_fields() {
         let original = Admit {
-            fabric: FabricOffer::CURRENT,
+            fabric: FabricOffer::decode([1, 1, 0, 1, 3, 252]),
             attempt: NonZeroU64::MIN,
             room: Some("stage"),
             owner: "proof",
@@ -522,6 +522,16 @@ mod tests {
         let decoded = Admit::decode(&wire).unwrap();
         assert_eq!(decoded.successor, original.successor);
         assert_eq!(decoded.fabric, original.fabric);
+        let current = Admit {
+            fabric: FabricOffer::CURRENT,
+            ..original
+        };
+        let current_wire = current.encode().unwrap();
+        assert_eq!(
+            current_wire,
+            b"\0\0\0\0\0\0\0\x01\x01\x01\0\x01\x83\xfc\0\x05stage\0\x05proof\0\x05a.b.c\0\x01\xff"
+        );
+        assert_eq!(Admit::decode(&current_wire).unwrap().fabric, current.fabric);
         wire.push(0);
         assert_eq!(Admit::decode(&wire).err(), Some(Error::Body));
         let token = "x".repeat(MAX_TOKEN.saturating_add(1));

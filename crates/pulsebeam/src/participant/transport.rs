@@ -85,6 +85,8 @@ fn sdp_fabric_profile(
     use pulsebeam_rtc::CodecProfile;
     match codec {
         CodecProfile::Opus => Some(Profile::Opus),
+        CodecProfile::Vp8 => Some(Profile::Vp8),
+        CodecProfile::Vp9 { profile_id: 0 } => Some(Profile::Vp9),
         CodecProfile::H264 {
             packetization_mode: 1,
             ..

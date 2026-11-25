@@ -424,6 +424,21 @@ fn writer_rejects_descriptor_inconsistent_with_structure() {
         writer.write(&wrong_chains, &mut buf),
         Err(DdWriteError::Inconsistent)
     );
+
+    let mut shifted = delta(&s, 0, 1);
+    shifted.frame_dependencies.frame_diffs.clear();
+    shifted.frame_dependencies.frame_diffs.push(2);
+    assert_eq!(
+        writer.write(&shifted, &mut buf),
+        Err(DdWriteError::Inconsistent)
+    );
+    shifted.fields.set_custom_fdiffs(true);
+    assert!(writer.write(&shifted, &mut buf).is_ok());
+    shifted.frame_dependencies.spatial_id = 1;
+    assert_eq!(
+        writer.write(&shifted, &mut buf),
+        Err(DdWriteError::Inconsistent)
+    );
 }
 
 #[test]

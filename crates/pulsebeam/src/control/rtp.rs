@@ -10,8 +10,7 @@ use pulsebeam_rtc::{
     RtpConfigurationLimits,
 };
 
-const STOCK_AV1_PARAMETERS: [(&str, &str); 3] =
-    [("level-idx", "5"), ("profile", "0"), ("tier", "0")];
+use wire::STOCK_AV1_PARAMETERS;
 
 pub(crate) fn is_stock_av1(codec: &RtpCodecParameters) -> bool {
     codec.name == "av1"
@@ -24,6 +23,26 @@ pub(crate) fn is_stock_av1(codec: &RtpCodecParameters) -> bool {
                 .get(name)
                 .is_some_and(|parameter| parameter == value)
         })
+}
+
+/// Fabric subset of the RTC format compiler. AV1 fallback is restricted to
+/// the explicitly negotiated stock format; other VP9 profiles are RTC-only.
+pub(crate) fn fabric_profile(
+    codec: &RtpCodecParameters,
+) -> Option<pulsebeam_core::fabric::Profile> {
+    use pulsebeam_core::fabric::Profile;
+    use pulsebeam_rtc::CodecProfile;
+    match codec.profile()? {
+        CodecProfile::Opus => Some(Profile::Opus),
+        CodecProfile::H264 {
+            packetization_mode: 1,
+            ..
+        } => Some(Profile::H264),
+        CodecProfile::Vp8 => Some(Profile::Vp8),
+        CodecProfile::Vp9 { profile_id: 0 } => Some(Profile::Vp9),
+        CodecProfile::Av1 { .. } if is_stock_av1(codec) => Some(Profile::Av1),
+        _ => None,
+    }
 }
 
 fn opus_format() -> wire::CodecFormat {
@@ -41,10 +60,22 @@ fn h264_format() -> wire::CodecFormat {
     }))
 }
 
-pub(crate) fn quic_capabilities() -> wire::RtpCapabilities {
+pub(crate) fn quic_capabilities(directional_video_dd: bool) -> wire::RtpCapabilities {
+    let media = if directional_video_dd {
+        &[
+            "audio/opus",
+            "video/h264",
+            "video/vp8",
+            "video/vp9",
+            "video/av1",
+        ][..]
+    } else {
+        &["audio/opus", "video/h264"][..]
+    };
     wire::RtpCapabilities {
-        codecs: [opus_format(), h264_format()]
-            .into_iter()
+        codecs: media
+            .iter()
+            .filter_map(|mime| wire::CodecFormat::native_quic_baseline(mime))
             .map(|format| wire::RtpCodecCapability {
                 format: Some(format),
                 ..Default::default()
@@ -230,6 +261,13 @@ fn extension_uri(value: &str) -> Result<&str, RtpConfigurationError> {
     wire::sdp::extension_uri(value).map_err(|_| RtpConfigurationError::Invalid)
 }
 
+fn deferred_native_video_mode(mime: &str, mode: wire::RtpScalabilityMode) -> bool {
+    use wire::RtpScalabilityMode::*;
+    matches!(mime, "video/av1" | "video/vp9")
+        && matches!(mode, L2t3KeyShift | L3t2KeyShift | L3t3KeyShift)
+        || mime == "video/av1" && matches!(mode, S3t1 | S3t1h | S3t2 | S3t2h | S3t3 | S3t3h)
+}
+
 pub(crate) fn publication_binding(
     parameters: &wire::RtpParameters,
     kind: wire::TrackKind,
@@ -295,10 +333,14 @@ fn binding(
             .iter()
             .any(|extension| !capabilities.header_extensions.contains(&extension.uri))
         || parameters.encodings.iter().any(|encoding| {
-            encoding
-                .scalability_mode
-                .as_ref()
-                .is_some_and(|mode| !capability.scalability_modes.contains(mode))
+            encoding.scalability_mode.as_deref().is_some_and(|mode| {
+                match validation::negotiated_video_mode(format, capability, mode) {
+                    Ok(mode) => {
+                        publication && deferred_native_video_mode(&format.mime_type, mode.mode())
+                    }
+                    Err(_) => true,
+                }
+            })
         })
     {
         return Err(Failure::Unsupported);
@@ -366,6 +408,151 @@ pub(crate) fn failure_code(error: RtpConfigurationError) -> wire::FailureCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quic_raw_video_capabilities_preserve_the_legacy_intersection() {
+        let legacy = quic_capabilities(false);
+        let current = quic_capabilities(true);
+        assert_eq!(validation::validate_capabilities(&legacy), Ok(()));
+        assert_eq!(validation::validate_capabilities(&current), Ok(()));
+        assert_eq!(legacy.codecs, current.codecs[..2]);
+        assert_eq!(legacy.codecs.len(), 2);
+        for (candidate, mime) in
+            current.codecs[2..]
+                .iter()
+                .zip(["video/vp8", "video/vp9", "video/av1"])
+        {
+            assert!(candidate.scalability_modes.is_empty());
+            let format = candidate.format.as_ref().unwrap();
+            assert_eq!(format.mime_type, mime);
+            let parameters = wire::QuicRtpParameters {
+                binding_id: 8,
+                incarnation: 9,
+                primary_ssrc: 37,
+                codec: Some(wire::RtpCodecParameters {
+                    payload_type: Some(125),
+                    format: Some(format.clone()),
+                    ..Default::default()
+                }),
+                video_dd: Some(wire::QuicVideoDd::Absent as i32),
+                ..Default::default()
+            };
+            let binding =
+                validation::QuicRtpBinding::compile(&parameters, wire::TrackKind::Video).unwrap();
+            assert_eq!(binding.payload_type(), 125);
+            assert_eq!(binding.ssrc().get(), 37);
+        }
+        assert_eq!(current.codecs.len(), 5);
+    }
+
+    #[test]
+    fn publication_mode_requires_the_selected_format_and_advertised_intersection() {
+        let mut capabilities = capabilities();
+        let mut rtp = wire::RtpParameters {
+            mid: "camera".into(),
+            codec: Some(wire::RtpCodecParameters {
+                payload_type: Some(96),
+                feedback: vec![wire::RtcpFeedback::TransportCc.into()],
+                format: Some(h264_format()),
+                ..Default::default()
+            }),
+            header_extensions: vec![wire::RtpHeaderExtensionParameters {
+                uri: wire::RtpHeaderExtensionType::RtpHeaderExtensionMid.into(),
+                id: 1,
+            }],
+            encodings: vec![wire::RtpEncodingParameters {
+                ssrc: Some(42),
+                ..Default::default()
+            }],
+            rtcp: Some(wire::RtcpParameters {
+                cname: "source".into(),
+                reduced_size: false,
+            }),
+            ..Default::default()
+        };
+        assert!(publication_binding(&rtp, wire::TrackKind::Video, &capabilities).is_ok());
+        rtp.encodings[0].scalability_mode = Some("L1T3".into());
+        assert!(publication_binding(&rtp, wire::TrackKind::Video, &capabilities).is_ok());
+        rtp.encodings[0].scalability_mode = Some("L1T2".into());
+        assert!(publication_binding(&rtp, wire::TrackKind::Video, &capabilities).is_err());
+        for capability in &mut capabilities.codecs {
+            if capability.format.as_ref() == Some(&h264_format()) {
+                capability.scalability_modes.push("S3T3h".into());
+            }
+        }
+        rtp.encodings[0].scalability_mode = Some("S3T3h".into());
+        assert!(publication_binding(&rtp, wire::TrackKind::Video, &capabilities).is_err());
+    }
+
+    #[test]
+    fn native_publication_rejects_deferred_modes_without_redefining_negotiation() {
+        let mut capabilities = quic_capabilities(true);
+        let mid = wire::RtpHeaderExtensionType::RtpHeaderExtensionMid.as_str();
+        capabilities.header_extensions.push(mid.into());
+        capabilities
+            .rtcp_modes
+            .push(wire::RtcpMode::Compound.into());
+        for mime in ["video/av1", "video/vp9"] {
+            let capability = capabilities
+                .codecs
+                .iter_mut()
+                .find(|codec| {
+                    codec
+                        .format
+                        .as_ref()
+                        .is_some_and(|format| format.mime_type == mime)
+                })
+                .unwrap();
+            let format = capability.format.clone().unwrap();
+            let shifted = ["L2T3_KEY_SHIFT", "L3T2_KEY_SHIFT", "L3T3_KEY_SHIFT"];
+            let s3 = ["S3T1", "S3T1h", "S3T2", "S3T2h", "S3T3", "S3T3h"];
+            let cases = ["L1T1", "L2T2_KEY_SHIFT"]
+                .into_iter()
+                .map(|mode| (mode, true))
+                .chain(shifted.into_iter().map(|mode| (mode, false)))
+                .chain(s3.into_iter().map(|mode| (mode, mime == "video/vp9")))
+                .collect::<Vec<_>>();
+            capability.scalability_modes = cases.iter().map(|(mode, _)| (*mode).into()).collect();
+            for (mode, admitted) in cases {
+                let rtp = wire::RtpParameters {
+                    mid: "camera".into(),
+                    header_extensions: vec![wire::RtpHeaderExtensionParameters {
+                        uri: mid.into(),
+                        id: 1,
+                    }],
+                    codec: Some(wire::RtpCodecParameters {
+                        payload_type: Some(96),
+                        format: Some(format.clone()),
+                        ..Default::default()
+                    }),
+                    encodings: vec![wire::RtpEncodingParameters {
+                        ssrc: Some(42),
+                        scalability_mode: Some(mode.into()),
+                        ..Default::default()
+                    }],
+                    rtcp: Some(wire::RtcpParameters {
+                        cname: "source".into(),
+                        reduced_size: false,
+                    }),
+                    ..Default::default()
+                };
+                assert!(
+                    receiving_binding(&rtp, wire::TrackKind::Video, &capabilities).is_ok(),
+                    "{mime} {mode} must remain negotiable"
+                );
+                let result = publication_binding(&rtp, wire::TrackKind::Video, &capabilities);
+                if admitted {
+                    assert!(result.is_ok(), "{mime} {mode}: {result:?}");
+                } else {
+                    assert_eq!(
+                        result.unwrap_err(),
+                        wire::FailureCode::Unsupported,
+                        "{mime} {mode}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn typed_bootstrap_preserves_declared_formats_and_enters_strict_admission() {

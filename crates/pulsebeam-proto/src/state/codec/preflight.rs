@@ -136,7 +136,8 @@ fn message(
             | (Some(Shape::QuicRtpParameters), 3, 2) => 4,
             (Some(Shape::SctpDataV1Parameters | Shape::QuicDataV1Parameters), 4, 0)
             | (Some(Shape::QuicRtpParameters), 4, 5) => 8,
-            (Some(Shape::QuicRtpParameters), 5, 0) => 16,
+            (Some(Shape::QuicRtpParameters | Shape::QuicDataV1Parameters), 5, 0) => 16,
+            (Some(Shape::QuicRtpParameters), 6, 0) => 32,
             (Some(Shape::TrackBinding), 1..=5, _)
             | (
                 Some(

@@ -140,6 +140,7 @@ pub(crate) struct FabricDataReceiver<P = wire::SctpDataV1Parameters> {
 pub(crate) struct ReceiverPolicy {
     pub(crate) enabled: bool,
     pub(crate) video: Option<VideoPolicy>,
+    pub(crate) decode_target: Option<pulsebeam_core::dd::evidence::DecodeTarget>,
 }
 
 pub(crate) fn track_kind(kind: i32) -> Option<TrackKind> {
@@ -221,6 +222,11 @@ pub(crate) fn receiver(
             let endpoint = data_v1_endpoint
                 .filter(|endpoint| Some(endpoint.source) == source.fabric_data_source())
                 .ok_or(wire::FailureCode::Incompatible)?;
+            if data.record_dd
+                && !matches!(transport, wire::track_binding::Transport::QuicDataV1(p) if p.record_dd)
+            {
+                return Err(wire::FailureCode::Incompatible);
+            }
             match transport {
                 wire::track_binding::Transport::SctpDataV1(parameters)
                     if wire::DataV1Binding::Sctp(*parameters).matches_delivery(data.delivery) =>
@@ -286,6 +292,7 @@ pub(crate) fn receiver(
         ReceiverPolicy {
             enabled: enabled(spec),
             video,
+            decode_target: receiver_decode_target(spec)?,
         },
     ))
 }
@@ -307,7 +314,43 @@ pub(crate) fn receiver_policy(
     Ok(ReceiverPolicy {
         enabled: enabled(spec),
         video,
+        decode_target: receiver_decode_target(spec)?,
     })
+}
+
+fn receiver_decode_target(
+    spec: &wire::ResourceSpec,
+) -> Result<Option<pulsebeam_core::dd::evidence::DecodeTarget>, wire::FailureCode> {
+    let Some(wire::resource_settings::Receive::Video(options)) = spec
+        .settings
+        .as_ref()
+        .and_then(|settings| settings.receive.as_ref())
+    else {
+        return Ok(None);
+    };
+    let Some(index) = options.decode_target else {
+        return Ok(None);
+    };
+    let Some(wire::resource_spec::Declaration::Subscription(subscription)) = &spec.declaration
+    else {
+        return Err(wire::FailureCode::Unsupported);
+    };
+    if subscription.kind != wire::TrackKind::Video as i32
+        || !matches!(
+            subscription
+                .binding
+                .as_ref()
+                .and_then(|binding| binding.transport.as_ref()),
+            Some(wire::track_binding::Transport::QuicRtp(_))
+        )
+    {
+        return Err(wire::FailureCode::Unsupported);
+    }
+    u8::try_from(index)
+        .ok()
+        .and_then(pulsebeam_core::dd::evidence::DecodeTarget::new)
+        .map(Some)
+        .ok_or(wire::FailureCode::InvalidConfiguration)
 }
 
 pub(crate) struct DataPublication {

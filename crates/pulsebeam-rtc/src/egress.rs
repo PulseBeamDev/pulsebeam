@@ -2658,32 +2658,62 @@ fn encode_rtp(
         forwarded_extensions,
         emit_mid,
     );
-    let Some(layout) = layout::PacketLayout::new(
-        payload.len(),
-        extensions.clone().map(|(id, value)| (id, value.len())),
+    crate::RtpHeader {
+        sequence,
+        timestamp,
+        ssrc,
+        payload_type,
+        marker,
+    }
+    .write_packet(
         sender_extension_form(sender),
-    ) else {
-        return false;
-    };
-    if packet.capacity() < layout.bytes {
-        return false;
+        extensions,
+        payload,
+        padding,
+        packet,
+    )
+}
+
+impl crate::RtpHeader {
+    /// Serialize a projected RTP packet before transport protection. Extension
+    /// IDs and extension form come from the destination binding. The caller
+    /// owns the packet capacity and includes any padding bytes in `payload`.
+    pub fn write_packet<'a>(
+        &self,
+        extension_form: crate::RtpExtensionForm,
+        extensions: impl Iterator<Item = (u8, &'a [u8])> + Clone,
+        payload: &[u8],
+        padding: bool,
+        packet: &mut Vec<u8>,
+    ) -> bool {
+        let Some(layout) = layout::PacketLayout::new(
+            payload.len(),
+            extensions.clone().map(|(id, value)| (id, value.len())),
+            extension_form,
+        ) else {
+            return false;
+        };
+        if packet.capacity() < layout.bytes || self.payload_type > 127 {
+            return false;
+        }
+        packet.clear();
+        packet.push(
+            0x80 | if layout.extensions.is_none() { 0 } else { 0x10 }
+                | if padding { 0x20 } else { 0 },
+        );
+        packet.push(self.payload_type | if self.marker { 0x80 } else { 0 });
+        packet.extend_from_slice(&self.sequence.to_be_bytes());
+        packet.extend_from_slice(&self.timestamp.to_be_bytes());
+        packet.extend_from_slice(&self.ssrc.to_be_bytes());
+        if let Some(layout) = layout.extensions
+            && !write_extensions(packet, extensions, layout)
+        {
+            return false;
+        }
+        packet.extend_from_slice(payload);
+        debug_assert_eq!(packet.len(), layout.bytes);
+        true
     }
-    packet.clear();
-    packet.push(
-        0x80 | if layout.extensions.is_none() { 0 } else { 0x10 } | if padding { 0x20 } else { 0 },
-    );
-    packet.push(payload_type | if marker { 0x80 } else { 0 });
-    packet.extend_from_slice(&sequence.to_be_bytes());
-    packet.extend_from_slice(&timestamp.to_be_bytes());
-    packet.extend_from_slice(&ssrc.to_be_bytes());
-    if let Some(layout) = layout.extensions
-        && !write_extensions(packet, extensions, layout)
-    {
-        return false;
-    }
-    packet.extend_from_slice(payload);
-    debug_assert_eq!(packet.len(), layout.bytes);
-    true
 }
 
 fn sender_extension_form(sender: &Sender) -> crate::RtpExtensionForm {

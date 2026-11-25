@@ -211,6 +211,7 @@ fn delivery_mismatch_fails_only_incompatible_receivers_and_revocation_keeps_the_
                         kind: Some(state::track::Kind::Data(state::DataTrack {
                             capture_clock: None,
                             delivery: state::DataDelivery::Ordered as i32,
+                            record_dd: false,
                         })),
                     }),
                 }),
@@ -335,6 +336,7 @@ fn resolved_source_description_does_not_claim_data_receiver_execution() {
                         kind: Some(state::track::Kind::Data(state::DataTrack {
                             capture_clock: None,
                             delivery: state::DataDelivery::Ordered as i32,
+                            record_dd: false,
                         })),
                     }),
                 }),

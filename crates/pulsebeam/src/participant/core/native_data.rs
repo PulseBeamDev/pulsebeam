@@ -709,6 +709,7 @@ impl Connection {
             publication.lane,
             data_v1_source,
             capture_clock,
+            false,
         );
         if first_admission {
             events.publish_track(track.clone());

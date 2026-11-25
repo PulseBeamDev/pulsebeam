@@ -7,9 +7,12 @@ use pulsebeam_core::{
     h264::{MAX_ACCESS_UNIT_SIZE, Packetization, PacketizedChunk, Packetizer},
 };
 
+pub mod av1;
 pub mod descriptor;
 pub mod jitter;
 pub mod units;
+pub mod vp8;
+pub mod vp9;
 
 /// Source packet coordinates. The installed publication supplies the SSRC,
 /// payload type and codec profile.
@@ -45,6 +48,7 @@ impl PacketBudget {
 pub enum PacketizeError {
     Empty,
     TooLarge,
+    InvalidFraming,
 }
 
 /// Packetized RTP, with independent frame boundaries (the Opus marker is not

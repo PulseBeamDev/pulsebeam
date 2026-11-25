@@ -45,6 +45,86 @@ fn raw(unit: &OutgoingUnit, index: u16) -> Vec<u8> {
 }
 
 #[test]
+fn descriptor_capable_receiver_preserves_sparse_metadata_and_rejects_conflicting_retry() {
+    let (tx, rx) = endpoints(Delivery::Unreliable);
+    let mut publisher = Publisher::new(tx, None, 0).unwrap();
+    let unit = publisher
+        .admit(tx, vec![9; 1025], DataSendOptions::default())
+        .unwrap();
+    let first = raw(&unit, 0);
+    let last = raw(&unit, 1);
+    let descriptor = [0xc0, 0, 1];
+    let mut scratch = [0; data_record::MAX_ENDPOINT_RECORD_BYTES];
+    let extended =
+        data_record::restore_endpoint_record(&last, Some(&descriptor), &mut scratch).unwrap();
+    let mut legacy = Subscriber::new(rx, None).unwrap();
+    let now = Duration::ZERO;
+    assert!(matches!(
+        legacy.offer(rx, extended, now),
+        Err(Error::Record(_))
+    ));
+    let mut capable = Subscriber::new(rx, None).unwrap().with_record_dd(true);
+    assert_eq!(capable.offer(rx, extended, now), Ok(None));
+    assert_eq!(capable.offer(rx, extended, now), Ok(None));
+    let assembled = capable.offer(rx, &first, now).unwrap().unwrap();
+    assert_eq!(assembled.bytes, vec![9; 1025]);
+    assert_eq!(
+        assembled.fragment_descriptors,
+        vec![DataFragmentDescriptor {
+            fragment_index: 1,
+            bytes: descriptor.to_vec(),
+        }]
+    );
+    assert_eq!(capable.offer(rx, extended, now), Ok(None));
+
+    let mut capable = Subscriber::new(rx, None).unwrap().with_record_dd(true);
+    assert_eq!(capable.offer(rx, extended, now), Ok(None));
+    assert_eq!(capable.offer(rx, &last, now), Err(Error::Conflict));
+    assert_eq!(capable.offer(rx, &first, now), Ok(None));
+}
+
+#[test]
+fn reliable_retry_reuses_the_initial_descriptor_bytes() {
+    let (tx, _) = endpoints(Delivery::Reliable);
+    let options = DataSendOptions {
+        captured_at: None,
+        fragment_descriptors: Some(vec![DataFragmentDescriptor {
+            fragment_index: 0,
+            bytes: vec![0xc0; data_record::MAX_DESCRIPTOR_BYTES],
+        }]),
+    };
+    let now = Duration::ZERO;
+    let mut legacy = ReliablePublisher::new(tx, None, 7).unwrap();
+    assert_eq!(
+        legacy.admit(tx, vec![0; 1024], options.clone(), now),
+        Err(Error::Binding)
+    );
+    assert_eq!(
+        legacy
+            .admit(tx, vec![0; 1024], DataSendOptions::default(), now)
+            .unwrap()
+            .unit_seq,
+        7
+    );
+    let mut capable = ReliablePublisher::new(tx, None, 7)
+        .unwrap()
+        .with_record_dd(true);
+    let admitted = capable.admit(tx, vec![0; 1024], options, now).unwrap();
+    let mut initial = vec![0; data_record::MAX_ENDPOINT_RECORD_BYTES];
+    let len = capable
+        .write_initial(admitted, 0, &mut initial, now)
+        .unwrap();
+    initial.truncate(len);
+    assert_eq!(
+        capable.next_action(CONTROL_RETRY),
+        Ok(Some(AdmissionAction::RetryFirst {
+            unit_seq: 7,
+            record: initial
+        }))
+    );
+}
+
+#[test]
 fn late_join_suffix_never_delivers_but_a_later_complete_unit_does() {
     let (tx, rx) = endpoints(Delivery::Unreliable);
     let mut publisher = Publisher::new(tx, None, 0).unwrap();
@@ -65,6 +145,7 @@ fn late_join_suffix_never_delivers_but_a_later_complete_unit_does() {
             unit_seq: current.unit_seq(),
             bytes: vec![9; 1_025],
             captured_at: None,
+            fragment_descriptors: vec![],
         }))
     );
     assert_eq!(subscriber.offer(rx, &raw(&current, 0), now), Ok(None));
@@ -379,6 +460,7 @@ fn reliable_publisher_retries_identical_first_record_until_bound_admission() {
                 vec![7; 1_025],
                 DataSendOptions {
                     captured_at: Some(stamp),
+                    fragment_descriptors: None,
                 },
                 now,
             )
@@ -668,6 +750,7 @@ fn capture_clock_and_sequence_exhaustion_fail_without_changing_unit_identity() {
     let mut publisher = Publisher::new(tx, Some(clock.clone()), u64::MAX).unwrap();
     let mut subscriber = Subscriber::new(rx, Some(clock.clone())).unwrap();
     let missing = DataSendOptions {
+        fragment_descriptors: None,
         captured_at: Some(CaptureTimestamp {
             clock: CaptureClock {
                 epoch: 0,
@@ -692,6 +775,7 @@ fn capture_clock_and_sequence_exhaustion_fail_without_changing_unit_identity() {
             vec![],
             DataSendOptions {
                 captured_at: Some(capture.clone()),
+                fragment_descriptors: None,
             },
         )
         .unwrap();
@@ -702,6 +786,7 @@ fn capture_clock_and_sequence_exhaustion_fail_without_changing_unit_identity() {
             unit_seq: u64::MAX,
             captured_at: Some(capture),
             bytes: vec![],
+            fragment_descriptors: vec![],
         }))
     );
     assert!(matches!(

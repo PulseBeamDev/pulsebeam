@@ -109,7 +109,7 @@ pub(in crate::control) fn decode(offers: Box<[WireLiveRouteAck]>) -> Option<Box<
 fn track_kind(profile: Profile) -> TrackKind {
     match profile {
         Profile::Opus => TrackKind::Audio,
-        Profile::H264 | Profile::Av1 => TrackKind::Video,
+        Profile::H264 | Profile::Av1 | Profile::Vp8 | Profile::Vp9 => TrackKind::Video,
         Profile::Data => TrackKind::Data,
     }
 }

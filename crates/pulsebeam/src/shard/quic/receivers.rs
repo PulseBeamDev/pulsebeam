@@ -3,7 +3,10 @@ use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 use std::time::Duration;
 
 use pulsebeam_agent_quic::{
-    data_bindings::{BindingId, Bindings, DataBinding, FabricOffer, InstallError, PayloadBinding},
+    data_bindings::{
+        BindingId, Bindings, DataBinding, FabricBinding, FabricOffer, InstallError, PayloadBinding,
+        rtp_profile,
+    },
     records::{Datagram, DatagramKind, PictureLossIndication, RtcpSenderReport},
     transport::{
         DatagramAdmission,
@@ -11,14 +14,17 @@ use pulsebeam_agent_quic::{
         listener::Association,
     },
 };
-use pulsebeam_core::fabric::{
-    MAJOR, Profile,
-    packet::{Agreement, MAX_PACKET_BYTES},
+use pulsebeam_core::{
+    dd::{evidence::DecodeTarget, output},
+    fabric::{
+        ExtensionKind, MAJOR, Profile,
+        packet::{Agreement, MAX_PACKET_BYTES},
+    },
 };
 use pulsebeam_proto::{
     data_control::SubscriberBinding,
     data_endpoint::Delivery,
-    state::{DataV1CaptureClock, TrackKind, validation::QuicRtpBinding},
+    state::{DataV1CaptureClock, QuicVideoDd, TrackKind, validation::QuicRtpBinding},
 };
 use pulsebeam_runtime::time::Instant;
 
@@ -28,9 +34,12 @@ use crate::{
     entity::ProjectRoomKey,
     participant::{
         data_fabric::project_record,
-        policy::{ExecutionFailure, ExecutionFailureKind, ReceiverExecution, ResourceObservation},
+        policy::{
+            ExecutionFailure, ExecutionFailureKind, ReceiverBinding, ReceiverExecution,
+            ResourceObservation,
+        },
     },
-    route::fabric::local::{DataWrite, Emission, PacketView, RepairRequest},
+    route::fabric::local::{DataWrite, Emission, OutputEvidence, PacketView, RepairRequest},
     rtp::fabric_egress::timeline,
     shard::{core::ShardCore, router::FabricLocalBranch},
     track::Track,
@@ -47,6 +56,7 @@ struct Subscriber {
     owned: u64,
     binding: PayloadBinding,
     source_room: ProjectRoomKey,
+    target: Option<DecodeTarget>,
     payload: SubscriberPayload,
     emission: Emission,
     branch: Option<FabricLocalBranch>,
@@ -58,7 +68,7 @@ enum SubscriberPayload {
     Data {
         endpoint: SubscriberBinding,
         capture_clock: Option<DataV1CaptureClock>,
-        wire: FramedOutput<()>,
+        wire: Box<FramedOutput<()>>,
     },
     Rtp(Box<RtpOutput>),
 }
@@ -66,11 +76,11 @@ enum SubscriberPayload {
 struct RtpOutput {
     profile: Profile,
     ssrc: NonZeroU32,
-    wire: FramedOutput<(
-        timeline::Projected,
-        timeline::Timeline<FabricLocalBranch>,
-        Option<u64>,
-    )>,
+    wire: FramedOutput<RtpCommit>,
+    dd: output::OutputMapper<FabricLocalBranch>,
+    dd_reset: Option<(FabricLocalBranch, u64)>,
+    requires_source_dd: bool,
+    await_whole_entry: bool,
     timeline: timeline::Timeline<FabricLocalBranch>,
     admitted: Option<u64>,
     last_branch: Option<FabricLocalBranch>,
@@ -80,11 +90,28 @@ struct RtpOutput {
     last_report: Option<Instant>,
 }
 
+struct RtpCommit {
+    projected: timeline::Projected,
+    timeline: timeline::Timeline<FabricLocalBranch>,
+    dd: Option<output::Prepared<FabricLocalBranch>>,
+    sender_ntp: Option<u64>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RtpEvidenceKey {
+    sequence: u64,
+    mode: output::Mode,
+    entry: bool,
+    reset: Option<u64>,
+    dd: Option<(u64, u64, u32)>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct OutputKey {
     branch: FabricLocalBranch,
     position: u64,
     repair: Option<RepairRequest>,
+    rtp: Option<RtpEvidenceKey>,
 }
 
 struct FramedOutput<T> {
@@ -99,16 +126,32 @@ enum OutputError {
 }
 
 impl<T> FramedOutput<T> {
-    fn new(
+    fn data(peer: FabricOffer, binding: DataBinding) -> Result<(Self, Emission), ExecutionFailure> {
+        let wire = FabricOffer::CURRENT
+            .with_data_record_dd()
+            .bind_data(peer, binding.record_dd)
+            .map_err(|_| ExecutionFailureKind::Unsupported)?;
+        Self::with_binding(wire, binding.id)
+    }
+
+    fn with_reception(
         peer: FabricOffer,
         profile: Profile,
         binding: NonZeroU16,
+        reception: Option<QuicVideoDd>,
     ) -> Result<(Self, Emission), ExecutionFailure> {
         let wire = FabricOffer::CURRENT
-            .bind(peer, profile, 0)
+            .bind_rtp_receiver(peer, profile, reception)
             .map_err(|_| ExecutionFailureKind::Unsupported)?;
+        Self::with_binding(wire, binding)
+    }
+
+    fn with_binding(
+        wire: FabricBinding,
+        binding: NonZeroU16,
+    ) -> Result<(Self, Emission), ExecutionFailure> {
         let emission = Emission::from_wire_profile(
-            profile as u8,
+            wire.agreement.profile() as u8,
             wire.agreement.extension_mask(),
             MAJOR,
             wire.agreement.revision(),
@@ -129,12 +172,12 @@ impl<T> FramedOutput<T> {
         self.sender.discard_pending();
     }
 
-    fn offer<'a>(
+    fn offer(
         &mut self,
         key: OutputKey,
         now: Instant,
         peer: &mut Association,
-        prepare: impl FnOnce() -> Option<(PacketView<'a>, T)>,
+        prepare: impl FnOnce(Agreement, &mut [u8]) -> Option<(usize, T)>,
     ) -> Result<T, OutputError> {
         if self
             .pending
@@ -144,12 +187,8 @@ impl<T> FramedOutput<T> {
             self.discard();
         }
         if self.pending.is_none() {
-            let (packet, commit) = prepare().ok_or(OutputError::Rejected)?;
             let mut bytes = [0; MAX_PACKET_BYTES];
-            let len = self
-                .agreement
-                .write(&packet, &mut bytes)
-                .map_err(|_| OutputError::Rejected)?;
+            let (len, commit) = prepare(self.agreement, &mut bytes).ok_or(OutputError::Rejected)?;
             let bytes = bytes.get(..len).ok_or(OutputError::Rejected)?;
             self.sender
                 .start(now.into_std(), Box::from(bytes))
@@ -183,17 +222,51 @@ impl RtpOutput {
         branch: FabricLocalBranch,
         now: Instant,
         packet: PacketView<'_>,
-        position: u64,
-        sender_ntp: Option<u64>,
+        sequence: u64,
+        evidence: OutputEvidence,
         peer: &mut Association,
     ) -> Result<(), OutputError> {
+        if let Some(fence) = evidence.reset_after
+            && self.dd_reset != Some((branch, fence))
+        {
+            self.wire.discard();
+            self.dd.lose_context();
+            self.dd_reset = Some((branch, fence));
+        }
+        if self.await_whole_entry
+            && evidence.mode == output::Mode::Whole
+            && !evidence.dd.as_ref().is_some_and(|(_, q)| {
+                let dd = &q.descriptor;
+                dd.start_of_frame
+                    && dd.attached_structure.is_some()
+                    && dd.frame_dependencies.frame_diffs.is_empty()
+            })
+        {
+            return Err(OutputError::Rejected);
+        }
+        let position = evidence.output_position;
         let key = OutputKey {
             branch,
             position,
             repair: None,
+            rtp: Some(RtpEvidenceKey {
+                sequence,
+                mode: evidence.mode,
+                entry: evidence.entry,
+                reset: evidence.reset_after,
+                dd: evidence
+                    .dd
+                    .as_ref()
+                    .map(|(frame, q)| (*frame, q.structure_sequence, q.active_targets)),
+            }),
         };
         let payload_bytes = u32::try_from(packet.payload().len()).unwrap_or(0);
-        let (projected, next, sender_ntp) = self.wire.offer(key, now, peer, || {
+        let RtpCommit {
+            projected,
+            timeline: next,
+            dd,
+            sender_ntp,
+        } = self.wire.offer(key, now, peer, |agreement, bytes| {
             let header = packet.header();
             if header.profile != self.profile {
                 return None;
@@ -216,11 +289,56 @@ impl RtpOutput {
                 .ok()?;
             let [.., a, b, c, d] = projected.sequence.to_be_bytes();
             let wire_sequence = u32::from_be_bytes([a, b, c, d]);
+            let packet = packet.with_receiver_media_position(wire_sequence, projected.timestamp);
+            let kind = ExtensionKind::DependencyDescriptor;
+            let (len, dd) =
+                if header.profile.is_video() && agreement.extension_mask() & kind.bit() != 0 {
+                    let proposal = self
+                        .dd
+                        .prepare(
+                            now.into_std(),
+                            output::Retention::SenderLifetime,
+                            output::Packet {
+                                source: branch,
+                                output_sequence: projected.sequence,
+                                mode: evidence.mode,
+                                entry: evidence.entry,
+                                dd: evidence.dd.as_ref().map(|(frame, qualified)| {
+                                    output::Evidence {
+                                        frame: *frame,
+                                        qualified,
+                                    }
+                                }),
+                            },
+                        )
+                        .ok()?;
+                    let mapped_dd = proposal.descriptor();
+                    if self.requires_source_dd && mapped_dd.is_none() {
+                        return None;
+                    }
+                    (
+                        agreement.write_mapped_dd(&packet, mapped_dd, bytes).ok()?,
+                        Some(proposal),
+                    )
+                } else if evidence.mode == output::Mode::Whole && !self.requires_source_dd {
+                    (agreement.write(&packet, bytes).ok()?, None)
+                } else {
+                    return None;
+                };
             Some((
-                packet.with_receiver_media_position(wire_sequence, projected.timestamp),
-                (projected, next, sender_ntp),
+                len,
+                RtpCommit {
+                    projected,
+                    timeline: next,
+                    dd,
+                    sender_ntp: evidence.sender_ntp,
+                },
             ))
         })?;
+        if let Some(dd) = dd {
+            self.dd.commit(dd).map_err(|_| OutputError::Rejected)?;
+        }
+        self.await_whole_entry = false;
         self.timeline = next;
         if self.last_branch != Some(branch) {
             self.pending_report = None;
@@ -311,7 +429,7 @@ impl Installed {
                     ReceiveTransport::QuicData(fabric) => {
                         let binding = DataBinding::from_parameters(fabric.parameters)
                             .ok_or(ExecutionFailureKind::Invalid)?;
-                        let (wire, emission) = FramedOutput::new(peer, Profile::Data, binding.id)?;
+                        let (wire, emission) = FramedOutput::data(peer, binding)?;
                         (
                             PayloadBinding::Data(binding),
                             SubscriberPayload::Data {
@@ -320,23 +438,30 @@ impl Installed {
                                     Track::Data(data) => data.capture_clock.clone(),
                                     _ => None,
                                 },
-                                wire,
+                                wire: Box::new(wire),
                             },
                             emission,
                         )
                     }
                     ReceiveTransport::QuicRtp(parameters) => {
-                        let (profile, kind) = match &plan.source {
-                            Track::Audio(_) => {
-                                (pulsebeam_core::fabric::Profile::Opus, TrackKind::Audio)
-                            }
-                            Track::Video(_) => {
-                                (pulsebeam_core::fabric::Profile::H264, TrackKind::Video)
-                            }
+                        let (kind, guarantees_dd) = match &plan.source {
+                            Track::Audio(_) => (TrackKind::Audio, false),
+                            Track::Video(video) => (TrackKind::Video, video.guarantees_video_dd),
                             _ => return Err(ExecutionFailureKind::Unsupported.into()),
                         };
                         let binding = QuicRtpBinding::compile(&parameters, kind)
                             .map_err(|_| ExecutionFailureKind::Invalid)?;
+                        binding
+                            .validate_video_dd_direction(false)
+                            .map_err(|_| ExecutionFailureKind::Invalid)?;
+                        if !guarantees_dd
+                            && (binding.video_dd() == Some(QuicVideoDd::Require)
+                                || plan.policy.decode_target.is_some())
+                        {
+                            return Err(ExecutionFailureKind::Unsupported.into());
+                        }
+                        let profile = rtp_profile(&binding.format().mime_type)
+                            .ok_or(ExecutionFailureKind::Unsupported)?;
                         let [.., a, b, c, d, e, f] = *self.connection.as_bytes();
                         let timeline = timeline::Timeline::new(
                             u16::from_be_bytes([a, b]),
@@ -346,13 +471,25 @@ impl Installed {
                         )
                         .ok_or(ExecutionFailureKind::Invalid)?;
                         let binding_id = binding.id();
-                        let (wire, emission) = FramedOutput::new(peer, profile, binding_id)?;
+                        let (wire, emission) = FramedOutput::with_reception(
+                            peer,
+                            profile,
+                            binding_id,
+                            binding.video_dd(),
+                        )?;
+                        if guarantees_dd && !emission.carries_video_dd() {
+                            return Err(ExecutionFailureKind::Unsupported.into());
+                        }
                         (
                             PayloadBinding::from(binding),
                             SubscriberPayload::Rtp(Box::new(RtpOutput {
                                 profile,
                                 ssrc: binding.ssrc(),
                                 wire,
+                                dd: output::OutputMapper::new(u16::from_be_bytes([a, b])),
+                                dd_reset: None,
+                                requires_source_dd: guarantees_dd,
+                                await_whole_entry: false,
                                 timeline,
                                 admitted: None,
                                 last_branch: None,
@@ -388,6 +525,7 @@ impl Installed {
                         owned: work.owned(),
                         binding,
                         source_room: plan.source_room,
+                        target: plan.policy.decode_target,
                         payload,
                         emission,
                         branch: None,
@@ -395,6 +533,19 @@ impl Installed {
                         sequence,
                     },
                 );
+                if !self
+                    .handoff
+                    .fact(Fact::Resource(ResourceObservation::ReceiverBinding {
+                        binding: reference,
+                        state: Some(ReceiverBinding {
+                            available: true,
+                            rtp: None,
+                        }),
+                    }))
+                {
+                    self.failed = true;
+                    return Err(ExecutionFailureKind::Retired.into());
+                }
             }
             ReceiverPreparation::Policy(policy) => {
                 let subscriber = self
@@ -405,12 +556,25 @@ impl Installed {
                 if subscriber.sequence >= sequence {
                     return Err(ExecutionFailureKind::Conflict.into());
                 }
+                let target_changed = subscriber.target != policy.decode_target;
+                if policy.decode_target.is_some()
+                    && !matches!(&subscriber.payload, SubscriberPayload::Rtp(output) if output.requires_source_dd)
+                {
+                    return Err(ExecutionFailureKind::Unsupported.into());
+                }
+                let leaving_filtered =
+                    subscriber.target.is_some() && policy.decode_target.is_none();
+                subscriber.target = policy.decode_target;
                 subscriber.sequence = sequence;
                 subscriber.execution.enabled = policy.enabled;
-                if !policy.enabled {
+                if !policy.enabled || target_changed {
                     match &mut subscriber.payload {
                         SubscriberPayload::Data { wire, .. } => wire.discard(),
-                        SubscriberPayload::Rtp(output) => output.wire.discard(),
+                        SubscriberPayload::Rtp(output) => {
+                            output.wire.discard();
+                            output.dd.lose_context();
+                            output.await_whole_entry |= leaving_filtered;
+                        }
                     }
                     if let Some((branch, receiver)) = subscriber
                         .branch
@@ -556,11 +720,12 @@ impl Installed {
                             receiver,
                             subscriber.execution.source,
                             subscriber.emission,
+                            subscriber.target,
                         ),
                     _ => None,
                 };
                 if let Some(branch) = subscriber.branch {
-                    if matches!(&subscriber.payload, SubscriberPayload::Rtp(output) if output.profile == pulsebeam_core::fabric::Profile::H264)
+                    if matches!(&subscriber.payload, SubscriberPayload::Rtp(output) if output.profile == Profile::H264 || subscriber.target.is_some() || output.await_whole_entry)
                     {
                         core.request_quic_receiver_refresh(receiver, branch);
                     }
@@ -596,25 +761,39 @@ impl Installed {
                             retry |= output.poll_report(subscriber.binding.binding_id(), now, peer);
                         }
                     }
-                    if matches!(
-                        core.admit_quic_rtp(
-                            branch,
-                            receiver,
-                            now,
-                            |packet, position, sender_ntp| {
-                                match output.offer(branch, now, packet, position, sender_ntp, peer)
-                                {
-                                    Ok(()) | Err(OutputError::Rejected) => Ok(()),
-                                    Err(OutputError::Deferred { runnable }) => {
-                                        retry |= runnable;
-                                        Err(())
-                                    }
+                    let mut rejected_filtered = false;
+                    let handoff =
+                        core.admit_quic_rtp(branch, receiver, now, |sequence, packet, evidence| {
+                            let filtered = matches!(evidence.mode, output::Mode::Filtered(_));
+                            match output.offer(branch, now, packet, sequence, evidence, peer) {
+                                Ok(()) => Ok(()),
+                                Err(OutputError::Rejected) => {
+                                    output.wire.discard();
+                                    output.dd.lose_context();
+                                    rejected_filtered = filtered;
+                                    Ok(())
+                                }
+                                Err(OutputError::Deferred { runnable }) => {
+                                    retry |= runnable;
+                                    Err(())
                                 }
                             }
-                        ),
-                        Ok(Some(()))
-                    ) {
-                        retry = true;
+                        });
+                    if let Ok(consumed) = handoff {
+                        if consumed.is_some() {
+                            retry = true;
+                        } else if let Some((key, _)) = output.wire.pending.as_ref() {
+                            rejected_filtered = key
+                                .rtp
+                                .is_some_and(|key| matches!(key.mode, output::Mode::Filtered(_)));
+                            output.wire.discard();
+                            if rejected_filtered {
+                                output.dd.lose_context();
+                            }
+                        }
+                    }
+                    if rejected_filtered {
+                        core.reject_filtered_quic_rtp(branch, receiver, now);
                     }
                     continue;
                 }
@@ -638,11 +817,12 @@ impl Installed {
                         branch,
                         position,
                         repair,
+                        rtp: None,
                     };
-                    match wire.offer(key, now, peer, || {
+                    match wire.offer(key, now, peer, |agreement, bytes| {
                         project_record(&packet, clock, repair.map(|repair| repair.fragment))
                             .ok()?;
-                        Some((packet, ()))
+                        Some((agreement.write(&packet, bytes).ok()?, ()))
                     }) {
                         Ok(()) => DataWrite::Written,
                         Err(OutputError::Deferred { runnable }) => {

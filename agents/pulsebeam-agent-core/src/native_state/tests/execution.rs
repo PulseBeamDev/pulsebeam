@@ -51,6 +51,7 @@ fn logical_receiver_reports_follow_the_owned_offer_not_the_publication() {
                             kind: Some(wire::track::Kind::Data(wire::DataTrack {
                                 capture_clock: None,
                                 delivery: wire::DataDelivery::Ordered as i32,
+                                record_dd: false,
                             })),
                         }),
                         execution: None,

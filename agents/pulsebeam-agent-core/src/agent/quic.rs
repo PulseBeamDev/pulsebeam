@@ -15,6 +15,12 @@ use super::{
 use crate::placement::{self, PendingPlacement, PlacementError};
 use crate::{Effect, Generation, HttpResponse, OperationId, QuicAdmit, QuicEffect, QuicEvent};
 
+#[derive(Clone, Copy)]
+pub(super) enum PublicationProfile {
+    LegacyH264Dd,
+    UnlayeredVideo(&'static str),
+}
+
 pub(super) enum Attempt {
     Placing {
         work: PendingPlacement,
@@ -30,6 +36,8 @@ pub(super) enum Attempt {
 #[doc(hidden)]
 pub struct QuicRtpPublication<'a> {
     pub publishes_h264_dd: bool,
+    pub emits_video_dd: Option<bool>,
+    pub mime_type: &'a str,
     pub generation: Generation,
     pub binding: core::num::NonZeroU16,
     pub ssrc: u32,
@@ -40,12 +48,20 @@ pub struct QuicRtpPublication<'a> {
 
 #[doc(hidden)]
 pub struct QuicRtpReceiver<'a> {
+    pub mime_type: &'a str,
+    pub av1_whole_source: bool,
+    pub video_dd: Option<i32>,
     pub generation: Generation,
     pub binding: core::num::NonZeroU16,
     pub ssrc: u32,
     pub payload_type: u8,
     pub ready: bool,
     pub publication_id: &'a str,
+}
+
+struct QuicFeatures {
+    directional_video_dd: bool,
+    data_record_dd: bool,
 }
 
 impl Agent {
@@ -111,13 +127,19 @@ impl Agent {
                                     .and_then(|settings| settings.enabled)
                                     == Some(true)
                         });
+                    let codec = parameters.codec.as_ref()?;
+                    let av1_whole_source = live.track.as_ref().is_some_and(|track| {
+                        matches!(track.kind.as_ref(), Some(state::track::Kind::Video(video)) if video.av1_whole_source)
+                    });
                     Some(QuicRtpReceiver {
+                        av1_whole_source,
+                        mime_type: &codec.format.as_ref()?.mime_type,
+                        video_dd: parameters.video_dd,
                         ready,
                         generation: session.generation,
                         binding,
                         ssrc: parameters.primary_ssrc,
-                        payload_type: u8::try_from(parameters.codec.as_ref()?.payload_type?)
-                            .ok()?,
+                        payload_type: u8::try_from(codec.payload_type?).ok()?,
                         publication_id: &subscription.publication_id,
                     })
                 })
@@ -162,7 +184,16 @@ impl Agent {
             return None;
         };
         let binding = core::num::NonZeroU16::new(u16::try_from(parameters.binding_id).ok()?)?;
-        let pt = u8::try_from(parameters.codec.as_ref()?.payload_type?).ok()?;
+        let codec = parameters.codec.as_ref()?;
+        let pt = u8::try_from(codec.payload_type?).ok()?;
+        let emits_video_dd = match parameters.video_dd {
+            Some(dd) => match state::QuicVideoDd::try_from(dd).ok()? {
+                state::QuicVideoDd::Emit => Some(true),
+                state::QuicVideoDd::Absent => Some(false),
+                _ => return None,
+            },
+            None => None,
+        };
         let ready = live.execution == state::ExecutionStatus::Installed as i32
             && target
                 .settings
@@ -171,6 +202,8 @@ impl Agent {
                 == Some(true);
         Some(QuicRtpPublication {
             publishes_h264_dd: parameters.publishes_h264_dd,
+            emits_video_dd,
+            mime_type: &codec.format.as_ref()?.mime_type,
             generation: session.generation,
             binding,
             ssrc: parameters.primary_ssrc,
@@ -189,17 +222,38 @@ impl Agent {
 
     #[doc(hidden)]
     pub fn enable_quic_h264_dd(&mut self, track_id: &str) -> Result<(), AgentError> {
+        self.configure_quic_publication(track_id, PublicationProfile::LegacyH264Dd)
+    }
+
+    #[doc(hidden)]
+    pub fn configure_quic_video(&mut self, track_id: &str, mime: &str) -> Result<(), AgentError> {
+        let mime = match mime {
+            "video/h264" => "video/h264",
+            "video/vp8" => "video/vp8",
+            "video/vp9" => "video/vp9",
+            "video/av1" => "video/av1",
+            _ => return Err(crate::ValidationError::QuicPublicationProfile.into()),
+        };
+        self.configure_quic_publication(track_id, PublicationProfile::UnlayeredVideo(mime))
+    }
+
+    fn configure_quic_publication(
+        &mut self,
+        track_id: &str,
+        profile: PublicationProfile,
+    ) -> Result<(), AgentError> {
         const MAX_TRACKS: usize = 64;
         if !self.quic || self.desired.connected || self.closing.is_some() {
             return Err(crate::ValidationError::QuicPublicationProfile.into());
         }
         crate::model::validate_track_id(track_id)?;
-        if self.quic_h264_dd_tracks.len() >= MAX_TRACKS
-            && !self.quic_h264_dd_tracks.contains(track_id)
+        if self.quic_publication_profiles.len() >= MAX_TRACKS
+            && !self.quic_publication_profiles.contains_key(track_id)
         {
             return Err(crate::ValidationError::QuicPublicationProfileLimit.into());
         }
-        self.quic_h264_dd_tracks.insert(track_id.into());
+        self.quic_publication_profiles
+            .insert(track_id.into(), profile);
         Ok(())
     }
 
@@ -372,6 +426,7 @@ impl Agent {
         participant_id: String,
         room: Option<String>,
         capabilities: &[u8],
+        features: QuicFeatures,
     ) -> Result<(), AgentError> {
         let Some(attempt) = self
             .attempt
@@ -425,6 +480,8 @@ impl Agent {
             },
         );
         session.quic_owner = Some(owner.clone());
+        session.quic_directional_video_dd = features.directional_video_dd;
+        session.quic_data_record_dd = features.data_record_dd;
         session.reliable_data_enabled = true;
         self.attempt = None;
         self.activate_session(session, join_revision);
@@ -438,20 +495,22 @@ impl Agent {
         &self,
         generation: Generation,
         binding: core::num::NonZeroU16,
-    ) -> Option<(crate::ChannelId, bool)> {
+    ) -> Option<(crate::ChannelId, bool, bool)> {
         self.active_quic_media()
             .filter(|active| active.generation == generation)?
             .payloads
             .iter()
             .find_map(|(&channel, physical)| {
-                (physical.offer.is_some()
-                    && matches!(physical.data_v1, state::DataV1Binding::Quic(parameters)
-                        if parameters.binding_id == u32::from(binding.get())))
-                .then_some((
-                    channel,
-                    physical.state == super::native::PayloadState::Active
-                        && physical.data_v1_receiver.is_some(),
-                ))
+                let state::DataV1Binding::Quic(parameters) = physical.data_v1 else {
+                    return None;
+                };
+                (physical.offer.is_some() && parameters.binding_id == u32::from(binding.get()))
+                    .then_some((
+                        channel,
+                        physical.state == super::native::PayloadState::Active
+                            && physical.data_v1_receiver.is_some(),
+                        parameters.record_dd,
+                    ))
             })
     }
 
@@ -463,6 +522,8 @@ impl Agent {
                 participant_id,
                 room,
                 capabilities,
+                directional_video_dd,
+                data_record_dd,
             } => {
                 return self.quic_accept(
                     generation,
@@ -470,6 +531,10 @@ impl Agent {
                     participant_id,
                     room,
                     &capabilities,
+                    QuicFeatures {
+                        directional_video_dd,
+                        data_record_dd,
+                    },
                 );
             }
             QuicEvent::Control {
@@ -490,7 +555,7 @@ impl Agent {
                 binding,
                 payload,
             } => {
-                if let Some((channel, true)) = self.quic_data_receiver(generation, binding) {
+                if let Some((channel, true, _)) = self.quic_data_receiver(generation, binding) {
                     self.handle_data_channel(crate::DataChannelEvent::Message {
                         generation,
                         channel,

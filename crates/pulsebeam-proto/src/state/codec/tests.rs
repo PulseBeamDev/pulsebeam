@@ -257,6 +257,7 @@ fn quic_binding_uses_new_wire_arm_and_is_scoped_to_the_negotiated_profile() {
             version: 1,
             incarnation: 9,
             delivery: DataV1Delivery::Unreliable as i32,
+            record_dd: false,
         })),
     };
     let quic_bytes = binding.encode_to_vec();
@@ -293,7 +294,18 @@ fn quic_binding_uses_new_wire_arm_and_is_scoped_to_the_negotiated_profile() {
     let Some(publication_spec::Kind::Data(data)) = publication.kind.as_mut() else {
         panic!("DATA fixture")
     };
-    data.binding = Some(binding);
+    let mut capable = binding;
+    let Some(Transport::QuicDataV1(parameters)) = capable.transport.as_mut() else {
+        panic!("QUIC DATA binding fixture");
+    };
+    parameters.record_dd = true;
+    assert_eq!(
+        capable.encode_to_vec(),
+        [
+            0x22, 17, 8, 7, 16, 1, 25, 9, 0, 0, 0, 0, 0, 0, 0, 32, 1, 40, 1
+        ]
+    );
+    data.binding = Some(capable);
     assert_eq!(
         validation::validate_spec_for(spec, validation::BindingProfile::Quic),
         Ok(())
@@ -315,6 +327,7 @@ fn quic_rtp_binding_compiles_opus_coordinates_without_rtc_fields() {
         incarnation: 9,
         primary_ssrc: 11,
         publishes_h264_dd: false,
+        video_dd: None,
         codec: Some(RtpCodecParameters {
             payload_type: Some(111),
             format: Some(CodecFormat::from(codec_format::Codec::Opus(
@@ -346,6 +359,50 @@ fn quic_rtp_binding_compiles_opus_coordinates_without_rtc_fields() {
         QuicRtpBinding::compile(&parameters, TrackKind::Audio),
         Err(ValidationError::Binding)
     );
+}
+
+#[test]
+fn directional_video_dd_keeps_legacy_h264_and_checks_direction() {
+    use validation::QuicRtpBinding;
+
+    let mut parameters = QuicRtpParameters {
+        binding_id: 7,
+        incarnation: 9,
+        primary_ssrc: 11,
+        publishes_h264_dd: true,
+        video_dd: None,
+        codec: Some(RtpCodecParameters {
+            payload_type: Some(102),
+            format: Some(CodecFormat::from(codec_format::Codec::H264(
+                H264Parameters::default(),
+            ))),
+            ..Default::default()
+        }),
+    };
+    let legacy = QuicRtpBinding::compile(&parameters, TrackKind::Video).unwrap();
+    assert!(legacy.publishes_h264_dd());
+    assert_eq!(legacy.video_dd(), None);
+    parameters.video_dd = Some(QuicVideoDd::Emit as i32);
+    assert!(QuicRtpBinding::compile(&parameters, TrackKind::Video).is_err());
+    parameters.publishes_h264_dd = false;
+    for (declared, publish, subscribe) in [
+        (QuicVideoDd::Absent, true, true),
+        (QuicVideoDd::Emit, true, false),
+        (QuicVideoDd::Accept, false, true),
+        (QuicVideoDd::Require, false, true),
+    ] {
+        parameters.video_dd = Some(declared as i32);
+        let binding = QuicRtpBinding::compile(&parameters, TrackKind::Video).unwrap();
+        assert_eq!(binding.validate_video_dd_direction(true).is_ok(), publish);
+        assert_eq!(
+            binding.validate_video_dd_direction(false).is_ok(),
+            subscribe
+        );
+    }
+    for unsupported in [0, 127] {
+        parameters.video_dd = Some(unsupported);
+        assert!(QuicRtpBinding::compile(&parameters, TrackKind::Video).is_err());
+    }
 }
 
 #[test]
@@ -432,6 +489,7 @@ fn lookup_state(enabled: bool, paired: bool) -> SourceLookupState {
             kind: Some(track::Kind::Data(DataTrack {
                 capture_clock: None,
                 delivery: DataDelivery::Lossy as i32,
+                record_dd: false,
             })),
         }),
     }
@@ -1161,6 +1219,13 @@ fn receive_replacements_preserve_explicit_zero_and_reject_not_clamp() {
     };
     let defaults = VideoReceiveOptions::default();
     assert_eq!(validation::validate_spec(&spec(defaults.clone())), Ok(()));
+    for decode_target in [0, 31] {
+        let explicit = VideoReceiveOptions {
+            decode_target: Some(decode_target),
+            ..defaults.clone()
+        };
+        assert_eq!(validation::validate_spec(&spec(explicit)), Ok(()));
+    }
     for invalid in [
         VideoReceiveOptions {
             max_height: Some(0),
@@ -1177,6 +1242,10 @@ fn receive_replacements_preserve_explicit_zero_and_reject_not_clamp() {
         },
         VideoReceiveOptions {
             priority: Some(0),
+            ..defaults.clone()
+        },
+        VideoReceiveOptions {
+            decode_target: Some(32),
             ..defaults.clone()
         },
     ] {
@@ -1208,6 +1277,7 @@ fn owned_confirmation_is_self_contained_and_execution_failure_is_not_rejection()
             kind: Some(track::Kind::Data(DataTrack {
                 capture_clock: None,
                 delivery: DataDelivery::Lossy as i32,
+                record_dd: false,
             })),
         }),
         execution: ExecutionStatus::Disabled as i32,
@@ -1426,6 +1496,12 @@ fn mutable_defaults_do_not_erase_codec_parameter_presence() {
         &default,
         &settings(options.clone())
     ));
+    options.decode_target = Some(0);
+    assert!(!validation::settings_equivalent(
+        &default,
+        &settings(options.clone())
+    ));
+    options.decode_target = None;
     options.priority = Some(2);
     assert!(!validation::settings_equivalent(
         &default,
@@ -1613,10 +1689,25 @@ fn capability_identity_uses_typed_defaults_without_guessing_unsupported_formats(
         room_id: String::from("room"),
         track_id: String::from("camera"),
         kind: Some(track::Kind::Video(VideoTrack {
+            av1_whole_source: false,
             format: Some(future_format.clone()),
         })),
     };
     assert_eq!(validation::validate_track(&unknown), Ok(()));
+    let mut whole = unknown.clone();
+    let Some(track::Kind::Video(video)) = whole.kind.as_mut() else {
+        panic!("video source");
+    };
+    video.av1_whole_source = true;
+    assert_eq!(
+        validation::validate_track(&whole),
+        Err(ValidationError::Format)
+    );
+    whole.kind = Some(track::Kind::Video(VideoTrack {
+        format: CodecFormat::native_quic_baseline("video/av1"),
+        av1_whole_source: true,
+    }));
+    assert_eq!(validation::validate_track(&whole), Ok(()));
     caps.codecs.pop();
     caps.codecs.push(capability(future_format));
     caps.header_extensions
@@ -1624,7 +1715,7 @@ fn capability_identity_uses_typed_defaults_without_guessing_unsupported_formats(
     caps.codecs[0].feedback.push("future-feedback".into());
     assert_eq!(validation::validate_capabilities(&caps), Ok(()));
     let mut missing = unknown;
-    missing.kind = Some(track::Kind::Video(VideoTrack { format: None }));
+    missing.kind = Some(track::Kind::Video(VideoTrack::default()));
     assert_eq!(
         validation::validate_track(&missing),
         Err(ValidationError::Format)

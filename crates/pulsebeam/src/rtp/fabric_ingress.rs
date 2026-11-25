@@ -11,6 +11,7 @@
 use std::{num::NonZeroU16, time::Instant};
 
 use arrayvec::ArrayVec;
+use pulsebeam_agent_quic::data_bindings::rtp_profile;
 use pulsebeam_core::fabric::{
     BorrowedPacket, Extension, ExtensionKind, ExtensionWidth, Profile,
     media_source::{
@@ -18,7 +19,7 @@ use pulsebeam_core::fabric::{
         Rejected,
     },
 };
-use pulsebeam_proto::state::{codec_format, validation::QuicRtpBinding};
+use pulsebeam_proto::state::validation::QuicRtpBinding;
 use pulsebeam_rtc::{
     AuthenticatedRtp, CodecProfile, RtpHeader, RtpReceiveCodec, RtpReceiveExtension,
 };
@@ -254,6 +255,8 @@ impl RtpIngressShadow {
             binding.codec.channels,
         ) {
             ("opus", Some(CodecProfile::Opus), Some(2)) => Profile::Opus,
+            ("vp8", Some(CodecProfile::Vp8), None) => Profile::Vp8,
+            ("vp9", Some(CodecProfile::Vp9 { profile_id: 0 }), None) => Profile::Vp9,
             (
                 "h264",
                 Some(CodecProfile::H264 {
@@ -514,11 +517,7 @@ impl QuicRtpIngress {
     }
 
     pub(crate) fn new(binding: QuicRtpBinding<'_>) -> Result<Self, DropReason> {
-        let profile = match binding.format().known_codec() {
-            Some(codec_format::Codec::Opus(_)) => Profile::Opus,
-            Some(codec_format::Codec::H264(_)) => Profile::H264,
-            _ => return Err(DropReason::Binding),
-        };
+        let profile = rtp_profile(&binding.format().mime_type).ok_or(DropReason::Binding)?;
         Ok(Self {
             profile,
             publishes_h264_dd: binding.publishes_h264_dd(),

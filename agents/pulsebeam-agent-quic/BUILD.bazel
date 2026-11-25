@@ -1,3 +1,4 @@
+load("@rules_python//python:defs.bzl", "py_test")
 load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
 load("@rules_rust//cargo:defs.bzl", "extract_cargo_lints")
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_clippy_test", "rust_library", "rust_test", "rustfmt_test")
@@ -80,6 +81,81 @@ rust_test(
     target_compatible_with = ["@platforms//os:linux"],
 )
 
+CODEC_REPLAY_SRCS = ["qa/codec_matrix.rs", "qa/codec_matrix/filtered.rs"]
+CODEC_REPLAY_INPUTS = [
+    "//crates/pulsebeam-testdata:layered_pilot_inputs",
+    "//crates/pulsebeam-testdata:video_matrix_cases",
+    "//crates/pulsebeam-testdata:video_matrix_inputs",
+]
+CODEC_REPLAY_ENV = {
+    "CODEC_CASES": "$(location //crates/pulsebeam-testdata:video_matrix_cases)",
+    "CODEC_FIXTURES": "$${pwd}/crates/pulsebeam-testdata/fixtures",
+}
+CODEC_REPLAY_DEPS = [
+    ":pulsebeam-agent-quic",
+    "//crates/pulsebeam-core",
+    "//crates/pulsebeam-testdata:wire_capture",
+    "@crates//:serde_json",
+    "@crates//:sha2",
+]
+
+rust_test(
+    name = "codec_matrix",
+    srcs = CODEC_REPLAY_SRCS + ["qa/codec_matrix/export.rs"],
+    crate_root = "qa/codec_matrix.rs",
+    compile_data = CODEC_REPLAY_INPUTS,
+    edition = crate_edition(),
+    rustc_env = CODEC_REPLAY_ENV,
+    deps = CODEC_REPLAY_DEPS,
+    target_compatible_with = ["@platforms//os:linux"],
+)
+
+rust_binary(
+    name = "codec_rtp_export",
+    srcs = CODEC_REPLAY_SRCS + ["qa/codec_matrix/export.rs"],
+    crate_root = "qa/codec_matrix.rs",
+    compile_data = CODEC_REPLAY_INPUTS + ["//crates/pulsebeam-testdata:codec_interop_audio_record_inputs"],
+    edition = crate_edition(),
+    rustc_env = CODEC_REPLAY_ENV,
+    deps = CODEC_REPLAY_DEPS + ["//crates/pulsebeam-rtc"],
+    testonly = True,
+    target_compatible_with = ["@platforms//os:linux"],
+)
+
+py_test(
+    name = "codec_interop",
+    size = "medium",
+    srcs = ["//crates/pulsebeam-testdata:scripts/codec_interop.py"],
+    main = "//crates/pulsebeam-testdata:scripts/codec_interop.py",
+    args = [
+        "--python",
+        "$(rootpath @codec_authoring_tools//:bin/python3)",
+        "$(rootpath :codec_rtp_export)",
+        "$(rootpath //crates/pulsebeam-libwebrtc-sys:codec_receive)",
+        "$(rootpath //crates/pulsebeam-testdata:fixtures/codec-inventory-v1.tsv)",
+        "$(rootpath //crates/pulsebeam-simulator:author_data_v1)",
+        "$(rootpath //tools:run-simulations.py)",
+        "$(rootpath //crates/pulsebeam-simulator:sim_binary)",
+        "$(rootpath //crates/pulsebeam-simulator:candidate)",
+    ],
+    data = [
+        ":codec_rtp_export",
+        "//crates/pulsebeam-libwebrtc-sys:codec_receive",
+        "//crates/pulsebeam-simulator:author_data_v1",
+        "//crates/pulsebeam-simulator:candidate",
+        "//crates/pulsebeam-simulator:sim_binary",
+        "//crates/pulsebeam-testdata:codec_interop_audio_record_inputs",
+        "//crates/pulsebeam-testdata:codec_interop_scripts",
+        "//crates/pulsebeam-testdata:fixtures/codec-inventory-v1.tsv",
+        "//crates/pulsebeam-testdata:layered_pilot_inputs",
+        "//crates/pulsebeam-testdata:video_matrix_inputs",
+        "//tools:run-simulations.py",
+        "@codec_authoring_tools//:bin/python3",
+    ],
+    tags = ["no-remote-exec"],
+    target_compatible_with = ["@platforms//os:linux", "@platforms//cpu:x86_64"],
+)
+
 rust_test(
     name = "portable_conformance",
     crate = ":executor-portable",
@@ -105,4 +181,4 @@ rust_binary(
 
 rust_clippy_test(name = "clippy", targets = [":pulsebeam-agent-quic", ":executor", ":executor-sim", ":unit_tests", ":encoded_worker"])
 rust_clippy_test(name = "portable_clippy", targets = [":executor-portable", ":portable_conformance"])
-rustfmt_test(name = "format", targets = [":pulsebeam-agent-quic", ":executor", ":unit_tests", ":encoded_worker"])
+rustfmt_test(name = "format", targets = [":pulsebeam-agent-quic", ":executor", ":unit_tests", ":encoded_worker", ":codec_matrix"])

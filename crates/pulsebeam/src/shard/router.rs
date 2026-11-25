@@ -500,10 +500,8 @@ fn fabric_profile_fits(kind: crate::entity::TrackKind, emission: Emission) -> bo
     use pulsebeam_core::fabric::Profile;
     matches!(
         (kind, emission.profile()),
-        (TrackKind::Audio, Profile::Opus)
-            | (TrackKind::Video, Profile::H264 | Profile::Av1)
-            | (TrackKind::Data, Profile::Data)
-    )
+        (TrackKind::Audio, Profile::Opus) | (TrackKind::Data, Profile::Data)
+    ) || (kind == TrackKind::Video && emission.profile().is_video())
 }
 
 pub(crate) struct ShardRuntime {
@@ -2117,7 +2115,7 @@ impl ShardRuntime {
         use pulsebeam_core::fabric::Profile;
         let rate = match bound.fanout.emission().profile() {
             Profile::Opus => ClockRate::OPUS,
-            Profile::H264 | Profile::Av1 => ClockRate::VIDEO,
+            Profile::H264 | Profile::Av1 | Profile::Vp8 | Profile::Vp9 => ClockRate::VIDEO,
             Profile::Data => return false,
         };
         if let Some((now, reference)) = reference
@@ -3706,6 +3704,50 @@ mod tests {
 
         assert_eq!(runtime.tracks.get(key).unwrap().origin, origin_before);
         assert!(runtime.tracks[key].media.sources().is_empty());
+    }
+
+    #[test]
+    fn unlayered_video_has_one_fabric_source_with_its_negotiated_encoding() {
+        use crate::{entity::TrackKind, route::fabric::RtpSourceEncoding};
+        use pulsebeam_core::fabric::Profile;
+
+        let _rng = pulsebeam_runtime::rand::seeded_rng(1);
+        let mut runtime = ShardRuntime::new(ShardId::new(0));
+        let publisher = SlotMap::<ParticipantHandle, ()>::with_key().insert(());
+        let encoding = RtpSourceEncoding {
+            primary: 73_u32.into(),
+            rid: None,
+            payload_type: 125_u8.into(),
+        };
+        for (profile, label) in [
+            (Profile::H264, "h264"),
+            (Profile::Vp8, "vp8"),
+            (Profile::Vp9, "vp9"),
+            (Profile::Av1, "av1"),
+        ] {
+            let publication = publication_id(TrackKind::Video, label);
+            let track = runtime.install_track(publication, None, Some(publisher), None);
+            let emission = Emission::new(profile, &[]).unwrap();
+            let source = runtime
+                .install_fabric_source(track, publisher, emission, None, Some(encoding))
+                .unwrap();
+            assert_eq!(runtime.fabric_emission(source), Some(emission));
+            assert_eq!(runtime.fabric_source_for_track(track), Some(source));
+            assert!(
+                runtime
+                    .install_fabric_source(
+                        track,
+                        publisher,
+                        emission,
+                        None,
+                        Some(RtpSourceEncoding {
+                            primary: 74_u32.into(),
+                            ..encoding
+                        })
+                    )
+                    .is_none()
+            );
+        }
     }
 
     #[test]

@@ -619,6 +619,18 @@ fn publication_outcome(
             None,
         );
     };
+    if agent.resources.data_record_dd(track_id) && !active.quic_data_record_dd {
+        return (
+            PublicationAdmissionStatus::Rejected,
+            false,
+            Some(ErrorInfo::new(
+                crate::ffi::ErrorCode::Unsupported,
+                "The QUIC peer does not support DATA_V1 record descriptors",
+            )),
+            PublicationExecution::Unavailable,
+            None,
+        );
+    }
     let resource = Resource::Publication {
         kind: wire::TrackKind::Data,
         track_id: track_id.into(),

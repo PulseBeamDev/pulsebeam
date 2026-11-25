@@ -1364,12 +1364,9 @@ fn dd_test_packet(
     attach: bool,
     omitted: bool,
 ) -> OwnedPacket {
-    use pulsebeam_core::{
-        dd::{
-            DdFields, DecodeTargetIndication, DependencyDescriptor, FrameDependencyTemplate,
-            MAX_DD_LEN, TemplateDependencyStructure,
-        },
-        fabric::Extension,
+    use pulsebeam_core::dd::{
+        DdFields, DecodeTargetIndication, DependencyDescriptor, FrameDependencyTemplate,
+        TemplateDependencyStructure,
     };
     let base = FrameDependencyTemplate {
         dtis: [DecodeTargetIndication::Switch].into_iter().collect(),
@@ -1380,7 +1377,6 @@ fn dd_test_packet(
         dtis: [DecodeTargetIndication::NotPresent].into_iter().collect(),
         ..Default::default()
     };
-    let mut raw = [0; MAX_DD_LEN];
     let descriptor = DependencyDescriptor {
         start_of_frame: true,
         end_of_frame: true,
@@ -1399,13 +1395,25 @@ fn dd_test_packet(
         frame_dependencies: if omitted { enhancement } else { base },
         resolution: None,
     };
-    let len = writer.write(&descriptor, &mut raw).unwrap();
+    write_dd_test_packet(writer, Profile::H264, sequence, 9000, &descriptor)
+}
+
+fn write_dd_test_packet(
+    writer: &mut DependencyDescriptorWriter,
+    profile: Profile,
+    sequence: u32,
+    timestamp: u32,
+    descriptor: &pulsebeam_core::dd::DependencyDescriptor,
+) -> OwnedPacket {
+    use pulsebeam_core::{dd::MAX_DD_LEN, fabric::Extension};
+    let mut raw = [0; MAX_DD_LEN];
+    let len = writer.write(descriptor, &mut raw).unwrap();
     FabricPacket::new(
         Header {
-            profile: Profile::H264,
+            profile,
             marker: true,
             sequence,
-            timestamp: 9000,
+            timestamp,
         },
         &[Extension {
             kind: ExtensionKind::DependencyDescriptor,
@@ -1486,6 +1494,60 @@ fn filtered_gap_suspends_without_holding_opaque_whole_source() {
 }
 
 #[test]
+fn stale_filtered_head_fences_live_continuation_until_fresh_entry() {
+    let emission = Emission::new(Profile::H264, &[ExtensionKind::DependencyDescriptor]).unwrap();
+    let mut fanout = SourceFanout::new(emission);
+    let mut destinations = SlotMap::with_key();
+    let destination = destinations.insert(());
+    let branch = fanout
+        .install_filtered_branch(destination, emission, DecodeTarget::new(0).unwrap())
+        .unwrap();
+    let now = Instant::now();
+    let next = now + Duration::from_millis(10);
+    let expired = now + MAX_AGE + Duration::from_millis(1);
+    let mut writer = DependencyDescriptorWriter::new();
+    let mut offer = |fanout: &mut SourceFanout, at, sequence: u16, attach| {
+        let packet = dd_switch_packet(&mut writer, u32::from(sequence), sequence, attach);
+        fanout.offer(at, at, u64::from(sequence), packet).unwrap()
+    };
+    assert_eq!(offer(&mut fanout, now, 100, true).enqueued, 1);
+    assert_eq!(
+        fanout.admit_with_evidence(
+            now,
+            branch,
+            destination,
+            |_| true,
+            |sequence, _, evidence| {
+                assert_eq!(sequence, 100);
+                assert!(evidence.entry);
+                Err::<(), _>("partial carrier admission")
+            }
+        ),
+        Err("partial carrier admission")
+    );
+    assert_eq!(offer(&mut fanout, next, 101, false).enqueued, 1);
+    assert!(fanout.take(expired, branch, destination).is_none());
+    assert_eq!(offer(&mut fanout, expired, 102, false).awaiting_entry, 1);
+    assert!(fanout.take(expired, branch, destination).is_none());
+    assert_eq!(offer(&mut fanout, expired, 103, true).enqueued, 1);
+    assert_eq!(
+        fanout.admit_with_evidence(
+            expired,
+            branch,
+            destination,
+            |_| true,
+            |sequence, _, evidence| {
+                assert!(evidence.entry);
+                assert_eq!(evidence.reset_after, Some(101));
+                assert!(evidence.dd.is_some());
+                Ok::<_, ()>(sequence)
+            }
+        ),
+        Ok(Some(103))
+    );
+}
+
+#[test]
 fn ordered_filter_compacts_only_qualified_omissions() {
     let emission = Emission::new(Profile::H264, &[ExtensionKind::DependencyDescriptor]).unwrap();
     let mut fanout = SourceFanout::new(emission);
@@ -1531,6 +1593,114 @@ fn ordered_filter_compacts_only_qualified_omissions() {
     let later = now + DD_REORDER_WAIT;
     fanout.offer(later, now, 104, packet).unwrap();
     take(&mut fanout, later, (104, 103));
+}
+
+#[test]
+fn one_publication_projects_independent_targets_across_wrap() {
+    for profile in [Profile::H264, Profile::Vp8, Profile::Vp9, Profile::Av1] {
+        prove_independent_decode_targets(profile);
+    }
+}
+
+fn prove_independent_decode_targets(profile: Profile) {
+    use pulsebeam_core::dd::{
+        DecodeTargetIndication::{NotPresent, Switch},
+        DependencyDescriptor, FrameDependencyTemplate, TemplateDependencyStructure,
+        output::Mode,
+    };
+    let spatial = matches!(profile, Profile::Vp9 | Profile::Av1);
+    let timestamp = |seq: u32| {
+        let picture = if spatial && seq == 102 {
+            1
+        } else {
+            seq.saturating_sub(100)
+        };
+        9000_u32.saturating_add(picture.saturating_mul(3000))
+    };
+    let emission = Emission::new(profile, &[ExtensionKind::DependencyDescriptor]).unwrap();
+    let mut fanout = SourceFanout::new(emission);
+    let mut destinations = SlotMap::with_key();
+    let whole = destinations.insert(());
+    let low = destinations.insert(());
+    let high = destinations.insert(());
+    let whole_branch = fanout.install_branch(whole, emission).unwrap();
+    let low_branch = fanout
+        .install_filtered_branch(low, emission, DecodeTarget::new(0).unwrap())
+        .unwrap();
+    let high_branch = fanout
+        .install_filtered_branch(high, emission, DecodeTarget::new(1).unwrap())
+        .unwrap();
+    let templates = [[Switch, Switch], [Switch, NotPresent], [NotPresent, Switch]]
+        .into_iter()
+        .enumerate()
+        .map(|(index, dtis)| FrameDependencyTemplate {
+            spatial_id: u8::from(spatial && index == 2),
+            temporal_id: if spatial {
+                u8::from(index == 1)
+            } else {
+                u8::try_from(index).unwrap()
+            },
+            dtis: dtis.into_iter().collect(),
+            ..Default::default()
+        })
+        .collect::<Vec<_>>();
+    let now = Instant::now();
+    let mut writer = DependencyDescriptorWriter::new();
+    for (seq, index) in (100_u32..).zip([0, 1, 2, 0]) {
+        let dd = DependencyDescriptor {
+            start_of_frame: true,
+            end_of_frame: true,
+            template_id: u8::try_from(index).unwrap(),
+            frame_number: (u16::MAX - 1)
+                .wrapping_add(u16::try_from(seq.saturating_sub(100)).unwrap()),
+            frame_dependencies: templates[index].clone(),
+            attached_structure: (seq == 100).then(|| {
+                Box::new(TemplateDependencyStructure {
+                    decode_target_count: 2,
+                    templates: templates.iter().cloned().collect(),
+                    ..Default::default()
+                })
+            }),
+            ..Default::default()
+        };
+        let packet = write_dd_test_packet(&mut writer, profile, seq, timestamp(seq), &dd);
+        fanout.offer(now, now, u64::from(seq), packet).unwrap();
+    }
+    for (branch, destination, mode, expected) in [
+        (whole_branch, whole, Mode::Whole, &[100, 101, 102, 103][..]),
+        (low_branch, low, Mode::Filtered(0), &[100, 101, 103][..]),
+        (high_branch, high, Mode::Filtered(1), &[100, 102, 103][..]),
+    ] {
+        for (projected, &source) in (100..).zip(expected) {
+            assert_eq!(
+                fanout.admit_with_evidence(
+                    now,
+                    branch,
+                    destination,
+                    |_| true,
+                    |sequence, packet, evidence| {
+                        assert_eq!(
+                            packet.header().timestamp,
+                            timestamp(u32::try_from(sequence).unwrap())
+                        );
+                        assert_eq!(evidence.mode, mode);
+                        let (number, dd) = evidence.dd.unwrap();
+                        assert_eq!(
+                            number,
+                            u64::from(u16::MAX - 1).saturating_add(sequence.saturating_sub(100))
+                        );
+                        assert_eq!(
+                            dd.descriptor.frame_dependencies.spatial_id,
+                            u8::from(spatial && sequence == 102)
+                        );
+                        Ok::<_, ()>((sequence, evidence.output_position))
+                    }
+                ),
+                Ok(Some((source, projected)))
+            );
+        }
+        assert!(fanout.take(now, branch, destination).is_none());
+    }
 }
 
 #[test]

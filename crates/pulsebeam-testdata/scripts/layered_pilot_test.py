@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import unittest
 
-from observe_vp9_pilot import correlate, elementary, inspect_encoder
+from observe_vp9_pilot import correlate, elementary, inspect_encoder, restart_switch
 
 ROOT = Path(__file__).resolve().parent.parent / "fixtures/vp9-pilot"
 
@@ -57,6 +57,17 @@ class LayeredPilot(unittest.TestCase):
                     self.assertEqual((frame["height"], frame["time_base"]), (360, "1/90000"))
                     self.assertEqual([len(bytes.fromhex(x)) for x in frame["planes_sha256"]], [32] * 3)
                 self.assertGreater(len({frame["planes_sha256"][0] for frame in upper_frames}), 1)
+                restart, selected, switched_ivf = restart_switch(received, edges)
+                switch = observation["restart_switch"]
+                self.assertEqual(switch["input_rtp"], restart)
+                self.assertEqual(switch["units"], selected)
+                self.assertEqual(switch["ivf_sha256"], hashlib.sha256(switched_ivf).hexdigest())
+                self.assertEqual([f["pts"] for f in switch["pictures"]], [f["pts"] for f in upper_frames])
+                self.assertEqual([f for f in switch["pictures"] if f["pts"] >= restart],
+                                 [f for f in upper_frames if f["pts"] >= restart])
+                for f in switch["pictures"]:
+                    size = (320, 180) if f["pts"] < restart else (640, 360)
+                    self.assertEqual((f["width"], f["height"], f["time_base"]), (*size, "1/90000"))
                 self.assertIsNotNone(observation["corrupt_retained"]["error"])
                 self.assertNotEqual(experiments["intact"], experiments["corrupt_retained"])
                 loss = observation["lost_lower"]

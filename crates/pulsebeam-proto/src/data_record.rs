@@ -240,7 +240,83 @@ pub fn wire_identity(record: &[u8]) -> Result<FragmentIdentity, Error> {
     Ok(parse(record, false)?.identity)
 }
 
+/// A structurally validated endpoint record projected into the two parts of
+/// the canonical transport record. A peer must agree to carry both parts.
+pub struct CanonicalRecord<'a> {
+    pub identity: FragmentIdentity,
+    pub payload: &'a [u8],
+    pub descriptor: Option<&'a [u8]>,
+}
+
+/// Separate the endpoint descriptor from its payload without interpreting the
+/// bound capture clock. The caller must transport the returned descriptor,
+/// or reject the entire record if the destination cannot represent it.
+pub fn split_endpoint_record<'a>(
+    record: &'a [u8],
+    scratch: &'a mut [u8],
+) -> Result<CanonicalRecord<'a>, Error> {
+    let parsed = parse(record, true)?;
+    let payload = if parsed.descriptor.is_some() {
+        write_projected(record, &parsed, None, scratch)?
+    } else {
+        record
+    };
+    Ok(CanonicalRecord {
+        identity: parsed.identity,
+        payload,
+        descriptor: parsed.descriptor,
+    })
+}
+
+/// Reconstitute the endpoint record from a canonical payload and the bound
+/// descriptor extension. Payloads already containing DD are rejected.
+pub fn restore_endpoint_record<'a>(
+    payload: &'a [u8],
+    descriptor: Option<&[u8]>,
+    scratch: &'a mut [u8],
+) -> Result<&'a [u8], Error> {
+    let parsed = parse(payload, false)?;
+    match descriptor {
+        Some(value) => write_projected(payload, &parsed, Some(value), scratch),
+        None => Ok(payload),
+    }
+}
+
+fn write_projected<'a>(
+    record: &[u8],
+    parsed: &Parsed<'_>,
+    descriptor: Option<&[u8]>,
+    scratch: &'a mut [u8],
+) -> Result<&'a [u8], Error> {
+    let prefix = record.get(..parsed.header_len).ok_or(Error::Length)?;
+    let extra = match descriptor {
+        Some(value) => {
+            check_descriptor_len(value.len())?;
+            value.len().saturating_add(1)
+        }
+        None => 0,
+    };
+    let offset = parsed.header_len.saturating_add(extra);
+    let len = offset.saturating_add(parsed.bytes.len());
+    let output = scratch.get_mut(..len).ok_or(Error::Length)?;
+    let (header, payload) = output.split_at_mut(offset);
+    let (head, field) = header.split_at_mut(parsed.header_len);
+    head.copy_from_slice(prefix);
+    let flags = head.get_mut(3).ok_or(Error::Length)?;
+    if let Some(value) = descriptor {
+        let (length, body) = field.split_first_mut().ok_or(Error::Length)?;
+        *length = u8::try_from(value.len()).map_err(|_| Error::DescriptorLength)?;
+        body.copy_from_slice(value);
+        *flags |= DESCRIPTOR;
+    } else {
+        *flags &= !DESCRIPTOR;
+    }
+    payload.copy_from_slice(parsed.bytes);
+    Ok(output)
+}
+
 struct Parsed<'a> {
+    header_len: usize,
     identity: FragmentIdentity,
     unit_len: u32,
     capture: Option<(i64, Option<u32>)>,
@@ -306,6 +382,7 @@ fn parse(record: &[u8], allow_descriptor: bool) -> Result<Parsed<'_>, Error> {
     let unit_len = u32::from_be_bytes(read(record, 18)?);
     check_fragment(unit_len, identity.count, identity.index, bytes.len())?;
     Ok(Parsed {
+        header_len: offset,
         identity,
         unit_len,
         capture,

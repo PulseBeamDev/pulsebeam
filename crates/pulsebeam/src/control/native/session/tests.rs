@@ -332,6 +332,7 @@ fn quic_opus_preparation_checks_capabilities_and_receiver_source_format() {
         incarnation: 9,
         primary_ssrc: 11,
         publishes_h264_dd: false,
+        video_dd: None,
         codec: Some(wire::RtpCodecParameters {
             payload_type: Some(111),
             format: Some(format.clone()),
@@ -473,6 +474,7 @@ fn data_v1_publication_keeps_its_exact_transport_in_the_execution_plan() {
         version,
         incarnation: u64::MAX,
         delivery: wire::DataV1Delivery::Unreliable as i32,
+        record_dd: false,
     };
     let quic = wire::track_binding::Transport::QuicDataV1(quic_parameters);
     let spec = |delivery: wire::DataDelivery, transport| {
@@ -610,6 +612,7 @@ fn source(reference: u64, label: &str) -> wire::Track {
         kind: Some(wire::track::Kind::Data(wire::DataTrack {
             capture_clock: None,
             delivery: wire::DataDelivery::Ordered as i32,
+            record_dd: false,
         })),
     }
 }
@@ -624,6 +627,7 @@ fn live(session: &NativeSession, work: &Preparation) -> wire::LiveResource {
         track.kind = Some(wire::track::Kind::Data(wire::DataTrack {
             capture_clock: data.capture_clock.clone(),
             delivery: data.delivery,
+            record_dd: false,
         }));
     }
     wire::LiveResource {
@@ -1767,7 +1771,8 @@ fn data_projection_uses_actual_metadata_without_a_payload_format_or_activity_cla
             observed.kind,
             Some(wire::track::Kind::Data(wire::DataTrack {
                 capture_clock: None,
-                delivery: expected as i32
+                delivery: expected as i32,
+                record_dd: false,
             }))
         );
         let descriptor = observed.clone();
@@ -2548,7 +2553,7 @@ fn fabric_receiver_offers_are_versioned_and_rotate_with_the_authenticated_source
         connection_id: connection,
         track_id: Some(TrackId::new("cursor").unwrap()),
     };
-    let fabric = |source| {
+    let fabric = |source, record_dd| {
         Track::native_data_publication(
             meta.clone(),
             DataLane::Latest,
@@ -2557,10 +2562,12 @@ fn fabric_receiver_offers_are_versioned_and_rotate_with_the_authenticated_source
                 id: "source-clock".into(),
                 epoch: source,
             }),
+            record_dd,
         )
     };
-    let first = fabric(10);
-    let legacy = fabric(0);
+    let first = fabric(10, false);
+    let capable = fabric(10, true);
+    let legacy = fabric(0, false);
     let subscription = wire::ResourceSpec {
         settings: Some(wire::ResourceSettings {
             enabled: Some(true),
@@ -2615,7 +2622,7 @@ fn fabric_receiver_offers_are_versioned_and_rotate_with_the_authenticated_source
     assert_eq!(offer(&mut model, &legacy), (0, None));
     assert_eq!(offer(&mut model, &first), (1, Some((10, 1))));
     assert_eq!(offer(&mut model, &first), (1, Some((10, 1))));
-    assert_eq!(offer(&mut model, &fabric(11)), (2, Some((11, 2))));
+    assert_eq!(offer(&mut model, &fabric(11, false)), (2, Some((11, 2))));
     assert_eq!(offer(&mut model, &legacy), (3, None));
     assert_eq!(offer(&mut model, &first), (4, Some((10, 3))));
     let mut other_subscriber = session();
@@ -2667,11 +2674,17 @@ fn fabric_receiver_offers_are_versioned_and_rotate_with_the_authenticated_source
             .is_empty()
     );
     let work = model.take_preparation().unwrap().unwrap();
-    let stale = fabric(11);
+    let stale = fabric(11, false);
     assert!(
         matches!(model.compile_execution(&work, None, |_| Some(super::super::ResolvedSource { track: &stale, publisher: &publisher })),
         Err(error) if error.code() == wire::FailureCode::Incompatible)
     );
+    assert!(matches!(
+        model.compile_execution(&work, None, |_| Some(super::super::ResolvedSource {
+            track: &capable, publisher: &publisher,
+        })),
+        Err(error) if error.code() == wire::FailureCode::Incompatible
+    ));
     use crate::control::native::{PreparedResource, ReceiveTransport, ReceiverPreparation};
     let ExecutionAction::Prepare {
         resource: PreparedResource::Receiver(ReceiverPreparation::Ready(plan)),
@@ -2703,12 +2716,13 @@ fn fabric_receiver_offers_are_versioned_and_rotate_with_the_authenticated_source
         pulsebeam_runtime::time::Instant::now(),
     );
     input(&mut quic, vec![present(1, 1, subscription)]).unwrap();
-    assert_eq!(offer(&mut quic, &first), (1, Some((10, 5))));
+    assert_eq!(offer(&mut quic, &capable), (1, Some((10, 5))));
     let parameters = wire::QuicDataV1Parameters {
         binding_id: 2,
         version: u32::from(pulsebeam_proto::data_endpoint::DATA_V1),
         incarnation: 19,
         delivery: wire::DataV1Delivery::Latest as i32,
+        record_dd: true,
     };
     quic.receive_input(
         &codec::encode_quic_client(&report(
@@ -2726,7 +2740,7 @@ fn fabric_receiver_offers_are_versioned_and_rotate_with_the_authenticated_source
     } = quic
         .compile_execution(&work, None, |_| {
             Some(super::super::ResolvedSource {
-                track: &first,
+                track: &capable,
                 publisher: &publisher,
             })
         })
@@ -2803,6 +2817,7 @@ fn logical_subscription_keeps_one_reservation_across_scoped_receiver_replacement
             DataLane::Latest,
             std::num::NonZeroU64::new(source_ids.get()),
             None,
+            false,
         )
     };
     let assert_state =

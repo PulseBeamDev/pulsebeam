@@ -51,6 +51,7 @@ fn confirmation(
                     kind: Some(wire::track::Kind::Data(wire::DataTrack {
                         capture_clock: None,
                         delivery: wire::DataDelivery::Ordered as i32,
+                        record_dd: false,
                     })),
                 }),
             },

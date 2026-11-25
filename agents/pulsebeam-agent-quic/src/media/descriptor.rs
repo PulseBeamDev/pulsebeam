@@ -18,6 +18,7 @@ pub enum WriteError {
     /// The first packet needs frame facts; continuations need an open frame
     /// with the same timestamp and the next source sequence.
     FramePosition,
+    MissingReference,
     Encode(DdWriteError),
 }
 
@@ -65,18 +66,37 @@ impl Writer {
         packet: &Packet<P>,
         facts: Option<&DependencyDescriptor>,
     ) -> Result<Encoded, WriteError> {
+        self.write_if(packet, facts, |_| true)?
+            .ok_or(WriteError::FramePosition)
+    }
+
+    /// A declined offer leaves both the descriptor structure and packet cursor
+    /// unchanged. The sink must not enqueue anything when declining.
+    pub fn write_if<P>(
+        &mut self,
+        packet: &Packet<P>,
+        facts: Option<&DependencyDescriptor>,
+        accept: impl FnOnce(Extension<'_>) -> bool,
+    ) -> Result<Option<Encoded>, WriteError> {
         let mut bytes = [0; MAX_DD_LEN];
+        let accept_bytes = |value: &[u8]| {
+            accept(Extension {
+                kind: ExtensionKind::DependencyDescriptor,
+                value,
+            })
+        };
         let len = match (packet.first, facts, &mut self.frame) {
             (true, Some(facts), None) => {
-                self.validate_dependencies(facts)
-                    .map_err(WriteError::Encode)?;
                 let mut descriptor = facts.clone();
                 descriptor.start_of_frame = true;
                 descriptor.end_of_frame = packet.last;
-                let len = self
+                let Some(len) = self
                     .codec
-                    .write(&descriptor, &mut bytes)
-                    .map_err(WriteError::Encode)?;
+                    .write_if(&descriptor, &mut bytes, accept_bytes)
+                    .map_err(WriteError::Encode)?
+                else {
+                    return Ok(None);
+                };
                 if !packet.last {
                     descriptor.start_of_frame = false;
                     descriptor.attached_structure = None;
@@ -93,11 +113,15 @@ impl Writer {
                 if frame.timestamp == packet.timestamp
                     && frame.next_sequence == packet.sequence =>
             {
-                frame.descriptor.end_of_frame = packet.last;
-                let len = self
+                let mut descriptor = frame.descriptor.clone();
+                descriptor.end_of_frame = packet.last;
+                let Some(len) = self
                     .codec
-                    .write(&frame.descriptor, &mut bytes)
-                    .map_err(WriteError::Encode)?;
+                    .write_if(&descriptor, &mut bytes, accept_bytes)
+                    .map_err(WriteError::Encode)?
+                else {
+                    return Ok(None);
+                };
                 frame.next_sequence = packet.sequence.wrapping_add(1);
                 if packet.last {
                     self.frame = None;
@@ -106,27 +130,65 @@ impl Writer {
             }
             _ => return Err(WriteError::FramePosition),
         };
-        Ok(Encoded { bytes, len })
+        Ok(Some(Encoded { bytes, len }))
+    }
+}
+
+/// One ordered frame-number space for the lifetime of an encoded publication.
+/// Encoder facts describe the packetized spatial frame, not the whole picture.
+pub struct Publisher {
+    writer: Writer,
+    next_frame: u16,
+    next_packet: Option<u32>,
+    completed_frames: u16,
+}
+
+impl Publisher {
+    pub fn new(first_frame: u16) -> Self {
+        Self {
+            writer: Writer::default(),
+            next_frame: first_frame,
+            next_packet: None,
+            completed_frames: 0,
+        }
     }
 
-    fn validate_dependencies(&self, facts: &DependencyDescriptor) -> Result<(), DdWriteError> {
-        let structure = facts
-            .attached_structure
-            .as_deref()
-            .or_else(|| self.codec.structure())
-            .ok_or(DdWriteError::NoStructure)?;
-        let template = structure
-            .template(facts.template_id)
-            .ok_or(DdWriteError::UnknownTemplateId(facts.template_id))?;
-        let dependencies = &facts.frame_dependencies;
-        if dependencies.spatial_id != template.spatial_id
-            || dependencies.temporal_id != template.temporal_id
-            || (!facts.fields.custom_dtis() && dependencies.dtis != template.dtis)
-            || (!facts.fields.custom_fdiffs() && dependencies.frame_diffs != template.frame_diffs)
-            || (!facts.fields.custom_chains() && dependencies.chain_diffs != template.chain_diffs)
+    pub fn next_frame(&self) -> u16 {
+        self.next_frame
+    }
+
+    /// Offer a packet and its descriptor as one operation. Facts are required
+    /// on the first packet only. Frame differences refer to already completed
+    /// frames in this publication; frames may share an RTP timestamp.
+    pub fn write_if<P>(
+        &mut self,
+        packet: &Packet<P>,
+        facts: Option<&DependencyDescriptor>,
+        accept: impl FnOnce(Extension<'_>) -> bool,
+    ) -> Result<bool, WriteError> {
+        if self.next_packet.is_some_and(|next| next != packet.sequence)
+            || (packet.marker && !packet.last)
+            || facts.is_some_and(|facts| facts.frame_number != self.next_frame)
         {
-            return Err(DdWriteError::Inconsistent);
+            return Err(WriteError::FramePosition);
         }
-        Ok(())
+        if facts.is_some_and(|facts| {
+            facts
+                .frame_dependencies
+                .frame_diffs
+                .iter()
+                .any(|&diff| diff == 0 || diff > self.completed_frames)
+        }) {
+            return Err(WriteError::MissingReference);
+        }
+        if self.writer.write_if(packet, facts, accept)?.is_none() {
+            return Ok(false);
+        }
+        self.next_packet = Some(packet.sequence.wrapping_add(1));
+        if packet.last {
+            self.next_frame = self.next_frame.wrapping_add(1);
+            self.completed_frames = self.completed_frames.saturating_add(1);
+        }
+        Ok(true)
     }
 }

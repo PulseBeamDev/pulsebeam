@@ -33,7 +33,7 @@ def _native_build_impl(ctx):
     if asan:
         args.add("--asan")
     if capture:
-        executable = ctx.actions.declare_file(prefix + "vp9_capture")
+        executable = ctx.actions.declare_file(prefix + capture.basename[:-3])
         args.add("--build", executable.dirname + "/build")
         args.add("--capture-source", capture)
         args.add("--capture-output", executable)

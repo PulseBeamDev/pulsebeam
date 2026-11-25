@@ -117,7 +117,10 @@ pub(super) fn track(id: &str, participant: &str, track_id: &str, kind: MediaKind
         room_id: "room".into(),
         track_id: track_id.into(),
         kind: Some(match kind {
-            MediaKind::Video => state::track::Kind::Video(state::VideoTrack { format }),
+            MediaKind::Video => state::track::Kind::Video(state::VideoTrack {
+                format,
+                ..Default::default()
+            }),
             MediaKind::Audio => state::track::Kind::Audio(state::AudioTrack { format }),
         }),
     }

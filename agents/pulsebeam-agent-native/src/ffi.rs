@@ -332,6 +332,7 @@ impl LocalDataTrack {
             runtime: self.runtime.publish_with_options(
                 options.delivery.unwrap_or_default().into(),
                 options.capture_clock,
+                options.record_dd.unwrap_or(false),
             )?,
         }))
     }

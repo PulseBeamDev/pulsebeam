@@ -552,7 +552,7 @@ fn quic_reserves_nonreused_payload_ids_without_rtc_effects() {
                 mode: crate::TopicMode::Ordered,
             }),
             None,
-            state::DataV1Delivery::Reliable,
+            (state::DataV1Delivery::Reliable, false),
             ids,
             effects,
         )
@@ -591,7 +591,7 @@ fn quic_reserves_nonreused_payload_ids_without_rtc_effects() {
         track_id: "voice".into(),
     };
     session.capabilities.rtp = state::RtpCapabilities::default();
-    assert!(quic_rtp_binding(session, &audio, None, false, &mut ids).is_none());
+    assert!(quic_rtp_binding(session, &audio, None, None, None, &mut ids).is_none());
     session
         .capabilities
         .rtp
@@ -602,7 +602,7 @@ fn quic_reserves_nonreused_payload_ids_without_rtc_effects() {
             ))),
             ..Default::default()
         });
-    let binding = quic_rtp_binding(session, &audio, None, false, &mut ids).unwrap();
+    let binding = quic_rtp_binding(session, &audio, None, None, None, &mut ids).unwrap();
     assert!(
         matches!(&binding.transport, Some(state::track_binding::Transport::QuicRtp(parameters)) if parameters.binding_id == 3 && parameters.primary_ssrc != 0)
     );
@@ -615,14 +615,74 @@ fn quic_reserves_nonreused_payload_ids_without_rtc_effects() {
     );
     session.state.stage(audio.clone(), Some(spec)).unwrap();
     assert_eq!(
-        quic_rtp_binding(session, &audio, None, false, &mut ids),
+        quic_rtp_binding(session, &audio, None, None, None, &mut ids),
         Some(binding)
     );
     let receiver = Resource::Reception(MediaSlot::RemoteAudio(0));
-    let binding =
-        quic_rtp_binding(session, &receiver, Some("publication"), false, &mut ids).unwrap();
     assert!(
-        matches!(&binding.transport, Some(state::track_binding::Transport::QuicRtp(parameters)) if parameters.binding_id == 4)
+        quic_rtp_binding(
+            session,
+            &receiver,
+            Some("publication"),
+            None,
+            None,
+            &mut ids
+        )
+        .is_none()
+    );
+    let source_format = state::CodecFormat::from(state::codec_format::Codec::Opus(
+        state::OpusParameters::default(),
+    ));
+    let disclosed =
+        crate::RtpSource::new("publication".into(), "stage".into(), source_format.clone());
+    let disclosed_binding = quic_rtp_binding(
+        session,
+        &receiver,
+        Some("publication"),
+        None,
+        Some(&disclosed),
+        &mut ids,
+    )
+    .unwrap();
+    assert!(matches!(&disclosed_binding.transport,
+        Some(state::track_binding::Transport::QuicRtp(parameters))
+            if parameters.binding_id == 4 && parameters.codec.as_ref().and_then(|codec| codec.format.as_ref()) == Some(&source_format)
+    ));
+    session
+        .state
+        .apply_batch(state::ServerStateBatch {
+            records: vec![confirmed(
+                state::resource_key::Key::Publication("publication".into()),
+                0,
+                state::confirmed_state::Value::Track(state::Track {
+                    publication_id: "publication".into(),
+                    participant_id: "remote".into(),
+                    room_id: "stage".into(),
+                    track_id: "voice".into(),
+                    kind: Some(state::track::Kind::Audio(state::AudioTrack {
+                        format: Some(source_format.clone()),
+                    })),
+                }),
+            )],
+            ..Default::default()
+        })
+        .unwrap();
+    let binding = quic_rtp_binding(
+        session,
+        &receiver,
+        Some("publication"),
+        None,
+        None,
+        &mut ids,
+    )
+    .unwrap();
+    let Some(state::track_binding::Transport::QuicRtp(parameters)) = &binding.transport else {
+        panic!("QUIC receiver binding");
+    };
+    assert_eq!(parameters.binding_id, 5);
+    assert_eq!(
+        parameters.codec.as_ref().unwrap().format.as_ref(),
+        Some(&source_format)
     );
     let spec = subscription(
         "publication".into(),
@@ -633,10 +693,47 @@ fn quic_reserves_nonreused_payload_ids_without_rtc_effects() {
     );
     session.state.stage(receiver.clone(), Some(spec)).unwrap();
     assert_eq!(
-        quic_rtp_binding(session, &receiver, Some("publication"), false, &mut ids),
+        quic_rtp_binding(
+            session,
+            &receiver,
+            Some("publication"),
+            None,
+            None,
+            &mut ids
+        ),
         Some(binding)
     );
-    assert!(quic_rtp_binding(session, &receiver, Some("another"), false, &mut ids).is_none());
+    assert!(quic_rtp_binding(session, &receiver, Some("another"), None, None, &mut ids).is_none());
+
+    let video = Resource::Publication {
+        kind: state::TrackKind::Video,
+        track_id: "camera".into(),
+    };
+    let vp8 = Some(super::super::quic::PublicationProfile::UnlayeredVideo(
+        "video/vp8",
+    ));
+    session
+        .capabilities
+        .rtp
+        .codecs
+        .push(state::RtpCodecCapability {
+            format: Some(state::CodecFormat::from(state::codec_format::Codec::Vp8(
+                Default::default(),
+            ))),
+            ..Default::default()
+        });
+    assert!(quic_rtp_binding(session, &video, None, vp8, None, &mut ids).is_none());
+    session.quic_directional_video_dd = true;
+    let selected = quic_rtp_binding(session, &video, None, vp8, None, &mut ids).unwrap();
+    let Some(state::track_binding::Transport::QuicRtp(parameters)) = selected.transport else {
+        panic!("QUIC video binding");
+    };
+    assert_eq!(parameters.binding_id, 6);
+    assert_eq!(parameters.video_dd, Some(state::QuicVideoDd::Absent as i32));
+    assert_eq!(
+        parameters.codec.unwrap().format.unwrap().mime_type,
+        "video/vp8"
+    );
     assert!(effects.is_empty());
 }
 
@@ -865,6 +962,7 @@ fn active_control_declares_only_prepared_payloads_and_retries_the_exact_serializ
                     kind: Some(state::track::Kind::Data(state::DataTrack {
                         capture_clock: None,
                         delivery: state::DataDelivery::Ordered as i32,
+                        record_dd: false,
                     })),
                 }),
                 execution: state::ExecutionStatus::Installed as i32,
@@ -1501,6 +1599,7 @@ fn received_resource_state_projects_prejoin_and_owner_local_intent() {
     let crate::ResourceResult::Owned { owner: publication } = agent
         .resource(crate::ResourceCommand::DeclareDataPublication {
             capture_clock: None,
+            record_dd: false,
             spec: crate::TrackSpec::Data {
                 track_id: "events".into(),
                 delivery: crate::TopicMode::Ordered,
@@ -1548,6 +1647,7 @@ fn logical_offer_selects_exact_identity_without_discovery_and_gates_pending_disa
         room_id: selector.room.clone(),
         track_id: selector.track_id.clone(),
         kind: Some(state::track::Kind::Video(state::VideoTrack {
+            av1_whole_source: false,
             format: Some(state::CodecFormat::from(state::codec_format::Codec::Vp8(
                 state::Vp8Parameters {},
             ))),
@@ -1618,6 +1718,7 @@ fn logical_offer_selects_exact_identity_without_discovery_and_gates_pending_disa
     );
     let desired = crate::DesiredState {
         video: vec![crate::VideoSubscription {
+            decode_target: None,
             slot: 0,
             publication_id: track.publication_id.clone(),
             selector: Some(selector.clone()),

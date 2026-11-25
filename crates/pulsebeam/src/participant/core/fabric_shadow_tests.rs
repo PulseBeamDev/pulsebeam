@@ -334,6 +334,7 @@ fn endpoint_pair_with_control(
         rtp_mode,
         data_stream,
         native,
+        None,
         [
             "127.0.0.1:6000".parse().unwrap(),
             "127.0.0.1:5000".parse().unwrap(),
@@ -348,6 +349,7 @@ fn endpoint_pair_at(
     rtp_mode: bool,
     data_stream: Option<NonZeroU16>,
     native: bool,
+    video_profile: Option<pulsebeam_core::fabric::Profile>,
     [local, remote]: [SocketAddr; 2],
 ) -> (EndpointPair, String) {
     let clock = net::ReceiveTime {
@@ -356,11 +358,46 @@ fn endpoint_pair_at(
             .checked_add(Duration::from_millis(12345))
             .unwrap(),
     };
+    use pulsebeam_core::fabric::Profile;
     let mut config = str0m::RtcConfig::new()
         .clear_codecs()
         .enable_opus(kind == str0m::media::MediaKind::Audio)
-        .enable_h264(kind == str0m::media::MediaKind::Video)
+        .enable_h264(kind == str0m::media::MediaKind::Video && video_profile.is_none())
+        .enable_vp8(video_profile == Some(Profile::Vp8))
+        .enable_vp9(video_profile == Some(Profile::Vp9))
+        .enable_av1(video_profile == Some(Profile::Av1))
         .set_rtp_mode(rtp_mode);
+    let capabilities = video_profile.map(|profile| {
+        use pulsebeam_rtc::{
+            PacketFeedbackKind, RtpCapabilities, RtpCodecCapability, RtpCodecParameters,
+            RtpConfigurationLimits,
+        };
+        let (name, fmtp) = match profile {
+            Profile::Vp8 => ("vp8", Default::default()),
+            Profile::Vp9 => ("vp9", [("profile-id".into(), "0".into())].into()),
+            Profile::Av1 => ("av1", Default::default()),
+            _ => panic!("unsupported fixture codec"),
+        };
+        RtpCapabilities {
+            codecs: vec![RtpCodecCapability {
+                parameters: RtpCodecParameters {
+                    name: name.into(),
+                    clock_rate: 90_000,
+                    channels: None,
+                    fmtp,
+                    feedback: ["transport-cc".into()].into(),
+                },
+                repair: false,
+            }],
+            extensions: crate::control::rtp::transport_capabilities(
+                &crate::control::rtp::capabilities(),
+            )
+            .unwrap()
+            .extensions,
+            feedback: PacketFeedbackKind::TransportWide,
+            limits: RtpConfigurationLimits::default(),
+        }
+    });
     if kind == str0m::media::MediaKind::Video && direction == str0m::media::Direction::RecvOnly {
         use pulsebeam_core::dd;
         config = config.set_extension(
@@ -404,7 +441,7 @@ fn endpoint_pair_at(
                 offer.to_sdp_string(),
                 crate::control::ufrag::test_credentials(),
                 clock,
-                None,
+                capabilities,
             )
             .unwrap();
     let (mid, codec) = match direction {
@@ -1739,6 +1776,7 @@ async fn filtered_fabric_dd_switch_on_installed_fid_and_nonfragmenting_socket() 
         true,
         None,
         false,
+        None,
         [local.local_addr(), remote.local_addr().unwrap()],
     );
     let [primary, repair] = crate::stock_rtc::answer_fid(&answer, mid.as_str());
@@ -3526,24 +3564,178 @@ fn prove_filtered_dd_switch(
 }
 
 #[test]
+fn native_video_reaches_a_protected_rtc_receiver_on_one_timeline() {
+    use crate::{
+        route::fabric::local::Emission,
+        rtp::{
+            fabric_egress::{
+                CaptureClock, EndpointHints, OutputLeg, SenderLeg, SourceMetadata, Vad, timeline,
+            },
+            fabric_ingress::QuicRtpIngress,
+        },
+        shard::core::FabricRtpFixture,
+    };
+    use pulsebeam_agent_quic::data_bindings::FabricOffer;
+    use pulsebeam_core::fabric::{FabricPacket, Header, MAJOR, Profile, packet::MAX_PACKET_BYTES};
+    use pulsebeam_proto::state::{self as wire, validation::QuicRtpBinding};
+    use str0m::media::{Direction, MediaKind};
+
+    let capabilities = crate::control::rtp::quic_capabilities(true);
+    let profiles = [Profile::H264, Profile::Vp8, Profile::Vp9, Profile::Av1];
+    assert_eq!(capabilities.codecs.len(), profiles.len() + 1);
+    for (candidate, profile) in capabilities.codecs.into_iter().skip(1).zip(profiles) {
+        let explicit = profile != Profile::H264;
+        let ((mut peer, receiver, mid, _, receiver_pt, _), _) = endpoint_pair_at(
+            MediaKind::Video,
+            Direction::RecvOnly,
+            true,
+            None,
+            false,
+            explicit.then_some(profile),
+            [
+                "127.0.0.1:6000".parse().unwrap(),
+                "127.0.0.1:5000".parse().unwrap(),
+            ],
+        );
+        let parameters = wire::QuicRtpParameters {
+            binding_id: 7,
+            incarnation: 9,
+            primary_ssrc: 39,
+            codec: Some(wire::RtpCodecParameters {
+                payload_type: Some(125),
+                format: candidate.format,
+                ..Default::default()
+            }),
+            video_dd: explicit.then_some(wire::QuicVideoDd::Absent as i32),
+            ..Default::default()
+        };
+        let binding = QuicRtpBinding::compile(&parameters, wire::TrackKind::Video).unwrap();
+        let offer = FabricOffer::CURRENT;
+        let tx = offer
+            .bind_rtp_publisher(offer, profile, false, explicit.then_some(false))
+            .unwrap()
+            .agreement;
+        let emission =
+            Emission::from_wire_profile(profile as u8, tx.extension_mask(), MAJOR, tx.revision())
+                .unwrap();
+        let mut shard = FabricRtpFixture::with_quic_publisher(
+            receiver,
+            binding,
+            emission,
+            peer.clock.monotonic,
+        );
+        peer.connect(shard.receiver());
+        let form = match peer.output_form.unwrap() {
+            pulsebeam_rtc::RtpExtensionForm::OneByte => ExtensionForm::OneByte,
+            pulsebeam_rtc::RtpExtensionForm::TwoByte => ExtensionForm::TwoByte,
+            pulsebeam_rtc::RtpExtensionForm::Mixed => ExtensionForm::Mixed,
+        };
+        let leg = SenderLeg::new(
+            OutputLeg {
+                mid,
+                primary: None,
+                max_wire_bytes: 1200,
+                replace_queued: false,
+            },
+            EndpointHints::new(profile, form, &[]).unwrap(),
+            timeline::Timeline::new(500, 1500, 90_000, 64).unwrap(),
+        );
+        assert!(shard.bind_output(
+            leg,
+            SourceMetadata {
+                vad: Vad::On,
+                capture: CaptureClock::Unmapped,
+                same_topology: true,
+            }
+        ));
+        let ingress = QuicRtpIngress::new(binding).unwrap();
+        let mut output_ssrc = None;
+        for (index, timestamp) in [9000, 9900].into_iter().enumerate() {
+            let payload = [0x24, u8::try_from(index).unwrap()];
+            let packet = FabricPacket::new(
+                Header {
+                    profile,
+                    marker: true,
+                    sequence: 100 + u32::try_from(index).unwrap(),
+                    timestamp,
+                },
+                &[],
+                payload,
+            )
+            .unwrap();
+            let mut bytes = [0; MAX_PACKET_BYTES];
+            let len = tx.write(&packet, &mut bytes).unwrap();
+            let packet = tx.decode(&bytes[..len]).unwrap();
+            shard.ingest_quic(ingress, &packet, peer.clock.monotonic);
+            for _ in 0..200 {
+                peer.step_receiver(&mut shard);
+                if peer.received.len() > index {
+                    break;
+                }
+            }
+            let packet = &peer.received[index];
+            assert_eq!(packet.payload.as_ref(), payload);
+            assert!(packet.header.marker);
+            assert_eq!(*packet.header.payload_type, receiver_pt);
+            assert_eq!(
+                packet.header.ssrc,
+                *output_ssrc.get_or_insert(packet.header.ssrc)
+            );
+            assert_eq!(
+                packet.header.sequence_number,
+                500 + u16::try_from(index).unwrap()
+            );
+            assert_eq!(packet.header.timestamp, 1500 + timestamp - 9000);
+        }
+    }
+}
+
+#[test]
 fn installed_fabric_branch_projects_authenticated_rtp_without_waiting_for_holes() {
+    use pulsebeam_core::fabric::Profile;
+    for profile in [
+        Profile::Opus,
+        Profile::H264,
+        Profile::Vp8,
+        Profile::Vp9,
+        Profile::Av1,
+    ] {
+        prove_authenticated_rtp_timeline(profile);
+    }
+}
+
+fn prove_authenticated_rtp_timeline(profile: pulsebeam_core::fabric::Profile) {
     use crate::rtp::fabric_egress::{
         CaptureClock, EndpointHints, OutputLeg, SenderLeg, SourceMetadata, Vad, timeline,
     };
     use crate::shard::core::FabricRtpFixture;
     use pulsebeam_core::fabric::{FabricPacket, Header, Profile};
 
-    let (mut pair, receiver_config, mid, _, payload_type) = media_pair(
-        str0m::media::MediaKind::Audio,
-        str0m::media::Direction::RecvOnly,
-        true,
-    );
-    let (mut publisher, publisher_config, publisher_leg, publisher_mid, publisher_pt) = media_pair(
-        str0m::media::MediaKind::Audio,
-        str0m::media::Direction::SendOnly,
-        true,
-    );
-    let mut shard = FabricRtpFixture::new(publisher_config, receiver_config, Profile::Opus, None);
+    use str0m::media::{Direction, MediaKind};
+    let (kind, selected) = match profile {
+        Profile::Opus => (MediaKind::Audio, None),
+        Profile::H264 => (MediaKind::Video, None),
+        _ => (MediaKind::Video, Some(profile)),
+    };
+    let pair_for = |direction| {
+        endpoint_pair_at(
+            kind,
+            direction,
+            true,
+            None,
+            false,
+            selected,
+            [
+                "127.0.0.1:6000".parse().unwrap(),
+                "127.0.0.1:5000".parse().unwrap(),
+            ],
+        )
+        .0
+    };
+    let (mut pair, receiver_config, mid, _, payload_type, _) = pair_for(Direction::RecvOnly);
+    let (mut publisher, publisher_config, publisher_leg, publisher_mid, publisher_pt, _) =
+        pair_for(Direction::SendOnly);
+    let mut shard = FabricRtpFixture::new(publisher_config, receiver_config, profile, None);
     publisher.connect(shard.publisher());
     pair.connect(shard.receiver());
     let form = match pair.output_form.unwrap() {
@@ -3551,7 +3743,8 @@ fn installed_fabric_branch_projects_authenticated_rtp_without_waiting_for_holes(
         pulsebeam_rtc::RtpExtensionForm::TwoByte => ExtensionForm::TwoByte,
         pulsebeam_rtc::RtpExtensionForm::Mixed => ExtensionForm::Mixed,
     };
-    let endpoint = EndpointHints::new(Profile::Opus, form, &[]).unwrap();
+    let endpoint = EndpointHints::new(profile, form, &[]).unwrap();
+    let clock_rate = profile.clock_rate();
     let leg = SenderLeg::new(
         OutputLeg {
             mid,
@@ -3560,7 +3753,7 @@ fn installed_fabric_branch_projects_authenticated_rtp_without_waiting_for_holes(
             replace_queued: false,
         },
         endpoint,
-        timeline::Timeline::new(500, 1500, 48_000, 64).unwrap(),
+        timeline::Timeline::new(500, 1500, clock_rate, 64).unwrap(),
     );
     let source = SourceMetadata {
         vad: Vad::On,
@@ -3571,7 +3764,7 @@ fn installed_fabric_branch_projects_authenticated_rtp_without_waiting_for_holes(
     let packet = |sequence, timestamp, marker| {
         FabricPacket::new(
             Header {
-                profile: Profile::Opus,
+                profile,
                 marker,
                 sequence,
                 timestamp,
@@ -3606,7 +3799,7 @@ fn installed_fabric_branch_projects_authenticated_rtp_without_waiting_for_holes(
             Some(&mut |rtp: AuthenticatedRtp<'_>| {
                 ingress = Some(
                     RtpIngressShadow::bind_whole(
-                        Profile::Opus,
+                        profile,
                         rtp.binding(),
                         ExtensionForm::OneByte,
                         &[],
@@ -3633,23 +3826,48 @@ fn installed_fabric_branch_projects_authenticated_rtp_without_waiting_for_holes(
     shard.use_negotiated_publication(publication, None);
     let clock_origin = publisher.clock.monotonic.max(pair.clock.monotonic);
     publisher.clock.monotonic = clock_origin;
-    // Start this real admission/egress trace 400 Opus ticks before a canonical
+    // Start this real admission/egress trace 400 media ticks before a canonical
     // wrap, at a modern instant that remains inside the fixture's UTC policy.
-    let wrap_tick = (19_000_u128 << 32) - 400;
-    let canonical_ns = i64::try_from((wrap_tick * 1_000_000_000).div_ceil(48_000)).unwrap();
+    let wraps = if profile == Profile::Opus {
+        19_000_u128
+    } else {
+        38_000
+    };
+    let wrap_tick = (wraps << 32) - 400;
+    let canonical_ns =
+        i64::try_from((wrap_tick * 1_000_000_000).div_ceil(u128::from(clock_rate))).unwrap();
     assert!(shard.attach_publisher_ingress_with_clock(
         ingress.unwrap(),
         clock_origin,
         pulsebeam_clock::time::GlobalInstant::from_nanos(canonical_ns),
     ));
     assert!(shard.bind_output(leg, source));
+    use pulsebeam_agent_quic::data_bindings::FabricOffer;
+    use pulsebeam_core::fabric::{MAJOR, packet::MAX_PACKET_BYTES};
+    let offer = FabricOffer::CURRENT;
+    let receiver_dd = matches!(profile, Profile::Vp8 | Profile::Vp9 | Profile::Av1)
+        .then_some(pulsebeam_proto::state::QuicVideoDd::Accept);
+    let agreement = offer
+        .bind_rtp_receiver(offer, profile, receiver_dd)
+        .unwrap()
+        .agreement;
+    let emission = crate::route::fabric::local::Emission::from_wire_profile(
+        profile as u8,
+        agreement.extension_mask(),
+        MAJOR,
+        agreement.revision(),
+    )
+    .unwrap();
+    let native_receiver = shard.add_quic_receiver(emission);
     let (mailbox_control, mut mailbox) = shard.bind_publisher_mailbox(publisher.clock.monotonic);
     let mut frames = Vec::new();
     let mut first_timestamp = None;
+    // Use exact nanosecond intervals at both source clock rates.
+    let step = if profile == Profile::Opus { 300 } else { 315 };
     for (index, (sequence, timestamp, marker, output_sequence, output_timestamp)) in [
         (100_u32, 1000_u32, false, 500_u16, 1500_u32),
-        (102, 1600, true, 502, 2100),
-        (101, 1300, false, 501, 1800),
+        (102, 1000 + 2 * step, true, 502, 1500 + 2 * step),
+        (101, 1000 + step, false, 501, 1500 + step),
     ]
     .into_iter()
     .enumerate()
@@ -3672,7 +3890,8 @@ fn installed_fabric_branch_projects_authenticated_rtp_without_waiting_for_holes(
         assert_eq!(offer.packet.header().marker, marker);
         let origin = *first_timestamp.get_or_insert_with(|| {
             let elapsed = offer.arrival.duration_since(clock_origin).as_nanos();
-            let ticks = (u128::try_from(canonical_ns).unwrap() + elapsed) * 48_000 / 1_000_000_000;
+            let ticks = (u128::try_from(canonical_ns).unwrap() + elapsed) * u128::from(clock_rate)
+                / 1_000_000_000;
             u32::try_from(ticks % (1u128 << 32)).unwrap()
         });
         assert!(origin > u32::MAX - 600, "trace must start before wrap");
@@ -3687,6 +3906,13 @@ fn installed_fabric_branch_projects_authenticated_rtp_without_waiting_for_holes(
         assert_eq!(offer.packet.payload(), opaque);
         assert_eq!(offer.packet.remaining_hops(), 7);
         let now = publisher.clock.monotonic;
+        let mut wire = [0; MAX_PACKET_BYTES];
+        let len = shard.read_quic_receiver(native_receiver, now, agreement, &mut wire);
+        let native = agreement.decode(&wire[..len]).unwrap();
+        assert_eq!(native.header().profile, profile);
+        assert_eq!(native.header().marker, marker);
+        assert_eq!(native.header().timestamp, expected_canonical);
+        assert_eq!(native.payload(), opaque);
         pair.clock.monotonic = now;
         for _ in 0..200 {
             pair.step_receiver(&mut shard);
@@ -3706,6 +3932,7 @@ fn installed_fabric_branch_projects_authenticated_rtp_without_waiting_for_holes(
     }
     assert_eq!(pair.received.len(), 3);
     let mut leg = shard.receiver().media_egress.remove(&mid).unwrap().leg;
+    shard.keep_only_rtc_receiver(native_receiver);
     drop(mailbox);
     drop(mailbox_control);
 
@@ -3755,7 +3982,7 @@ fn installed_fabric_branch_projects_authenticated_rtp_without_waiting_for_holes(
     assert_eq!(cut_packet.header.sequence_number, 506);
     assert!(cut_packet.header.marker);
     let cut_timestamp = u64::from(cut_packet.header.timestamp);
-    assert_eq!(cut_timestamp, 248_500);
+    assert_eq!(cut_timestamp, 200_500 + u64::from(clock_rate));
     let old_report = cut_packet.last_sender_info.expect("report before cut");
     assert_eq!(old_report.sender_packet_count, 3);
 
@@ -3779,7 +4006,9 @@ fn installed_fabric_branch_projects_authenticated_rtp_without_waiting_for_holes(
             .unwrap()
             .as_nanos();
         let elapsed_tai = utc + 37_000_000_000 - 8_000_082_000;
-        let ticks = u32::try_from((elapsed_tai * 48_000 / 1_000_000_000) % (1u128 << 32)).unwrap();
+        let ticks =
+            u32::try_from((elapsed_tai * u128::from(clock_rate) / 1_000_000_000) % (1u128 << 32))
+                .unwrap();
         let expected = ticks.wrapping_add(anchor_rtp.wrapping_sub(canonical));
         assert!(u32::try_from(rtp).unwrap().abs_diff(expected) <= 1);
     };

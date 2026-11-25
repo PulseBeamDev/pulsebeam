@@ -11,19 +11,28 @@ use pulsebeam_core::{
     rtp_serial::extend_u32,
 };
 
-use super::jitter::GapReason;
+use super::{av1, jitter::GapReason, vp8, vp9};
+
+mod av1_unit;
+mod recovery;
+mod vp8_unit;
+mod vp9_unit;
+pub use recovery::{Recovery, VideoRecovery};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Codec {
     Opus,
     H264,
+    Vp8,
+    Vp9,
+    Av1,
 }
 
 impl Codec {
     pub const fn clock_rate(self) -> u32 {
         match self {
             Self::Opus => 48_000,
-            Self::H264 => 90_000,
+            Self::H264 | Self::Vp8 | Self::Vp9 | Self::Av1 => 90_000,
         }
     }
 }
@@ -65,6 +74,26 @@ pub enum Access {
 }
 
 #[derive(Debug)]
+pub enum Framing {
+    Whole,
+    Vp8 {
+        descriptor: vp8::Descriptor,
+        /// Byte ranges in `Unit::data`, ordered by partition ID.
+        partitions: Vec<Range<usize>>,
+    },
+    Vp9 {
+        descriptor: vp9::Descriptor,
+        end_of_picture: bool,
+    },
+    Av1 {
+        layer: av1::Layer,
+        sequence_header: Option<Range<usize>>,
+        new_sequence: bool,
+        end_of_picture: bool,
+    },
+}
+
+#[derive(Debug)]
 pub struct Unit<S> {
     pub source: S,
     pub codec: Codec,
@@ -76,6 +105,7 @@ pub struct Unit<S> {
     pub arrived_at: Instant,
     pub access: Access,
     pub dependency: Dependency,
+    pub framing: Framing,
     pub data: Vec<u8>,
 }
 
@@ -94,6 +124,8 @@ pub enum Cause {
     Gap(GapReason),
     MissingBoundary,
     InvalidVideo(DepacketizationError),
+    InvalidFraming,
+    UnitLimit,
     EmptyOpus,
 }
 
@@ -161,10 +193,41 @@ impl Video {
 pub struct Depacketizer<S> {
     source: S,
     codec: Codec,
-    video: Option<Video>,
+    video: Option<VideoAssembly>,
     sequence: Option<u64>,
     dd: DependencyDescriptorReader,
     report: Option<SenderReport>,
+}
+
+enum VideoAssembly {
+    H264(Video),
+    Vp8(vp8_unit::Assembly),
+    Vp9(vp9_unit::Assembly),
+    Av1(av1_unit::Assembly),
+}
+
+impl VideoAssembly {
+    fn lose(&mut self) {
+        match self {
+            Self::H264(video) => video.lose(),
+            Self::Vp8(video) => video.lose(),
+            Self::Vp9(video) => video.lose(),
+            Self::Av1(video) => video.lose(),
+        }
+    }
+
+    fn push(
+        &mut self,
+        packet: &OrderedPacket<'_>,
+        dependency: Dependency,
+    ) -> Result<Option<Parts>, (Cause, u64)> {
+        match self {
+            Self::H264(video) => video.push(packet, dependency),
+            Self::Vp8(video) => video.push(packet, dependency),
+            Self::Vp9(video) => video.push(packet, dependency),
+            Self::Av1(video) => video.push(packet, dependency),
+        }
+    }
 }
 
 impl<S: Copy + Eq> Depacketizer<S> {
@@ -172,7 +235,19 @@ impl<S: Copy + Eq> Depacketizer<S> {
         Self {
             source,
             codec,
-            video: (codec == Codec::H264).then(Video::default),
+            video: match codec {
+                Codec::Opus => None,
+                Codec::H264 => Some(VideoAssembly::H264(Video::default())),
+                Codec::Vp8 => Some(VideoAssembly::Vp8(vp8_unit::Assembly::new(
+                    h264::MAX_ACCESS_UNIT_SIZE,
+                ))),
+                Codec::Vp9 => Some(VideoAssembly::Vp9(vp9_unit::Assembly::new(
+                    h264::MAX_ACCESS_UNIT_SIZE,
+                ))),
+                Codec::Av1 => Some(VideoAssembly::Av1(av1_unit::Assembly::new(
+                    h264::MAX_ACCESS_UNIT_SIZE,
+                ))),
+            },
             sequence: None,
             dd: DependencyDescriptorReader::new(),
             report: None,
@@ -182,13 +257,28 @@ impl<S: Copy + Eq> Depacketizer<S> {
     /// Apply a tighter video assembly bound before supplying any input.
     #[must_use]
     pub fn with_video_limit(mut self, bytes: std::num::NonZeroUsize) -> Self {
-        if let Some(video) = &mut self.video {
-            *video = Video {
-                codec: h264::Depacketizer::with_max_access_unit_size(
-                    bytes.get().min(h264::MAX_ACCESS_UNIT_SIZE),
-                ),
-                ..Video::default()
-            };
+        let limit = bytes.get().min(h264::MAX_ACCESS_UNIT_SIZE);
+        match &mut self.video {
+            Some(VideoAssembly::H264(video)) => {
+                *video = Video {
+                    codec: h264::Depacketizer::with_max_access_unit_size(limit),
+                    ..Video::default()
+                };
+            }
+            Some(VideoAssembly::Vp8(video)) => *video = vp8_unit::Assembly::new(limit),
+            Some(VideoAssembly::Vp9(video)) => *video = vp9_unit::Assembly::new(limit),
+            Some(VideoAssembly::Av1(video)) => video.set_limit(limit),
+            None => {}
+        }
+        self
+    }
+
+    /// Use marker-delimited AV1 only for a negotiated unlayered source without
+    /// dependency descriptors. Set this before supplying any input.
+    #[must_use]
+    pub fn with_av1_whole_source(mut self) -> Self {
+        if let Some(VideoAssembly::Av1(video)) = &mut self.video {
+            video.set_whole_source();
         }
         self
     }
@@ -285,6 +375,7 @@ impl<S: Copy + Eq> Depacketizer<S> {
                 arrived_at: packet.arrived_at,
                 access: Access::Audio,
                 dependency,
+                framing: Framing::Whole,
                 data: packet.payload.to_vec(),
             },
         };
@@ -298,6 +389,7 @@ impl<S: Copy + Eq> Depacketizer<S> {
             arrived_at: unit.arrived_at,
             access: unit.access,
             dependency: unit.dependency,
+            framing: unit.framing,
             data: unit.data,
         })))
     }
@@ -308,6 +400,7 @@ struct Parts {
     arrived_at: Instant,
     access: Access,
     dependency: Dependency,
+    framing: Framing,
     data: Vec<u8>,
 }
 
@@ -376,6 +469,7 @@ impl Video {
                     arrived_at: frame.arrived_at,
                     access,
                     dependency: frame.dependency,
+                    framing: Framing::Whole,
                     data,
                 }))
             }
@@ -390,6 +484,30 @@ impl Video {
     }
 }
 
+fn checked_dependency(
+    dependency: &Dependency,
+    start: bool,
+    end: bool,
+    spatial_id: u8,
+    temporal_id: Option<u8>,
+) -> Result<Option<u16>, Cause> {
+    let dd = match dependency {
+        Dependency::Parsed(dd)
+            if dd.spatial_id() == spatial_id
+                && temporal_id.is_none_or(|id| dd.temporal_id() == id) =>
+        {
+            dd.mandatory()
+        }
+        Dependency::MissingContext(dd) => dd.clone(),
+        Dependency::Absent => return Ok(None),
+        _ => return Err(Cause::InvalidFraming),
+    };
+    if dd.start_of_frame != start || dd.end_of_frame != end {
+        return Err(Cause::MissingBoundary);
+    }
+    Ok(Some(dd.frame_number))
+}
+
 fn read_dependency(reader: &mut DependencyDescriptorReader, bytes: Option<&[u8]>) -> Dependency {
     let Some(bytes) = bytes else {
         return Dependency::Absent;
@@ -400,67 +518,6 @@ fn read_dependency(reader: &mut DependencyDescriptorReader, bytes: Option<&[u8]>
             read_mandatory(bytes).map_or_else(Dependency::Invalid, Dependency::MissingContext)
         }
         Err(error) => Dependency::Invalid(error),
-    }
-}
-
-/// Optional conservative video recovery. Complete dependent units remain
-/// visible to the standalone depacketizer but are withheld by this stage.
-pub struct VideoRecovery<S> {
-    source: S,
-    awaiting_independent: bool,
-    refresh_taken: bool,
-}
-
-#[derive(Debug)]
-pub enum Recovery<S> {
-    Deliver(Event<S>),
-    Withheld(Unit<S>),
-    Retired,
-}
-
-impl<S: Copy + Eq> VideoRecovery<S> {
-    pub fn new(source: S) -> Self {
-        Self {
-            source,
-            awaiting_independent: true,
-            refresh_taken: false,
-        }
-    }
-
-    pub fn apply(&mut self, event: Event<S>) -> Recovery<S> {
-        match event {
-            Event::Discontinuity(gap) if gap.source == self.source => {
-                self.mark_loss();
-                Recovery::Deliver(Event::Discontinuity(gap))
-            }
-            Event::Unit(unit) if unit.source == self.source => {
-                if unit.access == Access::IndependentVideo {
-                    self.awaiting_independent = false;
-                } else if self.awaiting_independent && unit.access == Access::DependentVideo {
-                    return Recovery::Withheld(unit);
-                }
-                Recovery::Deliver(Event::Unit(unit))
-            }
-            _ => Recovery::Retired,
-        }
-    }
-
-    /// Fence dependent video after application-side loss, such as overflow.
-    pub fn mark_loss(&mut self) {
-        if !self.awaiting_independent {
-            self.awaiting_independent = true;
-            self.refresh_taken = false;
-        }
-    }
-
-    /// Return one generation-scoped refresh request per recovery interval.
-    /// Retain it on transport backpressure; no depacketizer sends feedback.
-    pub fn take_refresh(&mut self) -> Option<S> {
-        if !self.awaiting_independent || self.refresh_taken {
-            return None;
-        }
-        self.refresh_taken = true;
-        Some(self.source)
     }
 }
 

@@ -60,6 +60,7 @@ fn data_v1_send_does_not_bypass_an_owned_declaration_or_binding() {
         .resource(ResourceCommand::DeclareDataPublication {
             capture_clock: None,
             spec: declaration.clone(),
+            record_dd: false,
         })
         .unwrap()
     else {
@@ -98,6 +99,7 @@ fn owned_send_requires_authoritative_installation_not_discovery() {
                 kind: Some(state::track::Kind::Data(state::DataTrack {
                     capture_clock: None,
                     delivery: state::DataDelivery::Lossy as i32,
+                    record_dd: false,
                 })),
             }),
         )],

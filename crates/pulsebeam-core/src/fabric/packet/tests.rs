@@ -18,6 +18,143 @@ const OLD_OFFER: Offer = Offer {
 };
 
 #[test]
+fn video_dd_contract_requires_both_directional_facts() {
+    let profile = Profile::H264;
+    let offer = Offer::current(profile, 0);
+    let media = FabricPacket::new(
+        Header {
+            profile,
+            marker: true,
+            sequence: 42,
+            timestamp: 90,
+        },
+        &[],
+        [0x65, 0x90],
+    )
+    .unwrap();
+    let mut bytes = [0; MAX_PACKET_BYTES];
+    let plain = Agreement::negotiate_video(
+        profile,
+        offer,
+        VideoDdEmission::None,
+        offer,
+        VideoDdReception::Accepted,
+    )
+    .unwrap();
+    let len = plain.write(&media, &mut bytes).unwrap();
+    assert!(plain.decode(&bytes[..len]).is_ok());
+    assert_eq!(
+        plain.decode(OLD_H264),
+        Err(WireError::UnnegotiatedExtension)
+    );
+    let layered = Agreement::negotiate_video(
+        profile,
+        offer,
+        VideoDdEmission::EveryPacket,
+        offer,
+        VideoDdReception::Required,
+    )
+    .unwrap();
+    assert!(layered.decode(OLD_H264).is_ok());
+    assert_eq!(
+        layered.decode(&bytes[..len]),
+        Err(WireError::RequiredFeature)
+    );
+    assert_eq!(
+        layered.write(&media, &mut bytes),
+        Err(WireError::RequiredFeature)
+    );
+    for (emission, reception) in [
+        (VideoDdEmission::None, VideoDdReception::Required),
+        (VideoDdEmission::EveryPacket, VideoDdReception::None),
+    ] {
+        assert_eq!(
+            Agreement::negotiate_video(profile, offer, emission, offer, reception),
+            Err(WireError::RequiredFeature)
+        );
+    }
+    let legacy = Offer {
+        supported: 0,
+        ..offer
+    };
+    assert_eq!(
+        Agreement::negotiate_video(
+            profile,
+            offer,
+            VideoDdEmission::EveryPacket,
+            legacy,
+            VideoDdReception::Accepted,
+        ),
+        Err(WireError::RequiredFeature)
+    );
+}
+
+#[test]
+fn mapped_dd_replaces_only_the_descriptor_and_cannot_omit_required_dd() {
+    let current = Offer::current(Profile::H264, 0);
+    let required = Agreement::negotiate_video(
+        Profile::H264,
+        current,
+        VideoDdEmission::EveryPacket,
+        current,
+        VideoDdReception::Required,
+    )
+    .unwrap();
+    let source = required.decode(OLD_H264).unwrap();
+    let dd = [0xc0, 0, 0x80];
+    let mut bytes = [0; MAX_PACKET_BYTES];
+    let len = required
+        .write_mapped_dd(&source, Some(&dd), &mut bytes)
+        .unwrap();
+    let mapped = required.decode(&bytes[..len]).unwrap();
+    assert_eq!(mapped.header(), source.header());
+    assert_eq!(mapped.payload(), source.payload());
+    assert!(mapped.extensions().eq([
+        Extension {
+            kind: ExtensionKind::DependencyDescriptor,
+            value: &dd
+        },
+        source.extensions().nth(1).unwrap(),
+    ]));
+    assert_eq!(
+        required.write_mapped_dd(&source, None, &mut bytes),
+        Err(WireError::RequiredFeature)
+    );
+
+    let optional = Agreement::negotiate(Profile::H264, current, current).unwrap();
+    let len = optional.write_mapped_dd(&source, None, &mut bytes).unwrap();
+    let omitted = optional.decode(&bytes[..len]).unwrap();
+    assert!(omitted.extensions().eq(source.extensions().skip(1)));
+}
+
+#[test]
+fn vp_profiles_have_distinct_canonical_ids() {
+    for (profile, other, bytes) in [
+        (
+            Profile::Vp8,
+            Profile::Vp9,
+            [100, 1, 0, 0, 0, 42, 0, 0, 0, 90, 0, 0, 0x10],
+        ),
+        (
+            Profile::Vp9,
+            Profile::Vp8,
+            [101, 1, 0, 0, 0, 42, 0, 0, 0, 90, 0, 0, 0x0c],
+        ),
+    ] {
+        let offer = Offer::current(profile, 0);
+        let agreement = Agreement::negotiate(profile, offer, offer).unwrap();
+        let packet = agreement.decode(&bytes).unwrap();
+        assert_eq!(packet.header().profile, profile);
+        let mut encoded = [0; 13];
+        assert_eq!(agreement.write(&packet, &mut encoded), Ok(bytes.len()));
+        assert_eq!(encoded, bytes);
+        let offer = Offer::current(other, 0);
+        let wrong_agreement = Agreement::negotiate(other, offer, offer).unwrap();
+        assert!(wrong_agreement.decode(&bytes).is_err());
+    }
+}
+
+#[test]
 fn old_publisher_and_reader_keep_dependency_timing_and_payload() {
     let current = Offer::current(Profile::H264, 0);
     let inbound = Agreement::negotiate(Profile::H264, OLD_OFFER, current).unwrap();

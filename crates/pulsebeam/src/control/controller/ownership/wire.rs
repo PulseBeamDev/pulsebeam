@@ -670,6 +670,7 @@ mod tests {
                         publication_id: crate::entity::PublicationId::mint().to_string(),
                         track_id: "camera".into(),
                         kind: Some(track::Kind::Video(VideoTrack {
+                            av1_whole_source: false,
                             format: Some(CodecFormat {
                                 mime_type: "video/vp8".into(),
                                 clock_rate: 90_000,
@@ -996,6 +997,7 @@ mod tests {
         fact.descriptor.kind = Some(track::Kind::Data(DataTrack {
             capture_clock: None,
             delivery: DataDelivery::Ordered as i32,
+            record_dd: false,
         }));
         fact.layers = Box::new([]);
         let (_, owner) = snapshot.first().unwrap();

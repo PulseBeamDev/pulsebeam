@@ -254,7 +254,10 @@ impl Switcher {
     /// forwards every frame; a lowered target sheds temporal/spatial layers for
     /// finer bitrate control than dropping a whole simulcast encoding.
     pub fn set_decode_target(&mut self, target: DecodeTargetSelection) {
-        self.selector.set_target(target);
+        if self.selector.target() != target {
+            self.active_input_holes.clear();
+            self.selector.set_target(target);
+        }
     }
 
     pub fn decode_target(&self) -> DecodeTargetSelection {
@@ -320,6 +323,7 @@ impl Switcher {
                                 self.timeline.drop_input();
                             }
                         }
+                        FrameDecision::Unqualified => {}
                         FrameDecision::Forward => {
                             // A sender can discard a queued frame tail before
                             // assigning wire sequence numbers. Preserve its
@@ -383,9 +387,12 @@ impl Switcher {
             let Some(pkt) = cache.get(input_seq.into()) else {
                 continue;
             };
+            self.active_input_holes.remove(&input_seq);
+            if self.selector.decide(pkt) != FrameDecision::Forward {
+                continue;
+            }
             let mut out = pkt.clone();
             self.timeline.rewrite(&mut out);
-            self.active_input_holes.remove(&input_seq);
             self.note_emitted(out.seq_no, out.marker, out.rtp_ts.numer());
             emit(out);
         }

@@ -69,10 +69,21 @@ async fn native_platform_smoke() -> TestResult<()> {
         let context = bidi.browsing_context().top_level().await?;
         navigate(&bidi, &context, fixture.url("tests/uniffi-fixture.html")).await?;
         let _: () = evaluate_json(&bidi, &context, LOAD).await?;
-        let connected: bool = evaluate_json(&bidi, &context, &live)
+        let video: serde_json::Value = evaluate_json(&bidi, &context, &live)
             .await
             .map_err(|error| format!("connected-media: {error}"))?;
-        assert!(connected);
+        assert_eq!(video["videoCodec"], "video/H264");
+        assert!(
+            video["framesEncoded"]
+                .as_u64()
+                .is_some_and(|frames| frames > 1)
+        );
+        assert!(
+            video["framesDecoded"]
+                .as_u64()
+                .is_some_and(|frames| frames > 1)
+        );
+        eprintln!("Chromium live video: {video}");
         let rejections: usize = evaluate_json(
             &bidi,
             &context,

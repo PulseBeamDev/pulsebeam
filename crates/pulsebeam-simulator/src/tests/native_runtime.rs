@@ -416,6 +416,7 @@ impl LatestData {
                 core_ffi::DataPublishOptions {
                     delivery: Some(core_ffi::DataDelivery::Latest),
                     capture_clock: Some(Self::capture_clock()),
+                    record_dd: None,
                 },
             ))?,
             receiver: agent
@@ -455,6 +456,7 @@ impl LatestData {
                 nanos,
                 uncertainty_ns: Some(1_000),
             }),
+            fragment_descriptors: None,
         };
         let ready = async {
             loop {

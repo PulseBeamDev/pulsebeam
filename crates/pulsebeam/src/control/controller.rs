@@ -618,7 +618,8 @@ impl AdmissionProjection<'_> {
                     .map(Message::encode_to_vec)
                     .unwrap_or_default();
                 let result = Accepted {
-                    fabric: pulsebeam_agent_quic::data_bindings::FabricOffer::CURRENT,
+                    fabric: pulsebeam_agent_quic::data_bindings::FabricOffer::CURRENT
+                        .with_data_record_dd(),
                     connection: *pending.connection_id().as_bytes(),
                     participant: pending.participant.as_str(),
                     room: pending.scope.room.as_ref().map(RoomId::as_str),

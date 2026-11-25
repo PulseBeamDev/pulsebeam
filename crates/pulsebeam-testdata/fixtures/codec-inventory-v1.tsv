@@ -1,0 +1,81 @@
+codec	mode	sender	wire	fixed_target	switch	loss	gap
+AV1	L1T1	av1-v1/L1T1/encoded.tsv	av1-v1/L1T1/wire.bin	av1-v1/L1T1/observations.json	n/a	av1-v1/L1T1/faults.json	
+AV1	L1T2	av1-v1/L1T2/encoded.tsv	av1-v1/L1T2/wire.bin	av1-v1/L1T2/observations.json	av1-v1/L1T2/faults.json	av1-v1/L1T2/faults.json	
+AV1	L1T3	av1-v1/L1T3/encoded.tsv	av1-v1/L1T3/wire.bin	av1-v1/L1T3/observations.json	av1-v1/L1T3/faults.json	av1-v1/L1T3/faults.json	
+AV1	L2T1	av1-v1/L2T1/encoded.tsv	av1-v1/L2T1/wire.bin	av1-v1/L2T1/observations.json	av1-v1/L2T1/faults.json	av1-v1/L2T1/faults.json	
+AV1	L2T1h	av1-v1/L2T1h/encoded.tsv	av1-v1/L2T1h/wire.bin	av1-v1/L2T1h/observations.json	av1-v1/L2T1h/faults.json	av1-v1/L2T1h/faults.json	
+AV1	L2T2	av1-v1/L2T2/encoded.tsv	av1-v1/L2T2/wire.bin	av1-v1/L2T2/observations.json	av1-v1/L2T2/faults.json	av1-v1/L2T2/faults.json	
+AV1	L2T2h	av1-v1/L2T2h/encoded.tsv	av1-v1/L2T2h/wire.bin	av1-v1/L2T2h/observations.json	av1-v1/L2T2h/faults.json	av1-v1/L2T2h/faults.json	
+AV1	L2T3	av1-v1/L2T3/encoded.tsv	av1-v1/L2T3/wire.bin	av1-v1/L2T3/observations.json	av1-v1/L2T3/faults.json	av1-v1/L2T3/faults.json	
+AV1	L2T3h	av1-v1/L2T3h/encoded.tsv	av1-v1/L2T3h/wire.bin	av1-v1/L2T3h/observations.json	av1-v1/L2T3h/faults.json	av1-v1/L2T3h/faults.json	
+AV1	L3T1	av1-v1/L3T1/encoded.tsv	av1-v1/L3T1/wire.bin	av1-v1/L3T1/observations.json	av1-v1/L3T1/faults.json	av1-v1/L3T1/faults.json	
+AV1	L3T1h	av1-v1/L3T1h/encoded.tsv	av1-v1/L3T1h/wire.bin	av1-v1/L3T1h/observations.json	av1-v1/L3T1h/faults.json	av1-v1/L3T1h/faults.json	
+AV1	L3T2	av1-v1/L3T2/encoded.tsv	av1-v1/L3T2/wire.bin	av1-v1/L3T2/observations.json	av1-v1/L3T2/faults.json	av1-v1/L3T2/faults.json	
+AV1	L3T2h	av1-v1/L3T2h/encoded.tsv	av1-v1/L3T2h/wire.bin	av1-v1/L3T2h/observations.json	av1-v1/L3T2h/faults.json	av1-v1/L3T2h/faults.json	
+AV1	L3T3	av1-v1/L3T3/encoded.tsv	av1-v1/L3T3/wire.bin	av1-v1/L3T3/observations.json	av1-v1/L3T3/faults.json	av1-v1/L3T3/faults.json	
+AV1	L3T3h	av1-v1/L3T3h/encoded.tsv	av1-v1/L3T3h/wire.bin	av1-v1/L3T3h/observations.json	av1-v1/L3T3h/faults.json	av1-v1/L3T3h/faults.json	
+AV1	S2T1	av1-v1/S2T1/encoded.tsv	av1-v1/S2T1/wire.bin	av1-v1/S2T1/observations.json	av1-v1/S2T1/faults.json	av1-v1/S2T1/faults.json	
+AV1	S2T1h	av1-v1/S2T1h/encoded.tsv	av1-v1/S2T1h/wire.bin	av1-v1/S2T1h/observations.json	av1-v1/S2T1h/faults.json	av1-v1/S2T1h/faults.json	
+AV1	S2T2	av1-v1/S2T2/encoded.tsv	av1-v1/S2T2/wire.bin	av1-v1/S2T2/observations.json	av1-v1/S2T2/faults.json	av1-v1/S2T2/faults.json	
+AV1	S2T2h	av1-v1/S2T2h/encoded.tsv	av1-v1/S2T2h/wire.bin	av1-v1/S2T2h/observations.json	av1-v1/S2T2h/faults.json	av1-v1/S2T2h/faults.json	
+AV1	S2T3	av1-v1/S2T3/encoded.tsv	av1-v1/S2T3/wire.bin	av1-v1/S2T3/observations.json	av1-v1/S2T3/faults.json	av1-v1/S2T3/faults.json	
+AV1	S2T3h	av1-v1/S2T3h/encoded.tsv	av1-v1/S2T3h/wire.bin	av1-v1/S2T3h/observations.json	av1-v1/S2T3h/faults.json	av1-v1/S2T3h/faults.json	
+AV1	S3T1	missing	missing	missing	missing	missing	pinned libaom sender fails first delta after independent layer keyframes
+AV1	S3T1h	missing	missing	missing	missing	missing	pinned libaom sender fails first delta after independent layer keyframes
+AV1	S3T2	missing	missing	missing	missing	missing	three-spatial independent sender not qualified
+AV1	S3T2h	missing	missing	missing	missing	missing	three-spatial independent sender not qualified
+AV1	S3T3	missing	missing	missing	missing	missing	three-spatial independent sender not qualified
+AV1	S3T3h	missing	missing	missing	missing	missing	three-spatial independent sender not qualified
+AV1	L2T2_KEY	av1-v1/L2T2_KEY/encoded.tsv	av1-v1/L2T2_KEY/wire.bin	av1-v1/L2T2_KEY/observations.json	av1-v1/L2T2_KEY/faults.json	av1-v1/L2T2_KEY/faults.json	
+AV1	L2T2_KEY_SHIFT	av1-v1/L2T2_KEY_SHIFT/encoded.tsv	av1-v1/L2T2_KEY_SHIFT/wire.bin	av1-v1/L2T2_KEY_SHIFT/observations.json	av1-v1/L2T2_KEY_SHIFT/faults.json	av1-v1/L2T2_KEY_SHIFT/faults.json	
+AV1	L2T3_KEY	av1-v1/L2T3_KEY/encoded.tsv	av1-v1/L2T3_KEY/wire.bin	av1-v1/L2T3_KEY/observations.json	av1-v1/L2T3_KEY/faults.json	av1-v1/L2T3_KEY/faults.json	
+AV1	L2T3_KEY_SHIFT	missing	missing	missing	missing	missing	pinned libwebrtc has no matching mode or controller
+AV1	L3T1_KEY	av1-v1/L3T1_KEY/encoded.tsv	av1-v1/L3T1_KEY/wire.bin	av1-v1/L3T1_KEY/observations.json	av1-v1/L3T1_KEY/faults.json	av1-v1/L3T1_KEY/faults.json	
+AV1	L3T2_KEY	av1-v1/L3T2_KEY/encoded.tsv	av1-v1/L3T2_KEY/wire.bin	av1-v1/L3T2_KEY/observations.json	av1-v1/L3T2_KEY/faults.json	av1-v1/L3T2_KEY/faults.json	
+AV1	L3T2_KEY_SHIFT	missing	missing	missing	missing	missing	pinned libwebrtc has no matching mode or controller
+AV1	L3T3_KEY	av1-v1/L3T3_KEY/encoded.tsv	av1-v1/L3T3_KEY/wire.bin	av1-v1/L3T3_KEY/observations.json	av1-v1/L3T3_KEY/faults.json	av1-v1/L3T3_KEY/faults.json	
+AV1	L3T3_KEY_SHIFT	missing	missing	missing	missing	missing	pinned libwebrtc has no matching mode or controller
+H264	L1T1	h264-v1/L1T1/encoded.tsv	h264-v1/L1T1/wire.bin	h264-v1/L1T1/observations.json	n/a	h264-v1/L1T1/faults.json	
+H264	L1T2	h264-v1/L1T2/encoded.tsv	h264-v1/L1T2/wire.bin	h264-v1/L1T2/observations.json	h264-v1/L1T2/faults.json	h264-v1/L1T2/faults.json	
+H264	L1T3	h264-v1/L1T3/encoded.tsv	h264-v1/L1T3/wire.bin	h264-v1/L1T3/observations.json	h264-v1/L1T3/faults.json	h264-v1/L1T3/faults.json	
+VP8	L1T1	vp8-v1/L1T1/encoded.tsv	vp8-v1/L1T1/wire.bin	vp8-v1/L1T1/observations.json	n/a	vp8-v1/L1T1/faults.json	
+VP8	L1T2	vp8-v1/L1T2/encoded.tsv	vp8-v1/L1T2/wire.bin	vp8-v1/L1T2/observations.json	vp8-v1/L1T2/faults.json	vp8-v1/L1T2/faults.json	
+VP8	L1T3	vp8-v1/L1T3/encoded.tsv	vp8-v1/L1T3/wire.bin	vp8-v1/L1T3/observations.json	vp8-v1/L1T3/faults.json	vp8-v1/L1T3/faults.json	
+VP9	L1T1	vp9-v1/L1T1/encoded.tsv	vp9-v1/L1T1/wire.bin	vp9-v1/L1T1/observations.json	n/a	vp9-v1/L1T1/faults.json	
+VP9	L1T2	vp9-v1/L1T2/encoded.tsv	vp9-v1/L1T2/wire.bin	vp9-v1/L1T2/observations.json	vp9-v1/L1T2/faults.json	vp9-v1/L1T2/faults.json	
+VP9	L1T3	vp9-v1/L1T3/encoded.tsv	vp9-v1/L1T3/wire.bin	vp9-v1/L1T3/observations.json	vp9-v1/L1T3/faults.json	vp9-v1/L1T3/faults.json	
+VP9	L2T1	vp9-pilot/L2T1/encoded.tsv	vp9-pilot/L2T1/wire.bin	vp9-pilot/L2T1/observations.json	vp9-pilot/L2T1/observations.json	vp9-pilot/L2T1/observations.json	
+VP9	L2T1h	vp9-v1/L2T1h/encoded.tsv	vp9-v1/L2T1h/wire.bin	vp9-v1/L2T1h/observations.json	vp9-v1/L2T1h/faults.json	vp9-v1/L2T1h/faults.json	
+VP9	L2T2	vp9-v1/L2T2/encoded.tsv	vp9-v1/L2T2/wire.bin	vp9-v1/L2T2/observations.json	vp9-v1/L2T2/faults.json	vp9-v1/L2T2/faults.json	
+VP9	L2T2h	vp9-v1/L2T2h/encoded.tsv	vp9-v1/L2T2h/wire.bin	vp9-v1/L2T2h/observations.json	vp9-v1/L2T2h/faults.json	vp9-v1/L2T2h/faults.json	
+VP9	L2T3	vp9-v1/L2T3/encoded.tsv	vp9-v1/L2T3/wire.bin	vp9-v1/L2T3/observations.json	vp9-v1/L2T3/faults.json	vp9-v1/L2T3/faults.json	
+VP9	L2T3h	vp9-v1/L2T3h/encoded.tsv	vp9-v1/L2T3h/wire.bin	vp9-v1/L2T3h/observations.json	vp9-v1/L2T3h/faults.json	vp9-v1/L2T3h/faults.json	
+VP9	L3T1	vp9-v1/L3T1/encoded.tsv	vp9-v1/L3T1/wire.bin	vp9-v1/L3T1/observations.json	vp9-v1/L3T1/faults.json	vp9-v1/L3T1/faults.json	
+VP9	L3T1h	vp9-v1/L3T1h/encoded.tsv	vp9-v1/L3T1h/wire.bin	vp9-v1/L3T1h/observations.json	vp9-v1/L3T1h/faults.json	vp9-v1/L3T1h/faults.json	
+VP9	L3T2	vp9-v1/L3T2/encoded.tsv	vp9-v1/L3T2/wire.bin	vp9-v1/L3T2/observations.json	vp9-v1/L3T2/faults.json	vp9-v1/L3T2/faults.json	
+VP9	L3T2h	vp9-v1/L3T2h/encoded.tsv	vp9-v1/L3T2h/wire.bin	vp9-v1/L3T2h/observations.json	vp9-v1/L3T2h/faults.json	vp9-v1/L3T2h/faults.json	
+VP9	L3T3	vp9-v1/L3T3/encoded.tsv	vp9-v1/L3T3/wire.bin	vp9-v1/L3T3/observations.json	vp9-v1/L3T3/faults.json	vp9-v1/L3T3/faults.json	
+VP9	L3T3h	vp9-v1/L3T3h/encoded.tsv	vp9-v1/L3T3h/wire.bin	vp9-v1/L3T3h/observations.json	vp9-v1/L3T3h/faults.json	vp9-v1/L3T3h/faults.json	
+VP9	S2T1	vp9-pilot/S2T1/encoded.tsv	vp9-pilot/S2T1/wire.bin	vp9-pilot/S2T1/observations.json	vp9-pilot/S2T1/observations.json	vp9-pilot/S2T1/observations.json	
+VP9	S2T1h	vp9-v1/S2T1h/encoded.tsv	vp9-v1/S2T1h/wire.bin	vp9-v1/S2T1h/observations.json	vp9-v1/S2T1h/faults.json	vp9-v1/S2T1h/faults.json	
+VP9	S2T2	vp9-v1/S2T2/encoded.tsv	vp9-v1/S2T2/wire.bin	vp9-v1/S2T2/observations.json	vp9-v1/S2T2/faults.json	vp9-v1/S2T2/faults.json	
+VP9	S2T2h	vp9-v1/S2T2h/encoded.tsv	vp9-v1/S2T2h/wire.bin	vp9-v1/S2T2h/observations.json	vp9-v1/S2T2h/faults.json	vp9-v1/S2T2h/faults.json	
+VP9	S2T3	vp9-v1/S2T3/encoded.tsv	vp9-v1/S2T3/wire.bin	vp9-v1/S2T3/observations.json	vp9-v1/S2T3/faults.json	vp9-v1/S2T3/faults.json	
+VP9	S2T3h	vp9-v1/S2T3h/encoded.tsv	vp9-v1/S2T3h/wire.bin	vp9-v1/S2T3h/observations.json	vp9-v1/S2T3h/faults.json	vp9-v1/S2T3h/faults.json	
+VP9	S3T1	vp9-v1/S3T1/encoded.tsv	vp9-v1/S3T1/wire.bin	vp9-v1/S3T1/observations.json	vp9-v1/S3T1/faults.json	vp9-v1/S3T1/faults.json	
+VP9	S3T1h	vp9-v1/S3T1h/encoded.tsv	vp9-v1/S3T1h/wire.bin	vp9-v1/S3T1h/observations.json	vp9-v1/S3T1h/faults.json	vp9-v1/S3T1h/faults.json	
+VP9	S3T2	vp9-v1/S3T2/encoded.tsv	vp9-v1/S3T2/wire.bin	vp9-v1/S3T2/observations.json	vp9-v1/S3T2/faults.json	vp9-v1/S3T2/faults.json	
+VP9	S3T2h	vp9-v1/S3T2h/encoded.tsv	vp9-v1/S3T2h/wire.bin	vp9-v1/S3T2h/observations.json	vp9-v1/S3T2h/faults.json	vp9-v1/S3T2h/faults.json	
+VP9	S3T3	vp9-v1/S3T3/encoded.tsv	vp9-v1/S3T3/wire.bin	vp9-v1/S3T3/observations.json	vp9-v1/S3T3/faults.json	vp9-v1/S3T3/faults.json	
+VP9	S3T3h	vp9-v1/S3T3h/encoded.tsv	vp9-v1/S3T3h/wire.bin	vp9-v1/S3T3h/observations.json	vp9-v1/S3T3h/faults.json	vp9-v1/S3T3h/faults.json	
+VP9	L2T2_KEY	vp9-v1/L2T2_KEY/encoded.tsv	vp9-v1/L2T2_KEY/wire.bin	vp9-v1/L2T2_KEY/observations.json	vp9-v1/L2T2_KEY/faults.json	vp9-v1/L2T2_KEY/faults.json	
+VP9	L2T2_KEY_SHIFT	vp9-v1/L2T2_KEY_SHIFT/encoded.tsv	vp9-v1/L2T2_KEY_SHIFT/wire.bin	vp9-v1/L2T2_KEY_SHIFT/observations.json	vp9-v1/L2T2_KEY_SHIFT/faults.json	vp9-v1/L2T2_KEY_SHIFT/faults.json	
+VP9	L2T3_KEY	vp9-v1/L2T3_KEY/encoded.tsv	vp9-v1/L2T3_KEY/wire.bin	vp9-v1/L2T3_KEY/observations.json	vp9-v1/L2T3_KEY/faults.json	vp9-v1/L2T3_KEY/faults.json	
+VP9	L2T3_KEY_SHIFT	missing	missing	missing	missing	missing	pinned libwebrtc has no matching mode or controller
+VP9	L3T1_KEY	vp9-v1/L3T1_KEY/encoded.tsv	vp9-v1/L3T1_KEY/wire.bin	vp9-v1/L3T1_KEY/observations.json	vp9-v1/L3T1_KEY/faults.json	vp9-v1/L3T1_KEY/faults.json	
+VP9	L3T2_KEY	vp9-v1/L3T2_KEY/encoded.tsv	vp9-v1/L3T2_KEY/wire.bin	vp9-v1/L3T2_KEY/observations.json	vp9-v1/L3T2_KEY/faults.json	vp9-v1/L3T2_KEY/faults.json	
+VP9	L3T2_KEY_SHIFT	missing	missing	missing	missing	missing	pinned libwebrtc has no matching mode or controller
+VP9	L3T3_KEY	vp9-v1/L3T3_KEY/encoded.tsv	vp9-v1/L3T3_KEY/wire.bin	vp9-v1/L3T3_KEY/observations.json	vp9-v1/L3T3_KEY/faults.json	vp9-v1/L3T3_KEY/faults.json	
+VP9	L3T3_KEY_SHIFT	missing	missing	missing	missing	missing	pinned libwebrtc has no matching mode or controller
+OPUS	-	opus-v1/observations.json	opus-v1/rtp.json	opus-v1/observations.json	n/a	opus-v1/rtp.json	
+DATA_V1	-	data-v1/receipts.json	data-v1/receipts.json	n/a	n/a	data-v1/receipts.json	

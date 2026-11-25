@@ -716,6 +716,8 @@ pub struct AudioTrack {
 #[derive(Debug, Clone)]
 pub struct VideoTrack {
     pub meta: TrackMeta,
+    pub(crate) guarantees_video_dd: bool,
+    pub(crate) av1_whole_source: bool,
     pub(crate) format: Option<pulsebeam_proto::state::CodecFormat>,
     pub layers: Vec<TrackLayer>,
     stats: VideoStats,
@@ -726,6 +728,7 @@ pub struct VideoTrack {
 pub struct DataTrack {
     pub meta: TrackMeta,
     pub(crate) fabric_source: Option<std::num::NonZeroU64>,
+    pub(crate) record_dd: bool,
     pub(crate) capture_clock: Option<pulsebeam_proto::state::DataV1CaptureClock>,
     pub topic: Option<crate::track::Topic>,
     pub lane: crate::track::DataLane,
@@ -811,6 +814,8 @@ impl Track {
     ) -> Self {
         Self::Video(VideoTrack {
             meta,
+            guarantees_video_dd: false,
+            av1_whole_source: false,
             format: None,
             stats: VideoStats::new(&layers),
             layers,
@@ -828,6 +833,7 @@ impl Track {
             meta,
             topic: Some(topic),
             fabric_source: None,
+            record_dd: false,
             capture_clock: None,
             lane,
             reverse,
@@ -835,7 +841,7 @@ impl Track {
     }
 
     pub(crate) fn data_publication(meta: TrackMeta, lane: DataLane) -> Self {
-        Self::native_data_publication(meta, lane, None, None)
+        Self::native_data_publication(meta, lane, None, None, false)
     }
 
     pub(crate) fn native_data_publication(
@@ -843,11 +849,13 @@ impl Track {
         lane: DataLane,
         fabric_source: Option<std::num::NonZeroU64>,
         capture_clock: Option<pulsebeam_proto::state::DataV1CaptureClock>,
+        record_dd: bool,
     ) -> Self {
         Self::Data(DataTrack {
             meta,
             topic: None,
             fabric_source,
+            record_dd,
             capture_clock,
             lane,
             reverse: None,
@@ -1138,6 +1146,8 @@ fn new_video_encodings(
     let stats = VideoStats::new(&layers);
     let track = Track::Video(VideoTrack {
         meta: meta.clone(),
+        guarantees_video_dd: false,
+        av1_whole_source: false,
         format: None,
         layers,
         stats: stats.clone(),

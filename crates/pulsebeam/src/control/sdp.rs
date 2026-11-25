@@ -71,12 +71,23 @@ pub(crate) fn codec_format(
     codec: pulsebeam_rtc::CodecInfo,
 ) -> Option<pulsebeam_proto::state::CodecFormat> {
     use pulsebeam_proto::state::{
-        CodecFormat, H264Parameters, OpusParameters, codec_format::Codec,
+        CodecFormat, H264Parameters, OpusParameters, Vp8Parameters, Vp9Parameters,
+        codec_format::Codec,
     };
     use pulsebeam_rtc::CodecProfile;
     let codec = match codec.profile {
         CodecProfile::Opus if codec.clock_rate == 48_000 && codec.channels == Some(2) => {
             Codec::Opus(OpusParameters::default())
+        }
+        CodecProfile::Vp8 if codec.clock_rate == 90_000 && codec.channels.is_none() => {
+            Codec::Vp8(Vp8Parameters {})
+        }
+        CodecProfile::Vp9 { profile_id: 0 }
+            if codec.clock_rate == 90_000 && codec.channels.is_none() =>
+        {
+            Codec::Vp9(Vp9Parameters {
+                profile_id: Some(0),
+            })
         }
         CodecProfile::H264 {
             profile_level_id,
@@ -100,7 +111,10 @@ pub(super) fn codec_compatible(
         return false;
     };
     match (source.known_codec(), receiving) {
-        (Some(Codec::Opus(_)), Codec::Opus(_)) => true,
+        (Some(Codec::Opus(_)), Codec::Opus(_)) | (Some(Codec::Vp8(_)), Codec::Vp8(_)) => true,
+        (Some(Codec::Vp9(source)), Codec::Vp9(receiver)) => {
+            source.profile_id.unwrap_or(0) == receiver.profile_id.unwrap_or(0)
+        }
         (Some(Codec::H264(source)), Codec::H264(receiver)) => {
             source.profile_level_id.unwrap_or(0x42e01f)
                 == receiver.profile_level_id.unwrap_or(0x42e01f)

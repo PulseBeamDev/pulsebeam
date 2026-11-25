@@ -1,0 +1,9 @@
+requested_mode	L3T1_KEY
+format	AV1/90000
+profile_id	0
+ssrc	1349284706
+pt	98
+dd_id	9
+dd_uri	https://aomediacodec.github.io/av1-rtp-spec/#dependency-descriptor-rtp-header-extension
+rtp_offset	4294946816
+max_packet_bytes	1147

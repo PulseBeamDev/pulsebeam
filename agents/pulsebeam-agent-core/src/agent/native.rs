@@ -726,10 +726,11 @@ fn payload(
     resource: &Resource,
     registration: crate::TopicChannel,
     offer: Option<Offer>,
-    data_v1: state::DataV1Delivery,
+    format: (state::DataV1Delivery, bool),
     ids: &mut IdGenerator,
     effects: &mut VecDeque<Effect>,
 ) -> Option<state::TrackBinding> {
+    let (data_v1, record_dd) = format;
     use state::validation::BindingProfile;
     let quic = session.state.binding_profile() == BindingProfile::Quic;
     let channel = if let Some(channel) = session.payload_resources.get(resource).copied() {
@@ -738,6 +739,7 @@ fn payload(
             || physical.offer != offer
             || physical.state != PayloadState::Active
             || physical.data_v1.delivery() != data_v1 as i32
+            || matches!(physical.data_v1, state::DataV1Binding::Quic(p) if p.record_dd != record_dd)
         {
             return None;
         }
@@ -795,6 +797,7 @@ fn payload(
                 version,
                 incarnation: channel.get(),
                 delivery: data_v1 as i32,
+                record_dd,
             })
         } else {
             state::DataV1Binding::Sctp(state::SctpDataV1Parameters {
@@ -871,9 +874,11 @@ fn quic_rtp_binding(
     session: &mut Session,
     resource: &Resource,
     source: Option<&str>,
-    publishes_h264_dd: bool,
+    profile: Option<super::quic::PublicationProfile>,
+    disclosed: Option<&crate::RtpSource>,
     ids: &mut IdGenerator,
 ) -> Option<state::TrackBinding> {
+    use super::quic::PublicationProfile;
     use state::{publication_spec::Kind, resource_spec::Declaration, track_binding::Transport};
     if let Some(spec) = session.state.target_spec(resource) {
         let binding = match spec.declaration.as_ref()? {
@@ -906,20 +911,64 @@ fn quic_rtp_binding(
         | Resource::Reception(MediaSlot::RemoteAudio(_)) => false,
         _ => return None,
     };
-    let format = session
-        .capabilities
-        .rtp
-        .codecs
-        .iter()
-        .filter_map(|codec| codec.format.as_ref())
-        .find(|format| {
-            matches!(
-                (video, format.known_codec()),
-                (false, Some(state::codec_format::Codec::Opus(_)))
-                    | (true, Some(state::codec_format::Codec::H264(_)))
-            )
-        })?
-        .clone();
+    let supported = || {
+        session
+            .capabilities
+            .rtp
+            .codecs
+            .iter()
+            .filter_map(|codec| codec.format.as_ref())
+    };
+    let disclosed_format = disclosed
+        .filter(|facts| source == Some(facts.publication_id.as_str()))
+        .map(crate::RtpSource::format);
+    let format = match source {
+        Some(source) => {
+            let format = if let Some(track) = session.state.source(source) {
+                match (video, track.kind.as_ref()?) {
+                    (false, state::track::Kind::Audio(track)) => track.format.as_ref()?,
+                    (true, state::track::Kind::Video(track)) => track.format.as_ref()?,
+                    _ => return None,
+                }
+            } else {
+                let format = disclosed_format.as_ref()?;
+                let prefix = if video { "video/" } else { "audio/" };
+                format.mime_type.starts_with(prefix).then_some(format)?
+            };
+            supported()
+                .any(|candidate| state::validation::formats_equivalent(candidate, format))
+                .then_some(format)?
+        }
+        None => match profile {
+            Some(PublicationProfile::UnlayeredVideo(mime)) if video => {
+                supported().find(|format| {
+                    format.mime_type == mime && state::VideoMode::for_format(format, "L1T1").is_ok()
+                })?
+            }
+            Some(PublicationProfile::UnlayeredVideo(_)) => return None,
+            None | Some(PublicationProfile::LegacyH264Dd) => supported().find(|format| {
+                matches!(
+                    (video, format.known_codec()),
+                    (false, Some(state::codec_format::Codec::Opus(_)))
+                        | (true, Some(state::codec_format::Codec::H264(_)))
+                )
+            })?,
+        },
+    };
+    let video_dd = match format.mime_type.as_str() {
+        "audio/opus" | "video/h264" => None,
+        "video/vp8" | "video/vp9" | "video/av1" if session.quic_directional_video_dd => {
+            state::VideoMode::for_format(format, "L1T1").ok()?;
+            Some(if source.is_some() {
+                state::QuicVideoDd::Accept
+            } else {
+                state::QuicVideoDd::Absent
+            } as i32)
+        }
+        _ => return None,
+    };
+    let publishes_h264_dd = video && matches!(profile, Some(PublicationProfile::LegacyH264Dd));
+    let format = format.clone();
     let id = u16::try_from(session.next_stream).ok()?;
     session.next_stream = session.next_stream.checked_add(1)?;
     Some(state::TrackBinding {
@@ -928,6 +977,7 @@ fn quic_rtp_binding(
             incarnation: ids.channel().get(),
             primary_ssrc: u32::from(id),
             publishes_h264_dd,
+            video_dd,
             codec: Some(state::RtpCodecParameters {
                 payload_type: Some(if video { 102 } else { 111 }),
                 format: Some(format),
@@ -942,7 +992,7 @@ pub(super) fn reconcile(
     logs: &mut crate::logging::LogBuffer,
     desired: &DesiredState,
     resources: &crate::track::TrackResources,
-    quic_h264_dd_tracks: &alloc::collections::BTreeSet<String>,
+    quic_publication_profiles: &BTreeMap<String, super::quic::PublicationProfile>,
     ids: &mut IdGenerator,
     effects: &mut VecDeque<Effect>,
 ) -> Result<(), SignalingError> {
@@ -964,9 +1014,8 @@ pub(super) fn reconcile(
         };
         let binding = if session.state.binding_profile() == state::validation::BindingProfile::Quic
         {
-            let publishes_h264_dd =
-                kind == crate::MediaKind::Video && quic_h264_dd_tracks.contains(&value.track_id);
-            quic_rtp_binding(session, &resource, None, publishes_h264_dd, ids)
+            let profile = quic_publication_profiles.get(&value.track_id).copied();
+            quic_rtp_binding(session, &resource, None, profile, None, ids)
         } else {
             if let Some(want) = media_want(session, resource.clone(), &slot, None) {
                 media.insert(slot.clone(), want);
@@ -994,6 +1043,7 @@ pub(super) fn reconcile(
                 min_height: (video.min_height != 0).then_some(video.min_height),
                 min_fps: (video.min_fps != 0).then_some(video.min_fps),
                 priority: (video.priority != 0).then_some(video.priority),
+                decode_target: video.decode_target,
             },
         ));
         if let Some(selector) = &video.selector {
@@ -1006,8 +1056,17 @@ pub(super) fn reconcile(
         let resource = Resource::Reception(slot.clone());
         let track = &video.publication_id;
         if session.state.binding_profile() == state::validation::BindingProfile::Quic {
-            if let Some(source_room) = session.room_id.clone()
-                && let Some(binding) = quic_rtp_binding(session, &resource, Some(track), false, ids)
+            let disclosed = desired
+                .rtp_sources
+                .iter()
+                .find(|source| source.publication_id == *track);
+            if let Some(source_room) = session
+                .state
+                .source(track)
+                .map(|track| track.room_id.clone())
+                .or_else(|| disclosed.map(|source| source.room.clone()))
+                && let Some(binding) =
+                    quic_rtp_binding(session, &resource, Some(track), None, disclosed, ids)
             {
                 wanted.insert(
                     resource,
@@ -1116,10 +1175,21 @@ pub(super) fn reconcile(
         let slot = MediaSlot::RemoteAudio(index);
         let resource = Resource::Reception(slot.clone());
         if quic {
-            let Some(room) = session.room_id.clone() else {
+            let disclosed = desired
+                .rtp_sources
+                .iter()
+                .find(|source| source.publication_id == id);
+            let Some(room) = session
+                .state
+                .source(&id)
+                .map(|track| track.room_id.clone())
+                .or_else(|| disclosed.map(|source| source.room.clone()))
+            else {
                 continue;
             };
-            if let Some(binding) = quic_rtp_binding(session, &resource, Some(&id), false, ids) {
+            if let Some(binding) =
+                quic_rtp_binding(session, &resource, Some(&id), None, disclosed, ids)
+            {
                 wanted.insert(
                     resource,
                     subscription(id, room, state::TrackKind::Audio, binding, audio_options()),
@@ -1211,6 +1281,7 @@ pub(super) fn reconcile(
         let Some(state::track::Kind::Data(format)) = track.kind.as_ref() else {
             continue;
         };
+        let record_dd = format.record_dd;
         if session.room_id.as_ref() == Some(&track.room_id)
             && session.participant_id == track.participant_id
         {
@@ -1250,12 +1321,23 @@ pub(super) fn reconcile(
                 }
             }
         }
+        if record_dd && !session.quic_data_record_dd {
+            session.state.report_logical_receiver(
+                &resource,
+                offer,
+                state::logical_receiver_report::Outcome::Failure(state::Failure {
+                    code: state::FailureCode::Incompatible as i32,
+                    diagnostic: "DATA_V1 source requires record descriptor support".into(),
+                }),
+            )?;
+            continue;
+        }
         if let Some(binding) = payload(
             session,
             &resource,
             crate::TopicChannel::Subscriber(registration.clone()),
             Some(offer),
-            mode,
+            (mode, record_dd),
             ids,
             effects,
         ) {
@@ -1336,12 +1418,16 @@ pub(super) fn reconcile(
         let Some(mode) = data_v1_delivery(publisher.mode, session.reliable_data_enabled) else {
             continue;
         };
+        let record_dd = resources.data_record_dd(&publisher.topic);
+        if record_dd && !session.quic_data_record_dd {
+            continue;
+        }
         if let Some(binding) = payload(
             session,
             &resource,
             registration.clone(),
             None,
-            mode,
+            (mode, record_dd),
             ids,
             effects,
         ) {

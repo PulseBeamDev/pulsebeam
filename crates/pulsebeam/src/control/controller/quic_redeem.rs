@@ -1,7 +1,10 @@
 use std::num::NonZeroU64;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use pulsebeam_agent_quic::records::{Admit, Denial};
+use pulsebeam_agent_quic::{
+    data_bindings::FabricOffer,
+    records::{Admit, Denial},
+};
 use pulsebeam_core::auth::authenticate_participant_token;
 use pulsebeam_core::identity::{ConnectionId, RoomId};
 use pulsebeam_runtime::{sync::oneshot, time::Instant};
@@ -55,6 +58,7 @@ pub(super) struct Redeem<'a> {
     pub(super) sequence: NonZeroU64,
     pub(super) binding: ownership::RequestBinding,
     pub(super) successor_receipt: Option<&'a [u8]>,
+    directional_video_dd: bool,
 }
 
 impl ControllerActor {
@@ -107,6 +111,7 @@ impl ControllerActor {
             sequence,
             binding,
             successor_receipt,
+            directional_video_dd,
         } = self.preflight_quic_redeem(shard, body, wall_now, now)?;
         let state = ParticipantState {
             selection: Selection::Native,
@@ -116,7 +121,7 @@ impl ControllerActor {
             old_connection_id: None,
             authorization: Some(lease),
             profile: SignalingProtocol::State,
-            rtp_capabilities: Some(crate::control::rtp::quic_capabilities()),
+            rtp_capabilities: Some(crate::control::rtp::quic_capabilities(directional_video_dd)),
         };
         self.prepare_owned_attempt(
             state,
@@ -243,6 +248,7 @@ impl ControllerActor {
             sequence: admit.attempt,
             binding,
             successor_receipt: admit.successor,
+            directional_video_dd: FabricOffer::CURRENT.supports_directional_video_dd(admit.fabric),
         })
     }
 }

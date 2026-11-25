@@ -25,7 +25,7 @@ use rustls::RootCertStore;
 use tokio::time::{self, Instant};
 
 use crate::{
-    data_bindings::FabricOffer,
+    data_bindings::{FabricOffer, rtp_profile},
     media::units::{Codec, SenderReport},
     records::{Datagram, DatagramKind, PictureLossIndication, RtcpSenderReport},
     transport::{
@@ -316,7 +316,8 @@ impl Agent {
         binding: Binding,
         policy: timed::Policy,
     ) -> Result<(), timed::AttachError> {
-        let codec = receiver_codec(&self.core, binding).ok_or(timed::AttachError::NotLive)?;
+        let (codec, av1_whole_source) =
+            receiver_media(&self.core, binding).ok_or(timed::AttachError::NotLive)?;
         self.timed
             .retain(|&binding, _| live_rtp_receiver(&self.core, binding));
         if self.timed.contains_key(&binding) {
@@ -325,8 +326,11 @@ impl Agent {
         if self.timed.len() >= timed::TRACKS {
             return Err(timed::AttachError::Capacity);
         }
-        self.timed
-            .insert(binding, timed::Track::new(binding, codec, policy)?);
+        let mut track = timed::Track::new(binding, codec, policy)?;
+        if av1_whole_source {
+            track = track.with_av1_whole_source();
+        }
+        self.timed.insert(binding, track);
         if let Some(raw) = &mut self.raw_rtp {
             raw.packets.retain(|packet| packet.binding != binding);
         }
@@ -420,6 +424,20 @@ impl Agent {
             .send_data_at(spec, payload, self.clock_origin.elapsed())
     }
 
+    pub fn send_data_with_options(
+        &mut self,
+        spec: pulsebeam_agent_core::TrackSpec,
+        payload: Vec<u8>,
+        options: pulsebeam_agent_core::ffi::DataSendOptions,
+    ) -> Result<OperationId, AgentError> {
+        self.core.send_data_with_options_at(
+            spec,
+            payload,
+            Some(options),
+            self.clock_origin.elapsed(),
+        )
+    }
+
     /// The canonical ID of the installed and enabled local Opus publication.
     pub fn opus_publication_id(&self, track_id: &str) -> Option<&str> {
         let publication = self
@@ -481,6 +499,24 @@ impl Agent {
     /// Publish using `send_rtp` with encoder-supplied DD on every media packet.
     pub fn enable_h264_dependency_descriptors(&mut self, track_id: &str) -> Result<(), AgentError> {
         self.core.enable_quic_h264_dd(track_id)
+    }
+
+    /// Select the codec for a raw, unlayered video publication before connecting.
+    pub fn configure_video_codec(
+        &mut self,
+        track_id: &str,
+        profile: Profile,
+    ) -> Result<(), AgentError> {
+        let mime = match profile {
+            Profile::H264 => "video/h264",
+            Profile::Vp8 => "video/vp8",
+            Profile::Vp9 => "video/vp9",
+            Profile::Av1 => "video/av1",
+            Profile::Opus | Profile::Data => {
+                return Err(pulsebeam_agent_core::ValidationError::QuicPublicationProfile.into());
+            }
+        };
+        self.core.configure_quic_video(track_id, mime)
     }
 
     pub fn rtp_publication(&self, kind: MediaKind, track_id: &str) -> Option<Publication> {
@@ -578,6 +614,9 @@ impl Agent {
             return Err(SendPacketError::NotReady);
         }
         let publishes_h264_dd = live.publishes_h264_dd;
+        let emits_video_dd = live.emits_video_dd;
+        let profile =
+            rtp_profile(live.mime_type).ok_or(SendPacketError::Invalid(WireError::PayloadType))?;
         if publishes_h264_dd
             && !input.payload.is_empty()
             && !input.extensions.iter().any(|extension| {
@@ -600,10 +639,6 @@ impl Agent {
             .flatten()
             .find(|socket| socket.generation() == generation)
             .ok_or(SendPacketError::NotReady)?;
-        let profile = match kind {
-            MediaKind::Audio => Profile::Opus,
-            MediaKind::Video => Profile::H264,
-        };
         if !self
             .media_senders
             .get(&key)
@@ -611,7 +646,7 @@ impl Agent {
         {
             let offer = socket.peer_fabric().ok_or(SendPacketError::NotReady)?;
             let selected = FabricOffer::CURRENT
-                .bind_publisher(offer, profile, publishes_h264_dd)
+                .bind_rtp_publisher(offer, profile, publishes_h264_dd, emits_video_dd)
                 .map_err(SendPacketError::Invalid)?;
             self.media_senders.insert(
                 key.clone(),
@@ -1154,7 +1189,7 @@ impl Agent {
         let header = packet.header();
         let kind = match header.profile {
             Profile::Opus => MediaKind::Audio,
-            Profile::H264 => MediaKind::Video,
+            Profile::H264 | Profile::Vp8 | Profile::Vp9 | Profile::Av1 => MediaKind::Video,
             _ => return Ok(()),
         };
         let id = Binding {
@@ -1504,20 +1539,23 @@ enum Input {
 }
 
 fn live_rtp_receiver(core: &CoreAgent, binding: Binding) -> bool {
-    receiver_codec(core, binding).is_some()
+    receiver_media(core, binding).is_some()
 }
 
-fn receiver_codec(core: &CoreAgent, binding: Binding) -> Option<Codec> {
-    [
-        (MediaKind::Audio, Codec::Opus),
-        (MediaKind::Video, Codec::H264),
-    ]
-    .into_iter()
-    .find_map(|(kind, codec)| {
-        core.quic_rtp_receivers(kind)
-            .any(|live| live.generation == binding.generation && live.binding == binding.id)
-            .then_some(codec)
-    })
+fn receiver_media(core: &CoreAgent, binding: Binding) -> Option<(Codec, bool)> {
+    let receiver = [MediaKind::Audio, MediaKind::Video]
+        .into_iter()
+        .flat_map(|kind| core.quic_rtp_receivers(kind))
+        .find(|live| live.generation == binding.generation && live.binding == binding.id)?;
+    let codec = match rtp_profile(receiver.mime_type)? {
+        Profile::Opus => Codec::Opus,
+        Profile::H264 => Codec::H264,
+        Profile::Vp8 => Codec::Vp8,
+        Profile::Vp9 => Codec::Vp9,
+        Profile::Av1 => Codec::Av1,
+        Profile::Data => return None,
+    };
+    Some((codec, codec == Codec::Av1 && receiver.av1_whole_source))
 }
 
 async fn work<Id, T>(work: &mut Option<(Id, Work<T>)>) -> T {
@@ -1538,27 +1576,25 @@ async fn socket_turn(
     let generation = socket.generation();
     let retry = retry_payload_turn == Some(generation);
     let authorize = |binding| {
-        if let Some((_, ready)) = core.quic_data_receiver(generation, binding) {
-            return Some((ReceiveBinding::Data, ready));
+        if let Some((_, ready, record_dd)) = core.quic_data_receiver(generation, binding) {
+            return Some((ReceiveBinding::Data { record_dd }, ready));
         }
-        [
-            (MediaKind::Audio, Profile::Opus),
-            (MediaKind::Video, Profile::H264),
-        ]
-        .into_iter()
-        .find_map(|(kind, profile)| {
-            let receiver = core
-                .quic_rtp_receiver_bindings(kind)
-                .find(|live| live.generation == generation && live.binding == binding)?;
-            Some((
-                ReceiveBinding::Media {
-                    profile,
-                    ssrc: receiver.ssrc,
-                    payload_type: receiver.payload_type,
-                },
-                receiver.ready,
-            ))
-        })
+        [MediaKind::Audio, MediaKind::Video]
+            .into_iter()
+            .find_map(|kind| {
+                let receiver = core
+                    .quic_rtp_receiver_bindings(kind)
+                    .find(|live| live.generation == generation && live.binding == binding)?;
+                Some((
+                    ReceiveBinding::Media {
+                        profile: rtp_profile(receiver.mime_type)?,
+                        video_dd: receiver.video_dd,
+                        ssrc: receiver.ssrc,
+                        payload_type: receiver.payload_type,
+                    },
+                    receiver.ready,
+                ))
+            })
     };
     let Ok(event) = socket.progress(retry, authorize).await else {
         let event = socket.io_failure();

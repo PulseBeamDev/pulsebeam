@@ -369,7 +369,7 @@ impl FabricRtpFixture {
         let kind = match profile {
             Profile::Opus => TrackKind::Audio,
             Profile::Data => TrackKind::Data,
-            Profile::H264 | Profile::Av1 => TrackKind::Video,
+            Profile::H264 | Profile::Av1 | Profile::Vp8 | Profile::Vp9 => TrackKind::Video,
         };
         let publication_id = publisher_id.fixture_publication(kind, "fixture");
         let track = execution
@@ -404,6 +404,151 @@ impl FabricRtpFixture {
             }),
             target,
         }
+    }
+
+    pub(crate) fn with_quic_publisher(
+        receiver: ConnectionConfig,
+        binding: pulsebeam_proto::state::validation::QuicRtpBinding<'_>,
+        emission: Emission,
+        now: Instant,
+    ) -> Self {
+        use crate::route::fabric::RtpSourceEncoding;
+        let shard = ShardId::new(0);
+        let (_writer, updates) = crate::shard_update::new_shard_update(shard);
+        let mut core = ShardCore::new(
+            shard,
+            8,
+            1,
+            WallAnchor::new(std::time::SystemTime::UNIX_EPOCH, now),
+            updates,
+        );
+        core.execution.global_clock = Some(crate::clock::reference::ShardClock::fixture(
+            now,
+            pulsebeam_clock::time::GlobalInstant::from_nanos(1_800_000_000_000_000_000),
+        ));
+        let (publisher_id, publisher, association) =
+            register_quic_rtp_owner(&mut core.execution, 7);
+        let receiver_id = receiver.connection_id;
+        assert!(core.execution.add_participant(
+            NodeTransportAddress::new(TransportRoute::new(shard, 1), 1),
+            receiver,
+        ));
+        let receiver = core
+            .execution
+            .registry
+            .resolve_connection(receiver_id)
+            .unwrap();
+        let publication = publisher_id.fixture_publication(TrackKind::Video, "quic-media");
+        let (source, _) = core
+            .install_quic_rtp_source(
+                publisher,
+                publication,
+                association,
+                true,
+                RtpSourceEncoding {
+                    primary: binding.ssrc().get().into(),
+                    rid: None,
+                    payload_type: binding.payload_type().into(),
+                },
+                emission,
+            )
+            .unwrap();
+        core.execution.apply_plan(&TrackPlanUpdate {
+            publication_id: publication,
+            plan: Some(TrackPlan::new([receiver_id], [], None)),
+        });
+        let track = core.execution.runtime.track_handle(publication).unwrap();
+        let branch = core
+            .execution
+            .install_fabric_branch(track, source, receiver, emission)
+            .unwrap();
+        Self {
+            execution: core.execution,
+            #[cfg(feature = "transport-conformance")]
+            cross_shard: None,
+            publisher,
+            receiver,
+            emission,
+            binding: Some(FixtureRtpBinding {
+                track,
+                source,
+                branch,
+            }),
+            target: None,
+        }
+    }
+
+    pub(crate) fn ingest_quic(
+        &mut self,
+        ingress: crate::rtp::fabric_ingress::QuicRtpIngress,
+        packet: &pulsebeam_core::fabric::BorrowedPacket<'_>,
+        now: Instant,
+    ) {
+        self.execution.ingest_quic_media_packet(
+            self.binding().source,
+            self.publisher,
+            ingress,
+            packet,
+            now,
+        );
+    }
+
+    pub(crate) fn add_quic_receiver(
+        &mut self,
+        emission: Emission,
+    ) -> (FabricLocalBranch, ParticipantHandle) {
+        let (connection, receiver, _) = register_quic_rtp_owner(&mut self.execution, 8);
+        let publication = self
+            .execution
+            .runtime
+            .publication_id(self.binding().track)
+            .unwrap();
+        let rtc = self.receiver().connection_id;
+        self.execution.apply_plan(&TrackPlanUpdate {
+            publication_id: publication,
+            plan: Some(TrackPlan::new([rtc, connection], [], None)),
+        });
+        let branch = self
+            .execution
+            .install_quic_rtp_branch(receiver, publication, emission, None)
+            .unwrap();
+        (branch, receiver)
+    }
+
+    pub(crate) fn keep_only_rtc_receiver(
+        &mut self,
+        (branch, receiver): (FabricLocalBranch, ParticipantHandle),
+    ) {
+        let publication = self
+            .execution
+            .runtime
+            .publication_id(self.binding().track)
+            .unwrap();
+        let rtc = self.receiver().connection_id;
+        self.execution.apply_plan(&TrackPlanUpdate {
+            publication_id: publication,
+            plan: Some(TrackPlan::new([rtc], [], None)),
+        });
+        assert!(!self.execution.quic_rtp_branch_live(branch, receiver));
+    }
+
+    pub(crate) fn read_quic_receiver(
+        &mut self,
+        (branch, receiver): (FabricLocalBranch, ParticipantHandle),
+        now: Instant,
+        agreement: pulsebeam_core::fabric::packet::Agreement,
+        output: &mut [u8],
+    ) -> usize {
+        let mut size = 0;
+        assert_eq!(
+            self.execution
+                .admit_quic_rtp(branch, receiver, now, |_, packet, _| {
+                    size = agreement.write(&packet, output).map_err(|_| ())?;
+                    Ok(())
+                }),
+            Ok(Some(()))
+        );
+        size
     }
 
     pub(crate) fn attach_publisher_ingress_with_clock(
@@ -811,12 +956,12 @@ impl FabricRtpFixture {
     ) {
         use crate::route::{NodeRouteAddress, RouteId, fabric::ShardBinding};
         use crate::shard_update::CompiledRoute;
-        let receiver = self.receiver().connection_id;
-        let publication = self
-            .execution
-            .runtime
-            .publication_id(self.binding().track)
-            .unwrap();
+        let track = self.binding().track;
+        let publication = self.execution.runtime.publication_id(track).unwrap();
+        let local = self.execution.plans[track]
+            .local
+            .iter()
+            .map(|&receiver| self.execution.registry.connection_id(receiver).unwrap());
         let address = NodeRouteAddress::new(RouteId::new(ShardId::new(1), 2), 1);
         let mut links =
             pulsebeam_link::LinkControl::new(|| pulsebeam_link::LinkTime::from_nanos(0)).unwrap();
@@ -827,7 +972,7 @@ impl FabricRtpFixture {
                 tag: crate::link::delivery_tag(address),
             })
             .unwrap();
-        let mut plan = TrackPlan::new([receiver], [address], None);
+        let mut plan = TrackPlan::new(local, [address], None);
         plan.compiled_remote.push(CompiledRoute {
             address,
             tx,
@@ -1171,6 +1316,166 @@ fn packet(sequence: u32) -> OwnedPacket {
     .unwrap()
 }
 
+fn register_quic_rtp_owner(
+    execution: &mut ShardExecution,
+    slot: u32,
+) -> (ConnectionId, ParticipantHandle, std::num::NonZeroU64) {
+    let connection = ConnectionId::new();
+    let transport = NodeTransportAddress::new(TransportRoute::new(execution.shard_id, slot), 1);
+    let association = std::num::NonZeroU64::new(u64::from(slot)).unwrap();
+    assert!(execution.registry.insert_quic(
+        connection,
+        transport,
+        association,
+        crate::shard::participants::QuicGrant {
+            revision: 1,
+            expiry: pulsebeam_core::auth::AuthorizationExpiry::from_unix_seconds(100),
+        },
+    ));
+    (
+        connection,
+        execution.registry.resolve_connection(connection).unwrap(),
+        association,
+    )
+}
+
+#[test]
+fn quic_raw_video_uses_one_authenticated_fabric_timeline() {
+    use crate::{route::fabric::RtpSourceEncoding, rtp::fabric_ingress::QuicRtpIngress};
+    use pulsebeam_agent_quic::data_bindings::FabricOffer;
+    use pulsebeam_core::fabric::{Extension, MAJOR, packet::MAX_PACKET_BYTES};
+    use pulsebeam_proto::state::{self as wire, validation::QuicRtpBinding};
+
+    let _rng = pulsebeam_runtime::rand::seeded_rng(1);
+    let shard = ShardId::new(0);
+    let now = Instant::now();
+    let (_writer, updates) = crate::shard_update::new_shard_update(shard);
+    let mut core = ShardCore::new(
+        shard,
+        8,
+        1,
+        WallAnchor::new(std::time::SystemTime::UNIX_EPOCH, now),
+        updates,
+    );
+    core.execution.global_clock = Some(crate::clock::reference::ShardClock::fixture(
+        now,
+        pulsebeam_clock::time::GlobalInstant::from_nanos(1_800_000_000_000_000_000),
+    ));
+    let (publisher_id, publisher, association) = register_quic_rtp_owner(&mut core.execution, 7);
+    let (receiver_id, receiver, _) = register_quic_rtp_owner(&mut core.execution, 8);
+    let offer = FabricOffer::CURRENT;
+    for (candidate, (profile, label)) in crate::control::rtp::quic_capabilities(true)
+        .codecs
+        .into_iter()
+        .skip(1)
+        .zip([
+            (Profile::H264, "h264"),
+            (Profile::Vp8, "vp8"),
+            (Profile::Vp9, "vp9"),
+            (Profile::Av1, "av1"),
+        ])
+    {
+        let explicit = profile != Profile::H264;
+        let parameters = wire::QuicRtpParameters {
+            binding_id: 7,
+            incarnation: 9,
+            primary_ssrc: 39,
+            codec: Some(wire::RtpCodecParameters {
+                payload_type: Some(125),
+                format: candidate.format,
+                ..Default::default()
+            }),
+            video_dd: explicit.then_some(wire::QuicVideoDd::Absent as i32),
+            ..Default::default()
+        };
+        let binding = QuicRtpBinding::compile(&parameters, wire::TrackKind::Video).unwrap();
+        let ingress = QuicRtpIngress::new(binding).unwrap();
+        let tx = offer
+            .bind_rtp_publisher(offer, profile, false, explicit.then_some(false))
+            .unwrap()
+            .agreement;
+        let rx = offer
+            .bind_rtp_receiver(
+                offer,
+                profile,
+                explicit.then_some(wire::QuicVideoDd::Accept),
+            )
+            .unwrap()
+            .agreement;
+        let emission = |agreement: pulsebeam_core::fabric::packet::Agreement| {
+            Emission::from_wire_profile(
+                profile as u8,
+                agreement.extension_mask(),
+                MAJOR,
+                agreement.revision(),
+            )
+            .unwrap()
+        };
+        let publication = publisher_id.fixture_publication(TrackKind::Video, label);
+        let (source, _) = core
+            .install_quic_rtp_source(
+                publisher,
+                publication,
+                association,
+                true,
+                RtpSourceEncoding {
+                    primary: binding.ssrc().get().into(),
+                    rid: None,
+                    payload_type: binding.payload_type().into(),
+                },
+                emission(tx),
+            )
+            .unwrap();
+        core.execution.apply_plan(&TrackPlanUpdate {
+            publication_id: publication,
+            plan: Some(TrackPlan::new([receiver_id], [], None)),
+        });
+        let branch = core
+            .install_quic_rtp_branch(receiver, publication, emission(rx), None)
+            .unwrap();
+        let capture = [0x24; 8];
+        let media = FabricPacket::new(
+            Header {
+                profile,
+                marker: true,
+                sequence: 0x10001,
+                timestamp: 0xffff_fffe,
+            },
+            &[Extension {
+                kind: ExtensionKind::AbsoluteCaptureTime,
+                value: &capture,
+            }],
+            [0x42, 0x24],
+        )
+        .unwrap();
+        let mut input = [0; MAX_PACKET_BYTES];
+        let len = tx.write(&media, &mut input).unwrap();
+        let packet = tx.decode(&input[..len]).unwrap();
+        core.ingest_quic_media_packet(source, receiver, ingress, &packet, now);
+        assert_eq!(
+            core.admit_quic_rtp(branch, receiver, now, |_, _, _| panic!("foreign owner")),
+            Ok(None)
+        );
+        core.ingest_quic_media_packet(source, publisher, ingress, &packet, now);
+        let mut output = [0; MAX_PACKET_BYTES];
+        let mut len = 0;
+        assert_eq!(
+            core.admit_quic_rtp(branch, receiver, now, |_, packet, _| {
+                len = rx.write(&packet, &mut output).map_err(|_| ())?;
+                Ok(())
+            }),
+            Ok(Some(()))
+        );
+        let packet = rx.decode(&output[..len]).unwrap();
+        assert_eq!(packet.header().profile, profile);
+        assert!(packet.header().marker);
+        assert_eq!(packet.payload(), &[0x42, 0x24]);
+        assert_eq!(packet.extensions().next().unwrap().value, &capture);
+        core.retire_quic_publication(publication);
+        assert!(!core.quic_rtp_branch_live(branch, receiver));
+    }
+}
+
 #[test]
 fn quic_data_ingress_fences_owner_association_and_binding_before_admission() {
     use crate::participant::data_fabric::{Error, QuicInstallation, r3_record};
@@ -1230,6 +1535,7 @@ fn quic_data_ingress_fences_owner_association_and_binding_before_admission() {
             version: 1,
             incarnation: 1,
             delivery: DataV1Delivery::Reliable as i32,
+            record_dd: false,
         })
         .unwrap(),
     };

@@ -107,7 +107,18 @@ fn disabling_a_binding_abandons_its_incomplete_transfers_without_reopening_ids()
 fn sender_keeps_fixed_offsets_on_backpressure_and_fails_without_replanning() {
     let mut sender = Sender::new(framing(), BINDING);
     let now = Instant::now();
-    let payload = vec![7; MAX_PACKET_BYTES].into_boxed_slice();
+    use crate::data_bindings::FabricOffer;
+    use pulsebeam_core::fabric::{ExtensionKind, Profile};
+    use pulsebeam_proto::state::QuicVideoDd;
+
+    let offer = FabricOffer::CURRENT;
+    let agreement = offer
+        .bind_rtp_receiver(offer, Profile::Vp9, Some(QuicVideoDd::Require))
+        .unwrap()
+        .agreement;
+    let mut payload = vec![7; MAX_PACKET_BYTES].into_boxed_slice();
+    // Canonical VP9 packet with a three-byte mandatory DD and a full payload.
+    payload[..16].copy_from_slice(&[101, 1, 0, 0, 0, 42, 0, 0, 0, 90, 0, 4, 0x22, 0xc0, 0, 0x11]);
     sender.start(now, payload.clone()).unwrap();
     let mut frames = Vec::new();
     let mut submit = |bytes: &[u8]| {
@@ -133,10 +144,13 @@ fn sender_keeps_fixed_offsets_on_backpressure_and_fails_without_replanning() {
     assert_eq!(tail.len(), 152);
     let mut receiver = Receiver::new(framing(), BINDING);
     assert_eq!(receiver.receive(now, tail), Ok(None));
-    assert_eq!(
-        receiver.receive(now, head).unwrap().unwrap().as_ref(),
-        payload.as_ref()
-    );
+    let reassembled = receiver.receive(now, head).unwrap().unwrap();
+    assert_eq!(reassembled.as_ref(), payload.as_ref());
+    let packet = agreement.decode(reassembled.as_ref()).unwrap();
+    assert_eq!(packet.header().profile, Profile::Vp9);
+    let dd = packet.extensions().next().unwrap();
+    assert_eq!(dd.kind, ExtensionKind::DependencyDescriptor);
+    assert_eq!(dd.value, &[0xc0, 0, 0x11]);
 
     sender.start(now, payload.clone()).unwrap();
     assert_eq!(

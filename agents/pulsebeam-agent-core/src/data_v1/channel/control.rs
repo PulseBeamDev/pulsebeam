@@ -13,8 +13,8 @@ use pulsebeam_proto::{
 use crate::{ChannelId, Generation};
 
 use super::{
-    AssembledUnit, Error, MAX_RECORD_BYTES, PublisherMode, QueuedOriginal, ReceiveChannel,
-    SendChannel, SendKind,
+    AssembledUnit, Error, PublisherMode, QueuedOriginal, ReceiveChannel, SendChannel, SendKind,
+    record_capacity,
 };
 use crate::data_v1::{PublisherDelivery, ReceiptAction};
 
@@ -85,7 +85,7 @@ impl SendChannel {
                 {
                     return Ok(PublisherControl::Ignored);
                 }
-                let mut payload = alloc::vec![0; MAX_RECORD_BYTES];
+                let mut payload = alloc::vec![0; record_capacity(self.channel.record_dd)];
                 if let Some((size, expires)) = publisher.write_original_until(
                     self.channel.binding,
                     demand,

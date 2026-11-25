@@ -162,6 +162,11 @@ pub(super) struct Track {
 }
 
 impl Track {
+    pub(super) fn with_av1_whole_source(mut self) -> Self {
+        self.units = self.units.with_av1_whole_source();
+        self
+    }
+
     pub(super) fn new(binding: Binding, codec: Codec, policy: Policy) -> Result<Self, AttachError> {
         let reorder = policy.reorder();
         if reorder > REORDER_LIMIT
@@ -179,7 +184,7 @@ impl Track {
             policy,
             jitter: jitter::Buffer::new(binding, limits),
             units,
-            recovery: (codec == Codec::H264 && policy.max_age().is_some())
+            recovery: (codec != Codec::Opus && policy.max_age().is_some())
                 .then(|| VideoRecovery::new(binding)),
             refresh_at: None,
             queue: VecDeque::new(),
@@ -294,6 +299,10 @@ impl Track {
             }
             other => other,
         };
+        if self.after.is_some() {
+            self.record_overflow(&event);
+            return;
+        }
         let event = if let Some(recovery) = &mut self.recovery {
             match recovery.apply(event) {
                 Recovery::Deliver(event) => event,
@@ -307,16 +316,8 @@ impl Track {
             event
         };
         let bytes = retained_bytes(&event);
-        if self.after.is_some()
-            || self.queue.len() >= EVENTS
-            || self.queued_bytes.saturating_add(bytes) > QUEUED_BYTES
-        {
-            self.stats.handoff_overflow = self.stats.handoff_overflow.saturating_add(1);
-            let tally = loss(&mut self.after, &event);
-            tally.overflow = tally.overflow.saturating_add(1);
-            if let Some(recovery) = &mut self.recovery {
-                recovery.mark_loss();
-            }
+        if self.queue.len() >= EVENTS || self.queued_bytes.saturating_add(bytes) > QUEUED_BYTES {
+            self.record_overflow(&event);
             return;
         }
         if matches!(&event, Event::Unit(unit) if unit.access == Access::IndependentVideo) {
@@ -324,6 +325,15 @@ impl Track {
         }
         self.queue.push_back(event);
         self.queued_bytes = self.queued_bytes.saturating_add(bytes);
+    }
+
+    fn record_overflow(&mut self, event: &Event<Binding>) {
+        self.stats.handoff_overflow = self.stats.handoff_overflow.saturating_add(1);
+        let tally = loss(&mut self.after, event);
+        tally.overflow = tally.overflow.saturating_add(1);
+        if let Some(recovery) = &mut self.recovery {
+            recovery.lose_context();
+        }
     }
 
     pub(super) fn next(&mut self, now: Instant) -> Option<Receive> {
@@ -415,6 +425,9 @@ impl Track {
         };
     }
 }
+
+#[cfg(test)]
+mod tests;
 
 fn arrival(event: &Event<Binding>) -> Option<Instant> {
     match event {

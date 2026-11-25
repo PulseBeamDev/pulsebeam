@@ -539,7 +539,8 @@ fn live(value: wire::ConfirmedState, spec: &wire::ResourceSpec, participant: &st
         track.kind,
         Some(wire::track::Kind::Data(wire::DataTrack {
             capture_clock: None,
-            delivery: wire::DataDelivery::Latest as i32
+            delivery: wire::DataDelivery::Latest as i32,
+            record_dd: false,
         }))
     );
     assert!(!track.publication_id.is_empty());

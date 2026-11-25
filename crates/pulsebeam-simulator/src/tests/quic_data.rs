@@ -48,6 +48,8 @@ use pulsebeam_runtime::{
 use rustls::{RootCertStore, pki_types::PrivatePkcs8KeyDer, time_provider::DefaultTimeProvider};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+const LEGACY_FABRIC_OFFER: FabricOffer = FabricOffer::decode([1, 1, 0, 1, 0x03, 0xfc]);
+
 struct Client {
     transport: ClientTransport,
     socket: pulsebeam_udp::UdpSocket,
@@ -139,8 +141,7 @@ impl Client {
                 .poll(self.transport.connection(), Instant::now().into_std())
                 .map_err(|error| anyhow::anyhow!("admission failed: {error:?}"))?
             {
-                self.data_wire =
-                    Some(FabricOffer::CURRENT.bind(accepted.0.fabric, Profile::Data, 0)?);
+                self.data_wire = Some(admit.fabric.bind(accepted.0.fabric, Profile::Data, 0)?);
                 return Ok(accepted);
             }
             self.progress().await?;
@@ -363,6 +364,12 @@ fn latest_delivers_on_the_negotiated_binding() {
 }
 
 #[test]
+fn quic_data_record_dd_preserves_fragment_metadata() {
+    let host = pulsebeam_runtime::testing::test_host_ip("192.168.250.103");
+    replay_scenario(host, Scenario::DataRecordDd);
+}
+
+#[test]
 fn sctp_and_quic_exchange_unreliable_data() {
     replay_mixed(DataV1Delivery::Unreliable);
 }
@@ -547,6 +554,7 @@ fn quic_data_proposal(delivery: DataV1Delivery) -> Result<Vec<u8>> {
                                 version: 1,
                                 incarnation: 1,
                                 delivery: delivery as i32,
+                                record_dd: false,
                             },
                         )),
                     }),
@@ -673,6 +681,7 @@ async fn prepare_subscription(
                                             version: 1,
                                             incarnation: 1,
                                             delivery: delivery as i32,
+                                            record_dd: false,
                                         },
                                     )),
                                 },
@@ -903,7 +912,7 @@ async fn open_subscriber(
     let owner = placement.owner;
     let (_, mut control) = client
         .admit(Admit {
-            fabric: pulsebeam_agent_quic::data_bindings::FabricOffer::CURRENT,
+            fabric: LEGACY_FABRIC_OFFER,
             attempt: NonZeroU64::MIN,
             room: Some("stage"),
             owner: &owner,
@@ -1035,6 +1044,107 @@ where
     .with_sim_services("edge.example".into(), edge.ip(), placement))
 }
 
+async fn data_record_dd_exchange(
+    address: SocketAddr,
+    edge: SocketAddr,
+    roots: RootCertStore,
+    publisher_token: &str,
+    subscriber_token: &str,
+) -> Result<()> {
+    use pulsebeam_agent_core::{
+        AgentCommand, DataEvent, ResourceCommand, ResourceResult, TopicMode, TrackSelector,
+        TrackSpec, data_v1::DataFragmentDescriptor, ffi::DataSendOptions,
+    };
+    use pulsebeam_proto::data_record::{FRAGMENT_BYTES, MAX_DESCRIPTOR_BYTES};
+
+    let mut publisher = sim_quic_agent(address, edge, roots.clone(), publisher_token)?;
+    let mut subscriber = sim_quic_agent(address, edge, roots, subscriber_token)?;
+    let spec = TrackSpec::Data {
+        track_id: "records".into(),
+        delivery: TopicMode::Ordered,
+    };
+    publisher.resource(ResourceCommand::DeclareDataPublication {
+        spec: spec.clone(),
+        capture_clock: None,
+        record_dd: true,
+    })?;
+    let ResourceResult::Owned { owner } = subscriber.resource(ResourceCommand::ReceiveData {
+        spec: spec.clone(),
+        source: TrackSelector {
+            room: "stage".into(),
+            participant_id: "alice".into(),
+            track_id: "records".into(),
+        },
+    })?
+    else {
+        anyhow::bail!("subscriber ownership")
+    };
+    publisher.command(AgentCommand::Join("stage".into()))?;
+    subscriber.command(AgentCommand::Join("stage".into()))?;
+    let payload = vec![0x6b; 8 * FRAGMENT_BYTES + 1];
+    let descriptors = vec![
+        DataFragmentDescriptor {
+            fragment_index: 0,
+            bytes: vec![0x44; MAX_DESCRIPTOR_BYTES],
+        },
+        DataFragmentDescriptor {
+            fragment_index: 8,
+            bytes: vec![0xc0, 0, 1],
+        },
+    ];
+    let mut submitted = false;
+    loop {
+        if !submitted
+            && publisher
+                .snapshot()
+                .topics
+                .publishers
+                .iter()
+                .any(|status| status.channel.is_some())
+            && subscriber
+                .snapshot()
+                .topics
+                .subscribers
+                .iter()
+                .any(|status| status.channel.is_some())
+        {
+            publisher.send_data_with_options(
+                spec.clone(),
+                payload.clone(),
+                DataSendOptions {
+                    captured_at: None,
+                    fragment_descriptors: Some(descriptors.clone()),
+                },
+            )?;
+            submitted = true;
+        }
+        if let ResourceResult::Event { event: Some(event) } =
+            subscriber.resource(ResourceCommand::ReadData { owner })?
+        {
+            let DataEvent::Message {
+                participant_id,
+                data,
+                fragment_descriptors,
+                ..
+            } = event
+            else {
+                anyhow::bail!("expected an assembled DATA_V1 message: {event:?}");
+            };
+            ensure!(submitted && participant_id == "alice" && data == payload);
+            ensure!(fragment_descriptors.as_deref() == Some(descriptors.as_slice()));
+            ensure!(matches!(
+                subscriber.resource(ResourceCommand::ReadData { owner })?,
+                ResourceResult::Event { event: None }
+            ));
+            return Ok(());
+        }
+        pulsebeam_runtime::select! {
+            next = publisher.turn() => { next.map_err(|error| anyhow::anyhow!("DATA_V1 publisher: {error:?}"))?; },
+            next = subscriber.turn() => { next.map_err(|error| anyhow::anyhow!("DATA_V1 subscriber: {error:?}"))?; },
+        }
+    }
+}
+
 async fn mixed_exchange(
     address: SocketAddr,
     edge: SocketAddr,
@@ -1092,6 +1202,7 @@ async fn mixed_exchange(
     quic.resource(ResourceCommand::DeclareDataPublication {
         spec: outgoing.clone(),
         capture_clock: None,
+        record_dd: false,
     })?;
     let ResourceResult::Owned { owner } = quic.resource(ResourceCommand::ReceiveData {
         spec: TrackSpec::Data {
@@ -1194,11 +1305,18 @@ async fn mixed_exchange(
             anyhow::bail!("QUIC Agent drive: {error:?}");
         },
     };
-    ensure!(
-        matches!(received, Some(DataEvent::Message { publication_id, participant_id, data: message, .. })
-        if publication_id == publication && participant_id == "alice" && message == data)
-    );
+    let Some(DataEvent::Message {
+        publication_id,
+        participant_id,
+        data: quic_to_sctp,
+        ..
+    }) = received
+    else {
+        anyhow::bail!("expected SCTP recipient message");
+    };
+    ensure!(publication_id == publication && participant_id == "alice" && quic_to_sctp == data);
 
+    let mut publisher_loss = None;
     if delivery == DataV1Delivery::Reliable {
         use pulsebeam::sim_metrics::{ShardDataFault, arm_shard_data_trace, take_shard_data_trace};
         let trace = take_shard_data_trace().context("QUIC publisher repair trace")?;
@@ -1209,6 +1327,7 @@ async fn mixed_exchange(
             trace.repaired.contains(&dropped),
             "QUIC publisher must repair the dropped fragment: {trace:?}"
         );
+        publisher_loss = Some((dropped.unit_seq, true));
         arm_shard_data_trace(ShardDataFault::FirstLiveOffer);
     } else if delivery == DataV1Delivery::Unreliable {
         let trace = pulsebeam::sim_metrics::take_shard_data_trace()
@@ -1219,23 +1338,30 @@ async fn mixed_exchange(
                 && trace.repaired.is_empty(),
             "Unreliable must deliver past the gap without repair: {trace:?}"
         );
+        publisher_loss = trace.dropped.map(|fragment| (fragment.unit_seq, false));
     }
     let data = b"SCTP to QUIC";
     sender.send(data.to_vec(), None).await?;
-    loop {
+    let sctp_to_quic = loop {
         if let ResourceResult::Event { event: Some(event) } =
             quic.resource(ResourceCommand::ReadData { owner })?
         {
-            ensure!(
-                matches!(event, DataEvent::Message { participant_id, data: message, .. }
-                if participant_id == "sctp-peer" && message == data)
-            );
-            break;
+            let DataEvent::Message {
+                participant_id,
+                data: message,
+                ..
+            } = event
+            else {
+                anyhow::bail!("expected QUIC recipient message");
+            };
+            ensure!(participant_id == "sctp-peer" && message == data);
+            break message;
         }
         quic.turn()
             .await
             .map_err(|error| anyhow::anyhow!("QUIC Agent receive: {error:?}"))?;
-    }
+    };
+    let mut subscriber_loss = None;
     if delivery == DataV1Delivery::Reliable {
         let trace = pulsebeam::sim_metrics::take_shard_data_trace()
             .context("QUIC receiver repair trace")?;
@@ -1246,6 +1372,7 @@ async fn mixed_exchange(
             trace.repaired.contains(&dropped),
             "QUIC receiver must repair the dropped fragment: {trace:?}"
         );
+        subscriber_loss = Some((dropped.unit_seq, true));
         'delivery: loop {
             while let Some(notification) = quic.next_notification() {
                 if let Notification::ReliableData {
@@ -1267,6 +1394,20 @@ async fn mixed_exchange(
         }
     }
     sctp.close().await?;
+    if std::env::var_os("PULSEBEAM_AUTHOR_DATA_V1").is_some() {
+        let sample = serde_json::json!({
+            "delivery": format!("{delivery:?}"),
+            "quic_to_sctp": quic_to_sctp,
+            "sctp_to_quic": sctp_to_quic,
+            "publisher_loss": publisher_loss.map(|(unit_seq, repaired)| serde_json::json!({
+                "unit_seq": unit_seq, "repaired": repaired,
+            })),
+            "subscriber_loss": subscriber_loss.map(|(unit_seq, repaired)| serde_json::json!({
+                "unit_seq": unit_seq, "repaired": repaired,
+            })),
+        });
+        eprintln!("[simulation-generated] data-v1 {sample}");
+    }
     Ok(())
 }
 
@@ -1502,6 +1643,7 @@ async fn opus_exchange(
     let mut receiver = sim_quic_agent(address, edge, roots, receiver_token)?.with_raw_rtp();
     receiver.command(AgentCommand::ReplaceDesired(DesiredState {
         revision: 1,
+        rtp_sources: vec![stage_rtp_source(&publication_id, "audio/opus")],
         audio: AudioSubscription {
             pinned: vec![publication_id.clone()],
             ..Default::default()
@@ -1763,6 +1905,10 @@ async fn timed_opus_readers(
     receiver.command(AgentCommand::ReplaceDesired(DesiredState {
         revision: receiver.snapshot().desired_revision.saturating_add(1),
         connected: true,
+        rtp_sources: vec![
+            stage_rtp_source(voice.publication_id(), "audio/opus"),
+            stage_rtp_source(control.publication_id(), "audio/opus"),
+        ],
         audio: AudioSubscription {
             pinned: vec![
                 voice.publication_id().into(),
@@ -1984,6 +2130,7 @@ async fn mixed_opus_exchange(
         quic.resource(ResourceCommand::DeclareDataPublication {
             spec: bulk.clone(),
             capture_clock: None,
+            record_dd: false,
         })?;
     }
     let host = NativeHost::bind(rtc_host)?;
@@ -2213,6 +2360,7 @@ async fn mixed_opus_exchange(
             kind: MediaKind::Audio,
             active: true,
         }],
+        rtp_sources: vec![stage_rtp_source(&reverse_id, "audio/opus")],
         audio: AudioSubscription {
             pinned: vec![reverse_id.clone()],
             ..Default::default()
@@ -2270,8 +2418,22 @@ async fn mixed_opus_exchange(
     Ok(())
 }
 
+fn stage_rtp_source(publication_id: &str, mime: &str) -> pulsebeam_agent_core::RtpSource {
+    pulsebeam_agent_core::RtpSource::native_quic_baseline(
+        publication_id.into(),
+        "stage".into(),
+        mime,
+    )
+    .expect("stock native codec format")
+}
+
+fn stage_h264_source(publication_id: &str) -> pulsebeam_agent_core::RtpSource {
+    stage_rtp_source(publication_id, "video/h264")
+}
+
 fn pinned_video(publication_id: String) -> pulsebeam_agent_core::VideoSubscription {
     pulsebeam_agent_core::VideoSubscription {
+        decode_target: None,
         slot: 0,
         publication_id,
         selector: None,
@@ -2355,6 +2517,7 @@ async fn mixed_h264_exchange(
         receiver.command(AgentCommand::ReplaceDesired(DesiredState {
             revision: 1,
             video: vec![pinned_video(publication.clone())],
+            rtp_sources: vec![stage_h264_source(&publication)],
             ..Default::default()
         }))?;
         receiver.command(AgentCommand::Join("stage".into()))?;
@@ -2558,6 +2721,7 @@ async fn mixed_h264_exchange(
         connected: true,
         publications: vec![camera],
         video: vec![pinned_video(reverse_id.clone())],
+        rtp_sources: vec![stage_h264_source(&reverse_id)],
         ..Default::default()
     }))?;
     pulsebeam_runtime::time::timeout(Duration::from_secs(2), async {
@@ -2723,6 +2887,7 @@ async fn descriptor_h264_exchange(
         revision: receiver.snapshot().desired_revision.saturating_add(1),
         connected: true,
         video: vec![pinned_video(id.to_owned())],
+        rtp_sources: vec![stage_h264_source(id)],
         ..Default::default()
     }))?;
     let binding = pulsebeam_runtime::time::timeout(Duration::from_secs(2), async {
@@ -2748,37 +2913,78 @@ async fn descriptor_h264_exchange(
         H264::new(PacketBudget::new(1200, 24).context("DD RTP budget")?).context("H.264 budget")?;
     let wire = FabricOffer::CURRENT.bind_publisher(FabricOffer::CURRENT, Profile::H264, true)?;
     let template = FrameDependencyTemplate {
-        dtis: [DecodeTargetIndication::Switch].into_iter().collect(),
+        dtis: [DecodeTargetIndication::Switch; 2].into_iter().collect(),
         ..Default::default()
     };
     let key = DependencyDescriptor {
         frame_dependencies: template.clone(),
         attached_structure: Some(Box::new(TemplateDependencyStructure {
-            decode_target_count: 1,
+            decode_target_count: 2,
             templates: [template].into_iter().collect(),
             ..Default::default()
         })),
         ..Default::default()
     };
-    let mut dependent = DependencyDescriptor {
+    let mut second_key = key.clone();
+    second_key.frame_number = 1;
+    let mut omitted = DependencyDescriptor {
         frame_number: 2,
         attached_structure: None,
         ..key.clone()
     };
-    dependent.frame_dependencies.frame_diffs.push(1);
+    omitted.frame_dependencies.dtis = [
+        DecodeTargetIndication::Switch,
+        DecodeTargetIndication::NotPresent,
+    ]
+    .into_iter()
+    .collect();
+    omitted.fields.set_custom_dtis(true);
+    let mut dependent = DependencyDescriptor {
+        frame_number: 3,
+        attached_structure: None,
+        ..key.clone()
+    };
+    dependent.frame_dependencies.frame_diffs.push(2);
     dependent.fields.set_custom_fdiffs(true);
-    let mut second_key = key.clone();
-    second_key.frame_number = 1;
     let mut describe = Writer::default();
     let mut sequence = 0_u32;
-    let (mut sequence_offset, mut timestamp_offset) = (None, None);
-    let mut first_carriage = Vec::new();
-    for (frame, (data, facts)) in [(keyframe, key), (keyframe, second_key), (delta, dependent)]
-        .into_iter()
-        .enumerate()
-    {
+    let (mut timestamp_offset, mut frame_offset) = (None, None);
+    let mut last_received: Option<(u32, u32)> = None;
+    let mut dd_reader = pulsebeam_core::dd::DependencyDescriptorReader::new();
+    let mut source_dd_reader = pulsebeam_core::dd::DependencyDescriptorReader::new();
+    for (data, facts) in [
+        (keyframe, key),
+        (keyframe, second_key),
+        (keyframe, omitted),
+        (delta, dependent),
+    ] {
+        let frame = facts.frame_number;
         if frame == 1 {
             publisher.rebind(local).await?;
+            let accepted = receiver.snapshot().accepted_intent_revision;
+            let mut video = pinned_video(id.to_owned());
+            video.decode_target = Some(1);
+            receiver.command(AgentCommand::ReplaceDesired(DesiredState {
+                revision: receiver.snapshot().desired_revision.saturating_add(1),
+                connected: true,
+                video: vec![video],
+                rtp_sources: vec![stage_h264_source(id)],
+                ..Default::default()
+            }))?;
+            pulsebeam_runtime::time::timeout(Duration::from_secs(2), async {
+                while receiver.snapshot().accepted_intent_revision <= accepted
+                    || receiver.rtp_subscription(MediaKind::Video, id) != Some(binding)
+                {
+                    receiver
+                        .turn()
+                        .await
+                        .map_err(|error| anyhow::anyhow!("DD target selection: {error:?}"))?;
+                }
+                anyhow::Ok(())
+            })
+            .await
+            .context("DD target did not apply to the existing binding")??;
+            timestamp_offset = None;
         }
         let timestamp = 9000 + u32::from(facts.frame_number) * 3000;
         let packets = packetizer
@@ -2803,10 +3009,9 @@ async fn descriptor_h264_exchange(
                 sequence,
                 timestamp,
             };
-            let image = FabricPacket::new(header, &extensions, packet.payload.as_slice())?;
-            let mut bytes = [0; MAX_PACKET_BYTES];
-            let size = wire.agreement.write(&image, &mut bytes)?;
-            carriage.push(size > transport::framing::WHOLE_CAPACITY);
+            let source_dd = source_dd_reader
+                .read(dd.extension().value)
+                .map_err(|error| anyhow::anyhow!("source DD: {error:?}"))?;
             let send = async {
                 loop {
                     match publisher.send_rtp(&source, packet.as_send_packet(&extensions)) {
@@ -2821,6 +3026,9 @@ async fn descriptor_h264_exchange(
                         .await
                         .map_err(|error| anyhow::anyhow!("DD send progress: {error:?}"))?;
                 }
+                if frame == 2 {
+                    return anyhow::Ok(());
+                }
                 loop {
                     publisher
                         .turn()
@@ -2828,6 +3036,13 @@ async fn descriptor_h264_exchange(
                         .map_err(|error| anyhow::anyhow!("DD publisher: {error:?}"))?;
                 }
             };
+            if frame == 2 {
+                pulsebeam_runtime::time::timeout(Duration::from_secs(2), send)
+                    .await
+                    .context("DD omitted frame send deadline")??;
+                sequence = sequence.wrapping_add(1);
+                continue;
+            }
             let receive = async {
                 loop {
                     if let Some(event) = receiver.next_rtp() {
@@ -2846,20 +3061,74 @@ async fn descriptor_h264_exchange(
                 error = send => return error,
                 result = pulsebeam_runtime::time::timeout(Duration::from_secs(2), receive) => result.context("DD logical RTP delivery deadline")??,
             };
-            let offset = received.extended_sequence().wrapping_sub(sequence);
-            ensure!(*sequence_offset.get_or_insert(offset) == offset);
-            let offset = received.timestamp().wrapping_sub(timestamp);
+            let position = (received.extended_sequence(), received.timestamp());
+            let target_cut = frame == 1 && packet.first;
+            if let Some((seq, ts)) = last_received.replace(position) {
+                // A branch cut reserves one sequence number; filtering a known frame does not.
+                let expected = seq.wrapping_add(if target_cut { 2 } else { 1 });
+                ensure!(
+                    position.0 == expected,
+                    "filtered RTP sequence: expected {expected}, got {}",
+                    position.0
+                );
+                if packet.first {
+                    ensure!((1..(1 << 31)).contains(&position.1.wrapping_sub(ts)));
+                }
+            }
+            let offset = position.1.wrapping_sub(timestamp);
             ensure!(*timestamp_offset.get_or_insert(offset) == offset);
             ensure!(received.binding == binding && received.publication_id == id);
             ensure!(received.marker() == packet.last && received.payload() == packet.payload);
-            ensure!(received.extensions().any(|extension| extension.kind
-                == ExtensionKind::DependencyDescriptor
-                && extension.value == dd.extension().value));
+            let mapped_dd = received
+                .extensions()
+                .find(|extension| extension.kind == ExtensionKind::DependencyDescriptor)
+                .context("missing receiver DD")?;
+            let parsed = dd_reader
+                .read(mapped_dd.value)
+                .map_err(|error| anyhow::anyhow!("receiver DD: {error:?}"))?;
+            let offset = parsed.frame_number.wrapping_sub(facts.frame_number);
+            ensure!(*frame_offset.get_or_insert(offset) == offset);
+            ensure!(parsed.start_of_frame == packet.first && parsed.end_of_frame == packet.last);
+            ensure!(parsed.frame_dependencies == source_dd.frame_dependencies);
+            ensure!(dd_reader.active_decode_targets() == if frame == 0 { 0b11 } else { 0b10 });
+            let received_extensions: Vec<_> = received.extensions().collect();
+            let image = FabricPacket::new(header, &received_extensions, received.payload())?;
+            let mut bytes = [0; MAX_PACKET_BYTES];
+            let size = wire.agreement.write(&image, &mut bytes)?;
+            carriage.push(size > transport::framing::WHOLE_CAPACITY);
             let now = pulsebeam_runtime::time::Instant::now().into_std();
             ensure!(matches!(
                 reorder.push(now, received.into()),
                 jitter::Push::Queued
             ));
+            let now = if target_cut {
+                let deadline = reorder
+                    .deadline()
+                    .context("target cut has no reorder deadline")?;
+                pulsebeam_runtime::time::sleep_until(pulsebeam_runtime::time::Instant::from_std(
+                    deadline,
+                ))
+                .await;
+                let now = pulsebeam_runtime::time::Instant::now().into_std();
+                let Some(jitter::Output::Gap {
+                    sequence: gap,
+                    reason,
+                }) = reorder
+                    .poll(now)
+                    .map_err(|error| anyhow::anyhow!("DD reorder at target cut: {error:?}"))?
+                else {
+                    anyhow::bail!("target cut did not report the reserved RTP position");
+                };
+                ensure!(
+                    gap.end.checked_sub(gap.start) == Some(1) && gap.end == u64::from(position.0)
+                );
+                depacketize
+                    .gap(binding, gap, reason)
+                    .map_err(|error| anyhow::anyhow!("DD depacketizer at target cut: {error:?}"))?;
+                now
+            } else {
+                now
+            };
             let Some(jitter::Output::Packet {
                 input,
                 sequence: ordered,
@@ -2879,6 +3148,9 @@ async fn descriptor_h264_exchange(
             }
             sequence = sequence.wrapping_add(1);
         }
+        if frame == 2 {
+            continue;
+        }
         let Some(Event::Unit(unit)) = observed else {
             anyhow::bail!("no complete DD access unit");
         };
@@ -2886,21 +3158,17 @@ async fn descriptor_h264_exchange(
         let Dependency::Parsed(parsed) = unit.dependency else {
             anyhow::bail!("DD facts did not survive depacketization");
         };
-        ensure!(parsed.start_of_frame && parsed.frame_number == facts.frame_number);
+        ensure!(
+            parsed.start_of_frame
+                && Some(parsed.frame_number.wrapping_sub(facts.frame_number)) == frame_offset
+        );
         ensure!(
             parsed.frame_dependencies == facts.frame_dependencies
                 && parsed.attached_structure == facts.attached_structure
         );
-        match frame {
-            0 => {
-                ensure!(carriage.contains(&false) && carriage.contains(&true));
-                first_carriage = carriage;
-            }
-            1 => ensure!(
-                carriage == first_carriage
-                    && publisher.rtp_publication(MediaKind::Video, TRACK).as_ref() == Some(&source)
-            ),
-            _ => {}
+        if frame <= 1 {
+            ensure!(carriage.contains(&false) && carriage.contains(&true));
+            ensure!(publisher.rtp_publication(MediaKind::Video, TRACK).as_ref() == Some(&source));
         }
     }
     receiver.command(AgentCommand::Disconnect)?;
@@ -2929,6 +3197,7 @@ enum Scenario {
         delivery: DataV1Delivery,
         sctp_host: Option<std::net::IpAddr>,
     },
+    DataRecordDd,
     Opus,
     Mobility,
     FailedPath,
@@ -3013,7 +3282,8 @@ async fn witness(scenario: Scenario) -> Result<()> {
         Scenario::Data {
             sctp_host: Some(_),
             ..
-        } | Scenario::MixedOpus { .. }
+        } | Scenario::DataRecordDd
+            | Scenario::MixedOpus { .. }
             | Scenario::MixedH264 {
                 cross_shard: true,
                 ..
@@ -3050,6 +3320,10 @@ async fn witness(scenario: Scenario) -> Result<()> {
                 delivery,
             )
             .await;
+        }
+        if let Scenario::DataRecordDd = scenario {
+            return data_record_dd_exchange(address, edge, roots, &credential, &subscriber_token)
+                .await;
         }
         if let Scenario::MixedOpus { host, contention } = scenario {
             return mixed_opus_exchange(
@@ -3097,7 +3371,7 @@ async fn witness(scenario: Scenario) -> Result<()> {
         let owner = placement.owner;
         let (accepted, mut control) = client
             .admit(Admit {
-                fabric: pulsebeam_agent_quic::data_bindings::FabricOffer::CURRENT,
+                fabric: LEGACY_FABRIC_OFFER,
                 attempt: NonZeroU64::MIN,
                 room: Some("stage"),
                 owner: &owner,
@@ -3318,7 +3592,7 @@ async fn witness(scenario: Scenario) -> Result<()> {
         let mut next = Client::new(edge, roots, &issued).await?;
         let (accepted, mut control) = next
             .admit(Admit {
-                fabric: pulsebeam_agent_quic::data_bindings::FabricOffer::CURRENT,
+                fabric: LEGACY_FABRIC_OFFER,
                 attempt: NonZeroU64::new(2).context("valid attempt")?,
                 room: Some("stage"),
                 owner: &owner,

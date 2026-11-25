@@ -89,6 +89,7 @@ def main():
         ),
         core: (
             "`capturedAt`: CaptureTimestamp? = null",
+            "`fragmentDescriptors`: List<DataFragmentDescriptor>? = null",
             "`nanos`: kotlin.Long",
             "`uncertaintyNs`: kotlin.UInt? = null",
         ),
@@ -98,12 +99,14 @@ def main():
             "send(data: Data, options: DataSendOptions? = nil)",
         ),
         output / "pulsebeam_agent_core.swift": (
-            "init(capturedAt: CaptureTimestamp? = nil)",
+            "init(capturedAt: CaptureTimestamp? = nil, fragmentDescriptors: [DataFragmentDescriptor]? = nil)",
             "init(clock: CaptureClock, nanos: Int64, uncertaintyNs: UInt32? = nil)",
         ),
     }
     for source, expected in signatures.items():
         generated = source.read_text()
+        if source.suffix == ".swift":
+            generated = " ".join(re.sub(r"/\*\*.*?\*/", "", generated, flags=re.DOTALL).split())
         for signature in expected:
             if signature not in generated:
                 raise RuntimeError(f"{source.name} lacks data API signature {signature}")

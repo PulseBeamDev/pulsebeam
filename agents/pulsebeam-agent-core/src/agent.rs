@@ -159,6 +159,8 @@ struct Session {
     media_blocked: BTreeMap<MediaSlot, native::MediaWant>,
 
     quic_owner: Option<String>,
+    quic_directional_video_dd: bool,
+    quic_data_record_dd: bool,
     authorization_expires_at: Option<i64>,
     pending_renewal: Option<native::Renewal>,
     authorization_revision: u64,
@@ -207,6 +209,8 @@ impl Session {
             media_wanted: BTreeMap::new(),
             media_blocked: BTreeMap::new(),
             quic_owner: None,
+            quic_directional_video_dd: false,
+            quic_data_record_dd: false,
             authorization_expires_at: None,
             pending_renewal: None,
             authorization_revision: 0,
@@ -321,7 +325,7 @@ struct Closing {
 
 pub struct Agent {
     quic: bool,
-    quic_h264_dd_tracks: BTreeSet<String>,
+    quic_publication_profiles: BTreeMap<String, quic::PublicationProfile>,
     config: AgentConfig,
     config_credential_revision: u64,
     admission_denial: Option<credentials::AdmissionDenial>,
@@ -359,7 +363,7 @@ impl Agent {
         config.validate()?;
         Ok(Self {
             quic: false,
-            quic_h264_dd_tracks: BTreeSet::new(),
+            quic_publication_profiles: BTreeMap::new(),
             config,
             config_credential_revision: 0,
             admission_denial: None,
@@ -610,14 +614,21 @@ impl Agent {
             ResourceCommand::DeclareDataPublication {
                 spec,
                 capture_clock,
+                record_dd,
             } => {
+                if record_dd && !self.quic {
+                    return Err(AgentError::OperationFailed(crate::ffi::ErrorInfo {
+                        code: crate::ffi::ErrorCode::Unsupported,
+                        message: "DATA_V1 record descriptors require native QUIC".into(),
+                    }));
+                }
                 self.resources.validate_data_publication_claim(&spec)?;
                 let mut owned = self.resources.registrations();
                 owned.publishers.push(spec.publisher()?);
                 self.merged_topics(owned)?;
                 let owner = self.resources.new_owner()?;
                 self.resources
-                    .declare_data_publication(owner, &spec, capture_clock)?;
+                    .declare_data_publication(owner, &spec, capture_clock, record_dd)?;
                 ResourceResult::Owned { owner: owner.id() }
             }
             ResourceCommand::UpdatePublication { owner, present } => {
@@ -984,6 +995,7 @@ impl Agent {
                             generation,
                             channel,
                             binding,
+                            record_dd: parameters.record_dd,
                             operation,
                             payload,
                         }))
@@ -1349,7 +1361,8 @@ impl Agent {
         let video_changed = self.desired.video != desired.video;
         let intent_changed = self.desired.publications != desired.publications
             || video_changed
-            || self.desired.audio != desired.audio;
+            || self.desired.audio != desired.audio
+            || self.desired.rtp_sources != desired.rtp_sources;
         let topics_changed = self.desired.topics != desired.topics;
         let previous_video_count = self.desired.video.len();
         self.desired = desired;
@@ -3104,7 +3117,7 @@ impl Agent {
                 &mut self.logs,
                 &self.desired,
                 &self.resources,
-                &self.quic_h264_dd_tracks,
+                &self.quic_publication_profiles,
                 &mut self.ids,
                 &mut self.effects,
             ) {
@@ -3879,6 +3892,84 @@ mod response_tests {
             }],
             body: serde_json::to_vec(&body).unwrap(),
         }
+    }
+
+    #[test]
+    fn native_response_accepts_the_full_codec_mode_inventory() {
+        use pulsebeam_proto::state::{
+            CodecFormat, CodecParameter, RtpCapabilities, RtpCodecCapability, RtpScalabilityMode,
+            STOCK_AV1_PARAMETERS, VideoMode,
+        };
+
+        let codecs = ["video/av1", "video/vp9", "video/vp8", "video/h264"]
+            .into_iter()
+            .map(|mime_type| {
+                let parameters: &[(&str, &str)] = match mime_type {
+                    "video/av1" => &STOCK_AV1_PARAMETERS,
+                    "video/h264" => &[("packetization-mode", "1"), ("profile-level-id", "42e01f")],
+                    _ => &[],
+                };
+                let format = CodecFormat {
+                    mime_type: mime_type.into(),
+                    clock_rate: 90_000,
+                    channels: None,
+                    parameters: parameters
+                        .iter()
+                        .map(|&(name, value)| CodecParameter {
+                            name: name.into(),
+                            value: value.into(),
+                        })
+                        .collect(),
+                };
+                let scalability_modes = RtpScalabilityMode::ALL
+                    .iter()
+                    .map(|mode| mode.as_str())
+                    .filter(|mode| VideoMode::for_format(&format, mode).is_ok())
+                    .map(String::from)
+                    .collect();
+                RtpCodecCapability {
+                    format: Some(format),
+                    scalability_modes,
+                    ..Default::default()
+                }
+            })
+            .collect();
+        let capabilities = RtpCapabilities {
+            codecs,
+            ..Default::default()
+        };
+        const NATIVE_SDP_LIMIT: usize = 131_072;
+        let prefix = "v=0\r\n";
+        let line = "a=x\r\n";
+        let answer =
+            prefix.to_string() + &line.repeat((NATIVE_SDP_LIMIT - prefix.len()) / line.len());
+        let (candidate, parsed_answer) = parse_create_response(
+            &response(serde_json::json!({
+                "participant_id": "Stage_Participant",
+                "connection_id": "conn_0065WZSB8G1XN31RDHP9883WVRC",
+                "profile": "pulsebeam.media.v1",
+                "rtp_capabilities": capabilities,
+                "data_delivery": ["LATEST", "LOSSY", "ORDERED"],
+                "answer": answer,
+            })),
+            Credential {
+                token: "request-token".into(),
+                revision: 17,
+            },
+        )
+        .unwrap();
+        assert_eq!(candidate.capabilities.rtp, capabilities);
+        assert_eq!(parsed_answer, answer);
+        assert_eq!(
+            candidate
+                .capabilities
+                .rtp
+                .codecs
+                .iter()
+                .map(|codec| codec.scalability_modes.len())
+                .sum::<usize>(),
+            78,
+        );
     }
 
     #[test]

@@ -60,6 +60,7 @@ test_suite(
         "//agents/react:format", "//agents/react:unit_tests", "//agents/react:component_tests",
         "//apps/meet:component_tests", "//server/typescript:format",
         "//crates/pulsebeam-libwebrtc-sys:fast",
+        "//crates/pulsebeam-testdata:corpus_inventory", "//agents/pulsebeam-agent-quic:codec_matrix",
         "//tools:workflow_contract", "//tools:simulation_runner_contract", "//tools:calibration_contract", "//tools:scoreboard_contract",
         "//tools:ide_contract", "//tools:launcher_contract", "//tools:rust_pins_contract", "//tools:runtime_boundary_contract", "//tools:fix_contract",
         "//tools/nativelink:config_test", "//tools/nativelink:analyze_test", "//tools/nativelink:autostart_test", "//release:plan_contract",

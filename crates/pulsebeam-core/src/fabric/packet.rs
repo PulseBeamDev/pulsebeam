@@ -4,7 +4,7 @@
 //! routing or hop budget. Successful parsing is not source admission.
 
 use super::{
-    BorrowedPacket, ExtensionKind, FabricPacket, Form, Header, MAJOR, MAX_HOPS, Profile,
+    BorrowedPacket, Extension, ExtensionKind, FabricPacket, Form, Header, MAJOR, MAX_HOPS, Profile,
     REGISTRY_REVISION, WireError,
 };
 
@@ -49,12 +49,26 @@ const fn registered(profile: Profile, revision: u8) -> u16 {
     mask
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VideoDdEmission {
+    None,
+    EveryPacket,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VideoDdReception {
+    None,
+    Accepted,
+    Required,
+}
+
 /// Wire facts frozen for the lifetime of one authorized binding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Agreement {
     profile: Profile,
     revision: u8,
     extensions: u16,
+    requires_video_dd: bool,
 }
 
 impl Agreement {
@@ -71,7 +85,39 @@ impl Agreement {
             profile,
             revision,
             extensions,
+            requires_video_dd: false,
         })
+    }
+
+    /// Install one video direction. Extension capability is necessary but does
+    /// not promise that the publisher emits DD or that the reader requires it.
+    pub fn negotiate_video(
+        profile: Profile,
+        publisher: Offer,
+        emission: VideoDdEmission,
+        receiver: Offer,
+        reception: VideoDdReception,
+    ) -> Result<Self, WireError> {
+        if !profile.is_video() {
+            return Err(WireError::ExtensionProfile);
+        }
+        let mut agreement = Self::negotiate(profile, publisher, receiver)?;
+        let dd = ExtensionKind::DependencyDescriptor;
+        match (emission, reception) {
+            (VideoDdEmission::None, VideoDdReception::None | VideoDdReception::Accepted)
+                if (publisher.required | receiver.required) & dd.bit() == 0 =>
+            {
+                agreement.extensions &= !dd.bit();
+            }
+            (
+                VideoDdEmission::EveryPacket,
+                VideoDdReception::Accepted | VideoDdReception::Required,
+            ) if agreement.allows(dd) => {
+                agreement.requires_video_dd = true;
+            }
+            _ => return Err(WireError::RequiredFeature),
+        }
+        Ok(agreement)
     }
 
     pub const fn profile(self) -> Profile {
@@ -105,6 +151,7 @@ impl Agreement {
         let mut rest = optional;
         let mut last = 1;
         let mut needs_two = false;
+        let mut has_video_dd = false;
         while !rest.is_empty() {
             let (id, value, next) = form.read_element(rest)?;
             if id <= last {
@@ -115,9 +162,13 @@ impl Agreement {
                 return Err(WireError::UnnegotiatedExtension);
             }
             kind.validate(profile, value)?;
+            has_video_dd |= kind == ExtensionKind::DependencyDescriptor;
             needs_two |= value.len() > 16;
             last = id;
             rest = next;
+        }
+        if self.requires_video_dd && !has_video_dd {
+            return Err(WireError::RequiredFeature);
         }
         if (form == Form::Two) != needs_two {
             return Err(WireError::ExtensionLayout);
@@ -145,15 +196,61 @@ impl Agreement {
         packet: &FabricPacket<impl AsRef<[u8]>, impl AsRef<[u8]>>,
         output: &mut [u8],
     ) -> Result<usize, WireError> {
-        let header = packet.header();
+        self.write_extensions(
+            packet.header(),
+            packet.payload(),
+            || packet.extensions(),
+            output,
+        )
+    }
+
+    /// Replace or omit the source DD, leaving all other extension negotiation intact.
+    pub fn write_mapped_dd(
+        self,
+        packet: &FabricPacket<impl AsRef<[u8]>, impl AsRef<[u8]>>,
+        descriptor: Option<&[u8]>,
+        output: &mut [u8],
+    ) -> Result<usize, WireError> {
+        let kind = ExtensionKind::DependencyDescriptor;
+        if let Some(value) = descriptor {
+            kind.validate(packet.header().profile, value)?;
+            if !self.allows(kind) || !packet.extensions().any(|ext| ext.kind == kind) {
+                return Err(WireError::RequiredFeature);
+            }
+        }
+        self.write_extensions(
+            packet.header(),
+            packet.payload(),
+            || {
+                packet.extensions().filter_map(|ext| {
+                    if ext.kind == kind {
+                        descriptor.map(|value| Extension { kind, value })
+                    } else {
+                        Some(ext)
+                    }
+                })
+            },
+            output,
+        )
+    }
+
+    fn write_extensions<'a, I: Iterator<Item = Extension<'a>>>(
+        self,
+        header: Header,
+        payload: &[u8],
+        extensions: impl Fn() -> I,
+        output: &mut [u8],
+    ) -> Result<usize, WireError> {
         if header.profile != self.profile {
             return Err(WireError::PayloadType);
         }
         let mut needs_two = false;
         let mut count = 0_usize;
         let mut values = 0_usize;
-        for ext in packet.extensions() {
+        let mut has_video_dd = false;
+        for ext in extensions() {
             if self.allows(ext.kind) {
+                has_video_dd |= ext.kind == ExtensionKind::DependencyDescriptor;
                 needs_two |= ext.value.len() > 16;
                 count = count.saturating_add(1);
                 values = values.saturating_add(ext.value.len());
@@ -161,11 +258,13 @@ impl Agreement {
                 return Err(WireError::RequiredFeature);
             }
         }
+        if self.requires_video_dd && !has_video_dd {
+            return Err(WireError::RequiredFeature);
+        }
         let form = if needs_two { Form::Two } else { Form::One };
         let extension_bytes = count
             .saturating_mul(form.header_bytes())
             .saturating_add(values);
-        let payload = packet.payload();
         let len = BASE_BYTES
             .saturating_add(extension_bytes)
             .saturating_add(payload.len());
@@ -196,7 +295,7 @@ impl Agreement {
             j,
         ]);
         let (mut metadata, payload_out) = body.split_at_mut(extension_bytes);
-        for ext in packet.extensions().filter(|ext| self.allows(ext.kind)) {
+        for ext in extensions().filter(|ext| self.allows(ext.kind)) {
             let value_len = u8::try_from(ext.value.len()).map_err(|_| WireError::ExtensionValue)?;
             let (first, second) = form.element_header(ext.kind as u8, value_len);
             let (element, rest) = metadata.split_at_mut(form.element_bytes(ext.value.len()));

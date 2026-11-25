@@ -561,6 +561,7 @@ mod tests {
                     kind: Some(track::Kind::Data(crate::state::DataTrack {
                         capture_clock: None,
                         delivery: DataDelivery::Ordered as i32,
+                        record_dd: false,
                     })),
                 })
                 .collect(),

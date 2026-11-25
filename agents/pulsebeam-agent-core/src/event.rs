@@ -19,6 +19,8 @@ pub enum QuicEvent {
         participant_id: String,
         room: Option<String>,
         capabilities: Vec<u8>,
+        directional_video_dd: bool,
+        data_record_dd: bool,
     },
     Control {
         generation: Generation,

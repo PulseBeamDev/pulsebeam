@@ -69,6 +69,8 @@ impl Window {
             2 => Profile::H264,
             3 => Profile::Av1,
             4 => Profile::Data,
+            5 => Profile::Vp8,
+            6 => Profile::Vp9,
             _ => return Err(WireError::PayloadType),
         };
         let start = u64::from_be_bytes([a, b, c, d, e, f, g, h]);
@@ -120,6 +122,8 @@ impl Window {
             Profile::H264 => 2,
             Profile::Av1 => 3,
             Profile::Data => 4,
+            Profile::Vp8 => 5,
+            Profile::Vp9 => 6,
         };
         let [a, b, c, d, e, f, g, h] = self.start.to_be_bytes();
         let [i, j, k, l] = self.ssrc.get().to_be_bytes();

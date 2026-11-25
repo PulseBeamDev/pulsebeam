@@ -288,8 +288,9 @@ def build(args, lock_fd=None):
             capture = package / "capture"
             capture.mkdir()
             (capture / "BUILD.gn").symlink_to(overlay / "capture/BUILD.gn")
-            (capture / "vp9_capture.cc").symlink_to(Path(args.capture_source).absolute())
-            target = "//pulsebeam/capture:vp9_capture"
+            driver_source = Path(args.capture_source)
+            (capture / driver_source.name).symlink_to(driver_source.absolute())
+            target = "//pulsebeam/capture:" + driver_source.stem
         owned = package / "pulsebeam-webrtc-sys"
         (owned / "src").mkdir(parents=True)
         (owned / "src/bridge.rs").symlink_to(bridge)
@@ -318,8 +319,9 @@ def build(args, lock_fd=None):
         siso = root / "third_party/siso/cipd/siso"
         run([gn, "gen", build, f"--root={root}", f"--root-target={target}", "--ide=json", "--args=" + config], cwd=root, env=env, lock_fd=lock_fd)
         if args.capture_output:
-            run(siso_command(siso, build, args.executor, args.reapi, "vp9_capture"), cwd=root, env=env, lock_fd=lock_fd)
-            shutil.copyfile(build / "vp9_capture", args.capture_output)
+            driver_name = Path(args.capture_source).stem
+            run(siso_command(siso, build, args.executor, args.reapi, driver_name), cwd=root, env=env, lock_fd=lock_fd)
+            shutil.copyfile(build / driver_name, args.capture_output)
             Path(args.capture_output).chmod(0o755)
             return
         graph = json.loads((build / "project.json").read_text())

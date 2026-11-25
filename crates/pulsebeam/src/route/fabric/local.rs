@@ -119,6 +119,19 @@ impl Emission {
         minimum_revision: 0,
     };
 
+    pub(crate) const fn data(record_dd: bool) -> Self {
+        if record_dd {
+            let kind = ExtensionKind::DependencyDescriptor;
+            Self {
+                profile: Profile::Data,
+                mask: kind.bit(),
+                minimum_revision: kind.minimum_revision(),
+            }
+        } else {
+            Self::DATA
+        }
+    }
+
     pub fn new(profile: Profile, extensions: &[ExtensionKind]) -> Option<Self> {
         let mut mask = 0;
         let mut minimum_revision = 0;
@@ -144,8 +157,12 @@ impl Emission {
         self.mask & bit(kind) != 0
     }
 
+    pub(crate) fn carries_video_dd(self) -> bool {
+        self.profile.is_video() && self.includes(ExtensionKind::DependencyDescriptor)
+    }
+
     pub(crate) fn selects_dd_encoding(self) -> bool {
-        self.profile == Profile::H264 && self.includes(ExtensionKind::DependencyDescriptor)
+        self.profile == Profile::H264 && self.carries_video_dd()
     }
 
     pub(crate) const fn wire_profile(self) -> (u8, u16) {
@@ -398,7 +415,7 @@ struct Branch {
     queue: VecDeque<Queued>,
     filter: Option<Box<FilteredBranch>>,
     dd_reset: Option<u64>,
-    filtered_structure: Option<u64>,
+    filtered_structure: Option<(u64, u64)>,
     omitted: u64,
     last_omitted: Option<u64>,
 }
@@ -450,9 +467,7 @@ impl SourceFanout {
         receiver: Emission,
         target: DecodeTarget,
     ) -> Option<FabricBranchHandle> {
-        if !matches!(self.emission.profile, Profile::H264 | Profile::Av1)
-            || self.emission.mask & bit(ExtensionKind::DependencyDescriptor) == 0
-        {
+        if !self.emission.carries_video_dd() {
             return None;
         }
         self.install(
@@ -1349,14 +1364,7 @@ impl SourceFanout {
         if branch.dd_reset == self.high {
             return false;
         }
-        branch.dd_reset = self.high;
-        if let Some(filter) = &mut branch.filter {
-            filter.lose_context();
-            branch.queue.clear();
-            true
-        } else {
-            false
-        }
+        branch.reset_dd_output(self.high)
     }
 
     pub(crate) fn awaiting_entry(
@@ -1683,7 +1691,14 @@ impl SourceFanout {
         };
         for branch in self.branches.values_mut() {
             branch.discard_stale(now, &self.fates, |_| true);
-            branch.offer(now, work, ingress, qualified.as_ref(), false, &mut report);
+            branch.offer(
+                now,
+                work,
+                ingress,
+                qualified.as_ref(),
+                sequence == high,
+                &mut report,
+            );
         }
         Ok(report)
     }
@@ -1979,7 +1994,7 @@ impl Branch {
         work: LiveWork,
         ingress: Option<NonZeroU64>,
         evidence: Option<&(Qualified, FrameStatus)>,
-        ordered: bool,
+        in_order: bool,
         report: &mut Offers,
     ) {
         let LiveWork { sequence, hops, .. } = work;
@@ -2028,29 +2043,32 @@ impl Branch {
                     evidence.map_or((None, FrameStatus::Unresolved), |(q, f)| (Some(q), *f));
                 let qualified = qualified.filter(|q| {
                     self.filtered_structure
-                        .is_none_or(|old| q.structure_sequence >= old)
+                        .is_none_or(|(attachment, _)| q.structure_sequence >= attachment)
                 });
                 if qualified.is_none() && evidence.is_some() {
                     filtered = Some(Decision::Fenced);
                     return false;
                 }
-                let changed = qualified
-                    .is_some_and(|q| self.filtered_structure != Some(q.structure_sequence));
+                let changed = qualified.is_some_and(|q| {
+                    self.filtered_structure.map(|(_, origin)| origin) != Some(q.structure_origin)
+                });
                 let reset = changed && !filter.awaiting_entry();
                 if reset {
                     filter.lose_context();
                 }
                 if let Some(q) = qualified {
-                    self.filtered_structure = Some(q.structure_sequence);
+                    self.filtered_structure = Some((q.structure_sequence, q.structure_origin));
                 }
                 let qualified = qualified.filter(|q| {
                     !filter.awaiting_entry() || q.descriptor.attached_structure.is_some()
                 });
                 let mut decision = filter.offer(sequence, frame, qualified, enqueue);
-                if reset && decision != Decision::Entered {
+                if reset && decision != Decision::Entered || decision == Decision::Refused {
+                    filter.lose_context();
                     decision = Decision::Suspended;
                 }
                 if decision == Decision::Suspended {
+                    self.dd_reset = self.dd_reset.max(Some(sequence));
                     queue.clear();
                 } else if matches!(decision, Decision::Admitted | Decision::Entered)
                     && let Some(packet) = queue.back_mut()
@@ -2071,7 +2089,7 @@ impl Branch {
             (LiveOffer::Refused, Some(Decision::Omitted)) => {
                 // Only ordered, qualified omissions are known not to be loss.
                 // Freeze the projection when queuing; never renumber admitted work.
-                if ordered {
+                if in_order {
                     self.omitted = self.omitted.saturating_add(1);
                     self.last_omitted = Some(sequence);
                 }
@@ -2087,6 +2105,17 @@ impl Branch {
             _ => return,
         };
         *count = count.saturating_add(1);
+    }
+
+    fn reset_dd_output(&mut self, fence: Option<u64>) -> bool {
+        self.dd_reset = self.dd_reset.max(fence);
+        if let Some(filter) = &mut self.filter {
+            filter.lose_context();
+            self.queue.clear();
+            true
+        } else {
+            false
+        }
     }
 
     fn discard_stale(
@@ -2110,6 +2139,11 @@ impl Branch {
         }) {
             metrics::counter!("fabric_branch_dropped_packets", "reason" => "stale_or_revoked")
                 .increment(1);
+            if self.filter.is_some() {
+                let fence = self.queue.iter().map(|queued| queued.sequence).max();
+                self.reset_dd_output(fence);
+                return;
+            }
             self.discard_front();
         }
     }

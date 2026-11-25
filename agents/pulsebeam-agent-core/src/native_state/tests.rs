@@ -118,6 +118,7 @@ fn negotiated_native_profile_reuses_resource_revision_and_state_codec() {
                 version: 1,
                 incarnation: 1,
                 delivery: wire::DataV1Delivery::Reliable as i32,
+                record_dd: false,
             },
         )),
     });
@@ -164,6 +165,7 @@ fn live(revision: u64, spec: wire::ResourceSpec) -> wire::ConfirmedState {
                     kind: Some(wire::track::Kind::Data(wire::DataTrack {
                         capture_clock: None,
                         delivery: wire::DataDelivery::Ordered as i32,
+                        record_dd: false,
                     })),
                 }),
                 execution: if enabled {

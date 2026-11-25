@@ -31,6 +31,14 @@ native_build(
     visibility = ["//crates/pulsebeam-testdata:__pkg__"],
 )
 
+native_build(
+    name = "codec_receive",
+    bridge = "src/bridge.rs",
+    capture = "gn/capture/codec_receive.cc",
+    testonly = True,
+    visibility = ["//agents/pulsebeam-agent-quic:__pkg__"],
+)
+
 py_test(
     name = "native_build_test",
     srcs = ["native_build.py", "native_build_test.py", "source_manifest.py"],

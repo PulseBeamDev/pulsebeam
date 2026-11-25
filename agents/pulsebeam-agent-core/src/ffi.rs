@@ -86,6 +86,7 @@ pub struct PublicationIntent {
 
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct VideoDemand {
+    pub decode_target: Option<u32>,
     pub slot: u32,
     pub publication_id: String,
     pub selector: Option<TrackSelector>,
@@ -148,6 +149,9 @@ pub struct DataPublishOptions {
     pub delivery: Option<DataDelivery>,
     #[uniffi(default = None)]
     pub capture_clock: Option<CaptureClock>,
+    /// Allow fragment dependency descriptors on negotiated native QUIC bindings.
+    #[uniffi(default = None)]
+    pub record_dd: Option<bool>,
 }
 
 impl DataPublishOptions {
@@ -171,6 +175,9 @@ pub struct DataSubscribeOptions {
 pub struct DataSendOptions {
     #[uniffi(default = None)]
     pub captured_at: Option<CaptureTimestamp>,
+    /// Optional descriptors in strictly increasing DATA_V1 fragment index order.
+    #[uniffi(default = None)]
+    pub fragment_descriptors: Option<Vec<crate::data_v1::DataFragmentDescriptor>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
@@ -210,6 +217,7 @@ pub struct DesiredState {
     pub publications: Vec<PublicationIntent>,
     pub video: Vec<VideoDemand>,
     pub audio: AudioDemand,
+    pub rtp_sources: Vec<model::RtpSource>,
     pub topic_publishers: Vec<TopicPublisher>,
     pub topic_subscribers: Vec<TopicSubscriber>,
 }
@@ -833,6 +841,7 @@ impl DesiredState {
             publications: self.publications.into_iter().map(Into::into).collect(),
             video: self.video.into_iter().map(Into::into).collect(),
             audio: self.audio.into(),
+            rtp_sources: self.rtp_sources,
             topics: model::TopicRegistrations {
                 publishers: self.topic_publishers.into_iter().map(Into::into).collect(),
                 subscribers: self.topic_subscribers.into_iter().map(Into::into).collect(),
@@ -854,6 +863,7 @@ impl From<model::DesiredState> for DesiredState {
             publications: value.publications.into_iter().map(Into::into).collect(),
             video: value.video.into_iter().map(Into::into).collect(),
             audio: value.audio.into(),
+            rtp_sources: value.rtp_sources,
             topic_publishers: value
                 .topics
                 .publishers
@@ -952,6 +962,7 @@ impl From<model::PublicationIntent> for PublicationIntent {
 impl From<VideoDemand> for model::VideoSubscription {
     fn from(value: VideoDemand) -> Self {
         Self {
+            decode_target: value.decode_target,
             slot: value.slot,
             publication_id: value.publication_id,
             selector: value.selector.map(Into::into),
@@ -966,6 +977,7 @@ impl From<VideoDemand> for model::VideoSubscription {
 impl From<model::VideoSubscription> for VideoDemand {
     fn from(value: model::VideoSubscription) -> Self {
         Self {
+            decode_target: value.decode_target,
             slot: value.slot,
             publication_id: value.publication_id,
             selector: value.selector.map(Into::into),
@@ -1426,6 +1438,7 @@ mod tests {
 
         let desired = DesiredState {
             video: vec![VideoDemand {
+                decode_target: None,
                 slot: u32::MAX,
                 publication_id: String::new(),
                 selector: None,
@@ -1640,6 +1653,7 @@ mod tests {
             active: true,
         });
         assert_ffi_round_trip(VideoDemand {
+            decode_target: Some(0),
             slot: 1,
             publication_id: "participant/video".into(),
             selector: None,
@@ -1694,6 +1708,17 @@ mod tests {
             }],
             video: vec![],
             audio: AudioDemand::default(),
+            rtp_sources: vec![model::RtpSource {
+                publication_id: "participant/video".into(),
+                room: "stage".into(),
+                mime_type: "video/h264".into(),
+                clock_rate: 90_000,
+                channels: None,
+                parameters: vec![model::RtpSourceParameter {
+                    name: "packetization-mode".into(),
+                    value: "1".into(),
+                }],
+            }],
             topic_publishers: vec![publisher],
             topic_subscribers: vec![subscriber],
         });

@@ -30,6 +30,10 @@ pub(super) fn prepared_rtp_binding(
             })
         })
         .ok_or_else(|| Error::Envelope("codec format".into()))?;
+    let format = capability
+        .format
+        .as_ref()
+        .ok_or_else(|| Error::Envelope("codec format".into()))?;
     if let Some(repair) = &binding.codec.repair
         && (!capability.rtx_supported || repair.clock_rate != binding.codec.parameters.clock_rate)
     {
@@ -86,9 +90,8 @@ pub(super) fn prepared_rtp_binding(
                 .scalability_mode
                 .as_deref()
                 .map(|name| {
-                    if !capability.scalability_modes.iter().any(|mode| mode == name) {
-                        return Err(Error::Envelope("scalability mode".into()));
-                    }
+                    validation::negotiated_video_mode(format, capability, name)
+                        .map_err(|_| Error::Envelope("scalability mode".into()))?;
                     Ok(alloc::string::String::from(name))
                 })
                 .transpose()?;

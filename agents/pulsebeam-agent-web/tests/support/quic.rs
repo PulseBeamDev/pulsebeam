@@ -7,8 +7,8 @@ use tokio::net::{TcpListener, TcpStream};
 
 use agent_core::{
     AgentCommand, AgentConfig, AudioSubscription, DataEvent, DesiredState, MediaKind,
-    PublicationIntent, ResourceCommand, ResourceResult, TopicMode, TrackSelector, TrackSpec,
-    VideoSubscription,
+    PublicationIntent, ResourceCommand, ResourceResult, RtpSource, TopicMode, TrackSelector,
+    TrackSpec, VideoSubscription,
 };
 use noq_proto::rustls::RootCertStore;
 use pulsebeam_agent_quic::{executor::host::Agent, transport::DatagramAdmission};
@@ -177,6 +177,7 @@ async fn drive(agent: &mut Agent, browser_done: &Cell<bool>) -> TestResult<()> {
     agent.resource(ResourceCommand::DeclareDataPublication {
         spec: spec.clone(),
         capture_clock: None,
+        record_dd: false,
     })?;
     let ResourceResult::Owned { owner } = agent.resource(ResourceCommand::ReceiveData {
         spec: TrackSpec::Data {
@@ -258,11 +259,19 @@ async fn drive(agent: &mut Agent, browser_done: &Cell<bool>) -> TestResult<()> {
                     revision,
                     connected: true,
                     publications: publications.to_vec(),
+                    rtp_sources: [(&voice, "audio/opus"), (&camera, "video/h264")]
+                        .into_iter()
+                        .map(|(id, mime)| {
+                            RtpSource::native_quic_baseline(id.clone(), ROOM.into(), mime)
+                                .expect("browser fixture format")
+                        })
+                        .collect(),
                     audio: AudioSubscription {
                         pinned: vec![voice.clone()],
                         ..Default::default()
                     },
                     video: vec![VideoSubscription {
+                        decode_target: None,
                         slot: 0,
                         publication_id: camera.clone(),
                         selector: None,

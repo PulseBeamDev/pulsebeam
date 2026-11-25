@@ -992,13 +992,7 @@ impl Connection {
         for (&reference, receiver) in &self.native_receivers.receivers {
             if self
                 .ready_rtp_binding(receiver)
-                .is_some_and(|(_, _, _, profile)| {
-                    matches!(
-                        profile,
-                        pulsebeam_core::fabric::Profile::H264
-                            | pulsebeam_core::fabric::Profile::Av1
-                    )
-                })
+                .is_some_and(|(_, _, _, profile)| profile.is_video())
             {
                 events.stage_local_rtp_receiver(reference);
             }

@@ -579,6 +579,33 @@
         !video.paused,
       "fresh fixed-delay decoded/renderable frames",
     );
+    const inbound = await fixedReceiver.getStats();
+    const liveVideo = [...inbound.values()].find(
+      (entry) =>
+        entry.type === "inbound-rtp" &&
+        entry.kind === "video" &&
+        entry.framesDecoded > 1,
+    );
+    const selectedVideoCodec = inbound.get(liveVideo?.codecId)?.mimeType;
+    assert(
+      selectedVideoCodec === "video/H264",
+      `expected decoded video/H264 from the native browser binding, got ${selectedVideoCodec}`,
+    );
+    let encodedVideo;
+    await until(async () => {
+      for (const peer of peers) {
+        const stats = await originalGetStats.call(peer);
+        encodedVideo = [...stats.values()].find(
+          (entry) =>
+            entry.type === "outbound-rtp" &&
+            entry.kind === "video" &&
+            entry.framesEncoded > 1 &&
+            stats.get(entry.codecId)?.mimeType === selectedVideoCodec,
+        );
+        if (encodedVideo) return true;
+      }
+      return false;
+    }, `browser sends encoded ${selectedVideoCodec} frames`);
     let fixedPresentation = video.srcObject.getVideoTracks()[0];
     assert(
       presentedFrom(fixedTrack) &&
@@ -1084,7 +1111,12 @@
         handoffClones.every((clone) => clone.readyState === "ended"),
       "SDK stops owned media, not caller capture",
     );
-    return true;
+    return {
+      videoCodec: selectedVideoCodec,
+      scalabilityMode: encodedVideo.scalabilityMode ?? null,
+      framesEncoded: encodedVideo.framesEncoded,
+      framesDecoded: liveVideo.framesDecoded,
+    };
   } catch (error) {
     const info = error?.inner?.info;
     if (info) {

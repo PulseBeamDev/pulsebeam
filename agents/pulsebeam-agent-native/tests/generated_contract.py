@@ -14,12 +14,19 @@ async def witness():
     native = importlib.import_module("contract.pulsebeam_agent_native")
     assert core.DataPublishOptions().delivery is None
     assert core.DataPublishOptions().capture_clock is None
+    assert core.DataPublishOptions().record_dd is None
+    assert core.DataPublishOptions(record_dd=True).record_dd is True
     assert core.DataSubscribeOptions().delivery is None
     for delivery in (core.DataDelivery.UNRELIABLE, core.DataDelivery.LATEST):
         assert core.DataPublishOptions(delivery=delivery).delivery is delivery
         assert core.DataSubscribeOptions(delivery=delivery).delivery is delivery
     assert core.DataSendOptions().captured_at is None
-    assert list(inspect.signature(core.DataSendOptions).parameters) == ["captured_at"]
+    assert core.DataSendOptions().fragment_descriptors is None
+    assert list(inspect.signature(core.DataSendOptions).parameters) == [
+        "captured_at", "fragment_descriptors",
+    ]
+    descriptor = core.DataFragmentDescriptor(fragment_index=1, bytes=b"\xc0\x00\x01")
+    assert core.DataSendOptions(fragment_descriptors=[descriptor]).fragment_descriptors == [descriptor]
     capture = core.CaptureTimestamp(
         clock=core.CaptureClock(id="camera", epoch=(1 << 64) - 1),
         nanos=-(1 << 63),

@@ -186,7 +186,14 @@ impl Installed {
         if self.publishers.owned.len() == MAX_PUBLISHERS {
             return Err(ExecutionFailureKind::Capacity.into());
         }
-        let (wire, emission) = self.publisher_wire(Profile::Data, false)?;
+        let peer = self.peer_fabric.ok_or(ExecutionFailureKind::Retired)?;
+        let wire = peer
+            .bind_data(
+                FabricOffer::CURRENT.with_data_record_dd(),
+                binding.record_dd,
+            )
+            .map_err(|_| ExecutionFailureKind::Unsupported)?;
+        let emission = Self::publisher_emission(wire)?;
         let frames = Receiver::new(wire.framing, binding.id);
         let publisher = core
             .quic_owner_handle(self.transport)
@@ -225,8 +232,13 @@ impl Installed {
             connection_id: self.connection,
             track_id: Some(plan.track_id),
         };
-        let track =
-            Track::native_data_publication(meta, plan.lane, Some(incarnation), plan.capture_clock);
+        let track = Track::native_data_publication(
+            meta,
+            plan.lane,
+            Some(incarnation),
+            plan.capture_clock,
+            binding.record_dd,
+        );
         events.push_back(ShardEvent::TrackPublished(track.clone()));
         let execution = PublicationExecution {
             track,
@@ -270,6 +282,9 @@ impl Installed {
             .ok_or(ExecutionFailureKind::Invalid)?;
         let prepared = QuicRtpBinding::compile(&plan.parameters, kind)
             .map_err(|_| ExecutionFailureKind::Invalid)?;
+        prepared
+            .validate_video_dd_direction(true)
+            .map_err(|_| ExecutionFailureKind::Invalid)?;
         let binding = PayloadBinding::from(prepared);
         let ingress = crate::rtp::fabric_ingress::QuicRtpIngress::new(prepared)
             .map_err(|_| ExecutionFailureKind::Invalid)?;
@@ -306,8 +321,11 @@ impl Installed {
             rid: None,
             payload_type: prepared.payload_type().into(),
         };
-        let (wire, emission) =
-            self.publisher_wire(ingress.profile(), prepared.publishes_h264_dd())?;
+        let (wire, emission) = self.publisher_wire(
+            ingress.profile(),
+            prepared.publishes_h264_dd(),
+            prepared.video_dd(),
+        )?;
         let frames = Receiver::new(wire.framing, binding.binding_id());
         let (source, incarnation) = core
             .install_quic_rtp_source(publisher, id, association, plan.enabled, encoding, emission)
@@ -351,6 +369,10 @@ impl Installed {
             );
             if let Track::Video(video) = &mut track {
                 video.format = format;
+                video.guarantees_video_dd = prepared.publishes_h264_dd()
+                    || prepared.video_dd() == Some(wire::QuicVideoDd::Emit);
+                video.av1_whole_source = prepared.video_dd() == Some(wire::QuicVideoDd::Absent)
+                    && prepared.format().mime_type == "video/av1";
             }
             track
         };
@@ -452,19 +474,28 @@ impl Installed {
         &self,
         profile: Profile,
         publishes_h264_dd: bool,
+        video_dd: Option<wire::QuicVideoDd>,
     ) -> Result<(FabricBinding, Emission), ExecutionFailure> {
         let peer = self.peer_fabric.ok_or(ExecutionFailureKind::Retired)?;
-        let wire = FabricOffer::CURRENT
-            .bind_publisher(peer, profile, publishes_h264_dd)
+        let wire = peer
+            .bind_rtp_publisher(
+                FabricOffer::CURRENT,
+                profile,
+                publishes_h264_dd,
+                video_dd.map(|dd| dd == wire::QuicVideoDd::Emit),
+            )
             .map_err(|_| ExecutionFailureKind::Unsupported)?;
-        let emission = Emission::from_wire_profile(
-            profile as u8,
+        Ok((wire, Self::publisher_emission(wire)?))
+    }
+
+    fn publisher_emission(wire: FabricBinding) -> Result<Emission, ExecutionFailure> {
+        Emission::from_wire_profile(
+            wire.agreement.profile() as u8,
             wire.agreement.extension_mask(),
             MAJOR,
             wire.agreement.revision(),
         )
-        .ok_or(ExecutionFailureKind::Invalid)?;
-        Ok((wire, emission))
+        .ok_or_else(|| ExecutionFailureKind::Invalid.into())
     }
 
     pub(super) fn ingest_native_datagram(

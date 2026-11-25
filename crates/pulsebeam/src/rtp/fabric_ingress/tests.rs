@@ -92,65 +92,84 @@ impl RtpIngressShadow {
 }
 
 #[test]
-fn quic_opus_uses_canonical_packet_coordinates() {
+fn quic_ingress_uses_the_negotiated_profile_not_the_session_payload_type() {
     use pulsebeam_core::fabric::{FabricPacket, Header};
     use pulsebeam_proto::state as wire;
-    let parameters = wire::QuicRtpParameters {
-        binding_id: 7,
-        incarnation: 9,
-        primary_ssrc: 11,
-        publishes_h264_dd: false,
-        codec: Some(wire::RtpCodecParameters {
-            payload_type: Some(111),
-            format: Some(wire::CodecFormat::from(codec_format::Codec::Opus(
-                wire::OpusParameters::default(),
-            ))),
+
+    let capabilities = crate::control::rtp::quic_capabilities(true);
+    for (codec, profile) in capabilities.codecs.into_iter().zip([
+        Profile::Opus,
+        Profile::H264,
+        Profile::Vp8,
+        Profile::Vp9,
+        Profile::Av1,
+    ]) {
+        let video_dd = matches!(profile, Profile::Vp8 | Profile::Vp9 | Profile::Av1)
+            .then_some(wire::QuicVideoDd::Absent as i32);
+        let parameters = wire::QuicRtpParameters {
+            binding_id: 7,
+            incarnation: 9,
+            primary_ssrc: 11,
+            video_dd,
+            codec: Some(wire::RtpCodecParameters {
+                payload_type: Some(125),
+                format: codec.format,
+                ..Default::default()
+            }),
             ..Default::default()
-        }),
-    };
-    let binding = QuicRtpBinding::compile(&parameters, wire::TrackKind::Audio).unwrap();
-    let adapter = QuicRtpIngress::new(binding).unwrap();
-    let arrival = Instant::now();
-    let header = Header {
-        profile: Profile::Opus,
-        marker: true,
-        sequence: 0x1_005a,
-        timestamp: 100,
-    };
-    let packet = FabricPacket::new(header, &[], &[0xf8][..]).unwrap();
-    let view = packet.arrival_view(packet.remaining_hops()).unwrap();
-    let ingress = adapter.prepare_packet(arrival, &view).unwrap();
-    assert!(matches!(
-        ingress.position,
-        Position::CanonicalSequence(0x1_005a)
-    ));
-    assert_eq!(ingress.arrival, arrival);
-    ingress.with_input(|input| {
-        let Input::Media(media) = input else {
-            panic!("expected media");
         };
-        assert_eq!(
-            (media.timestamp, media.marker, media.payload),
-            (100, true, &[0xf8][..])
-        );
-        assert!(media.extensions.is_empty());
-    });
-    let wrong_profile = FabricPacket::new(
-        Header {
-            profile: Profile::H264,
-            ..header
-        },
-        &[],
-        &[0xf8][..],
-    )
-    .unwrap();
-    let view = wrong_profile
-        .arrival_view(wrong_profile.remaining_hops())
+        let kind = if profile.is_video() {
+            wire::TrackKind::Video
+        } else {
+            wire::TrackKind::Audio
+        };
+        let binding = QuicRtpBinding::compile(&parameters, kind).unwrap();
+        let adapter = QuicRtpIngress::new(binding).unwrap();
+        let arrival = Instant::now();
+        let header = Header {
+            profile,
+            marker: true,
+            sequence: 0x1_005a,
+            timestamp: 100,
+        };
+        let packet = FabricPacket::new(header, &[], [0xf8]).unwrap();
+        let view = packet.arrival_view(packet.remaining_hops()).unwrap();
+        let ingress = adapter.prepare_packet(arrival, &view).unwrap();
+        assert!(matches!(
+            ingress.position,
+            Position::CanonicalSequence(0x1_005a)
+        ));
+        assert_eq!(ingress.arrival, arrival);
+        ingress.with_input(|input| {
+            let Input::Media(media) = input else {
+                panic!("expected media")
+            };
+            assert_eq!(
+                (media.timestamp, media.marker, media.payload),
+                (100, true, &[0xf8][..])
+            );
+            assert!(media.extensions.is_empty());
+        });
+        let other = if profile.is_video() {
+            Profile::Opus
+        } else {
+            Profile::H264
+        };
+        let wrong = FabricPacket::new(
+            Header {
+                profile: other,
+                ..header
+            },
+            &[],
+            [0xf8],
+        )
         .unwrap();
-    assert!(matches!(
-        adapter.prepare_packet(arrival, &view),
-        Err(DropReason::Binding)
-    ));
+        let view = wrong.arrival_view(wrong.remaining_hops()).unwrap();
+        assert!(matches!(
+            adapter.prepare_packet(arrival, &view),
+            Err(DropReason::Binding)
+        ));
+    }
 }
 
 #[test]

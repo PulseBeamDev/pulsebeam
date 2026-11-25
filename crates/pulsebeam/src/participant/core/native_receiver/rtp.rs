@@ -18,29 +18,9 @@ pub(super) struct RtpReceiver {
 
 impl RtpReceiver {
     pub(super) fn new(configuration: ReceiverRtpConfiguration) -> Self {
-        use pulsebeam_core::fabric::Profile;
         let codec = &configuration.binding.description().codec.parameters;
-        let fabric_profile = match (configuration.kind, codec.name.as_str()) {
-            (MediaKind::Audio, "opus")
-                if codec.clock_rate == 48_000 && codec.channels == Some(2) =>
-            {
-                Some(Profile::Opus)
-            }
-            (MediaKind::Video, "h264")
-                if codec.clock_rate == 90_000
-                    && codec.channels.is_none()
-                    && codec
-                        .fmtp
-                        .get("packetization-mode")
-                        .is_some_and(|mode| mode == "1") =>
-            {
-                Some(Profile::H264)
-            }
-            (MediaKind::Video, "av1") if crate::control::rtp::is_stock_av1(codec) => {
-                Some(Profile::Av1)
-            }
-            _ => None,
-        };
+        let fabric_profile = crate::control::rtp::fabric_profile(codec)
+            .filter(|profile| profile.is_video() == (configuration.kind == MediaKind::Video));
         let fid = match configuration.binding.description().encodings.as_slice() {
             [encoding] if encoding.rid.is_none() => {
                 encoding.repair.map(|repair| [encoding.primary, repair])

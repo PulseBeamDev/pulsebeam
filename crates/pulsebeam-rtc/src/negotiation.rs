@@ -164,6 +164,8 @@ impl NegotiatedSessionFacts {
                             payload_type: codec.payload_type,
                             name: match codec.profile {
                                 crate::CodecProfile::Opus => "opus",
+                                crate::CodecProfile::Vp8 => "vp8",
+                                crate::CodecProfile::Vp9 { .. } => "vp9",
                                 crate::CodecProfile::H264 { .. } => "h264",
                                 crate::CodecProfile::Av1 { .. } => "av1",
                             }
@@ -1094,6 +1096,8 @@ fn parse_codecs(
             (SectionKind::Audio, Codec::Opus, 48_000, Some(2)) => Some("opus"),
             (SectionKind::Video, Codec::H264, 90_000, None) => Some("h264"),
             (SectionKind::Video, Codec::Av1, 90_000, None) if capabilities.is_some() => Some("av1"),
+            (SectionKind::Video, Codec::Vp8, 90_000, None) if capabilities.is_some() => Some("vp8"),
+            (SectionKind::Video, Codec::Vp9, 90_000, None) if capabilities.is_some() => Some("vp9"),
             _ => None,
         };
         if let Some(name) = name {
@@ -1118,8 +1122,10 @@ fn parse_codecs(
             if capability.is_none_or(|capability| capability.repair) {
                 repairable.insert(*parameter.pt);
             }
-            let profile = if parameter.spec.codec == Codec::Av1 {
-                crate::rtp_config::av1_profile(&codec_fmtp(raw, *parameter.pt)?)
+            let profile = if let Some(capability) = capability {
+                capability
+                    .parameters
+                    .profile()
                     .ok_or_else(NegotiationError::unsupported)?
             } else {
                 parse_codec_profile(raw, *parameter.pt, kind)?
@@ -2211,6 +2217,82 @@ mod tests {
                 accepted.connection.set_rtp_capabilities(capabilities),
                 Err(crate::RtpConfigurationError::CapabilityState)
             );
+        }
+    }
+
+    #[test]
+    fn vp_sdp_selection_requires_an_explicit_matching_capability() {
+        for (name, fmtp, profile) in [
+            ("VP8", "", crate::CodecProfile::Vp8),
+            (
+                "VP9",
+                "a=fmtp:102 profile-id=0",
+                crate::CodecProfile::Vp9 { profile_id: 0 },
+            ),
+        ] {
+            let offer = SdpOffer::new(fixture("chrome").as_str()
+                .replace("a=rtpmap:102 H264/90000", &format!("a=rtpmap:102 {name}/90000"))
+                .replace("a=fmtp:102 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f", fmtp)
+                .replace("\n\n", "\n"));
+            let accept = |config| {
+                RtcConnection::accept(
+                    config,
+                    SdpOffer::new(offer.as_str().to_owned()),
+                    at(),
+                    std::time::UNIX_EPOCH,
+                    ConnectionEntropy::new([8; 32]),
+                )
+            };
+            assert!(accept(config()).is_err());
+            let video = crate::RtpCodecParameters {
+                name: name.to_ascii_lowercase(),
+                clock_rate: 90_000,
+                channels: None,
+                fmtp: if fmtp.is_empty() {
+                    BTreeMap::new()
+                } else {
+                    [("profile-id".into(), "0".into())].into()
+                },
+                feedback: ["transport-cc".into()].into(),
+            };
+            let capabilities = crate::RtpCapabilities {
+                codecs: vec![
+                    crate::RtpCodecCapability {
+                        parameters: crate::RtpCodecParameters {
+                            name: "opus".into(),
+                            clock_rate: 48_000,
+                            channels: Some(2),
+                            fmtp: BTreeMap::new(),
+                            feedback: ["transport-cc".into()].into(),
+                        },
+                        repair: false,
+                    },
+                    crate::RtpCodecCapability {
+                        parameters: video,
+                        repair: false,
+                    },
+                ],
+                extensions: [
+                    "urn:ietf:params:rtp-hdrext:sdes:mid".into(),
+                    TWCC_URIS[0].into(),
+                ]
+                .into(),
+                feedback: PacketFeedbackKind::TransportWide,
+                limits: crate::RtpConfigurationLimits::default(),
+            };
+            assert_eq!(capabilities.codecs[1].parameters.profile(), Some(profile));
+            let accepted = accept(ConnectionConfig {
+                rtp_capabilities: Some(capabilities),
+                ..config()
+            })
+            .expect("explicit VP format");
+            assert!(
+                accepted
+                    .answer
+                    .as_str()
+                    .contains(&format!("a=rtpmap:102 {name}/90000"))
+            );
+            assert!(!accepted.answer.as_str().contains("a=rtpmap:121"));
         }
     }
 

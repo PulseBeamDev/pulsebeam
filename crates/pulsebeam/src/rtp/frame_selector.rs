@@ -25,6 +25,8 @@ pub enum FrameDecision {
     /// Drop it as an intentional layer shed — the egress stream renumbers around
     /// it so the subscriber never sees the gap as loss.
     Drop,
+    /// Missing evidence is loss, not an intentional omission.
+    Unqualified,
 }
 
 /// Decides whether each packet of the active encoding is forwarded.
@@ -65,8 +67,8 @@ pub enum DecodeTargetSelection {
 /// takes effect immediately — the finer, keyframe-free bitrate control DD exists
 /// to provide.
 ///
-/// A packet without a parsed descriptor is forwarded unchanged, so a stream that
-/// only intermittently carries DD still plays.
+/// Whole-source forwarding does not require DD. A selected target does, so an
+/// unqualified packet leaves a loss gap rather than joining the selected stream.
 #[derive(Debug, Default)]
 pub struct DependencyDescriptorSelector {
     target: DecodeTargetSelection,
@@ -100,10 +102,13 @@ impl DependencyDescriptorSelector {
 
 impl FrameSelector for DependencyDescriptorSelector {
     fn decide(&mut self, pkt: &RtpPacket) -> FrameDecision {
+        if self.target == DecodeTargetSelection::Full {
+            return FrameDecision::Forward;
+        }
         match pkt.ext_vals.dependency_descriptor() {
-            Some(dd) if !self.keep(dd) => FrameDecision::Drop,
-            // In target, or no descriptor to reason about: forward.
-            _ => FrameDecision::Forward,
+            Some(dd) if self.keep(dd) => FrameDecision::Forward,
+            Some(_) => FrameDecision::Drop,
+            None => FrameDecision::Unqualified,
         }
     }
 }
@@ -190,13 +195,11 @@ mod test {
     }
 
     #[test]
-    fn a_packet_without_a_descriptor_is_forwarded() {
+    fn missing_descriptor_is_loss_only_for_a_selected_target() {
         let mut sel = DependencyDescriptorSelector::with_target(DecodeTargetSelection::Target(0));
-        assert_eq!(
-            sel.decide(&plain_pkt()),
-            FrameDecision::Forward,
-            "cannot reason without DD, so never drop"
-        );
+        assert_eq!(sel.decide(&plain_pkt()), FrameDecision::Unqualified);
+        sel.set_target(DecodeTargetSelection::Full);
+        assert_eq!(sel.decide(&plain_pkt()), FrameDecision::Forward);
     }
 
     #[test]

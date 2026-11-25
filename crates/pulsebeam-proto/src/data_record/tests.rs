@@ -93,6 +93,20 @@ fn descriptor_and_clock_share_one_bounded_record() -> Result<(), Error> {
     assert_eq!(out.get(34), Some(&96));
     assert_eq!(Record::decode(&out, Some(CLOCK)), Ok(record));
     assert_eq!(Record::decode(&out, None), Err(Error::Clock));
+    let mut canonical = [0; MAX_RECORD_BYTES];
+    let split = split_endpoint_record(&out, &mut canonical)?;
+    assert_eq!(split.descriptor, Some(descriptor.as_slice()));
+    assert_eq!(split.identity, wire_identity(split.payload)?);
+    assert_eq!(
+        Record::decode_without_descriptor(split.payload, Some(CLOCK)),
+        Ok(record.without_dependency_descriptor())
+    );
+    let mut restored = [0; MAX_ENDPOINT_RECORD_BYTES];
+    assert_eq!(
+        restore_endpoint_record(split.payload, split.descriptor, &mut restored)?,
+        out
+    );
+    assert!(restore_endpoint_record(&out, split.descriptor, &mut restored).is_err());
     for (offset, byte, error) in [
         (3, 6, Error::Flags),
         (3, 15, Error::Flags),
