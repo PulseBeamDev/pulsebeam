@@ -23,6 +23,9 @@ pub enum ValidationError {
 
 type Result<T = ()> = core::result::Result<T, ValidationError>;
 
+pub const MAX_SELECTOR_DECLARATIONS: usize = 8;
+pub const MAX_SELECTOR_MATCHES: usize = 16;
+
 pub fn validate_client_batch(batch: &ClientStateBatch) -> Result {
     validate_client_batch_for(batch, BindingProfile::Rtc)
 }
@@ -184,6 +187,12 @@ fn validate_confirmed(
             }
             validate_logical_subscription_for(subscription, profile)
         }
+        (Key::Owned(reference), Some(Value::SubscriptionSelector(selector))) => {
+            if confirmed.evaluated_revision < *reference {
+                return Err(ValidationError::Confirmed);
+            }
+            validate_selector_state(selector)
+        }
         (Key::Owned(_), Some(Value::Absent(absent))) => {
             if !known::<AbsenceReason>(absent.reason)
                 || absent.reason == AbsenceReason::CreateRejected as i32
@@ -292,6 +301,12 @@ pub fn validate_spec_for(spec: &ResourceSpec, profile: BindingProfile) -> Result
             }
             validate_receive_settings(settings, kind)
         }
+        resource_spec::Declaration::SubscriptionSelector(selector) => {
+            if settings.receive.is_some() {
+                return Err(ValidationError::Settings);
+            }
+            validate_selector(selector)
+        }
         resource_spec::Declaration::Subscription(subscription) => {
             if !text(&subscription.publication_id, 128)
                 || !is_application_name(&subscription.source_room)
@@ -387,6 +402,7 @@ fn validate_live_for(live: &LiveResource, profile: BindingProfile) -> Result {
         Some(
             resource_spec::Declaration::SourceLookup(_)
                 | resource_spec::Declaration::LogicalSubscription(_)
+                | resource_spec::Declaration::SubscriptionSelector(_)
         )
     ) {
         return Err(ValidationError::Confirmed);
@@ -426,7 +442,8 @@ fn validate_live_for(live: &LiveResource, profile: BindingProfile) -> Result {
             }
         }
         resource_spec::Declaration::SourceLookup(_)
-        | resource_spec::Declaration::LogicalSubscription(_) => {
+        | resource_spec::Declaration::LogicalSubscription(_)
+        | resource_spec::Declaration::SubscriptionSelector(_) => {
             return Err(ValidationError::Confirmed);
         }
         resource_spec::Declaration::Subscription(subscription) => {
@@ -496,6 +513,75 @@ fn validate_live_for(live: &LiveResource, profile: BindingProfile) -> Result {
         ),
         _ => Err(ValidationError::Confirmed),
     }
+}
+
+fn validate_selector(selector: &SubscriptionSelectorSpec) -> Result {
+    if selector
+        .project_id
+        .as_deref()
+        .is_some_and(|project| !project.starts_with("p_") || !is_application_name(project))
+        || [&selector.room, &selector.participant_id, &selector.track_id]
+            .into_iter()
+            .any(|component| {
+                component
+                    .as_deref()
+                    .is_some_and(|value| !is_application_name(value))
+            })
+        || selector.kind.is_some_and(|kind| !known::<TrackKind>(kind))
+    {
+        return Err(ValidationError::Identity);
+    }
+    Ok(())
+}
+
+fn validate_selector_state(state: &SubscriptionSelectorState) -> Result {
+    let spec = state.spec.as_ref().ok_or(ValidationError::Confirmed)?;
+    validate_spec(spec)?;
+    let Some(resource_spec::Declaration::SubscriptionSelector(selector)) =
+        spec.declaration.as_ref()
+    else {
+        return Err(ValidationError::Confirmed);
+    };
+    let enabled = spec.settings.as_ref().and_then(|settings| settings.enabled) == Some(true);
+    match SelectorMatchStatus::try_from(state.status) {
+        Ok(SelectorMatchStatus::Complete) if enabled => {}
+        Ok(SelectorMatchStatus::Pending | SelectorMatchStatus::Overflow)
+            if enabled && state.matches.is_empty() =>
+        {
+            return Ok(());
+        }
+        Ok(SelectorMatchStatus::Complete) if state.matches.is_empty() => return Ok(()),
+        _ => return Err(ValidationError::Confirmed),
+    }
+    if state.matches.len() > MAX_SELECTOR_MATCHES {
+        return Err(ValidationError::Confirmed);
+    }
+    let mut previous = None;
+    for source in &state.matches {
+        crate::catalog::validate_address(source).map_err(|_| ValidationError::Identity)?;
+        let key = (
+            source.room.as_str(),
+            source.participant_id.as_str(),
+            source.kind,
+            source.track_id.as_str(),
+        );
+        if previous.is_some_and(|previous| previous >= key)
+            || selector.room.as_deref().is_some_and(|room| room != key.0)
+            || selector
+                .participant_id
+                .as_deref()
+                .is_some_and(|participant| participant != key.1)
+            || selector.kind.is_some_and(|kind| kind != key.2)
+            || selector
+                .track_id
+                .as_deref()
+                .is_some_and(|track| track != key.3)
+        {
+            return Err(ValidationError::Identity);
+        }
+        previous = Some(key);
+    }
+    Ok(())
 }
 
 pub fn validate_source_lookup(lookup: &SourceLookupState) -> Result {
@@ -964,6 +1050,10 @@ pub fn declarations_equivalent(left: &ResourceSpec, right: &ResourceSpec) -> boo
         (
             Some(Declaration::LogicalSubscription(left)),
             Some(Declaration::LogicalSubscription(right)),
+        ) => left == right,
+        (
+            Some(Declaration::SubscriptionSelector(left)),
+            Some(Declaration::SubscriptionSelector(right)),
         ) => left == right,
         _ => false,
     }

@@ -38,6 +38,19 @@ async def witness(endpoint, token, reader_token, catalog_token, room, package):
         ),
         log_level=core.LogLevel.WARN,
     ))
+    async def joined(owner):
+        updates = owner.updates()
+        try:
+            while True:
+                state = await updates.next()
+                assert state is not None, "Agent closed before admission"
+                assert state.status != core.AgentStatus.FAILED, state.error
+                if state.status == core.AgentStatus.JOINED:
+                    assert state.room == room
+                    return
+        finally:
+            updates.close()
+
     watch = catalog_agent.room(room).watch()
     watch_updates = watch.updates()
     assert agent.state().status == core.AgentStatus.IDLE
@@ -49,16 +62,17 @@ async def witness(endpoint, token, reader_token, catalog_token, room, package):
         assert initial.status == core.WatchStatus.LOADING and initial.participants is None
 
         async def catalog_page(predicate):
-            async def matching_page():
-                while True:
-                    state = await watch_updates.next()
-                    assert state is not None and state.error is None, state
-                    if state.participants is not None and predicate(state.participants):
-                        assert state.status == core.WatchStatus.LIVE
-                        return state
-            return await asyncio.wait_for(matching_page(), timeout=5)
+            while True:
+                state = await watch_updates.next()
+                assert state is not None and state.error is None, state
+                if state.participants is not None and predicate(state.participants):
+                    assert state.status == core.WatchStatus.LIVE
+                    return state
 
+        # Observe Loading before joining. Admission and page delivery are distinct
+        # events, bounded by the witness watchdog rather than a wall-clock SLA.
         catalog_agent.join(room)
+        await joined(catalog_agent)
         first_page = await catalog_page(lambda participants: any(
             participant.id() == "publisher" and any(
                 publication.track_id == "production-camera" and publication.kind.is_VIDEO()
@@ -85,17 +99,17 @@ async def witness(endpoint, token, reader_token, catalog_token, room, package):
                 await view.close()
 
         catalog_room = catalog_agent.room(room)
-        head = await asyncio.wait_for(settled_page(catalog_room.watch(core.WatchConfig(
+        head = await settled_page(catalog_room.watch(core.WatchConfig(
             limit=1, cursor=b"",
-        ))), timeout=5)
+        )))
         assert head.status == core.WatchStatus.LIVE and head.has_more
         assert len(head.participants) == 1
         cursor = bytes(head.next_cursor)
         assert cursor and head.cursor_expires_at_unix_seconds > 0
-        tail, wrong_scope = await asyncio.wait_for(asyncio.gather(
+        tail, wrong_scope = await asyncio.gather(
             settled_page(catalog_room.watch(core.WatchConfig(limit=1, cursor=cursor))),
             settled_page(catalog_room.watch(core.WatchConfig(limit=2, cursor=cursor))),
-        ), timeout=5)
+        )
         assert tail.status == core.WatchStatus.LIVE and len(tail.participants) == 1
         assert not tail.has_more and not tail.next_cursor
         assert {head.participants[0].id(), tail.participants[0].id()} == {
@@ -104,18 +118,6 @@ async def witness(endpoint, token, reader_token, catalog_token, room, package):
         assert wrong_scope.status == core.WatchStatus.FAILED and wrong_scope.participants is None
         assert wrong_scope.error.code == core.ErrorCode.INVALID_ARGUMENT
 
-        async def joined(owner):
-            updates = owner.updates()
-            try:
-                while True:
-                    state = await updates.next()
-                    assert state is not None, "Agent closed before admission"
-                    assert state.status != core.AgentStatus.FAILED, state.error
-                    if state.status == core.AgentStatus.JOINED:
-                        assert state.room == room
-                        return
-            finally:
-                updates.close()
         data = agent.data("foreign-bytes").publish()
         room_cursor = reader.room(room).participant("foreign").data(
             "foreign-bytes").subscribe()
@@ -168,9 +170,7 @@ async def witness(endpoint, token, reader_token, catalog_token, room, package):
         # Ordered receive starts at a live frontier, not retained history.
         producer = asyncio.create_task(establish_live_cursor())
         try:
-            await asyncio.wait_for(asyncio.gather(
-                message(room_cursor, setup), message(participant_cursor, setup),
-            ), timeout=5)
+            await asyncio.gather(message(room_cursor, setup), message(participant_cursor, setup))
         finally:
             if producer.done():
                 await producer
@@ -276,14 +276,14 @@ async def witness(endpoint, token, reader_token, catalog_token, room, package):
         assert publication.is_closed() and not camera.is_closed(), "publication close stopped producer"
         await camera.close()
         assert camera.is_closed(), "producer close did not retire input"
-        await asyncio.wait_for(agent.close(), timeout=5)
+        await agent.close()
         assert agent.state().status == core.AgentStatus.CLOSED
         assert agent.statistics() is None, "foreign native graph not retired"
         print("installed Python synchronous Agent/dynamic RTC/real SFU/live catalog/owned binary data/independent source/named media close PASS")
     finally:
         await watch.close()
         watch_updates.close()
-        await asyncio.wait_for(asyncio.gather(agent.close(), reader.close(), catalog_agent.close()), timeout=3)
+        await asyncio.gather(agent.close(), reader.close(), catalog_agent.close())
 
 
 async def admitted_publication(core, publication):

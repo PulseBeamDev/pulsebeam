@@ -131,6 +131,8 @@ pub enum TrackResourceError {
     AlreadyOwned,
     #[error("owned publication capacity exceeded")]
     PublicationCapacityExceeded,
+    #[error("selector observation capacity exceeded")]
+    SelectorObservationCapacityExceeded,
     #[error("owner already owns another resource")]
     OwnerInUse,
     #[error("resource owner identity space exhausted")]
@@ -366,6 +368,7 @@ impl PublicationOwner {
 
 struct DataReceiver {
     subscriber: TopicSubscriber,
+    selector_owner: Option<TrackOwner>,
     source: Option<String>,
     discontinuity: Option<DataEvent>,
     queue: VecDeque<DataEvent>,
@@ -540,6 +543,10 @@ pub enum ResourceCommand {
         owner: u64,
         source: String,
     },
+    BeginSelectorMediaObservation {
+        owner: TrackOwner,
+        source: crate::SelectorMatch,
+    },
     AuthorizeMediaObservation {
         control: MediaObservationControl,
     },
@@ -556,6 +563,10 @@ pub enum ResourceCommand {
     ReceiveData {
         spec: TrackSpec,
         source: TrackSelector,
+    },
+    ReceiveSelectorData {
+        owner: TrackOwner,
+        source: crate::SelectorMatch,
     },
     ReadData {
         owner: u64,
@@ -1559,11 +1570,46 @@ impl TrackResources {
         registrations.normalize();
         registrations.subscribers.dedup();
         registrations.validate()?;
+        self.insert_data_receiver(owner, subscriber, None)
+    }
+
+    pub(crate) fn receive_selector_data(
+        &mut self,
+        selector_owner: TrackOwner,
+        source: TrackSelector,
+        mode: TopicMode,
+    ) -> Result<TrackOwner, TrackResourceError> {
+        let subscriber = TopicSubscriber {
+            room: source.room,
+            participant_id: source.participant_id,
+            topic: source.track_id,
+            mode,
+        };
+        if self.receivers.values().any(|receiver| {
+            receiver.selector_owner == Some(selector_owner)
+                && receiver.subscriber.room == subscriber.room
+                && receiver.subscriber.participant_id == subscriber.participant_id
+                && receiver.subscriber.topic == subscriber.topic
+        }) {
+            return Err(TrackResourceError::AlreadyOwned);
+        }
+        let owner = self.new_owner()?;
+        self.insert_data_receiver(owner, subscriber, Some(selector_owner))?;
+        Ok(owner)
+    }
+
+    fn insert_data_receiver(
+        &mut self,
+        owner: TrackOwner,
+        subscriber: TopicSubscriber,
+        selector_owner: Option<TrackOwner>,
+    ) -> Result<(), TrackResourceError> {
         self.begin_intent(owner)?;
         self.receivers.insert(
             owner,
             DataReceiver {
                 subscriber,
+                selector_owner,
                 source: None,
                 discontinuity: None,
                 queue: VecDeque::new(),
@@ -1573,31 +1619,40 @@ impl TrackResources {
         Ok(())
     }
 
+    pub(crate) fn selector_data_receivers(
+        &self,
+    ) -> impl Iterator<Item = (TrackOwner, TrackOwner, &TopicSubscriber)> {
+        self.receivers.iter().filter_map(|(&owner, receiver)| {
+            Some((owner, receiver.selector_owner?, &receiver.subscriber))
+        })
+    }
+
     pub fn release_receiver(&mut self, owner: TrackOwner) -> bool {
         self.receivers.remove(&owner).is_some()
     }
 
     pub fn registrations(&self) -> TopicRegistrations {
-        let mut registrations =
-            TopicRegistrations {
-                publishers: self
-                    .producers
-                    .iter()
-                    .cloned()
-                    .chain(self.data_publications.iter().map(|(topic, publication)| {
-                        TopicPublisher {
+        let mut registrations = TopicRegistrations {
+            publishers: self
+                .producers
+                .iter()
+                .cloned()
+                .chain(
+                    self.data_publications
+                        .iter()
+                        .map(|(topic, publication)| TopicPublisher {
                             topic: topic.clone(),
                             mode: publication.delivery,
-                        }
-                    }))
-                    .collect(),
-                subscribers: self
-                    .receivers
-                    .values()
-                    .filter(|receiver| receiver.failure.is_none())
-                    .map(|receiver| receiver.subscriber.clone())
-                    .collect(),
-            };
+                        }),
+                )
+                .collect(),
+            subscribers: self
+                .receivers
+                .values()
+                .filter(|receiver| receiver.failure.is_none() && receiver.selector_owner.is_none())
+                .map(|receiver| receiver.subscriber.clone())
+                .collect(),
+        };
         registrations.normalize();
         registrations.subscribers.dedup();
         registrations
@@ -1636,7 +1691,7 @@ impl TrackResources {
             }
             receiver.fail(TrackResourceError::ReceiveFailed(error.clone()));
             update.ready.push(*owner);
-            update.registrations_changed = true;
+            update.registrations_changed |= receiver.selector_owner.is_none();
         }
         update
     }

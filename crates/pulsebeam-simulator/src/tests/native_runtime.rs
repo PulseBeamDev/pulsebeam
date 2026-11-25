@@ -673,6 +673,7 @@ fn native_agents_prove_media_topics_reconnect_and_close() {
             )
             .with_cluster(pulsebeam::cluster::Options {
                 ownership_peers: Vec::new(),
+                region_tree: None,
                 cluster_id: "native-reconnect".into(),
                 topology: pulsebeam::cluster::Topology::SingleNode,
                 listen: gossip,
@@ -760,7 +761,7 @@ fn native_agents_prove_media_topics_reconnect_and_close() {
 }
 
 #[test]
-fn native_joined_recovery_moves_to_a_distinct_controller_attempt() {
+fn native_joined_recovery_cannot_preempt_the_live_issuer() {
     let seed = std::env::var("PULSEBEAM_SIM_SEED")
         .map(|value| value.parse().expect("simulation seed must be a u64"))
         .unwrap_or(NATIVE_RUNTIME_SEED);
@@ -768,7 +769,7 @@ fn native_joined_recovery_moves_to_a_distinct_controller_attempt() {
     crate::sim_rand::set_thread_rng(seed);
     fastrand::seed(seed);
     let mut sim = turmoil::Builder::new()
-        .simulation_duration(Duration::from_secs(40))
+        .simulation_duration(Duration::from_secs(65))
         .rng_seed(seed)
         .build();
     let subnet = reserve_subnet();
@@ -828,7 +829,7 @@ fn native_joined_recovery_moves_to_a_distinct_controller_attempt() {
     };
     assert!(matching(
         "connection_ended",
-        "winner",
+        "conn",
         &keys["publisher_conn"]
     ));
     assert!(matching("publication_admitted", "pub", &keys["pub"]));
@@ -899,7 +900,7 @@ async fn prove_joined_recovery(
     .token;
     let (subscriber, task) = RuntimeAgent::managed_with_services(
         Config::new(pulsebeam_agent_core::AgentConfig {
-            endpoint: format!("http://{issuer_ip}:7070"),
+            endpoint: format!("http://{receiver_ip}:7070"),
             token: subscribe_token,
             retry: Default::default(),
             log_level: Default::default(),
@@ -917,7 +918,10 @@ async fn prove_joined_recovery(
             delivery: Some(core_ffi::DataDelivery::Latest),
         }))?;
     let feed_updates = feed.updates()?;
-    subscriber.connect().await?;
+    use anyhow::Context as _;
+    tokio::time::timeout(Duration::from_secs(3), subscriber.connect())
+        .await
+        .context("submit viewer connect")??;
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let state = feed_updates
@@ -964,7 +968,14 @@ async fn prove_joined_recovery(
             ..Default::default()
         }))?;
     agent.join(room.into())?;
-    let first = wait_connected_when(&agent, None, |_| true).await?;
+    let first = wait_connected_when(&agent, None, |_| true)
+        .await
+        .with_context(|| {
+            format!(
+                "initial publisher admission; HTTP statuses: {:?}",
+                evidence.lock().unwrap().statuses
+            )
+        })?;
     let first_support = agent.support_report();
     let first_connection: pulsebeam_core::identity::ConnectionId = first_support
         .connection_id
@@ -972,7 +983,6 @@ async fn prove_joined_recovery(
         .ok_or_else(|| anyhow::anyhow!("admitted publisher has no support key"))?
         .parse()?;
     anyhow::ensure!(viewer_connection != first_connection);
-    use anyhow::Context as _;
     let initial_id = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let state = feed_updates
@@ -1024,81 +1034,10 @@ async fn prove_joined_recovery(
     };
     receive_payload(b"before".as_slice(), initial_id.as_str())
         .await
-        .context("initial local DATA probe")?;
-    runtime.reconnect().await?;
-    let recovered = wait_connected_when(&agent, first.generation, |_| true).await?;
-    let recovered_support = agent.support_report();
-    let recovered_connection: pulsebeam_core::identity::ConnectionId = recovered_support
-        .connection_id
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("replacement publisher has no support key"))?
-        .parse()?;
-    anyhow::ensure!(
-        recovered_connection != first_connection && recovered_connection != viewer_connection
-    );
-    anyhow::ensure!(
-        recovered.participant_id == first.participant_id && recovered.room_id == first.room_id
-    );
-    {
-        let evidence = evidence.lock().unwrap();
-        let created = http::StatusCode::CREATED;
-        anyhow::ensure!(
-            matches!(evidence.statuses.as_slice(), [first, lost, wrong_target, retry @ .., accepted]
-                if *first == created && *lost == created && *wrong_target == http::StatusCode::GONE
-                    && *accepted == created && retry.iter().all(|status| *status == http::StatusCode::SERVICE_UNAVAILABLE)),
-            "unexpected admission sequence: {:?}",
-            evidence.statuses
-        );
-        anyhow::ensure!(
-            evidence.requests[1] == evidence.requests[2],
-            "wrong-target replay changed the pinned request"
-        );
-        anyhow::ensure!(
-            evidence.requests[2].1 != evidence.requests[3].1,
-            "receiving controller reused the issuer attempt"
-        );
-        anyhow::ensure!(
-            evidence.requests[3..]
-                .iter()
-                .all(|request| *request == evidence.requests[3]),
-            "authority retry changed the successor attempt or receipt"
-        );
-        let source = issuer_ip.to_string();
-        let destination = receiver_ip.to_string();
-        anyhow::ensure!(
-            evidence.posts[1].uri().host() == Some(source.as_str())
-                && evidence.posts[2..]
-                    .iter()
-                    .all(|request| request.uri().host() == Some(destination.as_str()))
-        );
-        let receipt = |body: &[u8]| {
-            serde_json::from_slice::<serde_json::Value>(body).unwrap()["successor_receipt"].clone()
-        };
-        anyhow::ensure!(!receipt(&evidence.requests[1].0).is_null());
-        anyhow::ensure!(receipt(&evidence.requests[1].0) == receipt(&evidence.requests[3].0));
-    }
-    let recovered_id = tokio::time::timeout(Duration::from_secs(8), async {
-        loop {
-            let state = feed_updates
-                .next()
-                .await?
-                .context("feed closed before WAN rebind")?;
-            if state.execution == core_ffi::PublicationExecution::Installed
-                && let Some(id) = state.source_track_id
-                && id != initial_id
-            {
-                return anyhow::Ok(id);
-            }
-        }
-    })
-    .await
-    .context("replacement DATA did not install over provisioned WAN")??;
-    receive_payload(b"after".as_slice(), recovered_id.as_str())
-        .await
-        .context("successor WAN DATA probe")?;
+        .context("initial WAN DATA probe")?;
     turmoil::partition(issuer_ip, receiver_ip);
     let bound = feed.state();
-    anyhow::ensure!(bound.source_track_id.as_deref() == Some(recovered_id.as_str()));
+    anyhow::ensure!(bound.source_track_id.as_deref() == Some(initial_id.as_str()));
 
     tokio::time::timeout(Duration::from_secs(17), async {
         loop {
@@ -1133,7 +1072,7 @@ async fn prove_joined_recovery(
                 .await?
                 .context("feed closed during WAN route repair")?;
             if state.execution == core_ffi::PublicationExecution::Installed
-                && state.source_track_id.as_deref() == Some(recovered_id.as_str())
+                && state.source_track_id.as_deref() == Some(initial_id.as_str())
             {
                 return anyhow::Ok(());
             }
@@ -1141,14 +1080,14 @@ async fn prove_joined_recovery(
     })
     .await
     .context("WAN rebind did not restore the current DATA publication")??;
-    receive_payload(b"refreshed".as_slice(), recovered_id.as_str())
+    receive_payload(b"refreshed".as_slice(), initial_id.as_str())
         .await
         .context("restored WAN DATA probe")?;
     anyhow::ensure!(feed.state().accepted_revision == bound.accepted_revision);
     anyhow::ensure!(viewer.snapshot().generation == viewer_generation && !feed.is_closed());
     anyhow::ensure!(viewer.support_report() == viewer_support);
     anyhow::ensure!(
-        agent.snapshot().generation == recovered.generation
+        agent.snapshot().generation == first.generation
             && agent.snapshot().connection == core_ffi::ConnectionState::Connected
     );
     let renewal = pulsebeam_server::sign_participant_token(
@@ -1173,13 +1112,84 @@ async fn prove_joined_recovery(
     .await
     .map_err(|_| anyhow::anyhow!("subscriber credential renewal was not accepted"))??;
     anyhow::ensure!(viewer.support_report() == viewer_support);
-    viewer.close().await?;
-    agent.close().await?;
+    let reconnect = agent.snapshots();
+    tokio::time::timeout(Duration::from_secs(3), runtime.reconnect())
+        .await
+        .context("submit publisher reconnect")??;
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let SnapshotUpdate::Snapshot { snapshot } = reconnect.next().await else {
+                anyhow::bail!("publisher snapshot stream closed during reconnect");
+            };
+            anyhow::ensure!(
+                snapshot.connection != core_ffi::ConnectionState::Connected
+                    || snapshot.generation == first.generation,
+                "receiver admitted a successor while the issuer still owned the publication"
+            );
+            if snapshot.failure.as_ref().is_some_and(|failure| {
+                failure.class == core_ffi::FailureClass::ParticipantSuperseded
+            }) {
+                return anyhow::Ok(());
+            }
+        }
+    })
+    .await
+    .with_context(|| {
+        format!(
+            "live-claim rejection not observed; HTTP statuses: {:?}",
+            evidence.lock().unwrap().statuses
+        )
+    })??;
+    {
+        let evidence = evidence.lock().unwrap();
+        let created = http::StatusCode::CREATED;
+        anyhow::ensure!(
+            matches!(evidence.statuses.as_slice(), [first, lost, wrong_target, retry @ .., denied]
+                if *first == created && *lost == created && *wrong_target == http::StatusCode::GONE
+                    && *denied == http::StatusCode::CONFLICT && retry.iter().all(|status| *status == http::StatusCode::SERVICE_UNAVAILABLE)),
+            "unexpected admission sequence: {:?}",
+            evidence.statuses
+        );
+        anyhow::ensure!(
+            evidence.requests[1] == evidence.requests[2],
+            "wrong-target replay changed the pinned request"
+        );
+        anyhow::ensure!(
+            evidence.requests[2].1 != evidence.requests[3].1,
+            "receiving controller reused the issuer attempt"
+        );
+        anyhow::ensure!(
+            evidence.requests[3..]
+                .iter()
+                .all(|request| *request == evidence.requests[3]),
+            "authority retry changed the successor attempt or receipt"
+        );
+        let source = issuer_ip.to_string();
+        let destination = receiver_ip.to_string();
+        anyhow::ensure!(
+            evidence.posts[1].uri().host() == Some(source.as_str())
+                && evidence.posts[2..]
+                    .iter()
+                    .all(|request| request.uri().host() == Some(destination.as_str()))
+        );
+        let receipt = |body: &[u8]| {
+            serde_json::from_slice::<serde_json::Value>(body).unwrap()["successor_receipt"].clone()
+        };
+        anyhow::ensure!(!receipt(&evidence.requests[1].0).is_null());
+        anyhow::ensure!(receipt(&evidence.requests[1].0) == receipt(&evidence.requests[3].0));
+    }
+    tokio::time::timeout(Duration::from_secs(5), viewer.close())
+        .await
+        .context("close WAN viewer")??;
+    // The lost issuer response left no acknowledged resource to close gracefully.
+    tokio::time::timeout(Duration::from_secs(3), runtime.abort())
+        .await
+        .context("stop fenced publisher runtime")??;
     Ok(serde_json::json!({
         "project": same_project.project.to_string(),
         "conn": viewer_connection.to_string(),
-        "publisher_conn": recovered_connection.to_string(),
-        "pub": recovered_id,
+        "publisher_conn": first_connection.to_string(),
+        "pub": initial_id,
         "jti": renewal.jti.to_string(),
     }))
 }
@@ -1351,12 +1361,56 @@ fn native_claims_h264_and_av1_senders_after_join() {
                 Ok(viewer.room("mixed".into())?.participant("mixed-publisher".into())?
                     .video(label.into())?.subscribe(None)?)
             };
+            use pulsebeam_agent_core::{SelectorStatus, SelectorTrackKind, SubscriptionSelector};
+            let broad = compatible.subscribe_selector(SubscriptionSelector {
+                participant_id: Some("mixed-publisher".into()),
+                kind: Some(SelectorTrackKind::Video),
+                ..Default::default()
+            })?;
+            let narrow = compatible.subscribe_selector(SubscriptionSelector {
+                room: Some("mixed".into()),
+                participant_id: Some("mixed-publisher".into()),
+                kind: Some(SelectorTrackKind::Video),
+                track_id: Some("camera".into()),
+                ..Default::default()
+            })?;
             let compatible_screen = subscribe(&compatible, "screen")?;
             let late_camera = subscribe(&late, "camera")?;
             wait_mixed_video_installed(&compatible_screen).await.context("install AV1 viewer")?;
             wait_mixed_video_installed(&late_camera).await.context("install H.264 viewer")?;
             let screen_frames = compatible_screen.frames()?;
             let camera_frames = late_camera.frames()?;
+            let wait_matches = async |selector: &pulsebeam_agent_native::ffi::SelectorSubscription, count| {
+                tokio::time::timeout(Duration::from_secs(4), async {
+                    loop {
+                        let state = selector.state().context("selector unexpectedly closed")?;
+                        if state.status == SelectorStatus::Complete && state.matches.len() == count {
+                            return anyhow::Ok(state.matches);
+                        }
+                        anyhow::ensure!(state.status != SelectorStatus::Rejected, "selector rejected: {:?}", state.error);
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }).await.context("selector match set")?
+            };
+            let broad_matches = wait_matches(&broad, 2).await?;
+            let narrow_matches = wait_matches(&narrow, 1).await?;
+            let camera_match = broad_matches.iter().find(|source| source.track_id == "camera").context("camera in wildcard set")?;
+            anyhow::ensure!(narrow_matches.as_slice() == std::slice::from_ref(camera_match));
+            let matched = async |selector: &pulsebeam_agent_native::ffi::SelectorSubscription| {
+                tokio::time::timeout(Duration::from_secs(4), async {
+                    loop {
+                        match selector.observe(camera_match.clone(), ReceiveMode::Decoded).await {
+                            Ok(receiver) => return anyhow::Ok(receiver),
+                            Err(pulsebeam_agent_native::ffi::NativeError::NotReady) => tokio::time::sleep(Duration::from_millis(10)).await,
+                            Err(error) => return Err(error.into()),
+                        }
+                    }
+                }).await.context("install selector camera")?
+            };
+            let broad_camera = matched(&broad).await?;
+            let narrow_camera = matched(&narrow).await?;
+            anyhow::ensure!(broad_camera.receiver() == narrow_camera.receiver());
+            anyhow::ensure!(broad_camera.source_track_id() == h264.admission.publication_id);
             camera.ready().await?;
             let screen_generation = compatible_session.generation.context("screen viewer generation")?;
             let camera_generation = late_session.generation.context("camera viewer generation")?;
@@ -1374,12 +1428,16 @@ fn native_claims_h264_and_av1_senders_after_join() {
             };
             let exchange = async |phase: u8| {
                 tokio::try_join!(
-                    mixed_decode(&screen_frames, screen_generation, (640, 360), phase),
-                    mixed_decode(&camera_frames, camera_generation, (320, 180), phase),
+                    mixed_decode(|| screen_frames.next(), screen_generation, (640, 360), phase),
+                    mixed_decode(|| camera_frames.next(), camera_generation, (320, 180), phase),
+                    mixed_decode(|| next_selector_picture(&broad_camera), screen_generation, (320, 180), phase),
                 )
             };
             let scenario = async {
-            let (first_screen, first_camera) = exchange(0).await.context("first mixed video exchange")?;
+            let (first_screen, first_camera, first_wildcard) = exchange(0).await.context("first mixed video exchange")?;
+            anyhow::ensure!(first_screen.receiver != first_wildcard.receiver);
+            narrow.close();
+            narrow_camera.close().await;
             anyhow::ensure!(compatible_screen.state().source_track_id == av1.admission.publication_id);
             anyhow::ensure!(compatible_screen.state().source_format == av1.admission.effective_format);
             anyhow::ensure!(late_camera.state().source_track_id == h264.admission.publication_id);
@@ -1395,8 +1453,14 @@ fn native_claims_h264_and_av1_senders_after_join() {
             anyhow::ensure!(incompatible.execution_error.is_some_and(|error| error.code == core_ffi::ErrorCode::Unsupported));
             anyhow::ensure!(incompatible.source_track_id == av1.admission.publication_id && incompatible.source_format == av1.admission.effective_format);
             phase.set(1);
-            let (next_screen, next_camera) = exchange(1).await.context("mixed video exchange after incompatibility")?;
-            anyhow::ensure!(next_screen == first_screen && next_camera == first_camera);
+            let (next_screen, next_camera, next_wildcard) = exchange(1).await.context("mixed video exchange after incompatibility")?;
+            anyhow::ensure!(next_screen == first_screen && next_camera == first_camera && next_wildcard == first_wildcard);
+            broad.close();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if matches!(broad_camera.next().await, pulsebeam_agent_native::MediaStreamUpdate::Closed) { break; }
+                }
+            }).await.context("last selector withdraws its camera output")?;
             anyhow::Ok((rejected_screen, updates))
             };
             let (_screen_subscription, updates) = tokio::select! { result = pump => result, result = scenario => result }?;
@@ -1493,8 +1557,33 @@ async fn wait_mixed_video_installed(
     .await?
 }
 
+async fn next_selector_picture(
+    receiver: &pulsebeam_agent_native::ffi::RemoteMediaReceiver,
+) -> Result<Option<pulsebeam_agent_native::ffi::VideoFrame>, pulsebeam_agent_native::ffi::NativeError>
+{
+    use pulsebeam_agent_native::{MediaStreamUpdate, OutputFrame};
+    loop {
+        match receiver.next().await {
+            MediaStreamUpdate::Closed => return Ok(None),
+            MediaStreamUpdate::Frame { frame } => {
+                if let OutputFrame::I420 { frame: pixels } = frame.frame {
+                    return Ok(Some(pulsebeam_agent_native::ffi::VideoFrame {
+                        track: frame.track,
+                        metadata: frame.metadata,
+                        frame: pixels,
+                    }));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 async fn mixed_decode(
-    frames: &pulsebeam_agent_native::ffi::VideoFrames,
+    mut next: impl AsyncFnMut() -> Result<
+        Option<pulsebeam_agent_native::ffi::VideoFrame>,
+        pulsebeam_agent_native::ffi::NativeError,
+    >,
     generation: u64,
     dimensions: (u32, u32),
     phase: u8,
@@ -1504,7 +1593,7 @@ async fn mixed_decode(
     let mut pictures = 0;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     loop {
-        let picture = tokio::time::timeout_at(deadline, frames.next())
+        let picture = tokio::time::timeout_at(deadline, next())
             .await
             .with_context(|| format!("fewer than two fresh {dimensions:?} pictures: saw {pictures}, expected phase {phase}, last {last_phase:?}, first {first:?}"))?
             .with_context(|| format!("decode {dimensions:?} video"))?

@@ -28,6 +28,15 @@ pub enum WatchStatus {
     Live,
     Failed,
     Closed,
+    Stale,
+    ResetRequired,
+    Partial,
+}
+
+impl WatchStatus {
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Failed | Self::Closed | Self::ResetRequired)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
@@ -98,7 +107,7 @@ pub struct WatchState {
 
 impl WatchState {
     pub(crate) fn close(&mut self) {
-        if self.status != WatchStatus::Failed {
+        if !self.status.is_terminal() {
             self.status = WatchStatus::Closed;
         }
         self.page = None;

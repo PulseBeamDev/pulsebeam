@@ -45,6 +45,57 @@ fn exact_prefix_and_project_wildcard_are_literal_and_case_sensitive() {
 }
 
 #[test]
+fn selector_preflight_intersects_one_grant_without_authorizing_receipt() {
+    let narrow = |room: &str, participant: &str, kind, label: &str| {
+        Grant::new(
+            vec![room.into()],
+            vec![Action::Subscribe],
+            Some(participant.into()),
+            Some(kind),
+            Some(label.into()),
+        )
+        .unwrap()
+    };
+    let grants = GrantSet::new(vec![
+        narrow("room-a", "alice", TrackKind::Video, "camera"),
+        narrow("room-b", "bob", TrackKind::Audio, "microphone"),
+        grant(&["*"], &[Action::Discover]),
+    ])
+    .unwrap();
+    for (room, participant, kind, label, expected) in [
+        (None, None, None, None, true),
+        (None, Some("alice"), Some(TrackKind::Video), None, true),
+        (Some("room-a"), None, None, Some("camera"), true),
+        (Some("room-a"), Some("bob"), None, None, false),
+        (None, Some("alice"), Some(TrackKind::Audio), None, false),
+        (None, Some("alice"), None, Some("microphone"), false),
+        (Some("missing"), None, None, None, false),
+        (Some("room-*"), None, None, None, false),
+        (None, Some("*"), None, None, false),
+        (None, None, None, Some("*"), false),
+    ] {
+        assert_eq!(
+            grants.may_match_subscription(room, participant, kind, label),
+            expected
+        );
+    }
+    assert!(!grants.allows(
+        Action::Subscribe,
+        "room-a",
+        Some("alice"),
+        Some(TrackKind::Video),
+        Some("other")
+    ));
+    assert!(grants.allows(
+        Action::Subscribe,
+        "room-b",
+        Some("bob"),
+        Some(TrackKind::Audio),
+        Some("microphone")
+    ));
+}
+
+#[test]
 fn grants_are_additive_and_filters_conjunctive_without_implied_actions() {
     let narrow = Grant::new(
         vec!["robots".into()],
@@ -221,6 +272,102 @@ fn discovery_filters_do_not_expose_zero_track_or_unrelated_descriptions() {
             .unwrap()
             .allows(Action::Discover, "robots", Some("robot"), None, None)
     );
+}
+
+#[test]
+fn discover_projection_preserves_conjunction_and_strips_every_other_scope() {
+    let filter = |participant: &str, label: &str, kind| {
+        Grant::new(
+            vec!["robots/*".into()],
+            vec![Action::Discover, Action::Subscribe],
+            Some(participant.to_owned()),
+            Some(kind),
+            Some(label.to_owned()),
+        )
+        .unwrap()
+    };
+    let source = GrantSet::new(vec![
+        filter("alice", "camera", TrackKind::Video),
+        filter("bob", "telemetry", TrackKind::Data),
+        grant(&["outside"], &[Action::Discover]),
+        grant(&["*"], &[Action::Join, Action::Publish]),
+    ])
+    .unwrap();
+    assert!(source.room_discover("robots/*").is_none());
+    let projection = source.room_discover("robots/a").unwrap();
+    assert_eq!(projection.room(), "robots/a");
+    let narrowed = projection.into_grants().unwrap();
+    assert!(narrowed.allows(
+        Action::Discover,
+        "robots/a",
+        Some("alice"),
+        Some(TrackKind::Video),
+        Some("camera")
+    ));
+    assert!(!narrowed.allows(
+        Action::Discover,
+        "robots/a",
+        Some("bob"),
+        Some(TrackKind::Video),
+        Some("camera")
+    ));
+    assert!(!narrowed.allows(Action::Discover, "robots/a", Some("alice"), None, None));
+    assert!(!narrowed.may_discover("robots/b"));
+    assert!(!narrowed.may_discover("outside"));
+    for action in [Action::Subscribe, Action::Join, Action::Publish] {
+        assert!(!narrowed.allows(
+            action,
+            "robots/a",
+            Some("alice"),
+            Some(TrackKind::Video),
+            Some("camera")
+        ));
+    }
+}
+
+#[test]
+fn routed_subscribe_scope_intersects_each_grant_and_accepts_no_other_actions() {
+    let filter = |participant: &str, kind, allow| {
+        Grant::new(
+            vec!["fleet/*".into()],
+            allow,
+            Some(participant.into()),
+            Some(kind),
+            None,
+        )
+        .unwrap()
+    };
+    let grants = GrantSet::new(vec![
+        filter(
+            "alice",
+            TrackKind::Data,
+            vec![Action::Discover, Action::Subscribe],
+        ),
+        filter("bob", TrackKind::Video, vec![Action::Subscribe]),
+        grant(&["outside"], &[Action::Discover]),
+    ])
+    .unwrap();
+    let scope = grants
+        .subscribe_scope(Some("fleet/a"), None, None, Some("feed"))
+        .unwrap();
+    assert_eq!(SubscribeScope::try_from(scope.0.clone()).unwrap(), scope);
+    assert!(scope.allows("fleet/a", "alice", TrackKind::Data, "feed"));
+    assert!(scope.allows("fleet/a", "bob", TrackKind::Video, "feed"));
+    assert!(!scope.allows("fleet/a", "alice", TrackKind::Video, "feed"));
+    assert!(!scope.allows("fleet/a", "alice", TrackKind::Data, "other"));
+    assert!(!scope.allows("fleet/b", "alice", TrackKind::Data, "feed"));
+    assert!(
+        grants
+            .subscribe_scope(Some("outside"), None, None, None)
+            .is_none()
+    );
+    assert!(
+        grants
+            .subscribe_scope(Some("fleet/*"), None, None, None)
+            .is_none()
+    );
+    assert!(SubscribeScope::try_from(grants).is_err());
+    assert!(SubscribeScope::try_from(GrantSet::default()).is_err());
 }
 
 #[test]

@@ -1,4 +1,6 @@
-use super::{Agent, Arc, ErrorCode, ErrorInfo, WebAgentError, video::Participant};
+use super::{
+    Agent, Arc, ErrorCode, ErrorInfo, SelectorSubscription, WebAgentError, video::Participant,
+};
 use agent_core::{TrackSpec, ffi};
 
 fn track_spec(label: String, delivery: ffi::DataDelivery) -> TrackSpec {
@@ -110,6 +112,29 @@ impl RemoteDataTrack {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let _ = options;
+            Err(super::browser_required())
+        }
+    }
+}
+
+#[uniffi::export]
+impl SelectorSubscription {
+    pub fn receive_data(
+        &self,
+        source: agent_core::SelectorMatch,
+    ) -> Result<Arc<DataSubscription>, WebAgentError> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let (owner, observer) = self.agent.runtime.claim_selector_data(self.owner, source)?;
+            Ok(Arc::new(DataSubscription {
+                agent: self.agent.clone(),
+                owner,
+                observer,
+            }))
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = source;
             Err(super::browser_required())
         }
     }

@@ -6,7 +6,7 @@ use crate::{
 
 impl NativeSession {
     pub(in crate::control) fn identify(&mut self, project: ProjectId, connection: ConnectionId) {
-        self.incident_context = Some((project, connection));
+        self.connection_identity = Some((project, connection));
     }
 }
 

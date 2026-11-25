@@ -97,6 +97,7 @@ pub(crate) fn validate_page_record(record: &CatalogPageRecord) -> Result<(), Cat
         || !is_application_name(&record.room)
         || record.fragments.len() > MAX_CATALOG_RECORDS
         || record.next_cursor.len() > MAX_CATALOG_CURSOR_BYTES
+        || (record.partial && record.has_more)
         || record.has_more != !record.next_cursor.is_empty()
         || record.has_more && record.cursor_expires_at_unix_seconds <= 0
         || !record.has_more && record.cursor_expires_at_unix_seconds != 0
@@ -170,6 +171,7 @@ pub struct CatalogPageMetadata {
     pub room: String,
     pub revision: u64,
     pub complete: bool,
+    pub partial: bool,
     pub has_more: bool,
     pub next_cursor: Vec<u8>,
     pub cursor_expires_at_unix_seconds: i64,
@@ -192,6 +194,7 @@ pub fn fragment_entry(
     if metadata.watch_id == 0
         || metadata.revision == 0
         || !is_application_name(&metadata.room)
+        || (metadata.partial && metadata.has_more)
         || metadata.next_cursor.len() > MAX_CATALOG_CURSOR_BYTES
         || metadata.has_more != !metadata.next_cursor.is_empty()
         || metadata.has_more && metadata.cursor_expires_at_unix_seconds <= 0
@@ -248,6 +251,7 @@ pub fn fragment_entry(
                 room: metadata.room.clone(),
                 revision: metadata.revision,
                 complete: metadata.complete && offset + size == entry_bytes.len(),
+                partial: metadata.partial,
                 has_more: metadata.has_more,
                 next_cursor: metadata.next_cursor.clone(),
                 cursor_expires_at_unix_seconds: metadata.cursor_expires_at_unix_seconds,
@@ -291,6 +295,7 @@ pub fn fragment_entry(
 pub struct CatalogPageSnapshot {
     pub revision: u64,
     pub entries: Vec<CatalogParticipantEntry>,
+    pub partial: bool,
     pub has_more: bool,
     pub next_cursor: Vec<u8>,
     pub cursor_expires_at_unix_seconds: i64,
@@ -320,7 +325,7 @@ pub struct CatalogAssembler {
     entries: Vec<CatalogParticipantEntry>,
     page_bytes: usize,
     page_records: usize,
-    page_complete: Option<(bool, Vec<u8>, i64)>,
+    page_complete: Option<(bool, bool, Vec<u8>, i64)>,
     page_finished: bool,
     failed: bool,
     finished: bool,
@@ -385,6 +390,7 @@ impl CatalogAssembler {
             return Err(CatalogError::Inconsistent);
         }
         let marker = (
+            record.partial,
             record.has_more,
             record.next_cursor.clone(),
             record.cursor_expires_at_unix_seconds,
@@ -525,14 +531,15 @@ impl CatalogAssembler {
         if self.failed || self.finished || !self.page_finished || self.pending.is_some() {
             return Ok(None);
         }
-        let (has_more, next_cursor, cursor_expires_at_unix_seconds) =
-            self.page_complete
-                .as_ref()
-                .ok_or(CatalogError::InvalidRecord)?;
+        let (partial, has_more, next_cursor, cursor_expires_at_unix_seconds) = self
+            .page_complete
+            .as_ref()
+            .ok_or(CatalogError::InvalidRecord)?;
         self.finished = true;
         Ok(Some(CatalogPageSnapshot {
             revision: self.revision,
             entries: core::mem::take(&mut self.entries),
+            partial: *partial,
             has_more: *has_more,
             next_cursor: next_cursor.clone(),
             cursor_expires_at_unix_seconds: *cursor_expires_at_unix_seconds,
@@ -579,6 +586,7 @@ mod tests {
                 room: "room".into(),
                 revision,
                 complete: false,
+                partial: false,
                 has_more: false,
                 next_cursor: Vec::new(),
                 cursor_expires_at_unix_seconds: 0,
@@ -593,6 +601,7 @@ mod tests {
         CatalogPageSnapshot {
             revision,
             entries,
+            partial: false,
             has_more: false,
             next_cursor: Vec::new(),
             cursor_expires_at_unix_seconds: 0,
@@ -692,6 +701,7 @@ mod tests {
             room: "room".into(),
             revision: 1,
             complete: false,
+            partial: false,
             has_more: false,
             next_cursor: Vec::new(),
             cursor_expires_at_unix_seconds: 0,
@@ -707,6 +717,7 @@ mod tests {
             room: "room".into(),
             revision: 1,
             complete: false,
+            partial: false,
             has_more: false,
             next_cursor: Vec::new(),
             cursor_expires_at_unix_seconds: 0,
@@ -779,6 +790,7 @@ mod tests {
             Ok(Some(CatalogPageSnapshot {
                 revision: 12,
                 entries: vec![value],
+                partial: false,
                 has_more: true,
                 next_cursor: vec![4, 2, 1],
                 cursor_expires_at_unix_seconds: 1234,

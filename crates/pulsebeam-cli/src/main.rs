@@ -10,6 +10,7 @@
 #![cfg_attr(test, allow(clippy::expect_used, clippy::panic, clippy::unwrap_used))]
 
 mod incident;
+mod ownership;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -176,6 +177,8 @@ enum Commands {
     Bench(BenchConfig),
     /// Reconstruct observed lifecycles from an authorized NDJSON log export on stdin
     Incident(incident::IncidentArgs),
+    /// Submit one JSON ownership request from stdin to the local operator socket
+    Ownership(ownership::OwnershipArgs),
     /// Mint a bearer token for a local development server
     Token(TokenConfig),
 }
@@ -272,6 +275,9 @@ fn main() -> Result<()> {
                 run_bench(cli.api_url, config).await?;
             }
             Commands::Incident(config) => {
+                config.run(std::io::stdin().lock(), std::io::stdout().lock())?;
+            }
+            Commands::Ownership(config) => {
                 config.run(std::io::stdin().lock(), std::io::stdout().lock())?;
             }
             Commands::Token(config) => println!("{}", development_token(config)?),

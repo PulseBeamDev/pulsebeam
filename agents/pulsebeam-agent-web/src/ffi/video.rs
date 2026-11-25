@@ -1,4 +1,4 @@
-use super::{Agent, Arc, ErrorCode, ErrorInfo, WebAgentError};
+use super::{Agent, Arc, ErrorCode, ErrorInfo, SelectorSubscription, WebAgentError};
 use agent_core::ffi;
 
 fn invalid_address() -> ErrorInfo {
@@ -280,6 +280,12 @@ macro_rules! playback_output {
             }
         }
 
+        media_output!($output);
+    };
+}
+
+macro_rules! media_output {
+    ($output:ident) => {
         #[derive(uniffi::Object)]
         pub struct $output {
             #[cfg(target_arch = "wasm32")]
@@ -307,3 +313,46 @@ macro_rules! playback_output {
 
 playback_output!(VideoSubscription, WebVideoOutput);
 playback_output!(AudioSubscription, WebAudioOutput);
+media_output!(WebSelectorOutput);
+
+#[uniffi::export]
+impl SelectorSubscription {
+    pub async fn playback_output(
+        &self,
+        source: agent_core::SelectorMatch,
+    ) -> Result<Arc<WebSelectorOutput>, WebAgentError> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            if source.kind == agent_core::SelectorTrackKind::Data {
+                return Err(ErrorInfo::new(
+                    ErrorCode::Unsupported,
+                    "Data matches have no playback output",
+                )
+                .into());
+            }
+            let observation = self
+                .agent
+                .runtime
+                .observe_selector_media(self.owner, source)
+                .await
+                .map_err(|_| {
+                    if self.state().is_none() {
+                        ErrorInfo::new(ErrorCode::Closed, "Subscription selector is closed")
+                    } else {
+                        ErrorInfo::new(
+                            ErrorCode::NotReady,
+                            "Selected playback output is unavailable",
+                        )
+                    }
+                })?;
+            Ok(Arc::new(WebSelectorOutput {
+                output: playback::Output::new(observation)?,
+            }))
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = source;
+            Err(super::browser_required())
+        }
+    }
+}

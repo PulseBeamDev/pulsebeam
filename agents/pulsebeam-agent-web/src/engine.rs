@@ -80,7 +80,7 @@ struct Control {
     accepting: Cell<bool>,
     wake_pending: Cell<bool>,
     publication_owners: RefCell<BTreeMap<u64, ()>>,
-    resource_observers: RefCell<BTreeMap<u64, ResourceKind>>,
+    resource_observers: RefCell<BTreeMap<u64, (ResourceKind, ResourceState)>>,
     watch_owners: catalog::WatchOwners,
 }
 
@@ -219,7 +219,10 @@ impl Driver {
                 .resource_observers
                 .borrow()
                 .get(&owner)
-                .and_then(|kind| kind.state(&self.control.agent.borrow(), owner))
+                .map(|(kind, last)| {
+                    kind.state(&self.control.agent.borrow(), owner)
+                        .unwrap_or_else(|| last.clone())
+                })
         });
         let result = self.control.resource(command);
         let mut turn = self.finish_turn(None);
@@ -260,16 +263,22 @@ impl Driver {
             })
             .collect();
 
-        let resources = self
-            .control
+        let mut resources = Vec::new();
+        self.control
             .resource_observers
-            .borrow()
-            .iter()
-            .filter_map(|(owner, kind)| {
-                kind.state(&agent, *owner)
-                    .map(|state| (*owner, state, false))
-            })
-            .collect();
+            .borrow_mut()
+            .retain(|&owner, (kind, last)| {
+                if let Some(state) = kind.state(&agent, owner) {
+                    *last = state.clone();
+                    resources.push((owner, state, false));
+                    true
+                } else {
+                    let mut state = last.clone();
+                    state.mark_closed();
+                    resources.push((owner, state, true));
+                    false
+                }
+            });
         let version = agent.snapshot().version;
         let snapshot = if self.published_version == Some(version) {
             None
@@ -414,6 +423,55 @@ impl ActorHandle {
         self.control.agent.borrow().snapshot().clone()
     }
 
+    #[cfg(all(target_arch = "wasm32", feature = "uniffi"))]
+    pub(crate) fn open_subscription_selector(
+        &self,
+        selector: agent_core::SubscriptionSelector,
+    ) -> Result<agent_core::TrackOwner, ErrorInfo> {
+        if !self.control.accepting.get() || self.sender.is_closed() {
+            return Err(ErrorInfo::new(
+                ErrorCode::Closed,
+                "Browser runtime is closed",
+            ));
+        }
+        let owner = self
+            .control
+            .agent
+            .borrow_mut()
+            .open_subscription_selector(selector)?;
+        if let Err(error) = self.schedule_core_change() {
+            self.control
+                .agent
+                .borrow_mut()
+                .close_subscription_selector(owner);
+            return Err(error);
+        }
+        Ok(owner)
+    }
+
+    #[cfg(all(target_arch = "wasm32", feature = "uniffi"))]
+    pub(crate) fn subscription_selector_state(
+        &self,
+        owner: agent_core::TrackOwner,
+    ) -> Option<agent_core::SelectorState> {
+        self.control
+            .agent
+            .borrow()
+            .subscription_selector_state(owner)
+    }
+
+    #[cfg(all(target_arch = "wasm32", feature = "uniffi"))]
+    pub(crate) fn close_subscription_selector(&self, owner: agent_core::TrackOwner) {
+        if self
+            .control
+            .agent
+            .borrow_mut()
+            .close_subscription_selector(owner)
+        {
+            let _ = self.schedule_core_change();
+        }
+    }
+
     pub(crate) fn join(&self, room: String) -> Result<(), ErrorInfo> {
         self.intent(AgentCommand::Join(room))
     }
@@ -457,13 +515,17 @@ impl ActorHandle {
         self.control
             .resource_observers
             .borrow_mut()
-            .insert(owner, kind);
+            .insert(owner, (kind, state.clone()));
         Some(state)
     }
 
     pub(crate) fn observed_resource_state(&self, owner: u64) -> Option<ResourceState> {
-        let kind = *self.control.resource_observers.borrow().get(&owner)?;
-        kind.state(&self.control.agent.borrow(), owner)
+        let observers = self.control.resource_observers.borrow();
+        let (kind, last) = observers.get(&owner)?;
+        Some(
+            kind.state(&self.control.agent.borrow(), owner)
+                .unwrap_or_else(|| last.clone()),
+        )
     }
 
     pub(crate) fn resource_states(&self) -> Vec<(u64, ResourceState)> {
@@ -472,7 +534,9 @@ impl ActorHandle {
             .resource_observers
             .borrow()
             .iter()
-            .filter_map(|(owner, kind)| kind.state(&agent, *owner).map(|state| (*owner, state)))
+            .filter_map(|(owner, (kind, _))| {
+                kind.state(&agent, *owner).map(|state| (*owner, state))
+            })
             .collect()
     }
 

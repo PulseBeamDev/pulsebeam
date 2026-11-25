@@ -705,6 +705,7 @@ mod tests {
                 .fixture_publication(crate::entity::TrackKind::Video, "camera"),
             incarnation: NonZeroU64::MIN,
             sequence_anchor: 37,
+            offer_cut: Some(NonZeroU64::MIN),
             window: Window::new(Profile::H264, 1 << 33, 0, NonZeroU32::MIN, 0).unwrap(),
         };
         let encode_image =
@@ -738,6 +739,62 @@ mod tests {
         mixed["routes"] = serde_json::json!([]);
         assert!(matches!(
             decode_wan(&serde_json::to_vec(&mixed).unwrap()),
+            Err(Error::Invalid)
+        ));
+    }
+
+    #[test]
+    fn wan_video_window_requires_exact_codec_and_single_stream() {
+        let mut endpoints = snapshot();
+        let room = endpoints[0].0.room;
+        let connection = endpoints[0].1.claim.connection();
+        let fact = &mut endpoints[0].1.publications[0];
+        let Some(track::Kind::Video(video)) = fact.descriptor.kind.as_mut() else {
+            panic!("expected video");
+        };
+        video.format.as_mut().unwrap().mime_type = "video/h264".into();
+        let publication = PublicationKey::Video(fact.descriptor.publication_id.parse().unwrap());
+        let source = |profile, publication| {
+            WanSourceWindow::from_sample(
+                room,
+                PublisherAnchor {
+                    publication,
+                    connection,
+                    incarnation: NonZeroU64::MIN,
+                    emission: Emission::new(profile, &[]).unwrap(),
+                },
+                65_536,
+            )
+        };
+        let encode = |endpoints: &Snapshot, source| {
+            super::encode(
+                NonZeroU64::MIN,
+                authority(),
+                endpoints,
+                RouteImage::Wan {
+                    offers: Box::default(),
+                    sources: Box::new([source]),
+                    retired: Vec::new(),
+                },
+            )
+        };
+        let h264 = source(Profile::H264, publication);
+        assert!(matches!(encode(&endpoints, h264), Err(Error::Invalid)));
+        endpoints[0].1.publications[0].layers =
+            Box::new([(SourceEncoding::Ssrc(12.into()), None, LayerQuality::High)]);
+        let image = encode(&endpoints, h264).unwrap();
+        assert_eq!(
+            decode_wan(&image).unwrap().wan.unwrap().sources.as_ref(),
+            &[h264]
+        );
+        assert!(matches!(
+            encode(&endpoints, source(Profile::Av1, publication)),
+            Err(Error::Invalid)
+        ));
+        let unknown =
+            ConnectionId::new().fixture_publication(crate::entity::TrackKind::Video, "camera");
+        assert!(matches!(
+            encode(&endpoints, source(Profile::H264, unknown)),
             Err(Error::Invalid)
         ));
     }
@@ -836,7 +893,15 @@ mod tests {
             domain::{Projection, Provenance, Quality},
             time::{Binding, DomainId, Generation, GlobalInstant, RtpTimestamp},
         };
-        let timed = source.with_projection(Some(Projection {
+        let origin = crate::cluster::mesh::Member {
+            node: pulsebeam_core::identity::NodeId::new(),
+            generation: NonZeroU64::MIN,
+        };
+        let timed = WanSourceWindow {
+            origin: Some(origin),
+            ..source
+        }
+        .with_projection(Some(Projection {
             global: GlobalInstant::from_nanos(100_000_000),
             rtp: RtpTimestamp(4_800),
             binding: Binding {
@@ -878,8 +943,10 @@ mod tests {
             decode_wan(&image).unwrap().wan.unwrap().sources,
             timed_windows
         );
-        let advanced =
-            WanSourceWindow::from_sample(source.room, publisher, source.sequence_anchor + 1);
+        let advanced = WanSourceWindow {
+            origin: Some(origin),
+            ..WanSourceWindow::from_sample(source.room, publisher, source.sequence_anchor + 1)
+        };
         let updated = plan_windows(vec![advanced], &timed_windows, 3);
         assert_eq!(updated[0].sequence_anchor, source.sequence_anchor);
         assert!(updated[0].timing.is_none());
@@ -902,6 +969,7 @@ mod tests {
             publication: publisher.publication,
             incarnation: publisher.incarnation,
             sequence_anchor: source.sequence_anchor,
+            offer_cut: None,
             window: pulsebeam_core::fabric::wan::Window::new(
                 Profile::Opus,
                 source.window_start,
@@ -912,6 +980,15 @@ mod tests {
             .unwrap(),
         };
         assert!(source.matches_ack(ack));
+        let cut = WanSourceWindow {
+            offer_cut: Some(NonZeroU64::MIN),
+            ..source
+        };
+        assert!(!cut.matches_ack(ack));
+        assert!(cut.matches_ack(relay::fabric::WanLiveRouteAck {
+            offer_cut: cut.offer_cut,
+            ..ack
+        }));
         assert!(!source.matches_ack(relay::fabric::WanLiveRouteAck {
             sequence_anchor: 0x1_fffe,
             ..ack

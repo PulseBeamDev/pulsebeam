@@ -15,6 +15,8 @@ pub use bound_udp::{
 
 pub use pulsebeam_udp::{BATCH_SIZE, ReceiveTime};
 use std::net::SocketAddr;
+#[cfg(target_os = "linux")]
+pub use tokio::net::UnixListener;
 pub use tokio::net::lookup_host;
 
 pub const CHUNK_SIZE: usize = 64 * 1024;

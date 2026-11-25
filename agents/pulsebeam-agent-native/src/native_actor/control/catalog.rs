@@ -79,7 +79,7 @@ impl Control {
                     // Terminal state is carried by Core's one-shot notification, not inferred from absence.
                     None => return None,
                 };
-                let closing = closing || state.status == agent_core::ffi::WatchStatus::Failed;
+                let closing = closing || state.status.is_terminal();
                 let notification = observer.prepare(state, closing).ok()?;
                 Some(Box::new(move || {
                     let _ = notification.notify();

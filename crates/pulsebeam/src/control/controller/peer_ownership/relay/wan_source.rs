@@ -8,6 +8,7 @@ use pulsebeam_core::fabric::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    cluster::mesh::Member,
     control::controller::ownership::observations::{EndpointFact, Snapshot},
     entity::{
         ConnectionId, EndpointKey, ProjectId, ProjectRoomKey, PublicationId, PublicationKey, RoomId,
@@ -34,6 +35,7 @@ pub(in crate::control) fn plan_windows(
             .iter()
             .find(|&source| {
                 source.room == candidate.room
+                    && source.origin == candidate.origin
                     && source.publisher == candidate.publisher
                     && source.window_start == candidate.window_start
             })
@@ -74,6 +76,7 @@ pub(in crate::control) fn plan_windows(
         {
             let successor = WanSourceWindow {
                 window_start,
+                offer_cut: None,
                 ..source
             };
             current.push(WanSourceWindow {
@@ -133,6 +136,9 @@ pub(in crate::control) struct WanSourceWindow {
     pub sequence_anchor: u64,
     pub window_start: u64,
     pub timing: Option<WanTimingPoint>,
+    // Routing provenance, not the owner or signer of the publication.
+    pub origin: Option<Member>,
+    pub offer_cut: Option<NonZeroU64>,
 }
 
 impl WanSourceWindow {
@@ -147,6 +153,8 @@ impl WanSourceWindow {
             sequence_anchor,
             window_start: Window::start_for(sequence_anchor),
             timing: None,
+            origin: None,
+            offer_cut: None,
         }
     }
 
@@ -236,6 +244,7 @@ impl WanSourceWindow {
             && self.publisher.incarnation == ack.incarnation
             && self.sequence_anchor == ack.sequence_anchor
             && self.window_start == ack.window.start()
+            && self.offer_cut == ack.offer_cut
             && self.forms() == ack.window.forms()
             && self.publisher.emission.profile() == ack.window.profile()
             && self.publisher.emission.wire_profile().1 == ack.window.emission()
@@ -261,8 +270,9 @@ impl WanSourceWindow {
                     Profile::Data => fact
                         .data_publisher(self.publisher.connection)
                         .is_some_and(|data| PublisherAnchor::from(data) == self.publisher),
-                    Profile::Opus => fact.opus_publication() == Some(self.publisher.publication),
-                    _ => false,
+                    profile => {
+                        fact.wan_rtp_publication() == Some((self.publisher.publication, profile))
+                    }
                 })
     }
 }
@@ -282,6 +292,10 @@ pub(in crate::control) struct WireWanSourceWindow {
     forms: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     timing: Option<WanTimingPoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    origin: Option<Member>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    offer_cut: Option<NonZeroU64>,
 }
 
 impl From<WanSourceWindow> for WireWanSourceWindow {
@@ -299,6 +313,8 @@ impl From<WanSourceWindow> for WireWanSourceWindow {
             extensions,
             forms: source.forms(),
             timing: source.timing,
+            origin: source.origin,
+            offer_cut: source.offer_cut,
         }
     }
 }
@@ -310,7 +326,8 @@ impl WireWanSourceWindow {
         let publication = match emission.profile() {
             Profile::Data => PublicationKey::Data(self.publication),
             Profile::Opus => PublicationKey::Audio(self.publication),
-            _ => return None,
+            Profile::H264 | Profile::Av1 => PublicationKey::Video(self.publication),
+            Profile::Vp8 | Profile::Vp9 => return None,
         };
         let source = WanSourceWindow {
             room: ProjectRoomKey {
@@ -325,6 +342,8 @@ impl WireWanSourceWindow {
             },
             sequence_anchor: self.sequence_anchor,
             window_start: self.window_start,
+            origin: self.origin,
+            offer_cut: self.offer_cut,
             timing: self.timing.filter(|point| {
                 Window::start_for(self.sequence_anchor) == self.window_start && point.valid()
             }),

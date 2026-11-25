@@ -28,7 +28,7 @@ impl NativeSession {
         let Some(owned) = &row.owned else {
             return false;
         };
-        if !self.permissions.permits_intent(&owned.declaration) {
+        if !self.permits_owned_intent(&owned.declaration) {
             return false;
         }
         if matches!(
@@ -70,6 +70,7 @@ impl NativeSession {
                 Some(
                     wire::confirmed_state::Value::Owned(_)
                         | wire::confirmed_state::Value::LogicalSubscription(_)
+                        | wire::confirmed_state::Value::SubscriptionSelector(_)
                 )
             )
         }) {
@@ -140,7 +141,7 @@ impl NativeSession {
                         .rows
                         .get(&Key::Owned(reference))
                         .and_then(|row| row.owned.as_ref())
-                        .is_some_and(|owned| observed_address(&owned.declaration).is_some())
+                        .is_some_and(|owned| is_observed_intent(&owned.declaration))
                     {
                         self.finish_source_lookup(
                             reference,

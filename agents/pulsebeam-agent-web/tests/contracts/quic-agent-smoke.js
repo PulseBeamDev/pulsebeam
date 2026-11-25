@@ -12,7 +12,6 @@
   const agent = new Agent({
     endpoint: "__ENDPOINT__",
     token: "__TOKEN__",
-    singleVideoEncoding: true,
   });
   const canvas = document.createElement("canvas");
   canvas.width = 320;

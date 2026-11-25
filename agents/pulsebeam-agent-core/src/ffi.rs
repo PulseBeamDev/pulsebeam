@@ -409,6 +409,7 @@ impl From<&model::AgentError> for ErrorInfo {
                 | model::TrackResourceError::InputOperationSpaceExhausted
                 | model::TrackResourceError::OwnerSpaceExhausted
                 | model::TrackResourceError::PublicationCapacityExceeded
+                | model::TrackResourceError::SelectorObservationCapacityExceeded
                 | model::TrackResourceError::SlotSpaceExhausted { .. },
             ) => (ErrorCode::CapacityExceeded, "Resource capacity exceeded"),
             model::AgentError::InvalidTopic(
@@ -734,6 +735,7 @@ pub enum ResourceFailure {
     AlreadyOwned,
     OwnerInUse,
     PublicationCapacityExceeded,
+    SelectorObservationCapacityExceeded,
     OwnerSpaceExhausted,
     InputOperationSpaceExhausted,
     PublicationConfigurationSpaceExhausted,
@@ -756,6 +758,9 @@ impl From<model::TrackResourceError> for ResourceFailure {
             model::TrackResourceError::OwnerInUse => Self::OwnerInUse,
             model::TrackResourceError::PublicationCapacityExceeded => {
                 Self::PublicationCapacityExceeded
+            }
+            model::TrackResourceError::SelectorObservationCapacityExceeded => {
+                Self::SelectorObservationCapacityExceeded
             }
             model::TrackResourceError::OwnerSpaceExhausted => Self::OwnerSpaceExhausted,
             model::TrackResourceError::InputOperationSpaceExhausted => {

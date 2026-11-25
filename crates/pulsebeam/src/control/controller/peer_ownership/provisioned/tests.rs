@@ -108,14 +108,13 @@ fn ready_requires_an_announced_exact_single_use_location() {
                             publication: connection.fixture_publication(TrackKind::Data, "repair"),
                             connection,
                             incarnation: scope.source,
-                            emission: Emission::DATA,
+                            emission: Emission::data(false),
                         },
                         shard: ShardId::new(0),
                         next: LiveNextHop {
                             peer,
                             key: scope.key
                         },
-                        expires_at: expires,
                         tx: tx.clone(),
                     },
                     request: lookup.request,

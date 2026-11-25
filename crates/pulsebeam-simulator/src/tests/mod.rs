@@ -1,6 +1,7 @@
 pub mod audio;
 pub mod bwe;
 pub mod calibration;
+mod capacity;
 pub mod common;
 pub mod connectivity;
 pub mod convergence;

@@ -314,9 +314,8 @@ fn publication_configuration_revisions_settle_without_input_and_exhaust_atomical
 fn publication_configuration_pending_completion_accepts_rejects_and_fences_stale_work() {
     let mut resources = TrackResources::default();
     let owner = resources.new_owner().unwrap();
-    let spec = video("camera");
     resources
-        .claim_default_publication(owner, spec.clone())
+        .claim_default_publication(owner, video("camera"))
         .unwrap();
     let (operation, _) = resources
         .begin_publication_input(owner, PublicationInputIntent::Replace, true, false)
@@ -1166,6 +1165,55 @@ fn exact_receive_references_share_until_the_last_owner_and_rooms_stay_distinct()
     resources.release_receiver(second);
     assert_eq!(resources.registrations().subscribers.len(), 1);
     assert_eq!(resources.registrations().subscribers[0].room, "room-b");
+}
+
+#[test]
+fn selector_data_cursors_share_delivery_without_registering_exact_interest() {
+    let mut resources = TrackResources::default();
+    let broad = resources.new_owner().unwrap();
+    let narrow = resources.new_owner().unwrap();
+    let source = TrackSelector {
+        room: "room".into(),
+        participant_id: "alice".into(),
+        track_id: "events".into(),
+    };
+    let mode = TopicMode::Ordered;
+    let first = resources
+        .receive_selector_data(broad, source.clone(), mode)
+        .unwrap();
+    let second = resources
+        .receive_selector_data(narrow, source.clone(), mode)
+        .unwrap();
+    assert_eq!(
+        resources.receive_selector_data(broad, source.clone(), mode),
+        Err(TrackResourceError::AlreadyOwned)
+    );
+    assert!(resources.registrations().subscribers.is_empty());
+    let subscriber = data(mode).subscriber(&source).unwrap();
+    let unit = |unit_seq| crate::data_v1::AssembledUnit {
+        unit_seq,
+        captured_at: None,
+        bytes: b"event".to_vec(),
+        fragment_descriptors: Vec::new(),
+    };
+    assert_eq!(
+        resources.receive_data_v1(&subscriber, "publication", unit(0)),
+        [first.id(), second.id()]
+    );
+    assert!(matches!(
+        resources.read(first).unwrap(),
+        Some(DataEvent::Message { sequence: 0, .. })
+    ));
+    resources.release(first);
+    assert_eq!(resources.read(first), Err(TrackResourceError::Released));
+    assert!(matches!(
+        resources.read(second).unwrap(),
+        Some(DataEvent::Message { sequence: 0, .. })
+    ));
+    assert_eq!(
+        resources.receive_data_v1(&subscriber, "publication", unit(1)),
+        [second.id()]
+    );
 }
 
 #[test]

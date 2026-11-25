@@ -22,6 +22,191 @@ fn quic_native_session_rejects_wrong_carrier_as_a_scoped_proposal() {
 }
 
 #[test]
+fn selector_declarations_are_bounded_and_retire_without_media_work() {
+    let mut session = NativeSession::default();
+    session.identify(ProjectId::new(), ConnectionId::new());
+    session
+        .authorization(900, 1, ResourcePermissions::RoomBound)
+        .unwrap();
+    let spec = wire::ResourceSpec {
+        declaration: Some(wire::resource_spec::Declaration::SubscriptionSelector(
+            wire::SubscriptionSelectorSpec::default(),
+        )),
+        settings: Some(wire::ResourceSettings {
+            enabled: Some(false),
+            receive: None,
+        }),
+    };
+    let records = (1..=9)
+        .map(|reference| present(reference, reference, spec.clone()))
+        .collect();
+    let effects = input(&mut session, records).unwrap();
+    assert!(effects.is_empty());
+    assert!(!session.preparation_pending(100));
+    assert_eq!(
+        session.rows[&Key::Owned(9)]
+            .value
+            .rejection
+            .as_ref()
+            .unwrap()
+            .code,
+        wire::FailureCode::CapacityExceeded as i32
+    );
+    assert!(!session.selector_scan_pending(100));
+    let remove = wire::ClientStateRecord {
+        owned: 1,
+        desired: Some(wire::DesiredState {
+            revision: 10,
+            value: Some(wire::desired_state::Value::Absent(true)),
+        }),
+        execution: None,
+    };
+    assert!(input(&mut session, vec![remove]).unwrap().is_empty());
+    input(&mut session, vec![present(11, 11, spec)]).unwrap();
+    assert!(matches!(
+        session.rows[&Key::Owned(11)].value.value,
+        Some(wire::confirmed_state::Value::SubscriptionSelector(_))
+    ));
+}
+
+#[test]
+fn selector_scan_publishes_only_finished_sets_and_fails_closed_on_overflow() {
+    use crate::{
+        control::{lifecycle::SelectorPage, topology::NamedTrack},
+        entity::{ParticipantId, RoomId, TrackId, TrackKind},
+    };
+    use wire::SelectorMatchStatus::{Complete, Overflow, Pending};
+    let project = ProjectId::new();
+    let mut session = NativeSession::default();
+    session.identify(project, ConnectionId::new());
+    session
+        .authorization(900, 1, ResourcePermissions::RoomBound)
+        .unwrap();
+    let spec = wire::ResourceSpec {
+        declaration: Some(wire::resource_spec::Declaration::SubscriptionSelector(
+            wire::SubscriptionSelectorSpec {
+                project_id: Some(project.to_string()),
+                ..Default::default()
+            },
+        )),
+        settings: Some(wire::ResourceSettings {
+            enabled: Some(true),
+            receive: None,
+        }),
+    };
+    input(&mut session, vec![present(1, 1, spec)]).unwrap();
+    let claimant = ConnectionId::new();
+    let source = |index| {
+        let label = format!("camera-{index:02}");
+        let name = NamedTrack {
+            room: RoomId::new("room").unwrap(),
+            participant: ParticipantId::new("publisher").unwrap(),
+            kind: TrackKind::Video,
+            track: TrackId::new(&label).unwrap(),
+        };
+        (name, claimant.fixture_publication(TrackKind::Video, &label))
+    };
+    let observed = |session: &NativeSession| {
+        let Some(wire::confirmed_state::Value::SubscriptionSelector(state)) =
+            &session.rows[&Key::Owned(1)].value.value
+        else {
+            panic!("selector confirmation")
+        };
+        (state.status(), state.matches.len())
+    };
+    session
+        .refresh_selector(100, |_, _, cursor| {
+            assert!(cursor.is_none());
+            Some(SelectorPage {
+                sources: vec![source(0)],
+                next: Some(source(0).0),
+            })
+        })
+        .unwrap();
+    assert_eq!(observed(&session), (Pending, 0));
+    session
+        .refresh_selector(100, |_, _, cursor| {
+            assert_eq!(cursor, Some(source(0).0));
+            Some(SelectorPage {
+                sources: vec![source(1)],
+                next: None,
+            })
+        })
+        .unwrap();
+    assert_eq!(observed(&session), (Complete, 2));
+    assert!(!session.selector_scan_pending(100));
+    assert_eq!(session.selector_interests().count(), 1);
+    session.selector_source_changed(1);
+    session
+        .refresh_selector(100, |_, _, cursor| {
+            assert!(cursor.is_none());
+            Some(SelectorPage {
+                sources: vec![source(0)],
+                next: Some(source(0).0),
+            })
+        })
+        .unwrap();
+    session.selector_source_changed(1);
+    session
+        .refresh_selector(100, |_, _, cursor| {
+            assert_eq!(cursor, Some(source(0).0));
+            Some(SelectorPage {
+                sources: Vec::new(),
+                next: None,
+            })
+        })
+        .unwrap();
+    assert_eq!(
+        observed(&session),
+        (Complete, 2),
+        "do not publish a cut invalidated mid-scan"
+    );
+    session
+        .refresh_selector(100, |_, _, cursor| {
+            assert!(cursor.is_none());
+            Some(SelectorPage {
+                sources: vec![source(2)],
+                next: None,
+            })
+        })
+        .unwrap();
+    assert_eq!(observed(&session), (Complete, 1));
+    session.selector_source_changed(1);
+    session
+        .refresh_selector(100, |_, _, _| {
+            Some(SelectorPage {
+                sources: (0..=validation::MAX_SELECTOR_MATCHES).map(source).collect(),
+                next: None,
+            })
+        })
+        .unwrap();
+    assert_eq!(observed(&session), (Overflow, 0));
+    assert_eq!(session.selector_interests().count(), 1);
+    session.selector_source_changed(1);
+    session
+        .refresh_selector(100, |_, _, _| {
+            Some(SelectorPage {
+                sources: vec![source(1)],
+                next: None,
+            })
+        })
+        .unwrap();
+    assert_eq!(observed(&session), (Complete, 1));
+    session
+        .authorization(900, 2, ResourcePermissions::Denied)
+        .unwrap();
+    // A grant update during the original sweep requests another bounded pass.
+    for _ in 0..2 {
+        assert!(session.service_revocations(1, |_| None).unwrap().is_empty());
+    }
+    assert!(!session.revocation_pending());
+    assert!(
+        matches!(session.rows[&Key::Owned(1)].value.value.as_ref(), Some(wire::confirmed_state::Value::Absent(absent)) if absent.reason == wire::AbsenceReason::PermissionRevoked as i32)
+    );
+    assert!(!session.selector_scan_pending(100));
+}
+
+#[test]
 fn successor_receipt_updates_independently_of_grant_and_is_cleared_on_close() {
     let mut session = NativeSession::default();
     let receipt = |value, expires| wire::SuccessorReceipt {

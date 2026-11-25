@@ -104,12 +104,9 @@ async fn ready_pair_with_windows(
     let left_secret = wan::LocalIdentity::generate().map_err(identity_error)?;
     let right_secret = wan::LocalIdentity::generate().map_err(identity_error)?;
     let bind_error = |error| anyhow::anyhow!("bind WAN test socket: {error:?}");
-    let left_socket = bind_socket(([127, 0, 0, 1], 0).into())
-        .await
-        .map_err(bind_error)?;
-    let right_socket = bind_socket(([127, 0, 0, 1], 0).into())
-        .await
-        .map_err(bind_error)?;
+    let loopback = SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 0));
+    let left_socket = bind_socket(loopback).await.map_err(bind_error)?;
+    let right_socket = bind_socket(loopback).await.map_err(bind_error)?;
     let left_addr = left_socket.local_addr();
     let right_addr = right_socket.local_addr();
     fn config(
@@ -208,6 +205,7 @@ pub(crate) async fn live_send_fixture(
                 purpose: Purpose::Live,
                 expires: expires.into_std(),
             },
+            false,
             None,
         )
         .map_err(|error| anyhow::anyhow!("install fixture WAN send: {error:?}"))?;
@@ -274,11 +272,14 @@ async fn protected_boundary_datagrams_reach_only_exactly_acknowledged_shard_wind
     let expires = now.checked_add(Duration::from_secs(2)).unwrap();
     let (installed, receipt) = oneshot::channel();
     let (report, mut active) = oneshot::channel();
+    let activity = ReceiveActivity::default();
     right.install(
         now,
         ReceiveCommand::Live {
             expires,
+            deadline: None,
             timing: None,
+            activity: Some(activity.clone()),
             children: vec![ChildInstall {
                 child,
                 tx: tx.clone(),
@@ -326,6 +327,7 @@ async fn protected_boundary_datagrams_reach_only_exactly_acknowledged_shard_wind
         .unwrap();
     right.poll(now).unwrap();
     assert_eq!(rx.try_recv_batch(&mut Vec::new(), 2), 0);
+    assert!(!activity.observed());
     assert!(matches!(
         active.try_recv(),
         Err(oneshot::error::TryRecvError::Empty)
@@ -334,7 +336,7 @@ async fn protected_boundary_datagrams_reach_only_exactly_acknowledged_shard_wind
     right.poll(now).unwrap();
     assert_eq!(active.try_recv().unwrap().unwrap(), window);
     for (delta, sequence, payload, sealed_len) in
-        [(1, 0x18001, 1187, 1215), (2, 0x18002, 1188, 1216)]
+        [(1, 0x18001, 1203, 1231), (2, 0x18002, 1204, 1232)]
     {
         let position = start | delta;
         let original = packet(sequence, payload).unwrap();
@@ -353,13 +355,19 @@ async fn protected_boundary_datagrams_reach_only_exactly_acknowledged_shard_wind
         assert_eq!(frame.tag, delivery_tag(address));
         assert!(
             matches!(frame.packet, ShardFrame::FabricWanImage { ingress, image: NetworkPacket { window: bound, position: received, packet, .. } }
-            if ingress == child.ingress && bound == window && received == position && packet.same_content(&original))
+            if ingress == child.ingress && bound == window && received == position
+                && packet.same_content(&original)
+                && packet.wan_received_bytes().is_some_and(|bytes| usize::from(bytes.get()) == sealed_len))
         );
     }
+    assert!(activity.observed());
+    let oversize = packet(0x18003, 1205).unwrap();
+    assert!(left.prepare(now, sender, start + 3, &oversize).is_err());
     assert_eq!(
-        packet(0x18003, 1189),
-        Err(pulsebeam_core::fabric::WireError::Oversize)
+        right.socket.local_addr().ip(),
+        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
     );
+    assert_eq!(wan::MAX_DATAGRAM_BYTES + 40 + 8, 1280);
     let position = start + 2;
     let repair_ssrc = NonZeroU32::new(0x0506_0710).unwrap();
     let repair_window = window.repair_window(position, repair_ssrc).unwrap();
@@ -460,7 +468,9 @@ async fn protected_boundary_datagrams_reach_only_exactly_acknowledged_shard_wind
         now,
         ReceiveCommand::Live {
             expires,
+            deadline: None,
             timing: None,
+            activity: None,
             children: vec![ChildInstall {
                 child: next_child,
                 tx,
@@ -625,7 +635,9 @@ async fn sparse_repair_requires_exact_receipt_and_live_parent() {
         now,
         ReceiveCommand::Live {
             expires,
+            deadline: None,
             timing: None,
+            activity: None,
             children: vec![ChildInstall {
                 child: parent,
                 tx: live_tx.clone(),
@@ -695,6 +707,7 @@ async fn sparse_repair_requires_exact_receipt_and_live_parent() {
                 purpose: Purpose::Live,
                 ..spec
             },
+            false,
             None,
         )
         .unwrap();
@@ -714,6 +727,7 @@ async fn sparse_repair_requires_exact_receipt_and_live_parent() {
             repair,
             live,
             spec,
+            false,
             Some(SendParent::Repair(parent.clone())),
         )
         .unwrap();
@@ -727,6 +741,7 @@ async fn sparse_repair_requires_exact_receipt_and_live_parent() {
             repair,
             repair,
             spec,
+            false,
             Some(SendParent::Repair(parent.clone())),
         )
         .unwrap();
@@ -799,6 +814,7 @@ async fn sparse_repair_requires_exact_receipt_and_live_parent() {
                 ssrc: fresh.ssrc(),
                 ..spec
             },
+            false,
             Some(SendParent::Repair(parent)),
         )
         .unwrap();

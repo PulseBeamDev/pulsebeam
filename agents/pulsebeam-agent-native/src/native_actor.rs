@@ -428,6 +428,12 @@ enum Command {
         selector: agent_core::TrackSelector,
         response: oneshot::Sender<Result<Subscription, Error>>,
     },
+    ObserveSelectorMatch {
+        owner: agent_core::TrackOwner,
+        source: agent_core::SelectorMatch,
+        mode: ReceiveMode,
+        response: oneshot::Sender<Result<RemoteMedia, Error>>,
+    },
     ObserveSubscription {
         owner: u64,
         mode: ReceiveMode,
@@ -743,6 +749,46 @@ impl Agent {
     pub async fn send_topic(&self, send: TopicSend) -> Result<(), Error> {
         self.command(AgentCommand::SendTopic(send)).await
     }
+    pub fn open_subscription_selector(
+        &self,
+        selector: agent_core::SubscriptionSelector,
+    ) -> Result<agent_core::TrackOwner, Error> {
+        self.core.external(|core| {
+            if self.is_closed() {
+                return Err(Error::Closed);
+            }
+            core.open_subscription_selector(selector)
+                .map_err(Error::Operation)
+        })
+    }
+    pub fn subscription_selector_state(
+        &self,
+        owner: agent_core::TrackOwner,
+    ) -> Option<agent_core::SelectorState> {
+        self.core.subscription_selector_state(owner)
+    }
+    pub async fn observe_selector_match(
+        &self,
+        owner: agent_core::TrackOwner,
+        source: agent_core::SelectorMatch,
+        mode: ReceiveMode,
+    ) -> Result<RemoteMedia, Error> {
+        let (response, result) = oneshot::channel();
+        self.commands
+            .send(Command::ObserveSelectorMatch {
+                owner,
+                source,
+                mode,
+                response,
+            })
+            .await
+            .map_err(|_| Error::Closed)?;
+        result.await.map_err(|_| Error::Closed)?
+    }
+    pub fn close_subscription_selector(&self, owner: agent_core::TrackOwner) -> bool {
+        self.core
+            .external(|core| core.close_subscription_selector(owner))
+    }
     pub fn join(&self, room: String) -> Result<(), Error> {
         self.intent(AgentCommand::Join(room))
     }
@@ -942,6 +988,7 @@ impl Drop for StreamLease {
 }
 pub struct RemoteMedia {
     observation: Option<agent_core::MediaObservationControl>,
+    selector_source: Option<String>,
     slot: MediaSlot,
     generation: u64,
     receiver: u64,
@@ -950,11 +997,13 @@ pub struct RemoteMedia {
 }
 impl RemoteMedia {
     pub fn source_track_id(&self) -> Option<&str> {
-        self.observation
-            .as_ref()?
-            .target
-            .as_ref()
-            .map(|target| target.source.as_str())
+        self.selector_source.as_deref().or_else(|| {
+            self.observation
+                .as_ref()?
+                .target
+                .as_ref()
+                .map(|target| target.source.as_str())
+        })
     }
 
     pub fn slot(&self) -> &MediaSlot {
@@ -1458,6 +1507,25 @@ where
                     let _ = response.send(result);
                 }
             }
+            Command::ObserveSelectorMatch {
+                owner,
+                source,
+                mode,
+                response,
+            } => {
+                if !response.is_closed() {
+                    let result = self
+                        .core
+                        .selector_media_receiver(owner, &source)
+                        .ok_or(Error::NotReady)
+                        .and_then(|(slot, source)| {
+                            let mut receiver = self.observe(slot, mode)?;
+                            receiver.selector_source = Some(source);
+                            Ok(receiver)
+                        });
+                    let _ = response.send(result);
+                }
+            }
             Command::ObserveSubscription {
                 owner,
                 mode,
@@ -1634,6 +1702,7 @@ where
         }
         Ok(RemoteMedia {
             observation: None,
+            selector_source: None,
             slot,
             generation,
             receiver,
@@ -4173,6 +4242,7 @@ mod tests {
         });
         let stream = RemoteMedia {
             observation: None,
+            selector_source: None,
             slot: MediaSlot::RemoteAudio(0),
             generation: 1,
             receiver: 7,

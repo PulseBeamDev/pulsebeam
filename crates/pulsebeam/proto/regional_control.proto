@@ -1,0 +1,12 @@
+syntax = "proto3";
+
+package pulsebeam.cluster.v1;
+
+service NeighborControl {
+  rpc Exchange(stream ControlFrame) returns (stream ControlFrame);
+}
+
+// One bounded control-lane record. Media uses the separate Fabric association.
+message ControlFrame {
+  bytes payload = 1;
+}

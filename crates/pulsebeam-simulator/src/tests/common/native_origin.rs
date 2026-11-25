@@ -801,18 +801,7 @@ impl NativeOriginCorrelation {
             {
                 continue;
             }
-            ensure!(
-                native.at >= event.captured,
-                "native output precedes its actual source capture"
-            );
-            ensure!(
-                native.dimensions == (u32::from(event.dimensions.0), u32::from(event.dimensions.1)),
-                "native dimensions differ from supplied encoding"
-            );
-            native
-                .pixel_sample
-                .context("invalid native I420")?
-                .require_fixture(event.pixel_sample)?;
+            Self::validate_event_picture(native, event)?;
             if let Some(expected) = expected {
                 native
                     .pixel_sample
@@ -828,6 +817,53 @@ impl NativeOriginCorrelation {
         anyhow::bail!(
             "no current source-event-associated I420 for {origin}, generation {generation}"
         )
+    }
+
+    fn validate_event_picture(
+        native: &NativePicture,
+        event: &AuthenticatedSourceEvent,
+    ) -> Result<()> {
+        ensure!(
+            native.at >= event.captured,
+            "native output precedes its actual source capture"
+        );
+        ensure!(
+            native.dimensions == (u32::from(event.dimensions.0), u32::from(event.dimensions.1)),
+            "native dimensions differ from supplied encoding"
+        );
+        native
+            .pixel_sample
+            .context("invalid native I420")?
+            .require_fixture(event.pixel_sample)
+    }
+
+    pub(super) fn first_fresh_decode(
+        &self,
+        origin: &str,
+        generation: u64,
+        since: Instant,
+    ) -> Result<(Instant, &NativeReceiverInfo)> {
+        ensure!(
+            self.event_failures == 0,
+            "source event association lost {} observations",
+            self.event_failures
+        );
+        let (native, event) = self
+            .pictures
+            .values()
+            .filter_map(|picture| {
+                let (native, event) = (picture.native.as_ref()?, picture.event.as_ref()?);
+                (native.track.generation == generation
+                    && event.captured >= since
+                    && event.event.source == origin
+                    && !picture.event_conflict
+                    && matches!(&picture.origin, Origin::Unique(source) if source == origin))
+                .then_some((native, event))
+            })
+            .min_by_key(|(native, _)| (native.at, native.track.receiver))
+            .context("no fresh source-attributed native decode")?;
+        Self::validate_event_picture(native, event)?;
+        Ok((native.at, &native.track))
     }
 
     /// Source cadence is deliberately not invented here. This proves genuine

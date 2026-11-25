@@ -142,10 +142,10 @@ impl RuntimeInner {
     #[cfg(feature = "uniffi")]
     pub(super) async fn observe_cancellable(
         self: &Rc<Self>,
-        owner: u64,
+        command: ResourceCommand,
     ) -> Result<BrowserMediaObservation, JsValue> {
         let cancellation = AbortObservationOnDrop(AbortController::new()?);
-        let observation = self.observe_owned(owner, Some(cancellation.0.signal()));
+        let observation = self.observe_owned(command, Some(cancellation.0.signal()));
         let (send, receive) = oneshot::channel();
         // UniFFI can drop the caller future while Core is allocating the request.
         // Let the observation finish cancellation so Core can retire that request.
@@ -155,9 +155,9 @@ impl RuntimeInner {
         receive.await.map_err(|_| closed_error())?
     }
 
-    pub(super) fn observe_owned(
+    fn observe_owned(
         self: &Rc<Self>,
-        owner: u64,
+        command: ResourceCommand,
         signal: Option<AbortSignal>,
     ) -> impl Future<Output = Result<BrowserMediaObservation, JsValue>> + use<> {
         let weak = Rc::downgrade(self);
@@ -167,9 +167,7 @@ impl RuntimeInner {
                 return Err(closed_error());
             }
             inner.observations.borrow_mut().beginning += 1;
-            let result = inner
-                .input_resource(ResourceCommand::BeginMediaObservation { owner })
-                .await;
+            let result = inner.input_resource(command).await;
             let (sender, mut receiver) = oneshot::channel();
             let mut observations = inner.observations.borrow_mut();
             observations.beginning -= 1;

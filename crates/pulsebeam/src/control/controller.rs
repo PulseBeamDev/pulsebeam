@@ -9,10 +9,16 @@ use std::{
 
 mod catalog;
 mod native_service;
+pub(crate) mod operator;
 pub(crate) mod ownership;
 pub mod peer_ownership;
+mod publisher_handoffs;
 mod quic_placement;
 pub(crate) mod quic_redeem;
+mod regional_routing;
+mod standby_egress;
+#[cfg(feature = "sim")]
+pub use standby_egress::sim::SimStandbyControl;
 
 use super::api::creation;
 use super::native::handler::StateProtocolHandler;
@@ -243,6 +249,8 @@ pub enum ControllerCommand {
     UnbindLinkReceive(pulsebeam_link::BindingId),
     Admission(AdmissionCommand),
     PeerOwnership(peer_ownership::Command),
+    PublisherHandoff(PublisherHandoffCommand),
+    StandbyControl(StandbyControlCommand),
     CreateParticipant(
         CreateParticipant,
         oneshot::Sender<Result<CreateParticipantReply, ControllerError>>,
@@ -406,6 +414,12 @@ impl std::fmt::Debug for NativeResourceRequest {
         formatter.write_str("NativeResourceRequest([redacted])")
     }
 }
+
+#[derive(Debug)]
+pub struct PublisherHandoffCommand(Box<publisher_handoffs::Request>);
+
+#[derive(Debug)]
+pub struct StandbyControlCommand(Box<standby_egress::Request>);
 
 #[derive(Debug)]
 pub struct DeleteNative {
@@ -781,9 +795,14 @@ pub struct ControllerActor {
     quic_placements: quic_placement::Placements,
     quic_authority: Option<(String, u16)>,
     peer_ownership: ownership::observations::Observations,
+    peer_selections: peer_ownership::Selections,
     provisioned_peers: Vec<peer_ownership::provisioned::Peer>,
+    regional_mesh: Option<crate::cluster::mesh::Exchange>,
+    regional_routing: Option<regional_routing::Routing>,
     ownership_entropy: pulsebeam_runtime::rand::Rng,
     receipt_trust: Option<ownership::receipt::Authority>,
+    publisher_handoffs: publisher_handoffs::PublisherHandoffs,
+    standby_outbox: standby_egress::Outbox,
     delivery_budget: creation::DeliveryBudget,
     steering: Option<Box<dyn Steering>>,
     materializations: VecDeque<MaterializationWork>,
@@ -868,9 +887,14 @@ impl ControllerActor {
             quic_placements: quic_placement::Placements::default(),
             quic_authority: None,
             peer_ownership: peer_ownership::new_observations(),
+            peer_selections: peer_ownership::Selections::default(),
             provisioned_peers: Vec::new(),
+            regional_mesh: None,
+            regional_routing: None,
             ownership_entropy,
             receipt_trust: None,
+            publisher_handoffs: publisher_handoffs::PublisherHandoffs::default(),
+            standby_outbox: standby_egress::Outbox::default(),
             delivery_budget: creation::DeliveryBudget::new(),
             steering: None,
             materializations: VecDeque::new(),
@@ -892,6 +916,13 @@ impl ControllerActor {
 
     pub(crate) fn set_quic_authority(&mut self, authority: Option<(String, u16)>) {
         self.quic_authority = authority;
+    }
+
+    pub(crate) fn set_publisher_handoff_store(
+        &mut self,
+        store: crate::cluster::handoff::Store,
+    ) -> anyhow::Result<()> {
+        self.publisher_handoffs.set_store(store)
     }
 
     pub(crate) fn set_ownership_mode(&mut self, mode: OwnershipMode) {
@@ -983,6 +1014,7 @@ impl ControllerActor {
                 .into_iter()
                 .chain(self.native_deadlines.first().map(|(deadline, _)| *deadline))
                 .chain(self.peer_ownership.deadline())
+                .chain(self.peer_selections.deadline())
                 .chain(self.quic_placements.deadline())
                 .chain(
                     self.provisioned_peers
@@ -1005,6 +1037,10 @@ impl ControllerActor {
                     () = poll_fn(|cx| self.links.as_mut().map_or(Poll::Pending, |links| links.poll_ready(cx))) => false,
                     Some(bytes) = self.deletion_rx.recv() => {
                         self.release_deletion(bytes);
+                        false
+                    },
+                    result = self.publisher_handoffs.wait_for_write() => {
+                        self.publisher_handoffs.complete_write(result);
                         false
                     },
                     Some(result) = self.renewal_rx.recv() => {
@@ -1292,6 +1328,18 @@ impl ControllerActor {
                 }
                 None
             }
+            ControllerCommand::PublisherHandoff(command) => {
+                self.process_publisher_handoff(*command.0, SystemTime::now());
+                None
+            }
+            ControllerCommand::StandbyControl(command) => {
+                self.process_standby_control(
+                    *command.0,
+                    pulsebeam_runtime::time::Instant::now(),
+                    SystemTime::now(),
+                );
+                None
+            }
             ControllerCommand::ReplaceAuthorization(message, expected_revision, reply) => {
                 let wall_now = SystemTime::now();
                 let connection_id = message.connection_id;
@@ -1445,7 +1493,10 @@ impl ControllerActor {
         let route =
             u16::try_from(shard.index()).map_err(|_| ControllerError::ServiceUnavailable)?;
         let now = pulsebeam_runtime::time::Instant::now();
-        let connection = ConnectionId::new();
+        let connection = scope
+            .endpoint(verified.participant_id)
+            .and_then(|endpoint| self.reserved_handoff_connection(endpoint))
+            .unwrap_or_else(ConnectionId::new);
         let (proof, successor) = if let Some(QuicContinuation { proof, successor }) = continuation {
             let key = ownership::PrincipalKey::from_verified(&verified);
             if !self
@@ -1560,7 +1611,36 @@ impl ControllerActor {
             successor_receipt,
             location,
         } = attempt;
-        let capabilities = message.state.rtp_capabilities.clone();
+        let CreateParticipant { mut state, offer } = message;
+        let location = match state
+            .authorization
+            .as_ref()
+            .and_then(|lease| {
+                lease.authority.room_id.map(|room| EndpointKey {
+                    room: ProjectRoomKey {
+                        project: lease.authority.project_id,
+                        room,
+                    },
+                    participant: lease.authority.participant_id,
+                })
+            })
+            .and_then(|endpoint| self.reserved_handoff_connection(endpoint))
+        {
+            Some(connection) => {
+                let suffix = format!("/{}", state.connection_id);
+                let prefix = location
+                    .to_str()
+                    .ok()
+                    .and_then(|location| location.strip_suffix(&suffix))
+                    .ok_or(ControllerError::ServiceUnavailable)?;
+                let location = axum::http::HeaderValue::from_str(&format!("{prefix}/{connection}"))
+                    .map_err(|_| ControllerError::ServiceUnavailable)?;
+                state.connection_id = connection;
+                location
+            }
+            None => location,
+        };
+        let capabilities = state.rtp_capabilities.clone();
         let project = AdmissionProjection::Rtc(RtcAdmissionProjection {
             location: &location,
             capabilities: capabilities.as_ref(),
@@ -1571,7 +1651,6 @@ impl ControllerActor {
             binding,
             successor_receipt,
         };
-        let CreateParticipant { state, offer } = message;
         self.prepare_owned_attempt(
             state,
             attempt,
@@ -1651,7 +1730,20 @@ impl ControllerActor {
         } else {
             ownership::ClaimRank::root(state.connection_id)
         };
-        if endpoint.is_some_and(|endpoint| !self.candidate_is_newer(endpoint, claim)) {
+        if let Some(endpoint) =
+            endpoint.filter(|&endpoint| !self.candidate_is_newer(endpoint, claim))
+        {
+            if self.reserved_handoff_connection(endpoint) == Some(claim.connection()) {
+                // The durable handoff can arrive before peer views reflect the predecessor cutoff.
+                return Err(ownership::Error::QuiescencePending.into());
+            }
+            return Err(ControllerError::Superseded.into());
+        }
+        let handoff_target =
+            endpoint.filter(|&endpoint| self.local_handoff_target(endpoint).is_some());
+        if handoff_target.is_some_and(|endpoint| {
+            self.reserved_handoff_connection(endpoint) != Some(state.connection_id)
+        }) {
             return Err(ControllerError::Superseded.into());
         }
         if endpoint.is_some_and(|endpoint| {
@@ -1724,6 +1816,9 @@ impl ControllerActor {
             image,
             successor_receipt,
         });
+        if let Some(endpoint) = handoff_target {
+            self.publisher_handoffs.consume_target(endpoint);
+        }
         Ok(OwnedPreparation::Start(ticket, Box::new(pending)))
     }
 
@@ -2267,6 +2362,23 @@ impl ControllerActor {
             .is_some()
     }
 
+    fn owns_local_publication(&self, shard: ShardId, track: &crate::track::TrackMeta) -> bool {
+        let endpoint = EndpointKey {
+            room: track.room,
+            participant: track.origin,
+        };
+        self.core
+            .registry
+            .get_endpoint(endpoint)
+            .is_some_and(|owner| {
+                owner.connection_id == track.connection_id
+                    && owner.shard_id == shard
+                    && owner
+                        .claim
+                        .is_none_or(|rank| !self.peer_lineage_retired(endpoint, rank))
+            })
+    }
+
     fn handle_shard_event(&mut self, (shard, event): ShardEventMessage) {
         match event {
             ShardEvent::NetworkMediaRepair(interest) => {
@@ -2328,11 +2440,7 @@ impl ControllerActor {
                 incarnation,
                 emission,
             } => {
-                if self
-                    .core
-                    .registry
-                    .get_incarnation(meta.origin, meta.connection_id)
-                    .is_some_and(|owner| owner.shard_id == shard)
+                if self.owns_local_publication(shard, &meta)
                     && let Some(outcome) = self.lifecycle.set_local_rtp_source(
                         &meta,
                         encoding,
@@ -2372,7 +2480,7 @@ impl ControllerActor {
                 self.publish_staged();
             }
             ShardEvent::TrackPublished(track) => {
-                if !self.current_incarnation(track.meta().origin, track.meta().connection_id) {
+                if !self.owns_local_publication(shard, track.meta()) {
                     return;
                 }
                 if let Some(outcome) = self.lifecycle.publish(
@@ -2385,10 +2493,12 @@ impl ControllerActor {
                 }
             }
             ShardEvent::OwnedTrackUnpublished { meta, reference } => {
-                self.begin_owned_unpublish(meta, reference);
+                if self.owns_local_publication(shard, &meta) {
+                    self.begin_owned_unpublish(meta, reference);
+                }
             }
             ShardEvent::TrackUnpublished(meta) => {
-                if !self.current_incarnation(meta.origin, meta.connection_id) {
+                if !self.owns_local_publication(shard, &meta) {
                     return;
                 }
                 if let Some(outcome) = self.lifecycle.unpublish(
@@ -2610,13 +2720,15 @@ impl ControllerActor {
             .deletion_bytes
             .checked_sub(completed.bytes)
             .unwrap_or_else(|| pulsebeam_runtime::fatal!("native deletion credit released twice"));
-        if let Some(result) = completed.ownership {
-            self.ownership.finish_retirement(
+        if let Some(result) = completed.ownership
+            && self.ownership.finish_retirement(
                 &result.ticket,
                 result.incarnation,
                 result.success,
                 pulsebeam_runtime::time::Instant::now(),
-            );
+            )
+        {
+            self.publisher_handoffs.cutoff_applied(result.incarnation);
         }
         if let Some(result) = completed.publication
             && let Some(meta) = self
@@ -3360,7 +3472,7 @@ impl ControllerActor {
                     let key = publication
                         .data_publisher(connection)
                         .map(|publisher| publisher.publication)
-                        .or_else(|| publication.opus_publication())?;
+                        .or_else(|| publication.wan_rtp_publication().map(|(key, _)| key))?;
                     Some((endpoint.room, key, connection))
                 })
             })
@@ -4230,7 +4342,10 @@ impl ControllerActor {
         if let Some(lease) = authorization {
             self.record_admitted_authorization(participant_id, connection_id, lease);
         }
-        self.reconcile_peer_sources(endpoint, pulsebeam_runtime::time::Instant::now());
+        self.reconcile_peer_source_changes(
+            BTreeSet::from([endpoint]),
+            pulsebeam_runtime::time::Instant::now(),
+        );
         // Retain the fence with bounded in-flight work, even if the replacement
         // is removed before an older materialization acknowledges installation.
         for work in &mut self.materializations {
@@ -4262,19 +4377,73 @@ impl ControllerActor {
     }
 
     fn candidate_is_newer(&self, endpoint: EndpointKey, claim: ownership::ClaimRank) -> bool {
-        !self.peer_lineage_retired(endpoint, claim)
-            && self
+        let now = pulsebeam_runtime::time::Instant::now();
+        let remote_allows_admission = match self.receipt_trust.as_ref() {
+            // A newer connection ID or a successor receipt is not proof that a
+            // remote publisher has stopped. Do not preempt a live remote claim.
+            Some(ownership::receipt::Authority::Provisioned(trust)) => {
+                use ownership::receipt::PeerTrust as _;
+                self.handoff_permits(endpoint, trust.issuer(), claim.connection())
+                    && self
+                        .peer_ownership
+                        .highest(endpoint, now, |_| true)
+                        .is_none()
+                    && self.provisioned_claim_views_ready(trust, now)
+            }
+            _ => self
                 .peer_ownership
-                .highest(endpoint, pulsebeam_runtime::time::Instant::now(), |rank| {
+                .highest(endpoint, now, |rank| {
                     !self.peer_lineage_retired(endpoint, rank)
                 })
-                .is_none_or(|remote| claim > remote)
+                .is_none_or(|remote| claim > remote),
+        };
+        !self.peer_lineage_retired(endpoint, claim)
+            && remote_allows_admission
             && self
                 .core
                 .registry
                 .get_endpoint(endpoint)
                 .and_then(|current| current.claim)
                 .is_none_or(|current| claim > current)
+    }
+
+    fn local_handoff_target(&self, endpoint: EndpointKey) -> Option<ConnectionId> {
+        use ownership::receipt::PeerTrust as _;
+        let ownership::receipt::Authority::Provisioned(trust) = self.receipt_trust.as_ref()? else {
+            return None;
+        };
+        self.publisher_handoffs
+            .local_target(endpoint, trust.issuer())
+    }
+
+    fn reserved_handoff_connection(&self, endpoint: EndpointKey) -> Option<ConnectionId> {
+        use ownership::receipt::PeerTrust as _;
+        let ownership::receipt::Authority::Provisioned(trust) = self.receipt_trust.as_ref()? else {
+            return None;
+        };
+        self.publisher_handoffs
+            .reserved_connection(endpoint, trust.issuer())
+    }
+
+    fn handoff_permits(
+        &self,
+        endpoint: EndpointKey,
+        issuer: ownership::receipt::Issuer,
+        connection: ConnectionId,
+    ) -> bool {
+        self.publisher_handoffs
+            .permits(endpoint, issuer, connection)
+    }
+
+    fn provisioned_claim_views_ready(
+        &self,
+        trust: &ownership::receipt::epoch::Trust,
+        now: pulsebeam_runtime::time::Instant,
+    ) -> bool {
+        trust.claim_views_ready(now, |node, incarnation, revision| {
+            self.peer_ownership
+                .has_fresh_view(node, incarnation, revision, now)
+        })
     }
 
     fn begin_patch_participant(
@@ -4321,11 +4490,14 @@ impl ControllerActor {
         end: ConnectionEnd,
     ) {
         if let Some(transport) = meta.transport {
-            self.ownership.withdraw_incarnation(ownership::Incarnation {
-                participant,
-                connection: meta.connection_id,
-                transport,
-            });
+            self.ownership.withdraw_incarnation(
+                ownership::Incarnation {
+                    participant,
+                    connection: meta.connection_id,
+                    transport,
+                },
+                meta.endpoint().zip(meta.claim),
+            );
         }
         let ordered = self
             .lifecycle
@@ -4387,7 +4559,10 @@ impl ControllerActor {
             self.publish_track_lifecycle(outcome);
         }
         if remove_current && let Some(endpoint) = meta.endpoint() {
-            self.reconcile_peer_sources(endpoint, pulsebeam_runtime::time::Instant::now());
+            self.reconcile_peer_source_changes(
+                BTreeSet::from([endpoint]),
+                pulsebeam_runtime::time::Instant::now(),
+            );
         }
         if meta.authorization.is_some() {
             log::connection_ended(meta.scope.project, meta.connection_id, end);
@@ -4922,9 +5097,14 @@ mod replacement_tests {
                 quic_placements: quic_placement::Placements::default(),
                 quic_authority: None,
                 peer_ownership: peer_ownership::new_observations(),
+                peer_selections: peer_ownership::Selections::default(),
                 provisioned_peers: Vec::new(),
+                regional_mesh: None,
+                regional_routing: None,
                 ownership_entropy: pulsebeam_runtime::rand::seeded_rng(19),
                 receipt_trust: None,
+                publisher_handoffs: publisher_handoffs::PublisherHandoffs::default(),
+                standby_outbox: standby_egress::Outbox::default(),
                 delivery_budget: creation::DeliveryBudget::new(),
                 steering: None,
                 materializations: VecDeque::new(),
@@ -5315,12 +5495,26 @@ mod replacement_tests {
         assert_eq!(ready_rx.try_recv().unwrap(), connection);
         let branches = crate::control::native::DataBranchIds::default();
         handler
-            .service(1, &branches, |_| None, |_, _| None, |_| None)
+            .service(
+                1,
+                &branches,
+                |_| None,
+                |_, _| None,
+                |_| None,
+                |_, _, _| None,
+            )
             .unwrap();
         assert!(handler.model.lookup_refresh_pending());
         assert_eq!(ready_rx.try_recv().unwrap(), connection);
         handler
-            .service(1, &branches, |_| None, |_, _| None, |_| None)
+            .service(
+                1,
+                &branches,
+                |_| None,
+                |_, _| None,
+                |_| None,
+                |_, _, _| None,
+            )
             .unwrap();
         assert!(!handler.model.lookup_refresh_pending());
         assert!(!handler.model.preparation_pending(1));
@@ -5444,6 +5638,7 @@ mod replacement_tests {
                     |_| None,
                     |_, _| None,
                     |_| None,
+                    |_, _, _| None,
                 )
                 .unwrap();
             let initial = endpoint.output().expect("initial session output in flight");
@@ -8903,8 +9098,1359 @@ mod replacement_tests {
         );
     }
 
+    #[pulsebeam_runtime::test(start_paused = true, crate = "pulsebeam_runtime::__harness")]
+    async fn provisioned_handoff_waits_for_physical_cutoff_and_all_pinned_peers() {
+        use ownership::{
+            Admission, ClaimRank, Incarnation, PrincipalKey, RequestBinding,
+            receipt::{Authority, Issuer, epoch::Trust},
+        };
+        use pulsebeam_core::{auth::ApiSigningKey, identity::NodeId};
+        use std::num::NonZeroU64;
+
+        let mut actor = actor();
+        let now = pulsebeam_runtime::time::Instant::now();
+        let wall_now = SystemTime::now();
+        let expiry = wall_now.duration_since(UNIX_EPOCH).unwrap().as_secs() + 120;
+        let local = Issuer {
+            trust_domain: [1; 16],
+            node: NodeId::new(),
+            incarnation: NonZeroU64::MIN,
+        };
+        let remote = Issuer {
+            node: NodeId::new(),
+            ..local
+        };
+        let a = ApiSigningKey::from_seed([1; 32]);
+        let b = ApiSigningKey::from_seed([2; 32]);
+        let a_key = a.public_key();
+        let b_key = b.public_key();
+        let mut trust = Trust::new(local, a, remote, b_key).unwrap();
+        let remote_trust = Trust::new(remote, b, local, a_key).unwrap();
+        let witness_issuer = Issuer {
+            node: NodeId::new(),
+            ..local
+        };
+        let witness_key = ApiSigningKey::from_seed([3; 32]);
+        trust
+            .pin_peer(witness_issuer, witness_key.public_key())
+            .unwrap();
+        let mut witness_trust = Trust::new(witness_issuer, witness_key, local, a_key).unwrap();
+        witness_trust.pin_peer(remote, b_key).unwrap();
+        let sequence = NonZeroU64::MIN;
+        let deadline = now + Duration::from_secs(1);
+        let open_view = |actor: &mut ControllerActor, issuer: Issuer, endpoints| {
+            let now = pulsebeam_runtime::time::Instant::now();
+            let deadline = now + Duration::from_secs(1);
+            let session = actor
+                .peer_ownership
+                .open(issuer.node, issuer.incarnation, None)
+                .unwrap();
+            actor
+                .peer_ownership
+                .snapshot(session, sequence, endpoints, now, deadline)
+                .unwrap();
+            session
+        };
+        let install_view = |trust: &mut Trust, issuer: Issuer, checkpoint| {
+            let now = pulsebeam_runtime::time::Instant::now();
+            let deadline = now + Duration::from_secs(1);
+            let view = trust
+                .validate_checkpoint(
+                    (issuer.node, issuer.incarnation),
+                    sequence,
+                    checkpoint,
+                    now,
+                    deadline,
+                )
+                .unwrap();
+            trust.install_checkpoint(view).unwrap();
+        };
+        install_view(&mut trust, witness_issuer, witness_trust.checkpoint());
+        open_view(&mut actor, witness_issuer, Box::new([]));
+        let snapshot = trust
+            .validate_checkpoint(
+                (remote.node, remote.incarnation),
+                sequence,
+                remote_trust.checkpoint(),
+                now,
+                deadline,
+            )
+            .unwrap();
+        trust.install_checkpoint(snapshot).unwrap();
+        let remote_session = actor
+            .peer_ownership
+            .open(remote.node, remote.incarnation, None)
+            .unwrap();
+        actor
+            .peer_ownership
+            .snapshot(remote_session, sequence, Box::new([]), now, deadline)
+            .unwrap();
+        actor.receipt_trust = Some(Authority::Provisioned(Box::new(trust)));
+
+        use crate::cluster::handoff::{Owner, Store};
+        use publisher_handoffs::Frame;
+        let directory = tempfile::tempdir().unwrap();
+        actor
+            .set_publisher_handoff_store(Store::open(directory.path()).unwrap())
+            .unwrap();
+        let room = RoomId::new("cutoff-image").unwrap();
+        let participant = ParticipantId::new("publisher").unwrap();
+        let lease = authorization_lease(expiry, wall_now, now, room.as_str(), room, participant);
+        let room = ProjectRoomKey {
+            project: lease.authority.project_id,
+            room,
+        };
+        let endpoint = EndpointKey { room, participant };
+        let shard = ShardId::new(0);
+        let connection = connection_id(7);
+        let transport = actor.core.reserve_transport(shard, now);
+        let incarnation = Incarnation {
+            participant,
+            connection,
+            transport,
+        };
+        let rank = ClaimRank::root(connection);
+        let principal = PrincipalKey::from_verified(&lease.authority);
+        let proof = actor
+            .ownership
+            .issue(principal.clone(), now, &mut actor.ownership_entropy)
+            .unwrap();
+        let request = RequestBinding::for_native(b"offer", "credential").unwrap();
+        let Admission::Start(ticket) = actor
+            .ownership
+            .begin(&principal, proof, NonZeroU64::MIN, request, now)
+            .unwrap()
+        else {
+            panic!("fresh attempt")
+        };
+        actor
+            .ownership
+            .bind(&ticket, &lease.authority, incarnation)
+            .unwrap();
+        actor.ownership.submit(incarnation).unwrap();
+        actor
+            .ownership
+            .commit(&ticket, b"answer".to_vec(), now)
+            .unwrap();
+        actor
+            .core
+            .registry
+            .commit_candidate(
+                participant,
+                room,
+                shard,
+                0,
+                transport,
+                connection,
+                SignalingProtocol::State,
+            )
+            .unwrap();
+        actor
+            .core
+            .registry
+            .update_authorization(&participant, connection, lease);
+
+        let image = |actor: &ControllerActor| {
+            actor
+                .local_endpoint_snapshot()
+                .unwrap()
+                .into_vec()
+                .into_iter()
+                .find(|(key, _)| *key == endpoint)
+                .map(|(_, fact)| fact)
+        };
+        assert_eq!(image(&actor).unwrap().claim, rank);
+        let mut successor = self::actor();
+        let mut remote_trust = remote_trust;
+        let remote_checkpoint = remote_trust.checkpoint();
+        let issuer_checkpoint = || {
+            let trust =
+                Trust::new(local, ApiSigningKey::from_seed([1; 32]), remote, b_key).unwrap();
+            trust.checkpoint()
+        };
+        install_view(&mut remote_trust, local, issuer_checkpoint());
+        let session = open_view(&mut successor, local, Box::new([]));
+        successor.receipt_trust = Some(Authority::Provisioned(Box::new(remote_trust)));
+        let successor_dir = tempfile::tempdir().unwrap();
+        successor
+            .set_publisher_handoff_store(Store::open(successor_dir.path()).unwrap())
+            .unwrap();
+        let (handoff, _owner_endpoint) =
+            super::super::native::handoff::pair(connection, actor.native_ready_tx.clone());
+        actor.native_connections.insert(
+            connection,
+            NativeService {
+                handler: StateProtocolHandler::new(participant, Some(room.room), None, handoff)
+                    .unwrap(),
+                deadline: None,
+            },
+        );
+        let keys = KeyRegistry::new(
+            room.project,
+            vec![pulsebeam_core::auth::KeyRegistryEntry {
+                key_id: *pulsebeam_core::auth::DEVELOPMENT_API_KEY_ID,
+                public_key: *pulsebeam_core::auth::DEVELOPMENT_API_PUBLIC_KEY,
+            }],
+        )
+        .unwrap();
+        let key = pulsebeam_server::insecure_dev_api_key().unwrap();
+        let token_for = |subject: &str, room_pattern: &str| {
+            pulsebeam_server::sign_participant_token(
+                &key,
+                &full_grants(room_pattern),
+                subject,
+                expiry,
+            )
+            .unwrap()
+            .token
+        };
+        let principal_for = |subject: &str, room_pattern: &str| {
+            authenticate_participant_token(&keys, &token_for(subject, room_pattern), expiry - 120)
+                .unwrap()
+        };
+        struct PendingOperatorResponse(pulsebeam_runtime::task::JoinHandle<serde_json::Value>);
+        let operate = async |actor: &mut ControllerActor, request: serde_json::Value| {
+            let request = serde_json::to_vec(&request).unwrap();
+            let (sender, mut commands) = mailbox::bounded(std::num::NonZeroUsize::MIN);
+            let keys = keys.clone();
+            let response = pulsebeam_runtime::task::spawn(async move {
+                let response = operator::reply(&request, &keys, &sender).await.unwrap();
+                serde_json::from_slice::<serde_json::Value>(&response).unwrap()
+            });
+            let command = commands.recv().await.expect("operator dispatched handoff");
+            assert!(actor.process_command(command).is_none());
+            PendingOperatorResponse(response)
+        };
+        let prepare = serde_json::json!({
+            "token": token_for(participant.as_str(), "*"),
+            "action": {"operation": "prepare_handoff", "room": room.room},
+        });
+        let PendingOperatorResponse(prepared) = operate(&mut successor, prepare.clone()).await;
+        let prepared = prepared.await.unwrap();
+        assert_eq!(prepared["status"], "handoff_prepared");
+        let PendingOperatorResponse(repeated) = operate(&mut successor, prepare).await;
+        assert_eq!(repeated.await.unwrap(), prepared);
+        let target: Owner = serde_json::from_value(prepared["successor"].clone()).unwrap();
+        assert_eq!(target.node, remote.node);
+        assert!(successor.reserved_handoff_connection(endpoint).is_none());
+        let initiate = async |actor: &mut ControllerActor,
+                              subject: &str,
+                              room_pattern: &str,
+                              connection_id: ConnectionId,
+                              inspect: bool| {
+            let mut action = serde_json::json!({
+                "operation": if inspect { "handoff_status" } else { "handoff" },
+                "successor": target,
+                "sequence": sequence,
+            });
+            if inspect {
+                action["room"] = serde_json::json!(room.room);
+            }
+            operate(actor, serde_json::json!({
+                "token": token_for(subject, room_pattern), "connection": connection_id, "action": action,
+            })).await
+        };
+        let status = async |actor: &mut ControllerActor,
+                            subject: &str,
+                            room_pattern: &str,
+                            connection_id,
+                            inspect| {
+            let PendingOperatorResponse(response) =
+                initiate(actor, subject, room_pattern, connection_id, inspect).await;
+            response.await.unwrap()["status"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        assert_eq!(
+            status(&mut actor, "unrelated", "*", connection, false).await,
+            "unauthorized"
+        );
+        assert_eq!(
+            status(
+                &mut actor,
+                participant.as_str(),
+                "unjoined",
+                connection,
+                false
+            )
+            .await,
+            "unauthorized"
+        );
+        assert_eq!(
+            status(
+                &mut actor,
+                participant.as_str(),
+                "*",
+                target.connection,
+                false
+            )
+            .await,
+            "rejected"
+        );
+        assert_eq!(image(&actor).unwrap().claim, rank);
+        let publication =
+            connection.fixture_publication(crate::entity::TrackKind::Audio, "microphone");
+        let track = crate::control::native::fixture::audio_track(crate::track::TrackMeta {
+            room,
+            origin: participant,
+            connection_id: connection,
+            id: publication,
+            track_id: Some(crate::entity::TrackId::new("microphone").unwrap()),
+        });
+        assert!(
+            actor
+                .lifecycle
+                .publish(track, &actor.core.registry, now)
+                .is_some()
+        );
+        let standby = |actor: &mut ControllerActor, subject, operation| {
+            let (reply, receipt) = oneshot::channel();
+            let command = StandbyControlCommand::new(standby_egress::Request {
+                resource: NativeResourceRequest {
+                    principal: principal_for(subject, "*"),
+                    connection_id: connection,
+                },
+                publication,
+                operation,
+                reply,
+            });
+            assert!(
+                actor
+                    .process_command(ControllerCommand::StandbyControl(command))
+                    .is_none()
+            );
+            receipt
+        };
+        let source = |label: &str| ownership::receipt::standby::Source {
+            node: remote.node,
+            generation: remote.incarnation,
+            connection: target.connection,
+            publication: target
+                .connection
+                .fixture_publication(crate::entity::TrackKind::Audio, label),
+            track: crate::entity::TrackId::new(label).unwrap(),
+        };
+        let grant = |source, expires_at| standby_egress::Operation::Grant { source, expires_at };
+        let grant_expiry = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 20;
+        let encoder = source("microphone");
+        assert!(matches!(
+            standby(&mut actor, "unrelated", grant(encoder, grant_expiry))
+                .await
+                .unwrap(),
+            Err(ControllerError::AuthorizationRejected)
+        ));
+        assert!(matches!(
+            standby(
+                &mut actor,
+                participant.as_str(),
+                grant(source("other"), grant_expiry)
+            )
+            .await
+            .unwrap(),
+            Err(ControllerError::AuthorizationRejected)
+        ));
+        assert!(matches!(
+            standby(&mut actor, participant.as_str(), grant(encoder, expiry + 1))
+                .await
+                .unwrap(),
+            Err(ControllerError::AuthorizationExpired)
+        ));
+        let standby_egress::Receipt::Granted { owner, grant } = standby(
+            &mut actor,
+            participant.as_str(),
+            grant(encoder, grant_expiry),
+        )
+        .await
+        .unwrap()
+        .unwrap() else {
+            panic!("expected a grant, not queue admission")
+        };
+        assert_eq!(owner.endpoint, endpoint);
+        assert_eq!(owner.rank, rank);
+        assert!(actor.standby_outbox.is_empty());
+        assert!(matches!(
+            standby(
+                &mut actor,
+                participant.as_str(),
+                standby_egress::Operation::Select {
+                    revision: sequence,
+                    delegated: Some((encoder, grant)),
+                }
+            )
+            .await
+            .unwrap(),
+            Ok(standby_egress::Receipt::Queued)
+        ));
+        assert!(!actor.standby_outbox.is_empty());
+        let PendingOperatorResponse(committed) =
+            initiate(&mut actor, participant.as_str(), "*", connection, false).await;
+        actor.refresh_standby_outbox(now, wall_now);
+        assert!(actor.standby_outbox.is_empty());
+        assert!(actor.core.registry.get_endpoint(endpoint).is_none());
+        let retiring = image(&actor).unwrap();
+        assert_eq!(retiring.claim, rank);
+        assert!(retiring.publications.is_empty());
+        assert!(actor.retiring_native.contains_key(&connection));
+        assert!(actor.ownership.next_retirement().is_none());
+        pulsebeam_runtime::time::advance(Duration::from_millis(100)).await;
+        actor.service_native_connections();
+        assert!(!actor.retiring_native.contains_key(&connection));
+        assert_eq!(actor.ownership.next_retirement().unwrap().1, incarnation);
+        let cutoff = |success| NativeDeletionCompletion {
+            bytes: 0,
+            publication: None,
+            ownership: Some(OwnershipCutoff {
+                ticket: ticket.clone(),
+                incarnation,
+                success,
+            }),
+        };
+        actor.ownership.start_retirement(&ticket);
+        actor.release_deletion(cutoff(false));
+        actor.release_deletion(cutoff(true));
+        assert_eq!(image(&actor).unwrap().claim, rank);
+        assert!(!committed.is_finished());
+        actor.ownership.retry_retirement(incarnation);
+        actor.ownership.start_retirement(&ticket);
+        actor.release_deletion(cutoff(true));
+        assert_eq!(image(&actor).unwrap().claim, rank);
+        assert!(!committed.is_finished());
+        let completion = actor.publisher_handoffs.wait_for_write().await;
+        actor.publisher_handoffs.complete_write(completion);
+        assert_eq!(
+            status(&mut actor, participant.as_str(), "*", connection, true).await,
+            "handoff_pending"
+        );
+        assert!(!committed.is_finished());
+        assert_eq!(image(&actor).unwrap().claim, rank);
+        assert!(!actor.candidate_is_newer(endpoint, ClaimRank::root(connection_id(9))));
+        let target_origin = (remote.node, remote.incarnation);
+        assert!(
+            actor
+                .publisher_handoffs
+                .offer((remote.node, NonZeroU64::new(2).unwrap()), now)
+                .is_none()
+        );
+        let offer = actor.publisher_handoffs.offer(target_origin, now).unwrap();
+        let Some(Frame::Offer(proof)) = Frame::decode(&offer) else {
+            panic!("handoff offer")
+        };
+        let handoff = proof.handoff;
+        assert!(handoff.successor == target);
+        assert!(actor.publisher_handoffs.offer(target_origin, now).is_none());
+
+        pulsebeam_runtime::time::advance(Duration::from_secs(301)).await;
+        assert!(matches!(
+            successor.accept_publisher_handoff(session, *proof),
+            Err(ownership::receipt::Error::Unfresh)
+        ));
+        let now = pulsebeam_runtime::time::Instant::now();
+        let deadline = now + Duration::from_secs(1);
+        let refreshed = NonZeroU64::new(2).unwrap();
+        let Some(Authority::Provisioned(trust)) = successor.receipt_trust.as_mut() else {
+            panic!("successor authority");
+        };
+        let view = trust
+            .validate_checkpoint(
+                (local.node, local.incarnation),
+                refreshed,
+                issuer_checkpoint(),
+                now,
+                deadline,
+            )
+            .unwrap();
+        trust.install_checkpoint(view).unwrap();
+        successor
+            .peer_ownership
+            .snapshot(session, refreshed, Box::new([]), now, deadline)
+            .unwrap();
+
+        let mut modified = *proof;
+        modified.handoff.successor.connection = connection_id(9);
+        assert!(matches!(
+            successor.accept_publisher_handoff(session, modified),
+            Err(ownership::receipt::Error::Invalid)
+        ));
+        assert!(
+            successor
+                .receive_publisher_handoff(session, Frame::decode(&offer).unwrap())
+                .is_none()
+        );
+        let candidate = ClaimRank::root(target.connection);
+        assert!(!successor.candidate_is_newer(endpoint, candidate));
+        assert!(
+            successor
+                .receive_publisher_handoff(session, Frame::decode(&offer).unwrap())
+                .is_none()
+        );
+        let result = successor.publisher_handoffs.wait_for_write().await;
+        successor.publisher_handoffs.complete_write(result);
+        let trust = actor.receipt_trust.take();
+        drop(actor);
+        assert_eq!(committed.await.unwrap()["status"], "outcome_unknown");
+        let mut actor = self::actor();
+        actor.receipt_trust = trust;
+        actor
+            .set_publisher_handoff_store(Store::open(directory.path()).unwrap())
+            .unwrap();
+        assert_eq!(
+            status(&mut actor, participant.as_str(), "*", connection, true).await,
+            "handoff_pending"
+        );
+        let remote_session = actor
+            .peer_ownership
+            .open(remote.node, remote.incarnation, None)
+            .unwrap();
+        actor
+            .peer_ownership
+            .snapshot(remote_session, sequence, Box::new([]), now, deadline)
+            .unwrap();
+        assert_eq!(image(&actor).unwrap().claim, rank);
+        assert!(!actor.candidate_is_newer(endpoint, ClaimRank::root(connection_id(9))));
+        let retry = actor
+            .publisher_handoffs
+            .offer(target_origin, now + Duration::from_millis(250))
+            .unwrap();
+        assert_eq!(retry, offer);
+        let witness_session = open_view(&mut actor, witness_issuer, Box::new([]));
+        let retry_on_wire = protected_ownership_lane(now)(retry);
+        let ack = successor
+            .receive_publisher_handoff(session, Frame::decode(&retry_on_wire).unwrap())
+            .unwrap();
+        let wrong = Frame::Committed([0; 64]);
+        actor.receive_publisher_handoff(remote_session, wrong);
+        assert_eq!(image(&actor).unwrap().claim, rank);
+        actor.receive_publisher_handoff(remote_session, Frame::decode(&ack).unwrap());
+        assert_eq!(image(&actor).unwrap().claim, rank);
+        assert!(
+            actor
+                .publisher_handoffs
+                .offer(target_origin, now + Duration::from_secs(1))
+                .is_none()
+        );
+
+        let mut witness = self::actor();
+        install_view(&mut witness_trust, local, issuer_checkpoint());
+        install_view(&mut witness_trust, remote, remote_checkpoint);
+        let predecessor_view = open_view(
+            &mut witness,
+            local,
+            image(&actor)
+                .into_iter()
+                .map(|fact| (endpoint, fact))
+                .collect(),
+        );
+        open_view(&mut witness, remote, Box::new([]));
+        witness.receipt_trust = Some(Authority::Provisioned(Box::new(witness_trust)));
+        let witness_dir = tempfile::tempdir().unwrap();
+        witness
+            .set_publisher_handoff_store(Store::open(witness_dir.path()).unwrap())
+            .unwrap();
+        let witness_origin = (witness_issuer.node, witness_issuer.incarnation);
+        let witness_offer = actor.publisher_handoffs.offer(witness_origin, now).unwrap();
+        let ungranted = ClaimRank::root(connection_id(9));
+        assert!(!witness.candidate_is_newer(endpoint, ungranted));
+        assert!(
+            witness
+                .receive_publisher_handoff(predecessor_view, Frame::decode(&witness_offer).unwrap())
+                .is_none()
+        );
+        let result = witness.publisher_handoffs.wait_for_write().await;
+        witness.publisher_handoffs.complete_write(result);
+        let witness_ack = witness
+            .receive_publisher_handoff(predecessor_view, Frame::decode(&witness_offer).unwrap())
+            .unwrap();
+        actor.receive_publisher_handoff(witness_session, Frame::decode(&witness_ack).unwrap());
+        assert_eq!(image(&actor).unwrap().claim, rank);
+        let confirmed = actor.publisher_handoffs.wait_for_write().await;
+        actor.publisher_handoffs.complete_write(confirmed);
+        assert_eq!(
+            status(&mut actor, participant.as_str(), "*", connection, true).await,
+            "handoff_completed"
+        );
+        assert_eq!(
+            status(&mut actor, "unrelated", "*", connection, true).await,
+            "handoff_not_found"
+        );
+        assert_eq!(
+            status(
+                &mut actor,
+                participant.as_str(),
+                "unjoined",
+                connection,
+                true
+            )
+            .await,
+            "unauthorized"
+        );
+
+        let withdrawn = NonZeroU64::new(2).unwrap();
+        let Some(Authority::Provisioned(trust)) = witness.receipt_trust.as_mut() else {
+            panic!("witness authority")
+        };
+        let view = trust
+            .validate_checkpoint(
+                (local.node, local.incarnation),
+                withdrawn,
+                issuer_checkpoint(),
+                now,
+                deadline,
+            )
+            .unwrap();
+        trust.install_checkpoint(view).unwrap();
+        witness
+            .peer_ownership
+            .snapshot(predecessor_view, withdrawn, Box::new([]), now, deadline)
+            .unwrap();
+        let Some(Authority::Provisioned(trust)) = witness.receipt_trust.as_ref() else {
+            panic!("witness authority")
+        };
+        assert!(witness.provisioned_claim_views_ready(trust, now));
+        assert!(!witness.candidate_is_newer(endpoint, ungranted));
+        drop(witness);
+        assert!(!Store::load_fences(witness_dir.path()).unwrap().allows(
+            handoff.scope,
+            Owner {
+                domain: witness_issuer.trust_domain,
+                node: witness_issuer.node,
+                generation: witness_issuer.incarnation,
+                connection: ungranted.connection(),
+            }
+        ));
+        assert!(
+            actor
+                .publisher_handoffs
+                .offer(target_origin, now + Duration::from_secs(1))
+                .is_none()
+        );
+        assert!(image(&actor).is_none());
+        drop(actor);
+        let store = Store::open(directory.path()).unwrap();
+        assert!(store.current(handoff.scope).unwrap() == Some(handoff));
+        assert!(store.pending().is_none());
+        assert!(successor.candidate_is_newer(endpoint, candidate));
+        assert!(!successor.candidate_is_newer(endpoint, ClaimRank::root(connection_id(9))));
+        successor.negotiator = Negotiator::new(vec![pulsebeam_rtc::LocalCandidate::Udp(
+            "127.0.0.1:6000".parse().unwrap(),
+        )]);
+        let (_, offer) = crate::control::negotiator::application_only_test_connection_and_offer();
+        let proposed = connection_id(9);
+        let message = || CreateParticipant {
+            state: ParticipantState {
+                room_id: Some(room.room),
+                participant_id: participant,
+                connection_id: proposed,
+                old_connection_id: None,
+                authorization: Some(authorization_lease(
+                    expiry,
+                    wall_now,
+                    now,
+                    room.room.as_str(),
+                    room.room,
+                    participant,
+                )),
+                selection: super::super::sdp::Selection::Native,
+                profile: SignalingProtocol::State,
+                rtp_capabilities: Some(crate::control::rtp::capabilities()),
+            },
+            offer: offer.clone(),
+        };
+        let principal = principal_for(participant.as_str(), "*");
+        let admit = |successor: &mut ControllerActor| {
+            let proof = successor
+                .issue_ownership(&principal, Some(room.room), wall_now)
+                .unwrap();
+            successor.begin_owned_create(
+                message(),
+                OwnershipAttempt {
+                    proof,
+                    sequence,
+                    binding: RequestBinding::for_native(b"successor offer", "credential").unwrap(),
+                    location: axum::http::HeaderValue::from_str(&format!(
+                        "https://receiver.test/native/{proposed}"
+                    ))
+                    .unwrap(),
+                    successor_receipt: None,
+                },
+                wall_now,
+            )
+        };
+        let OwnedPreparation::Start(_, pending) = admit(&mut successor).unwrap() else {
+            panic!("fresh target admission");
+        };
+        assert_eq!(pending.connection_id(), target.connection);
+        assert!(
+            successor
+                .receive_publisher_handoff(session, Frame::Offer(proof))
+                .is_some()
+        );
+        assert!(successor.reserved_handoff_connection(endpoint).is_none());
+        assert!(matches!(
+            admit(&mut successor),
+            Err(OwnedAdmissionError::Request(ControllerError::Superseded))
+        ));
+        drop(successor);
+        let fences = Store::load_fences(successor_dir.path()).unwrap();
+        assert!(fences.allows(handoff.scope, target));
+        assert!(!fences.allows(
+            handoff.scope,
+            Owner {
+                generation: NonZeroU64::new(2).unwrap(),
+                ..target
+            }
+        ));
+    }
+
     #[test]
-    fn stale_media_events_cannot_republish_or_unpublish_the_replacement() {
+    fn provisioned_admission_cannot_preempt_a_live_remote_owner_without_a_route() {
+        use ownership::{
+            ClaimRank,
+            observations::EndpointFact,
+            receipt::{Authority, Issuer, epoch::Trust},
+        };
+        use pulsebeam_core::{auth::ApiSigningKey, identity::NodeId};
+        use std::num::NonZeroU64;
+
+        let mut actor = actor();
+        let now = pulsebeam_runtime::time::Instant::now();
+        let deadline = now + Duration::from_secs(1);
+        let epoch = NonZeroU64::MIN;
+        let local = Issuer {
+            trust_domain: [1; 16],
+            node: NodeId::new(),
+            incarnation: epoch,
+        };
+        let remote = Issuer {
+            node: NodeId::new(),
+            ..local
+        };
+        let a = ApiSigningKey::from_seed([1; 32]);
+        let b = ApiSigningKey::from_seed([2; 32]);
+        let a_key = a.public_key();
+        let b_key = b.public_key();
+        let local_trust = Trust::new(local, a, remote, b_key).unwrap();
+        let remote_trust = Trust::new(remote, b, local, a_key).unwrap();
+        actor.receipt_trust = Some(Authority::Provisioned(Box::new(local_trust)));
+        let endpoint = EndpointKey {
+            room: ProjectRoomKey::fixture(RoomId::new("authority").unwrap()),
+            participant: ParticipantId::new("publisher").unwrap(),
+        };
+        let owner = ClaimRank::root(connection_id(1));
+        let ungranted = ClaimRank::root(connection_id(2));
+        let successor = owner.successor(connection_id(3)).unwrap();
+        assert!(!actor.candidate_is_newer(endpoint, ungranted));
+
+        let session = actor.peer_ownership.open(remote.node, epoch, None).unwrap();
+        let Some(Authority::Provisioned(trust)) = actor.receipt_trust.as_mut() else {
+            unreachable!()
+        };
+        let checkpoint = trust
+            .validate_checkpoint(
+                (remote.node, epoch),
+                epoch,
+                remote_trust.checkpoint(),
+                now,
+                deadline,
+            )
+            .unwrap();
+        trust.install_checkpoint(checkpoint).unwrap();
+        assert!(!actor.candidate_is_newer(endpoint, ungranted));
+        actor
+            .peer_ownership
+            .snapshot(session, epoch, Box::new([]), now, deadline)
+            .unwrap();
+        assert!(actor.candidate_is_newer(endpoint, ungranted));
+        actor
+            .peer_ownership
+            .snapshot(
+                session,
+                NonZeroU64::new(2).unwrap(),
+                Box::new([(
+                    endpoint,
+                    EndpointFact {
+                        claim: owner,
+                        publications: Box::new([]),
+                    },
+                )]),
+                now,
+                deadline,
+            )
+            .unwrap();
+        assert!(!actor.candidate_is_newer(endpoint, ungranted));
+        assert!(!actor.candidate_is_newer(endpoint, successor));
+
+        // An empty newer image does not establish absence unless the retirement
+        // checkpoint names the same cut.
+        let revision = NonZeroU64::new(3).unwrap();
+        actor
+            .peer_ownership
+            .snapshot(session, revision, Box::new([]), now, deadline)
+            .unwrap();
+        assert!(!actor.candidate_is_newer(endpoint, ungranted));
+        let Some(Authority::Provisioned(trust)) = actor.receipt_trust.as_mut() else {
+            unreachable!()
+        };
+        let checkpoint = trust
+            .validate_checkpoint(
+                (remote.node, epoch),
+                revision,
+                remote_trust.checkpoint(),
+                now,
+                deadline,
+            )
+            .unwrap();
+        trust.install_checkpoint(checkpoint).unwrap();
+        assert!(actor.candidate_is_newer(endpoint, ungranted));
+
+        use crate::cluster::handoff::{Handoff, Owner, Scope, Store};
+        let directory = tempfile::tempdir().unwrap();
+        let transferred = Handoff {
+            scope: Scope {
+                project: endpoint.room.project,
+                room: endpoint.room.room,
+                participant: endpoint.participant,
+            },
+            sequence: epoch,
+            predecessor: Owner {
+                domain: local.trust_domain,
+                node: local.node,
+                generation: epoch,
+                connection: owner.connection(),
+            },
+            successor: Owner {
+                domain: remote.trust_domain,
+                node: remote.node,
+                generation: epoch,
+                connection: successor.connection(),
+            },
+        };
+        Store::open(directory.path())
+            .unwrap()
+            .commit(transferred)
+            .unwrap();
+        actor
+            .publisher_handoffs
+            .restore(Store::load_fences(directory.path()).unwrap());
+        assert!(!actor.candidate_is_newer(endpoint, ungranted));
+        assert!(!actor.candidate_is_newer(endpoint, successor));
+
+        let returned = Handoff {
+            sequence: NonZeroU64::new(2).unwrap(),
+            predecessor: transferred.successor,
+            successor: Owner {
+                connection: ungranted.connection(),
+                ..transferred.predecessor
+            },
+            ..transferred
+        };
+        Store::open(directory.path())
+            .unwrap()
+            .commit(returned)
+            .unwrap();
+        actor
+            .publisher_handoffs
+            .restore(Store::load_fences(directory.path()).unwrap());
+        assert!(actor.candidate_is_newer(endpoint, ungranted));
+        assert!(!actor.candidate_is_newer(endpoint, successor));
+        actor.peer_ownership.close(session).unwrap();
+        assert!(!actor.candidate_is_newer(endpoint, ungranted));
+    }
+
+    #[test]
+    fn standby_control_fences_selection_across_authenticated_lanes() {
+        use crate::control::controller::ownership::{
+            ClaimRank,
+            observations::{EndpointFact, PublicationFact},
+            receipt::{
+                Error,
+                standby::{Owner, Source, wire::Frame},
+            },
+        };
+        use crate::entity::{TrackId, TrackKind};
+        use std::num::NonZeroU64;
+
+        let mut actor = actor();
+        let runtime_now = pulsebeam_runtime::time::Instant::now();
+        let room = RoomId::new("studio").unwrap();
+        let participant = ParticipantId::new("publisher").unwrap();
+        let endpoint = EndpointKey {
+            room: ProjectRoomKey {
+                project: *pulsebeam_core::auth::DEVELOPMENT_PROJECT_ID,
+                room,
+            },
+            participant,
+        };
+        let connection = connection_id(1);
+        let encoder = connection_id(2);
+        let source = Source {
+            node: pulsebeam_core::identity::NodeId::new(),
+            generation: std::num::NonZeroU64::MIN,
+            connection: encoder,
+            publication: encoder.fixture_publication(TrackKind::Audio, "microphone"),
+            track: TrackId::new("microphone").unwrap(),
+        };
+        let wall_now = UNIX_EPOCH + Duration::from_secs(100);
+        actor.set_ownership_mode(OwnershipMode::Standalone);
+        let trust = actor.receipt_trust.as_deref().unwrap();
+        let issuer = trust.issuer();
+        let owner = Owner {
+            endpoint,
+            issuer,
+            rank: ClaimRank::root(connection),
+            authorization: 1,
+            expires_at: 120,
+        };
+        let grant = owner.issue(trust, source, 110, 100).unwrap();
+        let alternate_connection = connection_id(4);
+        let alternate = Source {
+            node: pulsebeam_core::identity::NodeId::new(),
+            connection: alternate_connection,
+            publication: alternate_connection.fixture_publication(TrackKind::Audio, "microphone"),
+            ..source
+        };
+        let alternate_grant = owner.issue(trust, alternate, 110, 100).unwrap();
+        let primary = Source {
+            node: issuer.node,
+            generation: issuer.incarnation,
+            connection,
+            publication: connection.fixture_publication(TrackKind::Audio, "microphone"),
+            ..source
+        };
+        let encoder_publisher = ParticipantId::new("independent-encoder").unwrap();
+        let encoder_endpoint = EndpointKey {
+            participant: encoder_publisher,
+            ..endpoint
+        };
+        let publication = |source: Source, origin| {
+            PublicationFact::from_track(&crate::control::native::fixture::audio_track(
+                crate::track::TrackMeta {
+                    room: endpoint.room,
+                    id: source.publication,
+                    origin,
+                    connection_id: source.connection,
+                    track_id: Some(source.track),
+                },
+            ))
+            .unwrap()
+        };
+        let primary_publication = publication(primary, participant);
+        let standby_publication = publication(source, encoder_publisher);
+        let alternate_publisher = ParticipantId::new("alternate-encoder").unwrap();
+        let alternate_endpoint = EndpointKey {
+            participant: alternate_publisher,
+            ..endpoint
+        };
+        let mut links =
+            pulsebeam_link::LinkControl::<()>::new(|| pulsebeam_link::LinkTime::from_nanos(0))
+                .unwrap();
+        let primary_route = links.reserve_network_id().unwrap();
+        let standby_route = links.reserve_network_id().unwrap();
+        let alternate_route = links.reserve_network_id().unwrap();
+        let authority_session = actor
+            .peer_ownership
+            .open(issuer.node, issuer.incarnation, Some(primary_route))
+            .unwrap();
+        let standby_session = actor
+            .peer_ownership
+            .open(source.node, source.generation, Some(standby_route))
+            .unwrap();
+        actor
+            .peer_ownership
+            .snapshot(
+                authority_session,
+                NonZeroU64::MIN,
+                Box::new([(
+                    endpoint,
+                    EndpointFact {
+                        claim: owner.rank,
+                        publications: Box::new([primary_publication]),
+                    },
+                )]),
+                runtime_now,
+                runtime_now + Duration::from_secs(15),
+            )
+            .unwrap();
+        let note_encoder =
+            |actor: &mut ControllerActor, session, endpoint, source: Source, fact| {
+                actor
+                    .peer_ownership
+                    .snapshot(
+                        session,
+                        NonZeroU64::MIN,
+                        Box::new([(
+                            endpoint,
+                            EndpointFact {
+                                claim: ClaimRank::root(source.connection),
+                                publications: Box::new([fact]),
+                            },
+                        )]),
+                        runtime_now,
+                        runtime_now + Duration::from_secs(15),
+                    )
+                    .unwrap();
+                actor.reconcile_peer_sources(endpoint, runtime_now);
+            };
+        note_encoder(
+            &mut actor,
+            standby_session,
+            encoder_endpoint,
+            source,
+            standby_publication.clone(),
+        );
+        let alternate_session = actor
+            .peer_ownership
+            .open(alternate.node, alternate.generation, Some(alternate_route))
+            .unwrap();
+        note_encoder(
+            &mut actor,
+            alternate_session,
+            alternate_endpoint,
+            alternate,
+            publication(alternate, alternate_publisher),
+        );
+        assert_eq!(actor.lifecycle.ingress_sources(encoder_endpoint).count(), 1);
+        actor.reconcile_peer_sources(endpoint, runtime_now);
+        let installed = |actor: &ControllerActor| {
+            actor
+                .lifecycle
+                .ingress_sources(endpoint)
+                .map(|(track, route)| (track.id(), track.meta().connection_id, route))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            installed(&actor),
+            [(primary.publication, connection, primary_route)]
+        );
+        let mut authority_lane = protected_ownership_lane(runtime_now);
+        let mut encoder_lane = protected_ownership_lane(runtime_now);
+        let accept = |actor: &mut ControllerActor, session, wire: Box<[u8]>| {
+            actor.receive_standby_control(
+                session,
+                Frame::decode(&wire).unwrap(),
+                runtime_now,
+                wall_now,
+            )
+        };
+        let mut receive = |actor: &mut ControllerActor, session, frame: Frame| {
+            let wire = frame.encode().unwrap();
+            let delivered = if session == authority_session {
+                authority_lane(wire)
+            } else {
+                encoder_lane(wire)
+            };
+            accept(actor, session, delivered)
+        };
+        let advertise = |publisher| Frame::Encoder {
+            owner,
+            source,
+            grant,
+            publisher,
+        };
+        let select_at = |revision, delegated| Frame::Select {
+            owner,
+            primary,
+            revision,
+            delegated,
+        };
+        let select = |delegated| select_at(NonZeroU64::MIN, delegated);
+        assert_eq!(
+            receive(&mut actor, authority_session, advertise(encoder_publisher)),
+            Err(Error::Scope)
+        );
+        assert_eq!(
+            receive(&mut actor, standby_session, advertise(participant)),
+            Err(Error::Scope)
+        );
+        receive(&mut actor, standby_session, advertise(encoder_publisher)).unwrap();
+        assert_eq!(
+            installed(&actor),
+            [(primary.publication, connection, primary_route)]
+        );
+        assert_eq!(
+            receive(&mut actor, standby_session, select(Some((source, grant)))),
+            Err(Error::Scope)
+        );
+        receive(&mut actor, authority_session, select(Some((source, grant)))).unwrap();
+        assert_eq!(
+            installed(&actor),
+            [(source.publication, encoder, standby_route)]
+        );
+        assert_eq!(actor.lifecycle.ingress_sources(encoder_endpoint).count(), 0);
+        actor.reconcile_peer_sources(encoder_endpoint, runtime_now);
+        assert_eq!(actor.lifecycle.ingress_sources(encoder_endpoint).count(), 0);
+        let advertise_alternate = Frame::Encoder {
+            owner,
+            source: alternate,
+            grant: alternate_grant,
+            publisher: alternate_publisher,
+        };
+        accept(
+            &mut actor,
+            alternate_session,
+            protected_ownership_lane(runtime_now)(advertise_alternate.encode().unwrap()),
+        )
+        .unwrap();
+        assert_eq!(
+            installed(&actor),
+            [(source.publication, encoder, standby_route)]
+        );
+        receive(
+            &mut actor,
+            authority_session,
+            select_at(
+                NonZeroU64::new(2).unwrap(),
+                Some((alternate, alternate_grant)),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            installed(&actor),
+            [(alternate.publication, alternate_connection, alternate_route)]
+        );
+        assert_eq!(actor.lifecycle.ingress_sources(encoder_endpoint).count(), 1);
+        assert_eq!(
+            actor.lifecycle.ingress_sources(alternate_endpoint).count(),
+            0
+        );
+        receive(
+            &mut actor,
+            authority_session,
+            select_at(NonZeroU64::new(3).unwrap(), None),
+        )
+        .unwrap();
+        assert_eq!(
+            installed(&actor),
+            [(primary.publication, connection, primary_route)]
+        );
+        assert_eq!(actor.lifecycle.ingress_sources(encoder_endpoint).count(), 1);
+        receive(
+            &mut actor,
+            authority_session,
+            select_at(NonZeroU64::new(4).unwrap(), Some((source, grant))),
+        )
+        .unwrap();
+        assert_eq!(
+            installed(&actor),
+            [(source.publication, encoder, standby_route)]
+        );
+        assert_eq!(actor.lifecycle.ingress_sources(encoder_endpoint).count(), 0);
+        actor.close_link_peer(standby_route);
+        assert!(installed(&actor).is_empty());
+        actor.reconcile_peer_sources(endpoint, runtime_now);
+        assert!(
+            installed(&actor).is_empty(),
+            "neither a reachable primary nor another granted encoder may replace the selection"
+        );
+
+        let replacement_route = links.reserve_network_id().unwrap();
+        let replacement_session = actor
+            .peer_ownership
+            .open(source.node, source.generation, Some(replacement_route))
+            .unwrap();
+        let mut replacement_lane = protected_ownership_lane(runtime_now);
+        assert_eq!(
+            receive(&mut actor, standby_session, advertise(encoder_publisher)),
+            Err(Error::NoAuthority)
+        );
+        assert_eq!(
+            accept(
+                &mut actor,
+                replacement_session,
+                replacement_lane(advertise(encoder_publisher).encode().unwrap()),
+            ),
+            Err(Error::Scope)
+        );
+        // Reopening the same origin needs a new snapshot revision.
+        let replacement_revision = NonZeroU64::new(2).unwrap();
+        actor
+            .peer_ownership
+            .snapshot(
+                replacement_session,
+                replacement_revision,
+                Box::new([(
+                    encoder_endpoint,
+                    EndpointFact {
+                        claim: ClaimRank::root(encoder),
+                        publications: Box::new([standby_publication]),
+                    },
+                )]),
+                runtime_now,
+                runtime_now + Duration::from_secs(15),
+            )
+            .unwrap();
+        accept(
+            &mut actor,
+            replacement_session,
+            replacement_lane(advertise(encoder_publisher).encode().unwrap()),
+        )
+        .unwrap();
+        assert_eq!(
+            installed(&actor),
+            [(source.publication, encoder, replacement_route)]
+        );
+
+        assert_eq!(
+            receive(&mut actor, authority_session, select(None)),
+            Err(Error::Invalid)
+        );
+
+        // A newer authenticated encoder claim fences the selected incarnation
+        // even when that claim has no route of its own.
+        let rival = actor
+            .peer_ownership
+            .open(
+                pulsebeam_core::identity::NodeId::new(),
+                NonZeroU64::MIN,
+                None,
+            )
+            .unwrap();
+        actor
+            .peer_ownership
+            .snapshot(
+                rival,
+                NonZeroU64::MIN,
+                Box::new([(
+                    encoder_endpoint,
+                    EndpointFact {
+                        claim: ClaimRank::root(encoder)
+                            .successor(connection_id(3))
+                            .unwrap(),
+                        publications: Box::new([]),
+                    },
+                )]),
+                runtime_now,
+                runtime_now + Duration::from_secs(15),
+            )
+            .unwrap();
+        actor.reconcile_peer_source_changes(
+            std::collections::BTreeSet::from([encoder_endpoint]),
+            runtime_now,
+        );
+        assert!(installed(&actor).is_empty());
+
+        actor.peer_ownership.close(rival).unwrap();
+        actor.reconcile_peer_source_changes(
+            std::collections::BTreeSet::from([encoder_endpoint]),
+            runtime_now,
+        );
+        assert_eq!(
+            installed(&actor),
+            [(source.publication, encoder, replacement_route)]
+        );
+        actor
+            .peer_ownership
+            .snapshot(
+                replacement_session,
+                NonZeroU64::new(3).unwrap(),
+                Box::new([]),
+                runtime_now,
+                runtime_now + Duration::from_secs(15),
+            )
+            .unwrap();
+        actor.reconcile_peer_source_changes(
+            std::collections::BTreeSet::from([encoder_endpoint]),
+            runtime_now,
+        );
+        assert!(installed(&actor).is_empty());
+        actor.expire_peer_sources(runtime_now + Duration::from_secs(10));
+        assert!(installed(&actor).is_empty());
+        assert!(
+            actor
+                .peer_ownership
+                .endpoint(
+                    authority_session,
+                    endpoint,
+                    runtime_now + Duration::from_secs(10)
+                )
+                .is_some()
+        );
+    }
+
+    fn protected_ownership_lane(
+        now: pulsebeam_runtime::time::Instant,
+    ) -> impl FnMut(Box<[u8]>) -> Box<[u8]> {
+        use std::num::NonZeroU64;
+
+        use crate::link::fabric_codec::FabricWanCodec;
+        use pulsebeam_link::{LinkTime, wan};
+
+        let now = now.into_std();
+        let client_key = wan::LocalIdentity::generate().unwrap();
+        let server_key = wan::LocalIdentity::generate().unwrap();
+        let build = |role, local: &wan::LocalIdentity, remote: &wan::LocalIdentity, port| {
+            wan::Driver::with_control(
+                wan::Config {
+                    binding: wan::Binding {
+                        epoch: NonZeroU64::MIN,
+                        generation: NonZeroU64::MIN,
+                        peer: ([127, 0, 0, 1], port).into(),
+                    },
+                    role,
+                    local,
+                    peer: remote.fingerprint(),
+                    bootstrap_mtu: 1200,
+                    limits: wan::Limits {
+                        active_windows: 1,
+                        epoch_windows: 1,
+                    },
+                },
+                FabricWanCodec,
+                now,
+            )
+            .unwrap()
+        };
+        let (mut client, tx) = build(wan::Role::Client, &client_key, &server_key, 10001);
+        let (mut server, mut rx) = build(wan::Role::Server, &server_key, &client_key, 10002);
+        let mut pump = move || {
+            let mut wire = std::collections::VecDeque::new();
+            let enqueue = |wire: &mut std::collections::VecDeque<_>,
+                           to: std::net::SocketAddr,
+                           bytes: &[u8]| {
+                wire.push_back((to, bytes.to_vec()));
+                wan::SocketOutcome::Accepted { bytes: bytes.len() }
+            };
+            client
+                .tick(now, &mut |to, bytes| enqueue(&mut wire, to, bytes))
+                .unwrap();
+            server
+                .tick(now, &mut |to, bytes| enqueue(&mut wire, to, bytes))
+                .unwrap();
+            for _ in 0..64 {
+                let Some((to, packet)) = wire.pop_front() else {
+                    return;
+                };
+                let target = if to.port() == 10001 {
+                    &mut server
+                } else {
+                    &mut client
+                };
+                assert!(
+                    target
+                        .receive(now, target.binding(), &packet, &mut |to, bytes| enqueue(
+                            &mut wire, to, bytes
+                        ))
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            panic!("WAN control exchange did not quiesce");
+        };
+        pump();
+        assert!(tx.is_ready() && rx.is_ready());
+        move |bytes| {
+            tx.try_send(bytes, LinkTime(u64::MAX)).unwrap();
+            pump();
+            rx.try_recv().unwrap()
+        }
+    }
+
+    #[test]
+    fn media_events_require_the_current_endpoint_and_shard() {
         let mut actor = actor();
         let room_id = RoomId::new("media-fence").unwrap();
         let participant = crate::entity::fixture_participant_id();
@@ -8928,10 +10474,10 @@ mod replacement_tests {
                 )
                 .unwrap();
         }
-        let make_track = |connection_id: ConnectionId| {
+        let make_track = |room: RoomId, connection_id: ConnectionId| {
             crate::track::Track::data(
                 crate::track::TrackMeta {
-                    room: crate::entity::ProjectRoomKey::fixture(room_id),
+                    room: crate::entity::ProjectRoomKey::fixture(room),
                     id: connection_id
                         .fixture_publication(crate::entity::TrackKind::Data, "rt/chat"),
                     origin: participant,
@@ -8943,7 +10489,7 @@ mod replacement_tests {
                 None,
             )
         };
-        let stale_track = make_track(stale);
+        let stale_track = make_track(room_id, stale);
         let stale_meta = stale_track.meta().clone();
         let endpoint = EndpointKey {
             room: stale_meta.room,
@@ -8965,11 +10511,30 @@ mod replacement_tests {
             "a retired connection cannot add a publication"
         );
 
-        actor.handle_shard_event((
-            ShardId::new(0),
-            ShardEvent::TrackPublished(make_track(current)),
-        ));
+        for (shard, room) in [
+            (ShardId::new(1), room_id),
+            (ShardId::new(0), RoomId::new("other-room").unwrap()),
+        ] {
+            let track = make_track(room, current);
+            let wrong_endpoint = EndpointKey {
+                room: track.meta().room,
+                participant,
+            };
+            actor.handle_shard_event((shard, ShardEvent::TrackPublished(track)));
+            assert!(
+                actor
+                    .lifecycle
+                    .publisher_sources(wrong_endpoint.room, participant, current)
+                    .next()
+                    .is_none()
+            );
+        }
+
+        let track = make_track(room_id, current);
+        let live_meta = track.meta().clone();
+        actor.handle_shard_event((ShardId::new(0), ShardEvent::TrackPublished(track)));
         actor.handle_shard_event((ShardId::new(0), ShardEvent::TrackUnpublished(stale_meta)));
+        actor.handle_shard_event((ShardId::new(1), ShardEvent::TrackUnpublished(live_meta)));
         assert!(
             actor
                 .lifecycle

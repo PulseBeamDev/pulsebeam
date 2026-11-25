@@ -4,7 +4,14 @@ use pulsebeam_proto::state::validation::BindingProfile;
 
 use super::handoff::{ControllerHandoff, Fact};
 use super::{ExecutionCommand, InputError, NativeSession, OutputError, ResolvedSource};
-use crate::entity::{ParticipantId, PublicationKey, RoomId};
+use crate::{
+    control::{
+        lifecycle::SelectorPage,
+        permissions::{ResourcePermissions, SubscriptionSelector},
+        topology::NamedTrack,
+    },
+    entity::{ParticipantId, PublicationKey, RoomId},
+};
 
 const FACT_BUDGET: usize = 32;
 const PREPARATION_BUDGET: usize = 32;
@@ -148,6 +155,11 @@ impl StateProtocolHandler {
         lookup_source: impl Fn(
             &pulsebeam_proto::state::LogicalSourceAddress,
         ) -> Option<ResolvedSource<'a>>,
+        scan_selector: impl FnOnce(
+            &ResourcePermissions,
+            SubscriptionSelector,
+            Option<NamedTrack>,
+        ) -> Option<SelectorPage>,
     ) -> Result<bool, InputError> {
         if self.handoff.failed() {
             return Err(OutputError::InvalidObservation.into());
@@ -197,6 +209,7 @@ impl StateProtocolHandler {
         }
         self.model
             .refresh_source_lookups(FACT_BUDGET, unix_now, branches, &lookup_source)?;
+        self.model.refresh_selector(unix_now, scan_selector)?;
         self.model.service_source_waits_in_room(
             unix_now,
             pulsebeam_runtime::time::Instant::now(),
@@ -247,6 +260,7 @@ impl StateProtocolHandler {
             && (self.model.revocation_pending()
                 || self.model.preparation_pending(unix_now)
                 || self.model.lookup_refresh_pending()
+                || self.model.selector_scan_pending(unix_now)
                 || self.model.logical_retirement_pending()
                 || self.model.catalog.pending() && self.model.needs_poll())
             && !self.handoff.schedule()

@@ -189,6 +189,8 @@ async fn foreign_witness(
             }
         }
     });
+    // Both installed consumers connect only to this test's loopback SFU.
+    command.env("NO_PROXY", "*").env("no_proxy", "*");
     let output = tokio::time::timeout(timeout, command.output()).await;
     responder.abort();
     let response = responder.await;
@@ -262,14 +264,11 @@ async fn production_native_i420(receiver_room: &str) -> Result<()> {
     let endpoint = server.endpoint();
     // This constructor selects ThreadedRuntime, production reqwest and native
     // Linux sockets. No ControlledWorld or simulator clock is present.
-    let publisher = Agent::spawn(
-        config(&endpoint, "publisher", true)?,
-        Host::new(Box::new(reqwest::Client::new())),
-    )
-    .await?;
+    let http = || reqwest::Client::builder().no_proxy().build().map(Box::new);
+    let publisher = Agent::spawn(config(&endpoint, "publisher", true)?, Host::new(http()?)).await?;
     let subscriber = Agent::spawn(
         config_in_room(&endpoint, "subscriber", false, receiver_room)?,
-        Host::new(Box::new(reqwest::Client::new())),
+        Host::new(http()?),
     )
     .await?;
     let camera = publisher.create_video_input(Default::default()).await?;

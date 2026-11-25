@@ -1,7 +1,7 @@
 use super::*;
 use agent_core::{
     TrackOwner,
-    ffi::{ErrorCode, ErrorInfo, WatchConfig, WatchState, WatchStatus},
+    ffi::{ErrorCode, ErrorInfo, WatchConfig, WatchState},
 };
 
 pub(super) type WatchOwners = RefCell<BTreeMap<u64, TrackOwner>>;
@@ -14,7 +14,7 @@ impl Control {
             let Some(state) = agent.catalog_watch_state(*owner) else {
                 return false;
             };
-            let closing = state.status == WatchStatus::Failed;
+            let closing = state.status.is_terminal();
             states.push((*id, state, closing));
             !closing
         });
@@ -95,7 +95,7 @@ impl ActorHandle {
             .iter()
             .filter_map(|(id, owner)| {
                 agent.catalog_watch_state(*owner).map(|state| {
-                    let closing = state.status == WatchStatus::Failed;
+                    let closing = state.status.is_terminal();
                     (*id, state, closing)
                 })
             })

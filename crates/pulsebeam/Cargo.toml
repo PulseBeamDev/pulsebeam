@@ -75,10 +75,17 @@ utoipa-swagger-ui = { version = "9.0.2", features = ["axum", "debug-embed"] }
 uuid = { version = "1.23.2", features = ["v4", "v5", "v7"] }
 zerocopy = { version = "0.8.56", features = ["derive"] }
 parking_lot = "0.12.5"
+prost = "0.14.4"
+tokio-stream = "0.1.18"
+tonic = { version = "0.14.9", default-features = false, features = ["codegen", "router", "transport", "tls-aws-lc"] }
+tonic-prost = "0.14.9"
+
+[build-dependencies]
+tonic-prost-build = { version = "0.14.9", default-features = false, features = ["transport"] }
 
 [dev-dependencies]
 noq-proto = { version = "=1.4.0", default-features = false, features = ["rustls", "aws-lc-rs"] }
-rcgen = { version = "0.14.7", default-features = false, features = ["crypto", "aws_lc_rs"] }
+rcgen = { version = "0.14.7", default-features = false, features = ["crypto", "aws_lc_rs", "pem"] }
 tempfile = "3.24"
 pulsebeam-agent-native = { path = "../../agents/pulsebeam-agent-native", features = ["transport-conformance"] }
 pulsebeam-rtc-simulation = { path = "../pulsebeam-rtc/simulation" }

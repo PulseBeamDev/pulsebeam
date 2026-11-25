@@ -1,4 +1,4 @@
-//! A bounded control lane on a provisioned authenticated association.
+//! Bounded control delivery on a provisioned peer session.
 
 use super::{Fence, LinkTime, Ordering, SendErrorKind, Shared, network};
 
@@ -10,6 +10,7 @@ pub struct PeerControl {
     state: Shared<Fence>,
     outbound: pulsebeam_queue::Sender<Chunk>,
     inbound: pulsebeam_queue::Receiver<Box<[u8]>>,
+    frame_bytes: usize,
 }
 
 impl PeerControl {
@@ -28,7 +29,7 @@ impl PeerControl {
         if !self.is_ready() {
             return Err(SendErrorKind::NotReady);
         }
-        if bytes.len() > CONTROL_FRAME_BYTES {
+        if bytes.len() > self.frame_bytes {
             return Err(SendErrorKind::TooLarge);
         }
         self.outbound
@@ -67,7 +68,79 @@ pub(super) struct HostLane {
     pub(super) pending: Option<Chunk>,
 }
 
+/// The transport end of one ordered control stream. Construct it only after
+/// authenticating the provisioned neighbor. Dropping it fences this incarnation
+/// of the stream, even if a replacement stream is already connected.
+pub struct StreamControl {
+    state: Shared<Fence>,
+    outbound: StreamOutbound,
+    inbound: StreamInbound,
+}
+
+impl StreamControl {
+    pub fn new_authenticated(frame_bytes: std::num::NonZeroUsize) -> (PeerControl, Self) {
+        let state = Shared::new(Fence::new(network::READY));
+        let frame_bytes = frame_bytes.get();
+        let (peer, host) = pair_with_limit(state.clone(), frame_bytes);
+        (
+            peer,
+            Self {
+                state,
+                outbound: StreamOutbound(host.outgoing),
+                inbound: StreamInbound {
+                    incoming: host.incoming,
+                    frame_bytes,
+                },
+            },
+        )
+    }
+
+    /// Borrow the two directions independently, so backpressure in one does not
+    /// stop the transport from driving the other.
+    pub fn directions(&mut self) -> (&mut StreamOutbound, &mut StreamInbound) {
+        (&mut self.outbound, &mut self.inbound)
+    }
+}
+
+impl Drop for StreamControl {
+    fn drop(&mut self) {
+        self.state.store(network::CLOSED, Ordering::Release);
+    }
+}
+
+pub struct StreamOutbound(pulsebeam_queue::Receiver<Chunk>);
+
+impl StreamOutbound {
+    /// The driver must check the deadline in the lane's local clock domain
+    /// before sending the frame. Expiration is not a wire timestamp.
+    pub async fn recv(&mut self) -> Option<(Box<[u8]>, LinkTime)> {
+        let chunk = self.0.recv().await?;
+        Some((chunk.bytes, chunk.expires_at))
+    }
+}
+
+pub struct StreamInbound {
+    incoming: pulsebeam_queue::Sender<Box<[u8]>>,
+    frame_bytes: usize,
+}
+
+impl StreamInbound {
+    pub async fn send(&mut self, frame: Box<[u8]>) -> Result<(), SendErrorKind> {
+        if frame.len() > self.frame_bytes {
+            return Err(SendErrorKind::TooLarge);
+        }
+        self.incoming
+            .send(frame)
+            .await
+            .map_err(|_| SendErrorKind::Closed)
+    }
+}
+
 pub(super) fn pair(state: Shared<Fence>) -> (PeerControl, HostLane) {
+    pair_with_limit(state, CONTROL_FRAME_BYTES)
+}
+
+fn pair_with_limit(state: Shared<Fence>, frame_bytes: usize) -> (PeerControl, HostLane) {
     let (outbound, outgoing) = pulsebeam_queue::bounded(CAPACITY);
     let (incoming, inbound) = pulsebeam_queue::bounded(CAPACITY);
     (
@@ -75,6 +148,7 @@ pub(super) fn pair(state: Shared<Fence>) -> (PeerControl, HostLane) {
             state,
             outbound,
             inbound,
+            frame_bytes,
         },
         HostLane {
             outgoing,
@@ -82,4 +156,51 @@ pub(super) fn pair(state: Shared<Fence>) -> (PeerControl, HostLane) {
             pending: None,
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_lite::future::{block_on, poll_once};
+
+    #[test]
+    fn stream_is_bounded_ordered_and_fenced_on_drop() {
+        block_on(async {
+            let limit = CONTROL_FRAME_BYTES.saturating_mul(2);
+            let (mut peer, mut stream) =
+                StreamControl::new_authenticated(std::num::NonZeroUsize::new(limit).unwrap());
+            assert!(peer.is_ready());
+            let (outbound, inbound) = stream.directions();
+            let deadline = LinkTime::from_nanos(1);
+            let frame = |byte| Box::<[u8]>::from([byte]);
+            for index in 0..u8::try_from(CAPACITY.get()).unwrap() {
+                assert_eq!(peer.try_send(frame(index), deadline), Ok(()));
+                assert_eq!(inbound.send(frame(index)).await, Ok(()));
+            }
+            assert_eq!(
+                peer.try_send(frame(255), deadline),
+                Err(SendErrorKind::Full)
+            );
+            assert!(poll_once(inbound.send(frame(255))).await.is_none());
+            assert_eq!(
+                inbound
+                    .send(vec![0; limit.saturating_add(1)].into_boxed_slice())
+                    .await,
+                Err(SendErrorKind::TooLarge)
+            );
+            for index in 0..u8::try_from(CAPACITY.get()).unwrap() {
+                assert_eq!(outbound.recv().await, Some((frame(index), deadline)));
+                assert_eq!(peer.recv().await, Some(frame(index)));
+            }
+            assert!(poll_once(outbound.recv()).await.is_none());
+            assert_eq!(inbound.send(frame(0)).await, Ok(()));
+            drop(stream);
+            assert!(peer.is_closed());
+            assert_eq!(
+                peer.try_send(frame(0), deadline),
+                Err(SendErrorKind::Closed)
+            );
+            assert_eq!(peer.recv().await, None);
+        });
+    }
 }

@@ -531,6 +531,21 @@ impl Control {
         }
     }
 
+    pub(super) fn selector_media_receiver(
+        &self,
+        owner: agent_core::TrackOwner,
+        source: &agent_core::SelectorMatch,
+    ) -> Option<(MediaSlot, String)> {
+        self.with(|core| core.selector_media_receiver(owner, source))
+    }
+
+    pub(super) fn subscription_selector_state(
+        &self,
+        owner: agent_core::TrackOwner,
+    ) -> Option<agent_core::SelectorState> {
+        self.with(|core| core.subscription_selector_state(owner))
+    }
+
     pub(super) fn external<T>(&self, operation: impl FnOnce(&mut agent_core::Agent) -> T) -> T {
         let result = self.update(operation);
         self.changed.notify_one();

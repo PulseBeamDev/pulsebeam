@@ -23,6 +23,28 @@ pub(crate) struct PublicationFact {
 }
 
 impl PublicationFact {
+    /// Routed WAN representations use a single encoding without a wire RID.
+    /// The authenticated descriptor carries the codec, not an ingress SSRC.
+    pub(in crate::control::controller) fn routed_track(
+        endpoint: EndpointKey,
+        publisher: crate::shard_update::PublisherAnchor,
+        descriptor: &Track,
+    ) -> Option<MediaTrack> {
+        let layers: Box<[_]> = match descriptor.kind.as_ref()? {
+            track::Kind::Video(_) => {
+                Box::new([(SourceEncoding::Rid(None), None, LayerQuality::High)])
+            }
+            _ => Box::default(),
+        };
+        Self {
+            descriptor: descriptor.clone(),
+            fabric_data_source: (publisher.publication.kind() == TrackKind::Data)
+                .then_some(publisher.incarnation),
+            layers,
+        }
+        .media_track(endpoint, publisher.connection)
+    }
+
     pub(crate) fn from_track(track: &MediaTrack) -> Option<Self> {
         Some(Self {
             descriptor: crate::control::native::track_descriptor(track)?,
@@ -59,6 +81,34 @@ impl PublicationFact {
         }
         Some(PublicationKey::Audio(
             self.descriptor.publication_id.parse().ok()?,
+        ))
+    }
+
+    pub(in crate::control) fn wan_rtp_publication(
+        &self,
+    ) -> Option<(PublicationKey, pulsebeam_core::fabric::Profile)> {
+        use pulsebeam_core::fabric::Profile;
+
+        if let Some(key) = self.opus_publication() {
+            return Some((key, Profile::Opus));
+        }
+        let track::Kind::Video(video) = self.descriptor.kind.as_ref()? else {
+            return None;
+        };
+        let format = video.format.as_ref()?;
+        if self.layers.len() != 1 || format.clock_rate != 90_000 {
+            return None;
+        }
+        let profile = if format.mime_type.eq_ignore_ascii_case("video/h264") {
+            Profile::H264
+        } else if format.mime_type.eq_ignore_ascii_case("video/av1") {
+            Profile::Av1
+        } else {
+            return None;
+        };
+        Some((
+            PublicationKey::Video(self.descriptor.publication_id.parse().ok()?),
+            profile,
         ))
     }
 
@@ -387,6 +437,20 @@ impl Observations {
         Err(Error::Capacity)
     }
 
+    pub(crate) fn has_fresh_view(
+        &self,
+        node: NodeId,
+        incarnation: NonZeroU64,
+        revision: NonZeroU64,
+        now: Instant,
+    ) -> bool {
+        self.origins.get(&node).is_some_and(|origin| {
+            origin.incarnation == Some(incarnation)
+                && origin.revision == Some(revision)
+                && origin.is_fresh(now)
+        })
+    }
+
     pub(crate) fn highest(
         &self,
         endpoint: EndpointKey,
@@ -440,7 +504,9 @@ impl Observations {
         endpoints
     }
 
-    pub(crate) fn close_network(&mut self, network: NetworkId) -> Vec<EndpointKey> {
+    /// Retire routes without changing the authenticated control view or its
+    /// deadline. The control adapter closes its session separately.
+    pub(crate) fn detach_media(&mut self, network: NetworkId) -> Vec<EndpointKey> {
         let mut endpoints = BTreeSet::new();
         for origin in self
             .origins
@@ -448,9 +514,7 @@ impl Observations {
             .filter(|origin| origin.network == Some(network))
         {
             endpoints.extend(origin.endpoints.keys().copied());
-            origin.session = None;
             origin.network = None;
-            origin.withdraw();
         }
         endpoints.into_iter().collect()
     }
@@ -513,7 +577,6 @@ impl Observations {
             .flat_map(|origin| origin.endpoints.iter())
     }
 
-    #[cfg(test)]
     pub(crate) fn endpoint(
         &self,
         session: Session,
@@ -525,6 +588,22 @@ impl Observations {
             .filter(|origin| origin.session == Some(session.serial) && origin.is_fresh(now))?
             .endpoints
             .get(&endpoint)
+    }
+
+    pub(crate) fn active_session(&self, node: NodeId, generation: NonZeroU64) -> Option<Session> {
+        let origin = self.origins.get(&node)?;
+        (origin.incarnation == Some(generation)).then_some(())?;
+        Some(Session {
+            node,
+            serial: origin.session?,
+        })
+    }
+
+    pub(crate) fn media_route(&self, session: Session) -> Option<NetworkId> {
+        self.origins
+            .get(&session.node)
+            .filter(|origin| origin.session == Some(session.serial))?
+            .network
     }
 
     pub(crate) fn session_origin(&self, session: Session) -> Result<(NodeId, NonZeroU64), Error> {
@@ -802,7 +881,7 @@ mod tests {
     }
 
     #[test]
-    fn link_loss_withdraws_claims_and_fences_a_previously_sampled_image() {
+    fn media_loss_does_not_transfer_authority_and_closed_control_cannot_replay() {
         use pulsebeam_link::{
             LinkControl, LinkTime, NetworkClass, NetworkPeer, PeerRole, SecretCredential,
         };
@@ -832,6 +911,19 @@ mod tests {
             )
         };
         install(&mut view, session, 2).unwrap();
+        let other_network = link.reserve_network_id().unwrap();
+        let other_session = view
+            .open(NodeId::new(), revision(1), Some(other_network))
+            .unwrap();
+        let weaker = rank(0);
+        view.snapshot(
+            other_session,
+            revision(1),
+            claims(&[(alice, weaker)]),
+            now,
+            deadline,
+        )
+        .unwrap();
         assert_eq!(view.highest(alice, now, |_| true), Some(rank(1)));
         assert_eq!(
             view.ingress(alice, now, |_| true, |_| false)
@@ -839,9 +931,12 @@ mod tests {
             Some(network)
         );
         link.close_network(network);
-        assert_eq!(view.close_network(network), vec![alice]);
-        assert_eq!(view.highest(alice, now, |_| true), None);
+        assert_eq!(view.detach_media(network), vec![alice]);
+        assert_eq!(view.highest(alice, now, |_| true), Some(rank(1)));
         assert!(view.ingress(alice, now, |_| true, |_| false).is_none());
+        assert_eq!(view.session_origin(session), Ok((remote, revision(1))));
+        view.close(session).unwrap();
+        assert_eq!(view.highest(alice, now, |_| true), Some(weaker));
         assert_eq!(install(&mut view, session, 3), Err(Error::Stale));
         let next_network = link.open_network(peer, codec()).unwrap();
         let next_session = view.open(remote, revision(1), Some(next_network)).unwrap();

@@ -3610,12 +3610,11 @@ mod slot_switch_tests {
         }
     }
 
-    /// A slot with two simulcast layers of one track available to switch between.
     struct Fixture {
         slot: Slot,
         high: TrackLayer,
         low: TrackLayer,
-        cache: TrackStreamCache,
+        caches: HashMap<PublicationKey, TrackStreamCache>,
         writer: StreamWriter,
         emitted: Vec<RtpPacket>,
     }
@@ -3642,7 +3641,7 @@ mod slot_switch_tests {
                 slot,
                 high,
                 low,
-                cache: TrackStreamCache::new(),
+                caches: HashMap::new(),
                 writer: StreamWriter::new(),
                 emitted: Vec::new(),
             }
@@ -3653,11 +3652,15 @@ mod slot_switch_tests {
             let publication_id = layer.meta.id;
             let mut pkt = pkt.clone();
             pkt.ext_vals.rid = layer.rid;
-            self.cache.push_encoding(layer.encoding, pkt.clone());
+            let cache = self
+                .caches
+                .entry(publication_id)
+                .or_insert_with(TrackStreamCache::new);
+            cache.push_encoding(layer.encoding, pkt.clone());
             let promoted = self.slot.on_rtp(
                 publication_id,
                 pkt.arrival_ts,
-                Some(&self.cache),
+                Some(cache),
                 &mut self.writer,
             );
             while let Some(w) = self.writer.pop() {
@@ -3711,6 +3714,54 @@ mod slot_switch_tests {
 
         assert_eq!(fx.slot.test_active(), Some(low.stream_id()));
         assert_decodable(&fx.emitted, "Slot::on_rtp across a simulcast switch");
+    }
+
+    #[test]
+    fn withdrawing_a_publication_fences_the_old_encoder_and_rebases_on_the_new_keyframe() {
+        let t0 = Instant::now();
+        let mut fx = Fixture::new();
+        let mut primary = fx.high.clone();
+        primary.meta.track_id = Some(crate::entity::TrackId::new("camera").unwrap());
+        let mut standby = primary.clone();
+        standby.meta.connection_id = ConnectionId::new();
+        standby.meta.id = standby
+            .meta
+            .connection_id
+            .fixture_publication(crate::entity::TrackKind::Video, "camera");
+        assert_ne!(standby.meta.id, primary.meta.id);
+        let mut old = H264StreamBuilder::new(1, 300, 900_000, t0)
+            .with_parameter_sets(ParameterSetStyle::SeparatePacket);
+        let mut replacement =
+            H264StreamBuilder::new(2, 50_000, 12_000, t0 + Duration::from_millis(300))
+                .with_parameter_sets(ParameterSetStyle::SeparatePacket);
+
+        fx.slot.switch_to(&primary, false);
+        assert!(fx.ingest_all(&primary, &old.keyframe(3)));
+        fx.ingest_all(&primary, &old.delta_frame(3));
+        let predecessor = fx.emitted.last().unwrap().clone();
+        let cutoff = fx.emitted.len();
+
+        // Track removal stops the slot, then the scoped subscription gets its
+        // new publication. Both sources use the same encoding and track label.
+        fx.slot.stop();
+        fx.slot.switch_to(&standby, false);
+        assert!(!fx.ingest_all(&primary, &old.keyframe(3)));
+        assert!(!fx.ingest_all(&standby, &replacement.delta_frame(3)));
+        assert_eq!(fx.emitted.len(), cutoff);
+        assert!(fx.slot.test_active().is_none());
+
+        let fresh = replacement.keyframe(3);
+        assert!(fresh.last().unwrap().rtp_ts.numer() < predecessor.rtp_ts.numer());
+        assert!(fx.ingest_all(&standby, &fresh));
+        let first = &fx.emitted[cutoff];
+        assert_eq!(*first.seq_no, *predecessor.seq_no + 1);
+        assert!(first.rtp_ts.numer() > predecessor.rtp_ts.numer());
+        assert_eq!(fx.slot.test_active(), Some(standby.stream_id()));
+        let after_switch = fx.emitted.len();
+        assert!(!fx.ingest_all(&primary, &old.delta_frame(3)));
+        assert_eq!(fx.emitted.len(), after_switch);
+        fx.ingest_all(&standby, &replacement.delta_frame(3));
+        assert_decodable(&fx.emitted, "scoped publication replacement");
     }
 
     #[test]

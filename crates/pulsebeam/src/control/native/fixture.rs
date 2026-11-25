@@ -219,6 +219,7 @@ impl NativeControl {
                         publisher: &track.meta().origin,
                     })
                 },
+                |_, _, _| None,
             )
             .map(|_| ())
     }

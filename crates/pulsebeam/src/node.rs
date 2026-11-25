@@ -8,6 +8,8 @@ use pulsebeam_runtime::net::UdpMode;
 use pulsebeam_runtime::net::tcp::TcpListener;
 use pulsebeam_runtime::rand;
 use pulsebeam_runtime::rand::SeedableRng;
+#[cfg(feature = "sim")]
+use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::future::Future;
 use std::net::{Ipv6Addr, SocketAddr};
@@ -75,6 +77,12 @@ pub struct NodeBuilder {
     sim_startup_notification: Option<pulsebeam_runtime::sync::mpsc::Sender<()>>,
     #[cfg(feature = "sim")]
     sim_ownership_peer: Option<SimOwnershipPeer>,
+    #[cfg(feature = "sim")]
+    sim_regional_ports: BTreeMap<pulsebeam_core::identity::NodeId, crate::cluster::mesh::Port>,
+    #[cfg(feature = "sim")]
+    sim_standby_control: Option<
+        pulsebeam_runtime::sync::mpsc::Sender<crate::control::controller::SimStandbyControl>,
+    >,
     // Data-plane topology
     //
     // `data_threads` is physical executor width. Logical shard count is derived
@@ -95,7 +103,11 @@ pub struct NodeBuilder {
 
     // Services
     cluster: Option<crate::cluster::Options>,
+    region_tree: Option<crate::cluster::RegionTree>,
+    operator_socket: bool,
+    operator_listener: Option<std::os::unix::net::UnixListener>,
     provisioned_peers: Vec<ProvisionedPeer>,
+    publisher_handoff_store: Option<crate::cluster::handoff::Store>,
     link_listen: Option<SocketAddr>,
     link_control: Option<pulsebeam_runtime::sync::oneshot::Sender<crate::link::Control>>,
     http_api: Option<ListenerSource>,
@@ -136,6 +148,10 @@ impl NodeBuilder {
             sim_startup_notification: None,
             #[cfg(feature = "sim")]
             sim_ownership_peer: None,
+            #[cfg(feature = "sim")]
+            sim_regional_ports: BTreeMap::new(),
+            #[cfg(feature = "sim")]
+            sim_standby_control: None,
             data_threads: 1,
             shard_runtime: ExecutionConfig::default(),
             local_addr: None,
@@ -154,7 +170,11 @@ impl NodeBuilder {
                 unix_nanos: || 1_700_000_000_000_000_000,
             },
             cluster: None,
+            region_tree: None,
+            operator_socket: false,
+            operator_listener: None,
             provisioned_peers: Vec::new(),
+            publisher_handoff_store: None,
             link_listen: None,
             link_control: None,
             http_api: None,
@@ -201,6 +221,41 @@ impl NodeBuilder {
     #[cfg(feature = "sim")]
     pub fn with_sim_ownership_peer(mut self, peer: SimOwnershipPeer) -> Self {
         self.sim_ownership_peer = Some(peer);
+        self
+    }
+
+    /// Supply the authenticated regional control boundary in virtual time.
+    #[cfg(feature = "sim")]
+    pub fn with_sim_regional_port(
+        mut self,
+        peer: pulsebeam_core::identity::NodeId,
+        roles: (
+            crate::cluster::SimRegionalRole,
+            crate::cluster::SimRegionalRole,
+        ),
+        cost: crate::cluster::SimLinkCost,
+        sessions: pulsebeam_runtime::sync::mpsc::Receiver<pulsebeam_link::PeerControl>,
+    ) -> Self {
+        self.sim_regional_ports.insert(
+            peer,
+            crate::cluster::mesh::Port {
+                sessions,
+                roles,
+                cost: crate::cluster::mesh::LinkCost::Sim(cost),
+            },
+        );
+        self
+    }
+
+    /// Exercise the real owner and encoder request path during simulation.
+    #[cfg(feature = "sim")]
+    pub fn with_sim_standby_control(
+        mut self,
+        control: pulsebeam_runtime::sync::mpsc::Sender<
+            crate::control::controller::SimStandbyControl,
+        >,
+    ) -> Self {
+        self.sim_standby_control = Some(control);
         self
     }
 
@@ -356,6 +411,12 @@ impl NodeBuilder {
         self
     }
 
+    /// Enable the private ownership socket in the provisioned node's data directory.
+    pub fn with_operator_socket(mut self, enabled: bool) -> Self {
+        self.operator_socket = enabled;
+        self
+    }
+
     /// Opt into trusted-network membership. This does not change room placement.
     pub fn with_cluster(mut self, options: crate::cluster::Options) -> Self {
         self.cluster = Some(options);
@@ -453,6 +514,10 @@ impl NodeBuilder {
     /// Consumes the builder and runs the node until `shutdown` is cancelled.
     pub async fn run(mut self, shutdown: CancellationToken) -> Result<()> {
         let Some(options) = self.cluster.take() else {
+            anyhow::ensure!(
+                !self.operator_socket,
+                "operator socket requires provisioned cluster configuration"
+            );
             return self
                 .run_media(
                     shutdown,
@@ -476,7 +541,31 @@ impl NodeBuilder {
             self.link_listen = (!peer.fabric_wan).then_some(peer.listen);
         }
         self.provisioned_peers = options.ownership_peers.clone();
+        self.region_tree = options.region_tree.clone();
+        if self.operator_socket {
+            anyhow::ensure!(
+                !self.provisioned_peers.is_empty() && self.key_registry.is_some(),
+                "operator socket requires provisioned peers and a participant key registry"
+            );
+        }
+        let handoff_directory =
+            (!self.provisioned_peers.is_empty()).then(|| options.data_dir.clone());
         let membership = crate::cluster::Service::start(options).await?;
+        if let Some(directory) = handoff_directory {
+            let operator_socket = self.operator_socket;
+            let (store, listener) = pulsebeam_runtime::task::spawn_blocking(move || {
+                anyhow::Ok((
+                    crate::cluster::handoff::Store::open(&directory)?,
+                    operator_socket
+                        .then(|| crate::control::controller::operator::bind(&directory))
+                        .transpose()?,
+                ))
+            })
+            .await
+            .context("publisher ownership initialization worker failed")??;
+            self.publisher_handoff_store = Some(store);
+            self.operator_listener = listener;
+        }
         let relay_node = crate::log::RelayNode {
             node: membership.incarnation().node_id,
             incarnation: membership.incarnation().generation_id,
@@ -871,6 +960,9 @@ impl NodeBuilder {
         );
         controller.set_ownership_mode(ownership_mode);
         controller.set_quic_authority(quic_authority);
+        if let Some(store) = self.publisher_handoff_store {
+            controller.set_publisher_handoff_store(store)?;
+        }
         #[cfg(feature = "sim")]
         if let Some(peer) = self.sim_ownership_peer.as_ref() {
             controller.set_sim_ownership_peer(peer.clone());
@@ -889,7 +981,50 @@ impl NodeBuilder {
             controller.set_link_host(installs, relay_node.unwrap_or_else(crate::log::RelayNode::ephemeral));
             hosts.push(SocketHost::Legacy(host));
         }
+        let member = |(node, generation)| crate::cluster::mesh::Member { node, generation };
+        if let Some(tree) = &self.region_tree {
+            let local = self.provisioned_peers.first().context("region tree requires local identity")?;
+            controller.set_region_tree(member(local.local), tree.clone(), clock_origin);
+            controller.set_regional_media_key(&local.receipt_key)?;
+        }
+        #[cfg(feature = "sim")]
+        let mut sim_regional_ports = self.sim_regional_ports;
         for peer in self.provisioned_peers {
+            let scope = self.region_tree.as_ref().and_then(|tree| tree.adjacency(member(peer.local), member(peer.remote)));
+            #[cfg(not(feature = "sim"))]
+            let regional = if let Some(config) = peer.regional_control.clone() {
+                let roles = (config.role, config.peer_role);
+                let cost = crate::cluster::mesh::LinkCost::Fixed(config.link_cost);
+                let adjacency = crate::cluster::regional::Adjacency::open(
+                    config,
+                    peer.local,
+                    peer.remote,
+                    self.region_tree.as_ref(),
+                )
+                .await
+                .context("initializing regional control adjacency")?;
+                let (sender, receiver) = pulsebeam_runtime::sync::mpsc::channel(1);
+                let shutdown = shutdown.clone();
+                control_tasks.spawn(async move {
+                    if let Err(error) = adjacency.run(clock_origin, sender, shutdown.child_token()).await {
+                        tracing::error!(%error, "regional control service failed");
+                        shutdown.cancel();
+                    }
+                });
+                Some(crate::cluster::mesh::Port { sessions: receiver, roles, cost })
+            } else { None };
+            #[cfg(feature = "sim")]
+            let regional = {
+                anyhow::ensure!(peer.regional_control.is_none(), "regional TLS sockets require native execution");
+                let port = sim_regional_ports.remove(&peer.remote.0);
+                if self.region_tree.is_some() {
+                    anyhow::ensure!(
+                        scope.zip(port.as_ref()).is_some_and(|(scope, port)| scope.roles == port.roles),
+                        "simulated regional adjacency is not authorized by the configured region tree"
+                    );
+                }
+                port
+            };
             let provisioner = if peer.fabric_wan {
                 let (host, provisioner) = crate::link::wan_host::Service::bind(peer.listen, clock_origin).await.context("binding nonfragmenting Fabric WAN UDP")?;
                 hosts.push(SocketHost::Wan(host));
@@ -897,8 +1032,16 @@ impl NodeBuilder {
             } else {
                 None
             };
-            controller.add_provisioned_peer(peer, provisioner)?;
+            if scope.is_some_and(|scope| scope.is_border()) {
+                let remote = member(peer.remote);
+                controller.add_regional_border(remote, regional.context("region border requires regional control")?)?;
+                controller.attach_regional_border_media(remote, peer.transport, provisioner.context("region border requires a Fabric WAN socket")?)?;
+            } else {
+                controller.add_provisioned_peer(peer, provisioner, regional)?;
+            }
         }
+        #[cfg(feature = "sim")]
+        anyhow::ensure!(sim_regional_ports.is_empty(), "simulated regional port requires a provisioned adjacency");
         for host in hosts {
             let cancellation = shutdown.child_token();
             let node_shutdown = shutdown.clone();
@@ -928,6 +1071,13 @@ impl NodeBuilder {
             peer.attach(crate::control::controller::peer_ownership::Control::new(controller_command_tx.clone()));
         }
         #[cfg(feature = "sim")]
+        if let Some(control) = self.sim_standby_control {
+            let registry = self.key_registry.clone().context("simulated operator requires a key registry")?;
+            let _ = control.try_send(crate::control::controller::SimStandbyControl::new(
+                controller_command_tx.clone(), registry,
+            ));
+        }
+        #[cfg(feature = "sim")]
         if let Some(notification) = self.sim_startup_notification {
             let _ = notification.try_send(());
         }
@@ -937,6 +1087,20 @@ impl NodeBuilder {
             shard_event_rx,
             shutdown.child_token(),
         )));
+
+        if let Some(listener) = self.operator_listener {
+            let registry = self.key_registry.clone().context("operator socket requires a key registry")?;
+            let sender = controller_command_tx.clone();
+            let shutdown = shutdown.clone();
+            control_tasks.spawn(async move {
+                if let Err(error) = crate::control::controller::operator::serve(
+                    listener, registry, sender, shutdown.child_token(),
+                ).await {
+                    tracing::error!(%error, "ownership socket failed");
+                    shutdown.cancel();
+                }
+            });
+        }
 
         if let Some(source) = self.http_api {
             // Resolve listener

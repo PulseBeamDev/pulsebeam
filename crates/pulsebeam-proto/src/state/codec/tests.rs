@@ -5,7 +5,7 @@
     clippy::unwrap_used
 )]
 
-use alloc::{string::String, vec};
+use alloc::{boxed::Box, string::String, vec};
 
 use super::*;
 
@@ -1780,6 +1780,76 @@ fn session_and_owned_absence_have_distinct_failure_and_direction_rules() {
     };
     let batch = confirmed(resource_key::Key::Session(true), terminal);
     assert_eq!(decode_server(&encode_server(&batch).unwrap()), Ok(batch));
+}
+
+#[test]
+fn selector_snapshot_is_frame_bounded_and_never_contains_partial_or_duplicate_matches() {
+    let mut spec = ResourceSpec {
+        declaration: Some(resource_spec::Declaration::SubscriptionSelector(
+            SubscriptionSelectorSpec {
+                kind: Some(TrackKind::Video as i32),
+                ..Default::default()
+            },
+        )),
+        settings: Some(ResourceSettings {
+            enabled: Some(true),
+            receive: None,
+        }),
+    };
+    let batch = |spec: &ResourceSpec, status: SelectorMatchStatus, matches| ServerStateBatch {
+        records: vec![ServerStateRecord {
+            key: Some(ResourceKey {
+                key: Some(resource_key::Key::Owned(u64::MAX)),
+            }),
+            confirmed: Some(ConfirmedState {
+                evaluated_revision: u64::MAX,
+                value: Some(confirmed_state::Value::SubscriptionSelector(Box::new(
+                    SubscriptionSelectorState {
+                        spec: Some(spec.clone()),
+                        status: status as i32,
+                        matches,
+                    },
+                ))),
+                rejection: None,
+            }),
+        }],
+        ..Default::default()
+    };
+    let addresses = |count| {
+        (0..count)
+            .map(|index| LogicalSourceAddress {
+                room: "r".repeat(36),
+                participant_id: "p".repeat(36),
+                kind: TrackKind::Video as i32,
+                track_id: alloc::format!("video{index:031}"),
+            })
+            .collect::<alloc::vec::Vec<_>>()
+    };
+    let complete = SelectorMatchStatus::Complete;
+    let limit = validation::MAX_SELECTOR_MATCHES;
+    let full = batch(&spec, complete, addresses(limit));
+    assert_eq!(decode_server(&encode_server(&full).unwrap()), Ok(full));
+    assert!(encode_server(&batch(&spec, complete, addresses(limit + 1))).is_err());
+    let mut duplicate = addresses(1);
+    duplicate.push(duplicate[0].clone());
+    assert!(encode_server(&batch(&spec, complete, duplicate)).is_err());
+    let mut mismatch = addresses(1);
+    mismatch[0].kind = TrackKind::Audio as i32;
+    assert!(encode_server(&batch(&spec, complete, mismatch)).is_err());
+    for status in [SelectorMatchStatus::Pending, SelectorMatchStatus::Overflow] {
+        assert!(encode_server(&batch(&spec, status, addresses(0))).is_ok());
+        assert!(encode_server(&batch(&spec, status, addresses(1))).is_err());
+    }
+    let Some(resource_spec::Declaration::SubscriptionSelector(selector)) =
+        spec.declaration.as_mut()
+    else {
+        panic!("expected subscription selector declaration");
+    };
+    selector.room = Some("room*".into());
+    assert_eq!(
+        validation::validate_spec(&spec),
+        Err(ValidationError::Identity)
+    );
 }
 
 #[test]

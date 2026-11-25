@@ -72,10 +72,46 @@ struct Destination {
     pub tx: LinkTx<ShardFrame>,
 }
 
+pub(crate) use activity::ReceiveActivity;
+
+#[allow(
+    clippy::disallowed_types,
+    reason = "WAN socket publishes the first complete delivery once to its controller"
+)]
+mod activity {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    #[derive(Clone, Default)]
+    pub(crate) struct ReceiveActivity(Arc<AtomicBool>);
+
+    impl ReceiveActivity {
+        pub(crate) fn observed(&self) -> bool {
+            self.0.load(Ordering::Acquire)
+        }
+
+        pub(super) fn mark_observed(&self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+}
+
 struct LiveReceive {
     window: Staged<Window>,
+    deadline: Option<wan::LiveDeadline>,
+    activity: Option<ReceiveActivity>,
     timing: Option<crate::route::fabric::WindowTiming>,
     destinations: Vec<Destination>,
+}
+
+impl LiveReceive {
+    fn expires(&self) -> std::time::Instant {
+        self.deadline
+            .as_ref()
+            .map_or_else(|| self.window.spec().expires, wan::LiveDeadline::expires)
+    }
 }
 
 impl Drop for LiveReceive {
@@ -185,8 +221,10 @@ impl WanHost {
         &mut self,
         now: Instant,
         expires: Instant,
+        deadline: Option<wan::LiveDeadline>,
         timing: Option<crate::route::fabric::WindowTiming>,
         destinations: Vec<Destination>,
+        activity: Option<ReceiveActivity>,
     ) -> Result<LiveReceive, Error> {
         let first = destinations.first().ok_or(Error::Binding)?.child;
         let window = first.window.ok_or(Error::Binding)?;
@@ -225,11 +263,17 @@ impl WanHost {
             purpose: Purpose::Live,
             expires: expires.into_std(),
         };
-        let staged = self
-            .driver
-            .stage(now.into_std(), self.binding(), spec, window)?;
+        let staged = self.driver.stage_with_deadline(
+            now.into_std(),
+            self.binding(),
+            spec,
+            window,
+            deadline.clone(),
+        )?;
         Ok(LiveReceive {
             window: staged,
+            deadline,
+            activity,
             timing: timing.filter(|point| point.position == first.sequence_anchor),
             destinations,
         })
@@ -304,7 +348,7 @@ impl WanHost {
             || parent
                 .window
                 .and_then(|window| self.receives.get(&window.ssrc()))
-                .is_none_or(|live| expires.into_std() > live.window.spec().expires)
+                .is_none_or(|live| expires.into_std() > live.expires())
         {
             return Err(Error::Binding);
         }
@@ -344,17 +388,28 @@ impl WanHost {
             })
     }
 
+    #[cfg(test)]
     pub(crate) fn stage_send(
         &mut self,
         now: Instant,
         window: Window,
         spec: WindowSpec,
     ) -> Result<Staged<Window>, Error> {
+        self.stage_send_with_deadline(now, window, spec, None)
+    }
+
+    fn stage_send_with_deadline(
+        &mut self,
+        now: Instant,
+        window: Window,
+        spec: WindowSpec,
+        deadline: Option<wan::LiveDeadline>,
+    ) -> Result<Staged<Window>, Error> {
         if spec.direction != Direction::Send {
             return Err(Error::Binding);
         }
         self.driver
-            .stage(now.into_std(), self.binding(), spec, window)
+            .stage_with_deadline(now.into_std(), self.binding(), spec, window, deadline)
             .map_err(Error::from)
     }
 
@@ -579,11 +634,7 @@ impl WanHost {
             .into_iter()
             .chain(self.pending.values().map(Pending::expires))
             .chain(self.egress.next_deadline())
-            .chain(
-                self.receives
-                    .values()
-                    .map(|route| route.window.spec().expires),
-            )
+            .chain(self.receives.values().map(LiveReceive::expires))
             .chain(
                 self.repairs
                     .values()
@@ -648,7 +699,7 @@ impl WanHost {
         }
     }
 
-    fn deliver(&self, image: wan::Received<OwnedPacket, Window>, observed: ReceiveTime) {
+    fn deliver(&mut self, image: wan::Received<OwnedPacket, Window>, observed: ReceiveTime) {
         let spec = image.route.spec();
         #[cfg(feature = "sim")]
         if image.route.descriptor().profile() == pulsebeam_core::fabric::Profile::Data
@@ -670,20 +721,23 @@ impl WanHost {
                 &image.packet,
             );
         }
-        let expiry = Instant::from_std(spec.expires).saturating_duration_since(self.origin);
+        let expiry = Instant::from_std(image.expires).saturating_duration_since(self.origin);
         let expires = LinkTime::from_nanos(u64::try_from(expiry.as_nanos()).unwrap_or(u64::MAX));
         let handoff = |tx: &LinkTx<ShardFrame>, ingress, image| {
-            let _ = tx.try_send_received(
+            tx.try_send_received(
                 ShardFrame::FabricWanImage { ingress, image },
                 observed,
                 expires,
-            );
+            )
+            .is_ok()
         };
         match spec.purpose {
             Purpose::Live => {
+                #[cfg(feature = "sim")]
+                let peer_ip = self.binding().peer.ip();
                 let Some(route) = self
                     .receives
-                    .get(&spec.ssrc)
+                    .get_mut(&spec.ssrc)
                     .filter(|route| route.window == image.route)
                 else {
                     return;
@@ -691,7 +745,7 @@ impl WanHost {
                 #[cfg(feature = "sim")]
                 if image.route.descriptor().profile() == pulsebeam_core::fabric::Profile::Data {
                     crate::sim_metrics::record_wan_live_data(
-                        self.binding().peer.ip(),
+                        peer_ip,
                         self.socket.local_addr().ip(),
                         image.position,
                         image.packet.header().timestamp,
@@ -699,8 +753,12 @@ impl WanHost {
                 }
                 let mut frame: crate::route::fabric::NetworkPacket = image.into();
                 frame.capture = route.timing.and_then(|timing| timing.capture_for(&frame));
+                let mut complete = true;
                 for destination in &route.destinations {
-                    handoff(&destination.tx, destination.child.ingress, frame.clone());
+                    complete &= handoff(&destination.tx, destination.child.ingress, frame.clone());
+                }
+                if complete && let Some(activity) = route.activity.take() {
+                    activity.mark_observed();
                 }
             }
             Purpose::Repair { position } => {
@@ -732,7 +790,7 @@ impl WanHost {
         self.egress.fence_stale(&mut self.driver, now, changed);
         self.receives.retain(|_, route| {
             if changed
-                || now.into_std() >= route.window.spec().expires
+                || now.into_std() >= route.expires()
                 || route
                     .destinations
                     .iter()

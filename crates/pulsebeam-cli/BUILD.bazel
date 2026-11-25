@@ -13,7 +13,7 @@ extract_cargo_lints(name = "lints", manifest = "Cargo.toml", workspace = "//:Car
 
 rust_binary(
     name = "pulsebeam-cli",
-    srcs = ["src/main.rs", "src/incident.rs", "src/incident/tests.rs"],
+    srcs = ["src/main.rs", "src/incident.rs", "src/incident/tests.rs", "src/ownership.rs"],
     crate_root = "src/main.rs",
     edition = crate_edition(),
     rustc_env_files = [":cargo_env"],

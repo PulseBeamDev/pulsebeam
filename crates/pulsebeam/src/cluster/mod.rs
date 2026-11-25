@@ -1,9 +1,24 @@
 //! Optional trusted-network gossip. This service owns persistence and lifecycle,
 //! independently of shard execution and room authority.
 mod config;
+pub(crate) mod declarations;
+pub(crate) mod handoff;
+mod hierarchy;
 mod identity;
+pub(crate) mod mesh;
+#[cfg(not(feature = "sim"))]
+pub(crate) mod regional;
 
-pub use config::{Options, ProvisionedPeer, ServerConfig, Topology};
+// One catalog entry plus its envelope. The datagram lane keeps its MTU bound.
+pub(crate) const REGIONAL_FRAME_BYTES: usize =
+    pulsebeam_proto::catalog::MAX_CATALOG_ENTRY_BYTES + 1024;
+
+pub(crate) use config::MAX_PROVISIONED_PEERS;
+pub use config::{Options, ProvisionedPeer, RegionalControlConfig, ServerConfig, Topology};
+pub(crate) use hierarchy::MAX_CATALOG_MEMBERS;
+pub use hierarchy::RegionTree;
+#[cfg(feature = "sim")]
+pub use {declarations::Role as SimRegionalRole, mesh::SimLinkCost};
 
 use anyhow::{Context, Result};
 use chitchat::transport::Socket;
@@ -256,6 +271,7 @@ mod tests {
                 seeds: vec![seed],
                 data_dir: dir.path().to_owned(),
                 ownership_peers: Vec::new(),
+                region_tree: None,
             };
             let socket = ProbeSocket {
                 inner: socket,

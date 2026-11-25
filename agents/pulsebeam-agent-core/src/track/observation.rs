@@ -37,6 +37,7 @@ pub struct MediaObservationControl {
 #[derive(Default)]
 pub(super) struct MediaObservation {
     source: Option<String>,
+    selector_match: Option<crate::SelectorMatch>,
     control: Option<MediaObservationControl>,
     completed: bool,
     attached: bool,
@@ -87,6 +88,50 @@ impl TrackResources {
             },
         );
         Ok(id)
+    }
+
+    pub(crate) fn begin_selector_media_observation(
+        &mut self,
+        owner: TrackOwner,
+        source: crate::SelectorMatch,
+    ) -> Result<MediaObservationId, TrackResourceError> {
+        let start = MediaObservationId {
+            owner,
+            request: TrackOwner(0),
+        };
+        let end = MediaObservationId {
+            owner,
+            request: TrackOwner(u64::MAX),
+        };
+        let mut count = 0_usize;
+        for (_, observation) in self.observations.range(start..=end) {
+            if observation.selector_match.as_ref() == Some(&source) {
+                return Err(TrackResourceError::AlreadyOwned);
+            }
+            count = count.saturating_add(1);
+        }
+        if count >= pulsebeam_proto::state::validation::MAX_SELECTOR_MATCHES {
+            return Err(TrackResourceError::SelectorObservationCapacityExceeded);
+        }
+        let id = MediaObservationId {
+            owner,
+            request: self.new_owner()?,
+        };
+        self.observations.insert(
+            id,
+            MediaObservation {
+                selector_match: Some(source),
+                ..Default::default()
+            },
+        );
+        Ok(id)
+    }
+
+    pub(crate) fn selector_observation_match(
+        &self,
+        id: MediaObservationId,
+    ) -> Option<&crate::SelectorMatch> {
+        self.observations.get(&id)?.selector_match.as_ref()
     }
 
     pub(crate) fn audio_observation_source(&self, id: MediaObservationId) -> Option<&str> {

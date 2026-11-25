@@ -2,7 +2,10 @@
 
 #[cfg(feature = "http")]
 use std::future::Future;
-use std::{io, net::SocketAddr};
+use std::{
+    io,
+    net::{SocketAddr, SocketAddrV6},
+};
 
 #[cfg(not(feature = "sim"))]
 pub use tokio::net::{TcpListener, TcpStream};
@@ -56,25 +59,40 @@ impl axum::serve::Listener for TcpListener {
 /// Bind a reusable listener, preferring dual-stack IPv6 on native hosts.
 pub async fn bind(addr: SocketAddr) -> io::Result<TcpListener> {
     #[cfg(feature = "sim")]
-    {
-        TcpListener::bind(addr).await
-    }
+    return TcpListener::bind(addr).await;
     #[cfg(not(feature = "sim"))]
-    {
-        let socket = socket2::Socket::new(
-            socket2::Domain::for_address(addr),
-            socket2::Type::STREAM,
-            Some(socket2::Protocol::TCP),
-        )?;
-        if addr.is_ipv6() {
-            socket.set_only_v6(false)?;
-        }
-        socket.set_nonblocking(true)?;
-        socket.set_reuse_address(true)?;
-        socket.bind(&addr.into())?;
-        socket.listen(1024)?;
-        TcpListener::from_std(socket.into())
+    bind_native(addr, false)
+}
+
+/// Bind an IPv6-only listener, including when listening on the wildcard address.
+pub async fn bind_ipv6(addr: SocketAddrV6) -> io::Result<TcpListener> {
+    if addr.ip().to_ipv4_mapped().is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "IPv4-mapped addresses are not valid IPv6 listeners",
+        ));
     }
+    #[cfg(feature = "sim")]
+    return TcpListener::bind(addr.into()).await;
+    #[cfg(not(feature = "sim"))]
+    bind_native(addr.into(), true)
+}
+
+#[cfg(not(feature = "sim"))]
+fn bind_native(addr: SocketAddr, ipv6_only: bool) -> io::Result<TcpListener> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(addr),
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    if addr.is_ipv6() {
+        socket.set_only_v6(ipv6_only)?;
+    }
+    socket.set_nonblocking(true)?;
+    socket.set_reuse_address(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    TcpListener::from_std(socket.into())
 }
 
 /// A framed TCP connection. Framing limits and protocol policy belong to the caller.
@@ -114,4 +132,17 @@ pub async fn serve_http(
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown)
         .await
+}
+
+#[cfg(all(test, not(feature = "sim")))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ipv6_only_listener_does_not_enable_ipv4_mapped_connections() {
+        let listener = bind_ipv6("[::]:0".parse().unwrap()).await.unwrap();
+        assert!(socket2::SockRef::from(&listener).only_v6().unwrap());
+        let mapped = bind_ipv6("[::ffff:127.0.0.1]:0".parse().unwrap()).await;
+        assert_eq!(mapped.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+    }
 }

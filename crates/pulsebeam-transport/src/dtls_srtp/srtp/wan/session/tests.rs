@@ -119,6 +119,95 @@ fn authenticated_offer_retries_lost_accept_and_each_direction_proves_its_path() 
     assert!(client.lease(expired).is_none());
 }
 
+#[test]
+fn live_deadline_renewal_keeps_window_without_extending_prepared_packets() {
+    use crate::dtls_srtp::wan::{
+        Direction,
+        handoff::{Dropped, Submission},
+    };
+    use std::num::NonZeroU32;
+
+    let client_id = LocalIdentity::generate().unwrap();
+    let server_id = LocalIdentity::generate().unwrap();
+    let now = Instant::now();
+    let mut client = session(Role::Client, &client_id, &server_id, now);
+    let mut server = session(Role::Server, &server_id, &client_id, now);
+    let mut wire = Wire::default();
+    client.tick(now, &mut wire.send(false)).unwrap();
+    server.tick(now, &mut wire.send(true)).unwrap();
+    wire.deliver(now, &mut client, &mut server);
+
+    let expires = now + Duration::from_millis(100);
+    let renewed_until = now + Duration::from_millis(200);
+    let outbound = LiveDeadline::new(expires);
+    let inbound = LiveDeadline::new(expires);
+    let spec = WindowSpec {
+        authority: NonZeroU64::MIN,
+        direction: Direction::Send,
+        start: 0,
+        ssrc: NonZeroU32::MIN,
+        purpose: Purpose::Live,
+        expires,
+    };
+    let send = client
+        .stage_window_with_deadline(now, binding(true), spec, Some(outbound.clone()))
+        .unwrap();
+    let receive = server
+        .stage_window_with_deadline(
+            now,
+            binding(false),
+            WindowSpec {
+                direction: Direction::Receive,
+                ..spec
+            },
+            Some(inbound.clone()),
+        )
+        .unwrap();
+    client.activate_window(now, send).unwrap();
+    server.activate_window(now, receive).unwrap();
+
+    let rtp = |seq| [0x80, 0xe6, 0, seq, 1, 2, 3, 4, 0, 0, 0, 1, 0x65, 0x88];
+    let queued = client.prepare_media(now, send, 1, &rtp(1)).unwrap();
+    assert!(outbound.renew(now, renewed_until));
+    assert!(inbound.renew(now, renewed_until));
+    assert!(matches!(
+        client.submit_media(expires, queued, &mut |_, _| panic!(
+            "expired prepared packet"
+        )),
+        Submission::Dropped(Dropped::Stale)
+    ));
+
+    let packet = client.prepare_media(expires, send, 2, &rtp(2)).unwrap();
+    assert!(matches!(
+        client.submit_media(expires, packet, &mut wire.send(false)),
+        Submission::Accepted { .. }
+    ));
+    let (_, sealed) = wire.frames.pop_front().unwrap();
+    let opened = server.open_media(expires, binding(false), &sealed).unwrap();
+    assert_eq!(opened.window, receive);
+    assert_eq!(opened.expires, renewed_until);
+    assert!(matches!(
+        server.open_media(expires, binding(false), &sealed),
+        Err(Error::Protection(_))
+    ));
+    let shortened_until = expires + Duration::from_millis(20);
+    assert!(inbound.renew(expires, shortened_until));
+    assert!(matches!(
+        server.open_media(shortened_until, binding(false), &sealed),
+        Err(Error::Window)
+    ));
+    assert!(!inbound.renew(shortened_until, renewed_until));
+    assert!(!outbound.renew(renewed_until, renewed_until + Duration::from_secs(1)));
+    assert!(matches!(
+        client.prepare_media(renewed_until, send, 3, &rtp(3)),
+        Err(Error::Window)
+    ));
+    assert!(matches!(
+        server.open_media(renewed_until, binding(false), &sealed),
+        Err(Error::Window)
+    ));
+}
+
 fn feedback_wire(session: &mut Session, now: Instant) -> Vec<u8> {
     let mut feedback = None;
     session

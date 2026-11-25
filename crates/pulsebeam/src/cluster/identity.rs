@@ -95,29 +95,40 @@ impl Identity {
                     && generation.get() == state.generation),
             "provisioned ownership identity does not match the node's next membership incarnation"
         );
-        let next = directory.join(NEXT);
-        match fs::remove_file(&next) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).context("removing interrupted membership replacement"),
-        }
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&next)
-            .context("creating membership identity replacement")?;
-        serde_json::to_writer(&mut file, &state).context("writing membership identity")?;
-        file.write_all(b"\n")?;
-        sync(&file).context("synchronizing membership identity replacement")?;
-        fs::rename(&next, directory.join(STATE)).context("committing membership identity")?;
-        sync(&File::open(directory)?).context("synchronizing membership identity directory")?;
+        replace_json(directory, STATE, NEXT, &state, sync)?;
         Ok(Self {
             node_id: state.node_id,
             generation: state.generation,
             _lock: lock,
         })
     }
+}
+
+pub(super) fn replace_json(
+    directory: &Path,
+    state: &str,
+    next: &str,
+    value: &impl Serialize,
+    sync: impl Fn(&File) -> std::io::Result<()>,
+) -> Result<()> {
+    let next = directory.join(next);
+    match fs::remove_file(&next) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("removing interrupted state replacement"),
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&next)
+        .context("creating state replacement")?;
+    serde_json::to_writer(&mut file, value).context("encoding durable state")?;
+    file.write_all(b"\n")?;
+    sync(&file).context("synchronizing state replacement")?;
+    fs::rename(&next, directory.join(state)).context("committing state replacement")?;
+    sync(&File::open(directory)?).context("synchronizing state directory")?;
+    Ok(())
 }
 
 fn create_directory(directory: &Path) -> Result<()> {

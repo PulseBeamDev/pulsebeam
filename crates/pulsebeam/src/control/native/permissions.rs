@@ -45,7 +45,7 @@ impl ResourcePermissions {
                     .as_ref()
                     .is_some_and(|source| self.can_lookup_source(source))
             }
-            None => false,
+            Some(wire::resource_spec::Declaration::SubscriptionSelector(_)) | None => false,
         }
     }
 

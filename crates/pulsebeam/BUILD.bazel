@@ -1,12 +1,12 @@
 load("//tools:calibration.bzl", "VARIANTS", "sfu_variant_sources")
 load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
-load("@rules_rust//cargo:defs.bzl", "cargo_toml_env_vars", "extract_cargo_lints")
+load("@rules_rust//cargo:defs.bzl", "cargo_build_script", "cargo_toml_env_vars", "extract_cargo_lints")
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test", "rust_clippy_test", "rustfmt_test", "rust_binary")
 
 package(default_visibility = ["//visibility:public"])
 filegroup(name = "workflow_inputs", srcs = glob(["*.md", "docs/**/*.md", "Justfile", "scripts/*.sh"], allow_empty = True))
 exports_files(["Cargo.toml"])
-filegroup(name = "cargo_metadata_inputs", srcs = glob(["Cargo.toml", "uniffi.toml", "src/**/*.rs", "benches/**/*.rs", "examples/**/*.rs"], allow_empty = True))
+filegroup(name = "cargo_metadata_inputs", srcs = glob(["Cargo.toml", "build.rs", "proto/**/*.proto", "uniffi.toml", "src/**/*.rs", "benches/**/*.rs", "examples/**/*.rs"], allow_empty = True))
 
 cargo_toml_env_vars(name = "cargo_env", src = "Cargo.toml", workspace = "//:Cargo.toml")
 extract_cargo_lints(name = "lints", manifest = "Cargo.toml", workspace = "//:Cargo.toml")
@@ -25,7 +25,19 @@ _DEPS = all_crate_deps(normal = True) + [
     "//crates/pulsebeam-runtime",
     "//crates/pulsebeam-membership",
     "//crates/pulsebeam-transport:dtls_srtp",
+    ":regional_proto",
 ]
+
+cargo_build_script(
+    name = "regional_proto",
+    srcs = ["build.rs"],
+    edition = crate_edition(),
+    aliases = aliases(build = True),
+    deps = all_crate_deps(build = True),
+    data = ["proto/regional_control.proto"],
+    tools = ["@protobuf//:protoc"],
+    build_script_env = {"PROTOC": "$(execpath @protobuf//:protoc)"},
+)
 
 rust_library(
     name = "pulsebeam",
@@ -61,7 +73,7 @@ sfu_variant_sources(glob(["README.md", "src/**"], exclude = ["src/bin/**"]))
     rustc_env_files = [":cargo_env"],
     lint_config = ":lints",
     aliases = aliases(),
-    deps = all_crate_deps(normal = True) + ["//crates/pulsebeam-udp:pulsebeam-udp-sim", "//crates/pulsebeam-queue:pulsebeam-queue", "//crates/pulsebeam-link:pulsebeam-link", "//crates/pulsebeam-core:pulsebeam-core-sim", "//crates/pulsebeam-proto:pulsebeam-proto-json", "//crates/pulsebeam-rtc:pulsebeam-rtc", "//crates/pulsebeam-steer:pulsebeam-steer", "//crates/pulsebeam-clock", "//crates/pulsebeam-runtime:pulsebeam-runtime-sim", "//crates/pulsebeam-membership:pulsebeam-membership-sim", "//agents/pulsebeam-agent-quic:pulsebeam-agent-quic-sim", "//crates/pulsebeam-transport:dtls_srtp"],
+    deps = all_crate_deps(normal = True) + ["//crates/pulsebeam-udp:pulsebeam-udp-sim", "//crates/pulsebeam-queue:pulsebeam-queue", "//crates/pulsebeam-link:pulsebeam-link", "//crates/pulsebeam-core:pulsebeam-core-sim", "//crates/pulsebeam-proto:pulsebeam-proto-json", "//crates/pulsebeam-rtc:pulsebeam-rtc", "//crates/pulsebeam-steer:pulsebeam-steer", "//crates/pulsebeam-clock", "//crates/pulsebeam-runtime:pulsebeam-runtime-sim", "//crates/pulsebeam-membership:pulsebeam-membership-sim", "//agents/pulsebeam-agent-quic:pulsebeam-agent-quic-sim", "//crates/pulsebeam-transport:dtls_srtp", ":regional_proto"],
     proc_macro_deps = all_crate_deps(proc_macro = True),
 ) for variant in ["control"] + VARIANTS]
 
@@ -110,8 +122,10 @@ rust_test(
     crate_features = ["transport-conformance"],
     args = [
         "node::transport_conformance::",
+        "protected_boundary_datagrams_reach_only_exactly_acknowledged_shard_windows",
         "sparse_repair_requires_exact_receipt_and_live_parent",
         "provisioned_reverse_and_wan_sockets_cannot_activate_either_carrier",
+        "wan_host_receives_only_controller_scoped_commits_and_fences_on_peer_close",
         "filtered_fabric_dd_switch_on_installed_fid_and_nonfragmenting_socket",
         "dd_free_h264_repairs_at_exact_protected_ceiling_on_participant_udp",
         "maximum_native_data_record_crosses_capped_dtls13_udp",
@@ -153,10 +167,11 @@ rust_test(
     edition = crate_edition(),
     lint_config = ":lints",
     deps = [
-        "@crates//:anyhow", "@crates//:chitchat", "@crates//:serde",
-        "@crates//:serde_json", "@crates//:tempfile",
-        "@crates//:toml", "@crates//:tracing",
-        "//crates/pulsebeam-core", "//crates/pulsebeam-link", "//crates/pulsebeam-membership", "//crates/pulsebeam-runtime",
+        "@crates//:anyhow", "@crates//:base64", "@crates//:chitchat", "@crates//:serde",
+        "@crates//:serde_json", "@crates//:sha3", "@crates//:tempfile",
+        "@crates//:toml", "@crates//:tracing", "@crates//:prost", "@crates//:tokio-stream",
+        "@crates//:tonic", "@crates//:tonic-prost", "@crates//:rcgen", ":regional_proto",
+        "//crates/pulsebeam-core", "//crates/pulsebeam-link", "//crates/pulsebeam-membership", "//crates/pulsebeam-proto", "//crates/pulsebeam-runtime",
     ],
     proc_macro_deps = ["@crates//:async-trait"],
 )

@@ -33,6 +33,7 @@ fn page(id: u64) -> CatalogPageRecord {
         room: String::from("room"),
         revision: 1,
         complete: true,
+        partial: false,
         has_more: false,
         next_cursor: vec![],
         cursor_expires_at_unix_seconds: 0,

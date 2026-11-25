@@ -401,8 +401,12 @@ impl Links {
         self.host.is_some() || !self.wan.is_empty()
     }
 
-    pub(super) fn has_peer(&self, peer: pulsebeam_link::NetworkId) -> bool {
-        self.peers.contains_key(&peer) || self.wan.contains_key(&peer)
+    pub(super) fn accepts_ownership(&self, peer: NetworkId) -> bool {
+        self.peers.contains_key(&peer)
+            || self
+                .wan
+                .get(&peer)
+                .is_some_and(|wan| wan.carriage == wan::Carriage::Ownership)
     }
 
     pub(super) fn send_live(&self, binding: BindingId) -> bool {

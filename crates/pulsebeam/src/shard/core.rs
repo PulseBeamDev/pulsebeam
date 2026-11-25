@@ -1283,9 +1283,6 @@ impl ShardExecution {
                 timing: None,
             });
         }
-        if publisher.emission.profile() != pulsebeam_core::fabric::Profile::Opus {
-            return None;
-        }
         let (participant, source) = self.rtp_publisher_source(publisher)?;
         if !self.fabric_publisher_authorized(participant, source) {
             return None;
@@ -1341,10 +1338,12 @@ impl ShardExecution {
                     pulsebeam_core::fabric::Profile::Data => identity
                         .data_publisher()
                         .and_then(|publisher| self.data_publisher_source(publisher)),
-                    pulsebeam_core::fabric::Profile::Opus if cfg!(feature = "sim") => {
-                        self.rtp_publisher_source(identity)
+                    pulsebeam_core::fabric::Profile::Opus
+                    | pulsebeam_core::fabric::Profile::H264
+                    | pulsebeam_core::fabric::Profile::Av1 => self.rtp_publisher_source(identity),
+                    pulsebeam_core::fabric::Profile::Vp8 | pulsebeam_core::fabric::Profile::Vp9 => {
+                        None
                     }
-                    _ => None,
                 };
                 let Some((publisher, source)) = binding else {
                     return false;

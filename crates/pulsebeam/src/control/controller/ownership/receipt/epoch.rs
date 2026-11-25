@@ -138,6 +138,14 @@ impl Trust {
         Ok(())
     }
 
+    pub(in crate::control) fn pinned_origins(
+        &self,
+    ) -> impl Iterator<Item = (NodeId, NonZeroU64)> + '_ {
+        self.peers
+            .values()
+            .map(|peer| (peer.issuer.node, peer.issuer.incarnation))
+    }
+
     pub(in crate::control) fn checkpoint(&self) -> Checkpoint {
         Checkpoint {
             issuer: self.issuer,
@@ -226,6 +234,20 @@ impl Trust {
 
     pub(in crate::control) fn admission_ready(&self, now: Instant) -> bool {
         self.require_fresh_views(now).is_ok()
+    }
+
+    pub(in crate::control) fn claim_views_ready(
+        &self,
+        now: Instant,
+        mut current: impl FnMut(NodeId, NonZeroU64, NonZeroU64) -> bool,
+    ) -> bool {
+        !self.blocked()
+            && self.peers.values().all(|peer| {
+                peer.view.as_ref().is_some_and(|view| {
+                    now < view.deadline
+                        && current(peer.issuer.node, peer.issuer.incarnation, view.revision)
+                })
+            })
     }
 
     fn retired(&self, key: Key) -> bool {

@@ -158,7 +158,6 @@ pub(crate) struct CompiledPublisherSend {
     pub publisher: crate::shard_update::PublisherAnchor,
     pub shard: crate::id::ShardId,
     pub next: LiveNextHop,
-    pub expires_at: Instant,
     pub tx: crate::link::wan_host::WanTx,
 }
 
@@ -171,7 +170,7 @@ impl hop_expectations::Path for CompiledPublisherSend {
     }
 
     fn deadline(&self) -> Instant {
-        self.expires_at
+        self.tx.expires()
     }
 }
 
@@ -206,7 +205,6 @@ impl PublisherSendChange {
 pub(crate) struct CompiledLiveRelay {
     pub input: LiveNetworkChild,
     pub next: LiveNextHop,
-    pub expires_at: Instant,
     pub tx: crate::link::wan_host::WanTx,
 }
 

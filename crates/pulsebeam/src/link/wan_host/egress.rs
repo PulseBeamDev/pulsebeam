@@ -16,11 +16,18 @@ pub(super) struct Egress {
 
 struct Active {
     route: Staged<Window>,
+    deadline: Option<wan::LiveDeadline>,
     cutoff: BindingCutoff,
     parent: Option<BindingCutoff>,
 }
 
 impl Active {
+    fn expires(&self) -> std::time::Instant {
+        self.deadline
+            .as_ref()
+            .map_or_else(|| self.route.spec().expires, wan::LiveDeadline::expires)
+    }
+
     fn is_live(&self) -> bool {
         self.cutoff.is_live() && self.parent.as_ref().is_none_or(BindingCutoff::is_live)
     }
@@ -86,6 +93,7 @@ pub(crate) struct Install {
     window: Window,
     acknowledged: Window,
     spec: WindowSpec,
+    deadline: Option<wan::LiveDeadline>,
     report: oneshot::Sender<Result<(), Error>>,
 }
 
@@ -96,6 +104,7 @@ pub(crate) struct WanTx {
     window: Window,
     purpose: Purpose,
     expires: Instant,
+    deadline: Option<wan::LiveDeadline>,
     sender: pulsebeam_queue::Sender<Media>,
 }
 
@@ -134,6 +143,7 @@ impl SendFixture {
             window,
             purpose: Purpose::Live,
             expires,
+            deadline: None,
             sender,
         };
         (
@@ -148,6 +158,20 @@ impl SendFixture {
 }
 
 impl WanTx {
+    pub(crate) fn expires(&self) -> Instant {
+        self.deadline.as_ref().map_or(self.expires, |deadline| {
+            Instant::from_std(deadline.expires())
+        })
+    }
+
+    pub(crate) fn renew(&self, now: Instant, expires: Instant) -> bool {
+        self.is_live()
+            && self
+                .deadline
+                .as_ref()
+                .is_some_and(|deadline| deadline.renew(now.into_std(), expires.into_std()))
+    }
+
     pub(crate) fn is_live(&self) -> bool {
         self.cutoff.is_live() && self.parent.as_ref().is_none_or(BindingCutoff::is_live)
     }
@@ -170,7 +194,7 @@ impl WanTx {
         position: u64,
         packet: OwnedPacket,
     ) -> bool {
-        let deadline = deadline.min(self.expires);
+        let deadline = deadline.min(self.expires());
         if deadline <= now || !self.is_live() || !self.covers(position) {
             return false;
         }
@@ -234,15 +258,18 @@ impl Commands {
         window: Window,
         acknowledged: Window,
         spec: WindowSpec,
+        renewable: bool,
         parent: Option<SendParent>,
     ) -> Result<PendingTx, BindError> {
         let (report, receipt) = oneshot::channel();
+        let deadline = renewable.then(|| wan::LiveDeadline::new(spec.expires));
         let tx = WanTx {
             cutoff: cutoff.clone(),
             parent: parent.as_ref().map(|parent| parent.cutoff().clone()),
             window,
             purpose: spec.purpose,
             expires: Instant::from_std(spec.expires),
+            deadline: deadline.clone(),
             sender: self.media.clone(),
         };
         let pending = PendingTx {
@@ -255,6 +282,7 @@ impl Commands {
             window,
             acknowledged,
             spec,
+            deadline,
             report,
         })))?;
         Ok(pending)
@@ -275,7 +303,7 @@ impl Egress {
     pub(super) fn next_deadline(&self) -> Option<std::time::Instant> {
         self.routes
             .values()
-            .map(|active| active.route.spec().expires)
+            .map(Active::expires)
             .chain(
                 self.blocked
                     .as_ref()
@@ -296,7 +324,7 @@ impl Egress {
         let active = self.routes.get(&scope.window.ssrc())?;
         (now < scope.deadline
             && active.is_live()
-            && now.into_std() < active.route.spec().expires
+            && now.into_std() < active.expires()
             && active.cutoff.id() == scope.binding
             && active.route.descriptor() == scope.window)
             .then_some(active.route)
@@ -309,7 +337,7 @@ impl Egress {
         changed: bool,
     ) {
         self.routes.retain(|_, active| {
-            if changed || now.into_std() >= active.route.spec().expires || !active.is_live() {
+            if changed || now.into_std() >= active.expires() || !active.is_live() {
                 active.cutoff.fence();
                 driver.retire(active.route);
                 false
@@ -335,6 +363,7 @@ impl WanHost {
             window,
             acknowledged,
             spec,
+            deadline,
             report,
         } = install;
         if self
@@ -372,13 +401,17 @@ impl WanHost {
                     window: parent.window,
                     deadline: Instant::from_std(spec.expires),
                 };
-                self.egress.route(now, scope).is_some_and(|route| {
-                    let live = route.spec();
-                    live.purpose == Purpose::Live
-                        && live.authority == spec.authority
-                        && spec.expires <= live.expires
-                        && parent.window.repair_window(position, window.ssrc()).ok() == Some(window)
-                })
+                self.egress
+                    .route(now, scope)
+                    .and_then(|route| self.egress.routes.get(&route.descriptor().ssrc()))
+                    .is_some_and(|route| {
+                        let live = route.route.spec();
+                        live.purpose == Purpose::Live
+                            && live.authority == spec.authority
+                            && spec.expires <= route.expires()
+                            && parent.window.repair_window(position, window.ssrc()).ok()
+                                == Some(window)
+                    })
             }
             _ => false,
         };
@@ -392,7 +425,7 @@ impl WanHost {
             let _ = report.send(Err(Error::Binding));
             return;
         }
-        let route = match self.stage_send(now, window, spec) {
+        let route = match self.stage_send_with_deadline(now, window, spec, deadline.clone()) {
             Ok(route) => route,
             Err(error) => {
                 cutoff.fence();
@@ -407,6 +440,7 @@ impl WanHost {
                 window.ssrc(),
                 Active {
                     route,
+                    deadline,
                     cutoff,
                     parent: parent.map(|parent| parent.cutoff().clone()),
                 },

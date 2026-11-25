@@ -2382,6 +2382,73 @@ fn reconnect_posts_a_new_resource_and_swaps_only_after_the_candidate_is_ready() 
     );
     assert!(agent.snapshot().publications.contains_key("old-video"));
     assert!(agent.snapshot().remote_tracks.contains_key("old-video"));
+    let selector = agent
+        .open_subscription_selector(SubscriptionSelector {
+            participant_id: Some("remote".into()),
+            kind: Some(SelectorTrackKind::Video),
+            ..Default::default()
+        })
+        .unwrap();
+    let restore_match = |agent: &mut Agent, generation, channel, track_id: &str| {
+        let declarations: Vec<_> = native_connection::drain_batches(agent, generation, channel)
+            .into_iter()
+            .flat_map(|batch| {
+                assert!(
+                    batch.catalog_records.is_empty(),
+                    "selector does not require discovery"
+                );
+                batch.records
+            })
+            .filter_map(|record| {
+                let desired = record.desired?;
+                let state::desired_state::Value::Present(spec) = desired.value? else {
+                    return None;
+                };
+                matches!(
+                    &spec.declaration,
+                    Some(state::resource_spec::Declaration::SubscriptionSelector(_))
+                )
+                .then_some((record.owned, desired.revision, spec))
+            })
+            .collect();
+        let [(reference, revision, spec)] = declarations.as_slice() else {
+            panic!("expected one selector declaration: {declarations:?}");
+        };
+        let Some(state::resource_spec::Declaration::SubscriptionSelector(shape)) =
+            &spec.declaration
+        else {
+            panic!("expected subscription selector declaration");
+        };
+        assert_eq!(shape.participant_id.as_deref(), Some("remote"));
+        assert_eq!(shape.kind, Some(state::TrackKind::Video as i32));
+        assert_eq!(shape.track_id, None);
+        native_connection::observe(
+            agent,
+            generation,
+            channel,
+            vec![native_connection::confirmed(
+                state::resource_key::Key::Owned(*reference),
+                *revision,
+                state::confirmed_state::Value::SubscriptionSelector(Box::new(
+                    state::SubscriptionSelectorState {
+                        spec: Some(spec.as_ref().clone()),
+                        status: state::SelectorMatchStatus::Complete as i32,
+                        matches: vec![state::LogicalSourceAddress {
+                            room: "room".into(),
+                            participant_id: "remote".into(),
+                            kind: state::TrackKind::Video as i32,
+                            track_id: track_id.into(),
+                        }],
+                    },
+                )),
+            )],
+        );
+        let selected = agent.subscription_selector_state(selector).unwrap();
+        assert_eq!(selected.status, SelectorStatus::Complete);
+        assert!(matches!(selected.matches.as_slice(), [source] if source.track_id == track_id));
+        native_connection::drain_batches(agent, generation, channel);
+    };
+    restore_match(&mut agent, old_generation, control, "camera");
     let ResourceResult::Publication { owner, slot, .. } = agent
         .resource(ResourceCommand::ClaimPublication {
             spec: TrackSpec::Video {
@@ -2491,9 +2558,20 @@ fn reconnect_posts_a_new_resource_and_swaps_only_after_the_candidate_is_ready() 
                 slot: MediaSlot::LocalVideo(slot), format: None, video_codec: Some(VideoCodecRequirement::H264),
             }],
     ));
-    assert!(
-        agent.next_effect_after_turn().is_none(),
-        "no declarations without prepared resources"
+    let pending = agent.subscription_selector_state(selector).unwrap();
+    assert_eq!(pending.status, SelectorStatus::Pending);
+    assert!(pending.matches.is_empty());
+    native_connection::observe(
+        &mut agent,
+        replacement_generation,
+        replacement_cid,
+        vec![native_connection::grant(1)],
+    );
+    restore_match(
+        &mut agent,
+        replacement_generation,
+        replacement_cid,
+        "new-camera",
     );
     assert_eq!(agent.snapshot().generation, Some(replacement_generation));
     assert!(agent.snapshot().participants.is_empty());

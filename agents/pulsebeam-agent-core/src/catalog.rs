@@ -111,11 +111,11 @@ impl Catalogs {
         self.generation = None;
         self.pending.clear();
         for watch in self.watches.values_mut() {
-            if watch.state.status != WatchStatus::Loading || watch.state.page.is_some() {
+            if matches!(watch.state.status, WatchStatus::Live | WatchStatus::Partial) {
                 watch.state.observation_revision =
                     watch.state.observation_revision.saturating_add(1);
+                watch.state.status = WatchStatus::Stale;
             }
-            watch.state.status = WatchStatus::Loading;
             watch.state.page = None;
             watch.wire = None;
             watch.assembler = None;
@@ -179,6 +179,7 @@ impl Catalogs {
             .find(|(_, watch)| watch.wire == Some(id))?
             .0;
         let watch = self.watches.get_mut(&owner)?;
+        let mut status = WatchStatus::Failed;
         let failure = match record.response? {
             wire::catalog_server_record::Response::Error(error) => error
                 .failure
@@ -190,8 +191,14 @@ impl Catalogs {
                         wire::FailureCode::Incompatible | wire::FailureCode::Unsupported => {
                             ErrorCode::Unsupported
                         }
-                        wire::FailureCode::CapacityExceeded => ErrorCode::CapacityExceeded,
-                        wire::FailureCode::ResourceGone => ErrorCode::Closed,
+                        wire::FailureCode::CapacityExceeded => {
+                            status = WatchStatus::ResetRequired;
+                            ErrorCode::CapacityExceeded
+                        }
+                        wire::FailureCode::ResourceGone => {
+                            status = WatchStatus::ResetRequired;
+                            ErrorCode::Closed
+                        }
                         _ => ErrorCode::Internal,
                     };
                     ErrorInfo::new(code, "Catalog watch failed")
@@ -209,7 +216,10 @@ impl Catalogs {
                         return (watch.state.observation_revision != before)
                             .then(|| (owner, watch.state.clone()));
                     }
-                    Err(error) => error,
+                    Err(error) => {
+                        status = WatchStatus::ResetRequired;
+                        error
+                    }
                 }
             }
         };
@@ -223,7 +233,7 @@ impl Catalogs {
             },
         );
         watch.state.page = None;
-        watch.state.status = WatchStatus::Failed;
+        watch.state.status = status;
         watch.state.error = Some(failure);
         watch.state.observation_revision = watch.state.observation_revision.saturating_add(1);
         Some((owner, watch.state))
@@ -286,7 +296,11 @@ impl Catalogs {
             .collect::<Result<Vec<_>, ErrorInfo>>()?;
         watch.committed_revision = page.revision;
         watch.assembler = None;
-        watch.state.status = WatchStatus::Live;
+        watch.state.status = if page.partial {
+            WatchStatus::Partial
+        } else {
+            WatchStatus::Live
+        };
         watch.state.page = Some(
             CatalogPage {
                 revision: page.revision,

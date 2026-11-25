@@ -181,6 +181,7 @@ mod discovery;
 mod incident;
 mod logical;
 mod revocation;
+mod selectors;
 mod source_wait;
 use revocation::PermissionSweep;
 use source_wait::SourceWait;
@@ -218,7 +219,8 @@ impl DataBranchIds {
 pub(crate) struct NativeSession {
     binding_profile: validation::BindingProfile,
     pub(crate) cid: Option<ChannelId>,
-    incident_context: Option<(ProjectId, ConnectionId)>,
+    connection_identity: Option<(ProjectId, ConnectionId)>,
+    selectors: selectors::Selectors,
     pub(crate) catalog: catalog::CatalogSession,
     catalog_first: bool,
     rows: BTreeMap<Key, Row>,
@@ -323,7 +325,7 @@ impl NativeSession {
         self.charge(previous, confirmed_bytes(&value).saturating_add(overhead))?;
         let version = self.next_version()?;
         if let Some(row) = self.rows.get_mut(&key) {
-            if let (Some(context), Key::Owned(owned)) = (self.incident_context, &key) {
+            if let (Some(context), Key::Owned(owned)) = (self.connection_identity, &key) {
                 incident::subscription_changed(context, *owned, Some(&row.value), &value);
             }
             row.value = value;
@@ -340,7 +342,7 @@ impl NativeSession {
             return Ok(());
         }
         self.ordinal = self.ordinal.checked_add(1).ok_or(OutputError::Capacity)?;
-        if let (Some(context), Key::Owned(owned)) = (self.incident_context, &key) {
+        if let (Some(context), Key::Owned(owned)) = (self.connection_identity, &key) {
             incident::subscription_changed(context, *owned, None, &value);
         }
         self.order.insert(self.ordinal, key.clone());
@@ -591,6 +593,7 @@ impl NativeSession {
                 );
             self.permissions = permissions;
             self.permissions_changed();
+            self.reset_selector_scans()?;
         }
         self.grant_revision = revision;
         self.cancel_unsent_catalog()?;
@@ -681,9 +684,7 @@ impl NativeSession {
                     .rows
                     .get(&Key::Owned(reference))
                     .and_then(|row| row.owned.as_ref())
-                    .is_some_and(|owned| {
-                        !owned.retired && observed_address(&owned.declaration).is_some()
-                    })
+                    .is_some_and(|owned| !owned.retired && is_observed_intent(&owned.declaration))
             {
                 self.finish_source_lookup(reference, wire::AbsenceReason::Removed)?;
             }
@@ -828,7 +829,7 @@ impl NativeSession {
                     .rows
                     .get(&key)
                     .and_then(|row| row.owned.as_ref())
-                    .is_some_and(|owned| observed_address(&owned.declaration).is_some())
+                    .is_some_and(|owned| is_observed_intent(&owned.declaration))
                 {
                     let previous = self
                         .rows
@@ -912,11 +913,11 @@ impl NativeSession {
                 )?;
                 continue;
             }
-            if !self.permissions.permits_intent(spec) {
+            if !self.permits_owned_intent(spec) {
                 if existing.is_some() {
                     let previous = existing.map_or(0, |owned| owned.target.encoded_len());
-                    let lookup = existing
-                        .is_some_and(|owned| observed_address(&owned.declaration).is_some());
+                    let lookup =
+                        existing.is_some_and(|owned| is_observed_intent(&owned.declaration));
                     self.charge(previous, target.encoded_len())
                         .map_err(|_| InputError::Capacity)?;
                     self.rows
@@ -955,6 +956,7 @@ impl NativeSession {
                 continue;
             }
             if !live_fits(spec)
+                || (selector_spec(spec).is_some() && is_new && self.selectors.full())
                 || (publication_key(spec).is_some()
                     && is_new
                     && self.publications.len() >= MAX_PUBLICATIONS)
@@ -967,7 +969,7 @@ impl NativeSession {
                 continue;
             }
             let accepted_revision = target.revision;
-            let observes_source = observed_address(spec).is_some();
+            let observes_source = is_observed_intent(spec);
             let previous = self
                 .rows
                 .get(&key)
@@ -1030,6 +1032,7 @@ impl NativeSession {
         reason: wire::AbsenceReason,
     ) -> Result<(), OutputError> {
         let key = Key::Owned(reference);
+        self.selectors.remove(reference);
         let (revision, target_bytes) = {
             let row = self.rows.get(&key).ok_or(OutputError::InvalidObservation)?;
             let owned = row.owned.as_ref().ok_or(OutputError::InvalidObservation)?;
@@ -1174,6 +1177,15 @@ impl NativeSession {
                 next.spec = Some(spec);
                 Value::LogicalSubscription(Box::new(next))
             }
+            Some(Declaration::SubscriptionSelector(_)) => {
+                let previous = match current {
+                    Some(Value::SubscriptionSelector(previous)) => Some(previous.as_ref()),
+                    _ => None,
+                };
+                Value::SubscriptionSelector(Box::new(
+                    self.selectors.project(reference, spec, previous),
+                ))
+            }
             _ => return Err(InputError::Capacity),
         };
         let mut value = confirmed(projected);
@@ -1210,6 +1222,7 @@ impl NativeSession {
                     wire::confirmed_state::Value::Owned(_)
                         | wire::confirmed_state::Value::SourceLookup(_)
                         | wire::confirmed_state::Value::LogicalSubscription(_)
+                        | wire::confirmed_state::Value::SubscriptionSelector(_)
                 )
             ) {
                 owned.retired = true;
@@ -2730,7 +2743,10 @@ pub(crate) fn failure(code: wire::FailureCode) -> wire::Failure {
 fn confirmed_bytes(value: &wire::ConfirmedState) -> usize {
     if matches!(
         value.value,
-        Some(wire::confirmed_state::Value::LogicalSubscription(_))
+        Some(
+            wire::confirmed_state::Value::LogicalSubscription(_)
+                | wire::confirmed_state::Value::SubscriptionSelector(_)
+        )
     ) {
         // Pay for a full confirmation on admission, not when a source appears.
         codec::MAX_FRAME_SIZE
@@ -2756,6 +2772,17 @@ fn observed_address(spec: &wire::ResourceSpec) -> Option<&wire::LogicalSourceAdd
         Declaration::LogicalSubscription(subscription) => subscription.source.as_ref(),
         _ => None,
     }
+}
+
+fn selector_spec(spec: &wire::ResourceSpec) -> Option<&wire::SubscriptionSelectorSpec> {
+    match spec.declaration.as_ref()? {
+        wire::resource_spec::Declaration::SubscriptionSelector(selector) => Some(selector),
+        _ => None,
+    }
+}
+
+fn is_observed_intent(spec: &wire::ResourceSpec) -> bool {
+    observed_address(spec).is_some() || selector_spec(spec).is_some()
 }
 
 fn enabled(spec: &wire::ResourceSpec) -> bool {

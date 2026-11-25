@@ -177,7 +177,7 @@ impl FabricSource {
         let routes = publisher_sends
             .iter()
             .map(|hop| &hop.route)
-            .filter(|route| route.expires_at > now && route.tx.is_live())
+            .filter(|route| route.tx.expires() > now && route.tx.is_live())
             .filter(|route| wan_peers.insert(route.next.peer));
         if !data_expectations
             .get_or_insert_with(Box::default)
@@ -1748,7 +1748,7 @@ impl ShardRuntime {
         now: pulsebeam_runtime::time::Instant,
     ) -> bool {
         if route.shard != self.shard_id
-            || now >= route.expires_at
+            || now >= route.tx.expires()
             || !route.tx.is_live()
             || !lifetime.is_live()
         {
@@ -1772,7 +1772,7 @@ impl ShardRuntime {
         {
             return false;
         }
-        publisher_sends.retain(|hop| hop.route.tx.is_live() && now < hop.route.expires_at);
+        publisher_sends.retain(|hop| hop.route.tx.is_live() && now < hop.route.tx.expires());
         if !lifetime.is_live() {
             return false;
         }
@@ -2176,7 +2176,7 @@ impl ShardRuntime {
         }
         let peer_repair = publisher_sends
             .iter()
-            .any(|hop| now < hop.route.expires_at && hop.route.tx.is_live());
+            .any(|hop| now < hop.route.tx.expires() && hop.route.tx.is_live());
         let clock = &mut bound.publisher_clock;
         let mut assigned = None;
         let Some((sequence, hops, mut report)) =
@@ -2308,7 +2308,7 @@ impl ShardRuntime {
                 if let Some(outcome) = crate::route::fabric::relay::offer_live_network(
                     &mut hop.admissions,
                     &hop.route.tx,
-                    hop.route.expires_at,
+                    hop.route.tx.expires(),
                     &frozen,
                     now,
                 ) {
@@ -2865,7 +2865,7 @@ impl ShardRuntime {
         route.tx.is_live()
             && publisher_sends
                 .iter()
-                .any(|hop| hop.route.matches(route) && now < hop.route.expires_at)
+                .any(|hop| hop.route.matches(route) && now < hop.route.tx.expires())
     }
 
     pub(super) fn observe_publisher_data_expectation(
@@ -2997,7 +2997,7 @@ impl ShardRuntime {
                 let child = children
                     .iter()
                     .find(|child| child.spec == route.input && child.lifetime.is_live())?;
-                (bound, Some(child.ingress), route.expires_at)
+                (bound, Some(child.ingress), route.tx.expires())
             }
             MediaRepairParent::Publisher(route) => {
                 let bound = self.fabric_sources.get(publisher_source?)?;
@@ -3012,7 +3012,7 @@ impl ShardRuntime {
                 {
                     return None;
                 }
-                (bound, None, route.expires_at)
+                (bound, None, route.tx.expires())
             }
         };
         let (packet, cached_until) =

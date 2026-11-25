@@ -1,7 +1,7 @@
 # `pulsebeam-cli`
 
-Headless load and benchmark client for a running PulseBeam server. The current
-`bench` creates rooms of `pulsebeam-agent-native` peers, publishes the embedded
+Command-line tools for operating and benchmarking PulseBeam. The `bench`
+command creates rooms of `pulsebeam-agent-native` peers, publishes the embedded
 encoded fixtures, and records latency and transport snapshots as CSV. Each peer
 selects up to seven remote camera tracks from the first live catalog page,
 requested with a limit of 500 participants. It does not scan subsequent pages.
@@ -80,6 +80,40 @@ or installed route is not proof of delivery. If lookback is missing, widen the
 export within the authorized retention period. Expired evidence cannot be
 reconstructed from names. Keep exports and reports access-restricted and
 short-lived: these runtime IDs are pseudonymous, not anonymous.
+
+## Move a native publisher between provisioned nodes
+
+Enable `--operator-socket` on the source and destination servers. Run the CLI
+locally as the server user, with `--data-dir` pointing to that server's data
+directory. The CLI reads one JSON request from stdin and returns one JSON
+response. Supply a current token for the publisher and room in the top-level
+`token` field. Keep tokens out of command arguments and shell history. For
+example, pass a restricted request file with `pulsebeam-cli ownership --data-dir
+"$DATA_DIR" < "$REQUEST_FILE"`.
+
+1. On the destination, send `action: {"operation":"prepare_handoff","room":"general"}`.
+   Omit the top-level `connection` field. Save the entire `successor` object
+   from the `handoff_prepared` response. Preparation does not grant authority.
+2. On the source, set the top-level `connection` to the live predecessor's
+   `conn_*` ID. Send `action` with `operation: "handoff"`, the saved
+   `successor` object, and `sequence: 1` for the first move in this room and
+   participant scope. Increment the sequence for each subsequent move.
+3. Wait for `handoff_completed`, which means the predecessor stopped publishing
+   and all pinned peers committed the new fence. If the response is lost or
+   `outcome_unknown`, ask the source for `operation: "handoff_status"` with the
+   same predecessor connection, successor and sequence, plus the room in the
+   action. `handoff_pending` means delivery is still outstanding. Do not start
+   a new move or substitute a new successor to resolve a pending move.
+4. Start one fresh native admission for the same participant and room on the
+   destination. Verify the admitted connection matches `successor.connection`.
+   Completion of the handoff does not mean the publisher has connected or that
+   media is flowing.
+
+Prepare only when ready to move. Each destination generation holds up to 128
+unconsumed reservations, including abandoned ones. A reservation does not
+expire with time, so delayed delivery can still finish in that generation.
+Keep the destination generation running until the publisher is admitted. A
+new generation cannot use the old reservation or bypass an existing fence.
 
 ## Benchmark
 

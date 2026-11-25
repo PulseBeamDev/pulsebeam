@@ -385,19 +385,21 @@ impl Context {
             crate::MediaKind::Audio => Kind::Audio,
             crate::MediaKind::Video => Kind::Video,
         };
-        fn list(bindings: &Bindings, sending: bool) -> &[Binding] {
-            if sending {
-                bindings.publications.as_slice()
-            } else {
-                bindings.receptions.as_slice()
-            }
-        }
-        let active = list(&self.accepted.bindings, sending);
-        let index = active
-            .iter()
-            .position(|binding| binding.mid == mid)
+        let (active, retained) = if sending {
+            (
+                &mut self.accepted.bindings.publications,
+                &mut self.accepted.retained.publications,
+            )
+        } else {
+            (
+                &mut self.accepted.bindings.receptions,
+                &mut self.accepted.retained.receptions,
+            )
+        };
+        let binding = active
+            .iter_mut()
+            .find(|binding| binding.mid == mid)
             .ok_or_else(|| Error::Envelope(mid.into()))?;
-        let binding = &active[index];
         let codec = &binding.codec.parameters;
         if binding.kind != expected_kind
             || !(binding.complete() || sending && binding.identities_pending())
@@ -410,32 +412,21 @@ impl Context {
                     && codec.channels == expected.channels
                     && codec.fmtp == expected.fmtp
             })
-            || list(&self.accepted.retained, sending)
+            || retained
                 .iter()
                 .any(|binding| binding.mid != mid && binding.key == owner.key)
         {
             return Err(Error::Envelope(mid.into()));
         }
-        let retained = if sending {
-            &mut self.accepted.retained.publications
-        } else {
-            &mut self.accepted.retained.receptions
-        };
         let retained = retained
             .iter_mut()
             .find(|binding| binding.mid == mid)
             .ok_or(Error::CandidateState)?;
-        let mut claimed = binding.clone();
-        claimed.key = owner.key;
-        claimed.group = owner.group;
-        *retained = claimed.clone();
-        if sending {
-            self.accepted.bindings.publications[index] = claimed.clone();
-        } else {
-            self.accepted.bindings.receptions[index] = claimed.clone();
-        }
+        binding.key = owner.key;
+        binding.group = owner.group;
+        *retained = binding.clone();
         reservations.remove(mid);
-        Ok(claimed)
+        Ok(binding.clone())
     }
 
     /// Reconcile the current actual offer. Only new/replaced media need requests.

@@ -21,6 +21,7 @@ pub(crate) enum Resource {
     DataSubscription(String),
     LogicalReception(MediaSlot),
     LogicalData(TrackSelector),
+    SubscriptionSelector(u64),
     SourceLookup {
         room: String,
         participant_id: String,
@@ -36,6 +37,7 @@ impl Resource {
             Self::Reception(_) | Self::LogicalReception(_) => "media_subscription",
             Self::DataSubscription(_) | Self::LogicalData(_) => "data_subscription",
             Self::SourceLookup { .. } => "source_lookup",
+            Self::SubscriptionSelector(_) => "subscription_selector",
         }
     }
 
@@ -95,6 +97,10 @@ impl Resource {
                     && source.track_id == selector.track_id
             }),
             (
+                Self::SubscriptionSelector(owner),
+                Some(wire::resource_spec::Declaration::SubscriptionSelector(_)),
+            ) => *owner != 0,
+            (
                 Self::SourceLookup {
                     room,
                     participant_id,
@@ -119,7 +125,7 @@ impl Resource {
             | Self::LogicalReception(MediaSlot::LocalVideo(name) | MediaSlot::LocalAudio(name)) => {
                 name.len()
             }
-            Self::Reception(_) | Self::LogicalReception(_) => 0,
+            Self::Reception(_) | Self::LogicalReception(_) | Self::SubscriptionSelector(_) => 0,
             Self::DataSubscription(track) => track.len(),
             Self::LogicalData(selector) => selector
                 .room
@@ -1365,6 +1371,30 @@ impl NativeState {
         }
     }
 
+    pub(crate) fn selector_snapshot(&self, owner: u64) -> Option<&wire::SubscriptionSelectorState> {
+        if self.terminal || self.session.as_ref()?.authorization.is_none() {
+            return None;
+        }
+        let target = self.targets.get(&Resource::SubscriptionSelector(owner))?;
+        if target.spec.settings.as_ref()?.enabled != Some(true) {
+            return None;
+        }
+        let owned = self.owned.get(&target.reference?)?;
+        if owned.retiring || owned.awaiting_evaluation() {
+            return None;
+        }
+        let state = owned.confirmed.as_ref()?;
+        match state.value.as_ref()? {
+            wire::confirmed_state::Value::SubscriptionSelector(snapshot)
+                if state.rejection.is_none()
+                    && snapshot.spec.as_ref()?.settings.as_ref()?.enabled == Some(true) =>
+            {
+                Some(snapshot)
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn logical_offer(
         &self,
         resource: &Resource,
@@ -1478,6 +1508,7 @@ fn accepted_spec(state: &wire::ConfirmedState) -> Option<&wire::ResourceSpec> {
     match state.value.as_ref()? {
         wire::confirmed_state::Value::Owned(live) => live.spec.as_ref(),
         wire::confirmed_state::Value::SourceLookup(lookup) => lookup.spec.as_ref(),
+        wire::confirmed_state::Value::SubscriptionSelector(selector) => selector.spec.as_ref(),
         wire::confirmed_state::Value::LogicalSubscription(subscription) => {
             subscription.spec.as_ref()
         }

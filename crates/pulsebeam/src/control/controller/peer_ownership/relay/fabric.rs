@@ -120,10 +120,11 @@ pub(in crate::control) struct WanLiveRouteAck {
     pub publication: PublicationKey,
     pub incarnation: NonZeroU64,
     pub sequence_anchor: u64,
+    pub offer_cut: Option<NonZeroU64>,
     pub window: Window,
 }
 
-/// Only the explicitly selected WAN ownership exchange accepts this image.
+/// Wire form shared by WAN ownership exchanges and routed branch leases.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(in crate::control) struct WireWanLiveRouteAck {
@@ -132,6 +133,8 @@ pub(in crate::control) struct WireWanLiveRouteAck {
     publication: PublicationId,
     incarnation: NonZeroU64,
     sequence_anchor: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    offer_cut: Option<NonZeroU64>,
     extensions: u16,
     window: [u8; WINDOW_TUPLE_BYTES],
 }
@@ -144,9 +147,27 @@ impl From<WanLiveRouteAck> for WireWanLiveRouteAck {
             publication: ack.publication.publication_id(),
             incarnation: ack.incarnation,
             sequence_anchor: ack.sequence_anchor,
+            offer_cut: ack.offer_cut,
             extensions: ack.window.emission(),
             window: ack.window.to_tuple(),
         }
+    }
+}
+
+impl WireWanLiveRouteAck {
+    pub(in crate::control) fn decode(self) -> Option<WanLiveRouteAck> {
+        let window = Window::from_tuple(self.window, self.extensions).ok()?;
+        Some(WanLiveRouteAck {
+            room: ProjectRoomKey {
+                project: self.project,
+                room: self.room,
+            },
+            publication: PublicationKey::new(track_kind(window.profile()), self.publication),
+            incarnation: self.incarnation,
+            sequence_anchor: self.sequence_anchor,
+            offer_cut: self.offer_cut,
+            window,
+        })
     }
 }
 
@@ -160,20 +181,8 @@ pub(in crate::control) fn decode_wan(
     offers
         .into_iter()
         .map(|wire| {
-            let window = Window::from_tuple(wire.window, wire.extensions).ok()?;
-            if !keys.insert(window.ssrc()) {
-                return None;
-            }
-            Some(WanLiveRouteAck {
-                room: ProjectRoomKey {
-                    project: wire.project,
-                    room: wire.room,
-                },
-                publication: PublicationKey::new(track_kind(window.profile()), wire.publication),
-                incarnation: wire.incarnation,
-                sequence_anchor: wire.sequence_anchor,
-                window,
-            })
+            let ack = wire.decode()?;
+            keys.insert(ack.window.ssrc()).then_some(ack)
         })
         .collect()
 }
@@ -197,6 +206,7 @@ mod tests {
                 .fixture_publication(TrackKind::Video, "video"),
             incarnation: NonZeroU64::MIN,
             sequence_anchor: 0x17fff,
+            offer_cut: None,
             window: Window::new(
                 Profile::H264,
                 0x18000,

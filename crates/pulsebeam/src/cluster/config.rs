@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::io::Read;
 use std::net::{IpAddr, SocketAddr};
-use std::num::NonZeroU64;
+use std::num::{NonZeroU16, NonZeroU64};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
@@ -10,7 +10,13 @@ use pulsebeam_link::{NetworkClass, NetworkPeer, PeerFingerprint, PeerRole, Secre
 use pulsebeam_membership::NodeId;
 use serde::Deserialize;
 
-const MAX_PROVISIONED_PEERS: usize = 16;
+use super::{
+    declarations::Role,
+    hierarchy::{Adjacency, RegionTree, valid_region_name},
+    mesh::Member,
+};
+
+pub(crate) const MAX_PROVISIONED_PEERS: usize = 16;
 
 /// Identities pinned for one ownership Link. Never reuse a DTLS
 /// private key across committed incarnations or between nodes.
@@ -22,7 +28,7 @@ pub struct ProvisionedPeer {
     pub transport: NetworkPeer,
     /// Explicit programmatic selection of the WAN carrier, with no fallback.
     pub fabric_wan: bool,
-    /// Both pinned peers must support revision-1 Opus windows before enabling this.
+    pub regional_control: Option<RegionalControlConfig>,
     /// Explicitly allow WAN sources from this pinned upstream on this outgoing edge.
     pub relay_from: Option<NodeId>,
     pub authority_epoch: [u8; 16],
@@ -45,6 +51,57 @@ impl std::fmt::Debug for ProvisionedPeer {
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     pub cluster: Option<ClusterConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegionalControlConfig {
+    pub(crate) region: String,
+    pub(crate) role: Role,
+    pub(crate) peer_role: Role,
+    #[serde(default = "super::mesh::default_link_cost")]
+    pub(crate) link_cost: NonZeroU16,
+    pub(crate) listen: SocketAddr,
+    pub(crate) endpoint: SocketAddr,
+    pub(crate) peer_name: String,
+    pub(crate) certificate_pem: PathBuf,
+    pub(crate) private_key_pem: PathBuf,
+    pub(crate) peer_ca_pem: PathBuf,
+    pub(crate) peer_certificate_der: PathBuf,
+}
+
+impl RegionalControlConfig {
+    pub(super) fn scoped<'a>(
+        &self,
+        tree: &'a RegionTree,
+        local: (NodeId, NonZeroU64),
+        peer: (NodeId, NonZeroU64),
+    ) -> Result<Adjacency<'a>> {
+        let scope = tree
+            .adjacency(peer_member(local), peer_member(peer))
+            .context("regional adjacency is not authorized by the configured region tree")?;
+        ensure!(
+            scope.local_region == self.region && scope.roles == (self.role, self.peer_role),
+            "regional adjacency identity or roles do not agree with the region tree"
+        );
+        Ok(scope)
+    }
+
+    pub(crate) fn ipv6(addr: SocketAddr, listen: bool) -> Result<std::net::SocketAddrV6> {
+        let SocketAddr::V6(addr) = addr else {
+            anyhow::bail!("regional cluster requires IPv6 endpoints");
+        };
+        ensure!(
+            addr.port() != 0
+                && addr.scope_id() == 0
+                && addr.ip().to_ipv4_mapped().is_none()
+                && !addr.ip().is_multicast()
+                && !addr.ip().is_unicast_link_local()
+                && (listen || !addr.ip().is_unspecified()),
+            "invalid regional IPv6 endpoint"
+        );
+        Ok(addr)
+    }
 }
 
 impl ServerConfig {
@@ -109,19 +166,26 @@ impl ServerConfig {
             );
             seeds.insert(resolved);
         }
-        let ownership_peer = match cluster.ownership_peer {
-            Some(peer) => {
-                ensure!(
-                    cluster.topology == Topology::MultiNode,
-                    "[cluster.ownership_peer] requires multi_node topology"
-                );
-                Some(
-                    pulsebeam_runtime::task::spawn_blocking(move || peer.resolve())
-                        .await
-                        .context("ownership peer credential worker failed")??,
-                )
-            }
-            None => None,
+        let ownership_peers = if cluster.adjacency.is_empty() {
+            Vec::new()
+        } else {
+            ensure!(
+                cluster.topology == Topology::MultiNode,
+                "[[cluster.adjacency]] requires multi_node topology"
+            );
+            ensure!(
+                cluster.adjacency.len() <= MAX_PROVISIONED_PEERS,
+                "too many provisioned adjacencies"
+            );
+            pulsebeam_runtime::task::spawn_blocking(move || {
+                cluster
+                    .adjacency
+                    .into_iter()
+                    .map(PeerConfig::resolve)
+                    .collect::<Result<Vec<_>>>()
+            })
+            .await
+            .context("regional adjacency credential worker failed")??
         };
         let options = Options {
             cluster_id: cluster.id,
@@ -130,7 +194,8 @@ impl ServerConfig {
             advertise,
             seeds: seeds.into_iter().collect(),
             data_dir,
-            ownership_peers: ownership_peer.into_iter().collect(),
+            ownership_peers,
+            region_tree: cluster.region_tree,
         };
         options.validate_topology()?;
         Ok(Some(options))
@@ -148,7 +213,9 @@ pub struct ClusterConfig {
     seeds: Vec<String>,
     #[serde(default)]
     gossip: GossipConfig,
-    ownership_peer: Option<PeerConfig>,
+    #[serde(default)]
+    adjacency: Vec<PeerConfig>,
+    region_tree: Option<RegionTree>,
 }
 
 #[derive(Deserialize)]
@@ -166,15 +233,16 @@ struct PeerConfig {
     authority_epoch: String,
     receipt_key_file: PathBuf,
     peer_receipt_key: ApiPublicKey,
+    regional_control: RegionalControlConfig,
 }
 
 impl PeerConfig {
     fn resolve(self) -> Result<ProvisionedPeer> {
         let expected_peer = parse_hex(&self.peer_sha256)
             .map(PeerFingerprint::from_bytes)
-            .context("cluster.ownership_peer.peer_sha256 must be 64 hexadecimal digits")?;
+            .context("cluster.adjacency.peer_sha256 must be 64 hexadecimal digits")?;
         let authority_epoch = parse_hex(&self.authority_epoch)
-            .context("cluster.ownership_peer.authority_epoch must be 32 hexadecimal digits")?;
+            .context("cluster.adjacency.authority_epoch must be 32 hexadecimal digits")?;
         let signing_key =
             read_identity_file(&self.receipt_key_file).context("reading receipt signing key")?;
         let receipt_key = std::str::from_utf8(&signing_key)
@@ -193,7 +261,8 @@ impl PeerConfig {
             authority_epoch,
             receipt_key,
             peer_receipt_key: self.peer_receipt_key,
-            fabric_wan: false,
+            fabric_wan: true,
+            regional_control: Some(self.regional_control),
             relay_from: None,
             transport: NetworkPeer {
                 endpoint: self.peer_endpoint,
@@ -226,7 +295,7 @@ fn parse_hex<const N: usize>(input: &str) -> Option<[u8; N]> {
     Some(bytes)
 }
 
-fn read_identity_file(path: &Path) -> Result<Vec<u8>> {
+pub(super) fn read_identity_file(path: &Path) -> Result<Vec<u8>> {
     const MAX_DER_BYTES: u64 = 16 * 1024;
     ensure!(
         path.is_absolute(),
@@ -283,6 +352,7 @@ pub struct Options {
     pub seeds: Vec<SocketAddr>,
     pub data_dir: PathBuf,
     pub ownership_peers: Vec<ProvisionedPeer>,
+    pub region_tree: Option<RegionTree>,
 }
 
 impl Options {
@@ -305,7 +375,83 @@ impl Options {
         let mut endpoints = BTreeSet::new();
         let mut nodes = BTreeSet::new();
         let first = self.ownership_peers.first();
+        let regional = self
+            .ownership_peers
+            .iter()
+            .any(|peer| peer.regional_control.is_some());
+        if let Some(tree) = &self.region_tree {
+            let first =
+                first.context("region tree requires configured node identity and adjacencies")?;
+            ensure!(
+                tree.region(peer_member(first.local)).is_some(),
+                "local node is not in the configured region tree"
+            );
+            #[cfg(not(feature = "sim"))]
+            ensure!(
+                regional,
+                "region tree requires regional control adjacencies"
+            );
+        }
+        let mut local_region = None;
+        let mut control_listeners = BTreeSet::new();
+        let mut control_endpoints = BTreeSet::new();
+        if regional {
+            RegionalControlConfig::ipv6(self.listen, true)?;
+            RegionalControlConfig::ipv6(self.advertise, false)?;
+            for &seed in &self.seeds {
+                RegionalControlConfig::ipv6(seed, false)?;
+            }
+        }
         for peer in &self.ownership_peers {
+            if let Some(tree) = &self.region_tree {
+                ensure!(
+                    peer.relay_from.is_none()
+                        && tree
+                            .adjacency(peer_member(peer.local), peer_member(peer.remote))
+                            .is_some(),
+                    "hierarchical adjacencies must follow the configured region tree"
+                );
+            }
+            if regional {
+                let control = peer
+                    .regional_control
+                    .as_ref()
+                    .context("regional and legacy control peers cannot be mixed")?;
+                ensure!(
+                    valid_region_name(&control.region),
+                    "invalid regional control region name"
+                );
+                if let Some(tree) = &self.region_tree {
+                    control.scoped(tree, peer.local, peer.remote)?;
+                } else {
+                    ensure!(
+                        control.role.adjacent(control.peer_role),
+                        "invalid regional adjacency roles"
+                    );
+                }
+                let scope = (control.region.as_str(), control.role);
+                ensure!(
+                    local_region.get_or_insert(scope) == &scope,
+                    "all regional adjacencies must share a local region and role"
+                );
+                ensure!(
+                    peer.fabric_wan,
+                    "regional control requires a separate Fabric WAN association"
+                );
+                RegionalControlConfig::ipv6(peer.listen, false)?;
+                RegionalControlConfig::ipv6(peer.transport.endpoint, false)?;
+                RegionalControlConfig::ipv6(control.listen, true)?;
+                RegionalControlConfig::ipv6(control.endpoint, false)?;
+                ensure!(
+                    control_listeners.insert(control.listen)
+                        && control_endpoints.insert(control.endpoint),
+                    "regional control adjacencies require distinct listeners and endpoints"
+                );
+                ensure!(
+                    !control.peer_name.is_empty() && control.peer_name.len() <= 253,
+                    "regional control requires a provisioned peer certificate name"
+                );
+            }
             if let Some(upstream) = peer.relay_from {
                 ensure!(
                     peer.fabric_wan
@@ -337,7 +483,7 @@ impl Options {
             }
             ensure!(
                 self.topology == Topology::MultiNode,
-                "[cluster.ownership_peer] requires multi_node topology"
+                "provisioned peers require multi_node topology"
             );
             ensure!(
                 peer.local.0 != peer.remote.0,
@@ -380,8 +526,16 @@ impl Options {
             listeners.is_disjoint(&endpoints),
             "ownership listeners cannot also be peer endpoints"
         );
+        ensure!(
+            control_listeners.is_disjoint(&control_endpoints),
+            "control listeners cannot also be peer endpoints"
+        );
         Ok(())
     }
+}
+
+fn peer_member((node, generation): (NodeId, NonZeroU64)) -> Member {
+    Member { node, generation }
 }
 
 async fn resolve_host(host: &str, port: u16) -> Result<SocketAddr> {
@@ -467,31 +621,51 @@ mod tests {
     }
 
     #[pulsebeam_runtime::test(crate = "pulsebeam_runtime::__harness")]
-    async fn ownership_peer_requires_an_exact_pin_and_multi_node_topology() {
+    async fn regional_adjacencies_require_exact_pins_and_bounded_multi_node_configuration() {
         let local = NodeId::new();
         let remote = NodeId::new();
         let receipt_public = ApiSigningKey::from_seed([27; 32]).public_key();
-        let config = |topology: &str, fingerprint: &str| {
-            toml::from_str::<ServerConfig>(&format!(
-                "[cluster]\nid='test'\ntopology='{topology}'\nadvertise_host='127.0.0.1'\n\
-                 [cluster.gossip]\nlisten='127.0.0.1:7946'\n\
-                 [cluster.ownership_peer]\nlisten='127.0.0.1:9000'\n\
+        let config = |topology: &str, fingerprint: &str, count: usize| {
+            let mut body = format!(
+                "[cluster]\nid='test'\ntopology='{topology}'\nadvertise_host='::1'\n[cluster.gossip]\nlisten='[::1]:7946'\n"
+            );
+            let peer = format!(
+                "[[cluster.adjacency]]\nlisten='[::1]:9000'\n\
                  local_node='{local}'\nlocal_generation=2\npeer_node='{remote}'\npeer_generation=2\n\
-                 peer_endpoint='127.0.0.1:9001'\npeer_sha256='{fingerprint}'\n\
+                 peer_endpoint='[::1]:9001'\npeer_sha256='{fingerprint}'\n\
                  certificate_der='unused'\nkey_pkcs8_der='unused'\n\
                  authority_epoch='0123456789abcdef0123456789abcdef'\n\
-                 receipt_key_file='unused'\npeer_receipt_key='{receipt_public}'"
-            ))
-            .unwrap()
-            .resolve(Some("state".into()))
+                 receipt_key_file='unused'\npeer_receipt_key='{receipt_public}'\n\
+                 [cluster.adjacency.regional_control]\nregion='test'\nrole='edge'\npeer_role='router'\n\
+                 listen='[::1]:9002'\nendpoint='[::1]:9003'\npeer_name='router.example'\n\
+                 certificate_pem='unused'\nprivate_key_pem='unused'\npeer_ca_pem='unused'\npeer_certificate_der='unused'\n"
+            );
+            body.push_str(&peer.repeat(count));
+            let config = toml::from_str::<ServerConfig>(&body).unwrap();
+            assert_eq!(config.cluster.as_ref().unwrap().adjacency.len(), count);
+            config.resolve(Some("state".into()))
         };
         let valid = "aB".repeat(32);
         assert_eq!(parse_hex::<32>(&valid).unwrap(), [0xab; 32]);
         assert!(parse_hex::<32>(&"+a".repeat(32)).is_none());
-        let err = config("multi_node", "invalid").await.unwrap_err();
+        let err = config("multi_node", "invalid", 2).await.unwrap_err();
         assert!(format!("{err:#}").contains("peer_sha256"));
-        let err = config("single_node", &valid).await.unwrap_err();
+        let err = config("single_node", &valid, 1).await.unwrap_err();
         assert!(format!("{err:#}").contains("requires multi_node"));
+        let err = config(
+            "multi_node",
+            &valid,
+            MAX_PROVISIONED_PEERS.saturating_add(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("too many provisioned adjacencies"));
+        assert!(
+            toml::from_str::<ServerConfig>(
+                "[cluster]\nid='test'\nadvertise_host='::1'\n[cluster.ownership_peer]"
+            )
+            .is_err()
+        );
     }
 
     #[pulsebeam_runtime::test(crate = "pulsebeam_runtime::__harness")]

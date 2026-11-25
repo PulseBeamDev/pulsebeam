@@ -19,6 +19,36 @@ use crate::{
 use super::*;
 
 #[pulsebeam_runtime::test(crate = "pulsebeam_runtime::__harness")]
+async fn border_media_network_cannot_back_an_ownership_session() {
+    let origin = Instant::now();
+    let control = LinkControl::new(|| LinkTime::from_nanos(0)).unwrap();
+    let mut links = Links::new(control, Vec::new(), origin);
+    let (_host, provisioner) = wan_host::Service::bind("[::1]:0".parse().unwrap(), origin)
+        .await
+        .unwrap();
+    let network = links.reserve_wan_peer().unwrap();
+    let remote = SecretCredential::generate().unwrap();
+    let peer = NetworkPeer {
+        endpoint: "[::1]:9".parse().unwrap(),
+        expected_peer: remote.fingerprint(),
+        credential: SecretCredential::generate().unwrap(),
+        role: PeerRole::Initiator,
+        class: NetworkClass::Wan,
+    };
+    links
+        .attach_wan_host(
+            provisioner
+                .open_media(peer, network, NonZeroU64::MIN)
+                .unwrap(),
+            Carriage::Border,
+        )
+        .unwrap();
+    assert!(links.is_wan_peer(network));
+    assert!(!links.accepts_ownership(network));
+    assert!(links.wan_offers(network).is_empty());
+}
+
+#[pulsebeam_runtime::test(crate = "pulsebeam_runtime::__harness")]
 async fn wan_host_receives_only_controller_scoped_commits_and_fences_on_peer_close() {
     let origin = Instant::now();
     let mut control = LinkControl::new(move || {
@@ -55,8 +85,12 @@ async fn wan_host_receives_only_controller_scoped_commits_and_fences_on_peer_clo
         let (commands, receiver_lane) = provisioner
             .open(inbound.clone(), right, NonZeroU64::MIN, origin)
             .unwrap();
-        links.attach_wan_host(sender_commands).unwrap();
-        links.attach_wan_host(commands).unwrap();
+        links
+            .attach_wan_host(sender_commands, Carriage::Ownership)
+            .unwrap();
+        links
+            .attach_wan_host(commands, Carriage::Ownership)
+            .unwrap();
         (left, sender_lane, right, receiver_lane)
     };
     let (sender_peer, mut sender_lane, peer, mut receiver_lane) = initiate(&mut links);
@@ -120,6 +154,9 @@ async fn wan_host_receives_only_controller_scoped_commits_and_fences_on_peer_clo
         canonical_ingress: peer,
         start,
         forms: 0,
+        offer_cut: None,
+        regional: None,
+        routed: false,
         expires: now + Duration::from_secs(2),
         timing: None,
     };
@@ -180,6 +217,7 @@ async fn wan_host_receives_only_controller_scoped_commits_and_fences_on_peer_clo
             publication,
             incarnation: child.incarnation,
             sequence_anchor: 0,
+            offer_cut: None,
             window: live_window
         }]
     );
@@ -226,6 +264,8 @@ async fn wan_host_receives_only_controller_scoped_commits_and_fences_on_peer_clo
         sequence_anchor: 0,
         window_start: start,
         timing: None,
+        origin: None,
+        offer_cut: None,
     };
     let ack = offers[0];
     let deadline = now + Duration::from_secs(2);
@@ -238,16 +278,17 @@ async fn wan_host_receives_only_controller_scoped_commits_and_fences_on_peer_clo
                 ..ack
             },
             deadline,
+            false,
             now
         ),
         Err(BindError::Closed)
     ));
     assert!(matches!(
-        links.stage_wan_publisher_transport(sender_peer, source, ack, now, now),
+        links.stage_wan_publisher_transport(sender_peer, source, ack, now, false, now),
         Err(BindError::Closed)
     ));
     let (send_cutoff, mut pending) = links
-        .stage_wan_publisher_transport(sender_peer, source, ack, deadline, now)
+        .stage_wan_publisher_transport(sender_peer, source, ack, deadline, false, now)
         .unwrap();
     let tx = pulsebeam_runtime::time::timeout(timeout, async {
         loop {
@@ -259,6 +300,7 @@ async fn wan_host_receives_only_controller_scoped_commits_and_fences_on_peer_clo
     })
     .await
     .unwrap();
+    assert!(!tx.renew(now, deadline));
     let packet = FabricPacket::new(
         Header {
             profile: Profile::Data,
@@ -415,7 +457,7 @@ async fn wan_host_receives_only_controller_scoped_commits_and_fences_on_peer_clo
     };
     let now = Instant::now();
     assert!(matches!(
-        links.stage_wan_relay_transport(peer, child, relay_ack, deadline, now),
+        links.stage_wan_relay_transport(peer, child, relay_ack, deadline, false, now),
         Err(BindError::Closed)
     ));
     assert!(matches!(
@@ -427,12 +469,13 @@ async fn wan_host_receives_only_controller_scoped_commits_and_fences_on_peer_clo
                 ..relay_ack
             },
             deadline,
+            false,
             now
         ),
         Err(BindError::Closed)
     ));
     let (_, mut relay_pending) = links
-        .stage_wan_relay_transport(sender_peer, child, relay_ack, deadline, now)
+        .stage_wan_relay_transport(sender_peer, child, relay_ack, deadline, false, now)
         .unwrap();
     let relay_tx = pulsebeam_runtime::time::timeout(timeout, async {
         loop {
@@ -448,18 +491,101 @@ async fn wan_host_receives_only_controller_scoped_commits_and_fences_on_peer_clo
     let retired_label = [live_window.ssrc().get().to_be_bytes()];
     assert!(!links.accept_wan_retirements(sender_peer, &retired_label));
     assert!(relay_tx.is_live());
-    assert!(links.accept_wan_retirements(peer, &retired_label));
+    links.retain_wan_live_receives(peer, |current, ingress, children, _| {
+        assert_eq!(current, ack);
+        assert_eq!(ingress, peer);
+        assert_eq!(children, [child]);
+        false
+    });
     assert!(!live_cutoff.is_live());
     assert!(!relay_tx.is_live());
+    let mut replacement = spec();
+    replacement.live.publication = receiver.fixture_publication(TrackKind::Data, "replacement");
+    replacement.live.incarnation = NonZeroU64::new(2).unwrap();
+    replacement.live.addresses = vec![NodeRouteAddress::new(RouteId::new(ShardId::new(0), 2), 1)];
+    let replacement_source = WanSourceWindow {
+        publisher: PublisherAnchor {
+            publication: replacement.live.publication,
+            incarnation: replacement.live.incarnation,
+            ..source.publisher
+        },
+        ..source
+    };
+    let (committed, receipt) = oneshot::channel();
+    links.install_after(
+        replacement.live.addresses[0],
+        TrackRouteAction::Forward {
+            publication_id: replacement_source.publisher.publication,
+        },
+        Some(RouteScope {
+            room,
+            ingress: Some(peer),
+        }),
+        receipt,
+    );
+    committed.send(()).unwrap();
     let replacement_window = links
-        .stage_wan_live_receive(now, spec(), |child, _| {
+        .stage_wan_live_receive(now, replacement, |child, _| {
             let (installed, receipt) = oneshot::channel();
             installed.send(Some(child)).unwrap();
             receipt
         })
         .unwrap();
     assert_ne!(replacement_window.ssrc(), live_window.ssrc());
+    let replacement_ack = pulsebeam_runtime::time::timeout(timeout, async {
+        loop {
+            if let [ack] = links.wan_offers(peer).as_ref() {
+                break *ack;
+            }
+            pulsebeam_runtime::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(replacement_ack.window, replacement_window);
     assert!(!links.accept_wan_retirements(peer, &retired_label));
+    let (_, mut flight) = links
+        .stage_wan_publisher_transport(
+            sender_peer,
+            replacement_source,
+            replacement_ack,
+            deadline,
+            false,
+            now,
+        )
+        .unwrap();
+    let replacement_tx = pulsebeam_runtime::time::timeout(timeout, async {
+        loop {
+            if let Poll::Ready(tx) = flight.poll() {
+                break tx.unwrap();
+            }
+            pulsebeam_runtime::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(sender_lane.is_ready() && receiver_lane.is_ready());
+    let old_packet = FabricPacket::new(
+        Header {
+            sequence: packet.header().sequence + 1,
+            ..packet.header()
+        },
+        &[],
+        vec![0; 64].into_boxed_slice(),
+    )
+    .unwrap();
+    assert!(tx.try_send(Instant::now(), deadline, start + 1, old_packet));
+    assert!(replacement_tx.try_send(Instant::now(), deadline, start, packet.clone()));
+    assert!(
+        pulsebeam_runtime::time::timeout(timeout, mailbox.readable())
+            .await
+            .unwrap()
+    );
+    assert_eq!(mailbox.try_recv_batch(&mut frames, 2), 1);
+    assert!(
+        matches!(frames.pop().unwrap().packet, ShardFrame::FabricWanImage { image: NetworkPacket { window, position, .. }, .. }
+        if window == replacement_window && position == start)
+    );
     links.close_peer(peer);
     assert!(!relay_tx.try_send(Instant::now(), deadline, start, packet));
     assert!(links.wan_offers(peer).is_empty());

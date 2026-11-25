@@ -1,6 +1,7 @@
 use super::*;
 
 mod execution;
+mod selectors;
 mod source_lookup;
 
 #[test]

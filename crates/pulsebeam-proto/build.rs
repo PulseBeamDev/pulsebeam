@@ -57,6 +57,7 @@ fn main() {
         .boxed(".pulsebeam.media.v1.ConfirmedState.value.owned")
         .boxed(".pulsebeam.media.v1.ConfirmedState.value.source_lookup")
         .boxed(".pulsebeam.media.v1.ConfirmedState.value.logical_subscription")
+        .boxed(".pulsebeam.media.v1.ConfirmedState.value.subscription_selector")
         .skip_debug([".pulsebeam.media.v1.SuccessorReceipt"])
         .compile_protos(
             &["proto/state.proto", "proto/data_control.proto"],

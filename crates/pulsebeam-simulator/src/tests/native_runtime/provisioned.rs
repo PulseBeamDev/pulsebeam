@@ -10,11 +10,22 @@ use std::{
 };
 
 use anyhow::Context;
-use pulsebeam::cluster::{Options, ProvisionedPeer, Topology, prepare_provisioned_fixture};
+use pulsebeam::{
+    cluster::{Options, ProvisionedPeer, Topology, prepare_provisioned_fixture},
+    control::controller::SimStandbyControl,
+};
 use pulsebeam_core::{auth::ApiSigningKey, identity::NodeId};
 use pulsebeam_link::{NetworkClass, NetworkPeer, PeerRole, SecretCredential};
 use serde_json::{Value, json};
 use tracing_subscriber::{Layer, layer::SubscriberExt};
+
+mod regional;
+
+enum RoutingFixture<'a> {
+    Direct,
+    StaticTransit,
+    Regional(&'a mut regional::Fixture),
+}
 
 #[test]
 fn provisioned_native_cluster_relays_payload_and_reconstructs_incident() -> anyhow::Result<()> {
@@ -49,6 +60,464 @@ fn fabric_wan_diamond_converges() -> anyhow::Result<()> {
 #[test]
 fn provisioned_wan_opus_repairs_exact_position_on_fresh_window() -> anyhow::Result<()> {
     prove_provisioned_cluster(3, &[(0, 1), (1, 2)], core_ffi::TopicMode::Latest, true)
+}
+
+#[test]
+fn provisioned_wan_warm_video_switches_only_on_owner_selection() -> anyhow::Result<()> {
+    let seed = std::env::var("PULSEBEAM_SIM_SEED")
+        .map(|value| value.parse::<u64>())
+        .unwrap_or(Ok(NATIVE_RUNTIME_SEED))?;
+    let _sim_clocks = crate::sim_clock::SimClocksGuard::init();
+    crate::sim_rand::set_thread_rng(seed);
+    fastrand::seed(seed);
+    let subnet = reserve_subnet();
+    let ips = [1, 2, 3].map(|host| subnet_ip(subnet, host));
+    let client = subnet_ip(subnet, 4);
+    let mut sim = turmoil::Builder::new()
+        .simulation_duration(Duration::from_secs(25))
+        .rng_seed(seed)
+        .build();
+    let root = tempfile::tempdir()?;
+    let (tx, mut rx) = tokio::sync::mpsc::channel(3);
+    let identities = install_nodes(
+        &mut sim,
+        root.path(),
+        &ips,
+        &[(0, 1), (0, 2), (1, 2)],
+        seed,
+        Some(&tx),
+        RoutingFixture::Direct,
+    )?;
+    drop(tx);
+    sim.client(client, async move {
+        async move {
+            let key = pulsebeam_server::insecure_dev_api_key()?;
+            let wall_now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs();
+            let make_agent = |index: usize, subject, publisher| -> anyhow::Result<_> {
+                let signed = pulsebeam_server::sign_participant_token(
+                    &key,
+                    &serde_json::from_value(json!([
+                        {"rooms":["standby"],"allow":["join","publish","discover","subscribe"]}
+                    ]))?,
+                    subject,
+                    wall_now + 60,
+                )?;
+                let mut config = Config::new(pulsebeam_agent_core::AgentConfig {
+                    endpoint: format!("http://{}:7070", ips[index]),
+                    token: signed.token.clone(),
+                    retry: Default::default(),
+                    log_level: Default::default(),
+                });
+                if publisher {
+                    config.media.video_input = VideoInput::EncodedH264;
+                }
+                let host = NativeHost::bind(client)?;
+                let (runtime, actor) = RuntimeAgent::managed_with_services(
+                    config,
+                    Host::new(create_http_client()),
+                    move || host.runtime(),
+                )?;
+                tokio::task::spawn_local(actor);
+                runtime.join("standby".into())?;
+                Ok((runtime.clone(), Agent::from_runtime(runtime), signed.token))
+            };
+            let (owner_runtime, owner, owner_token) = make_agent(0, "owner", true)?;
+            let (encoder_runtime, encoder, encoder_token) = make_agent(1, "encoder", true)?;
+            let (_, viewer, _) = make_agent(2, "viewer", false)?;
+            let (_, primary_listener, _) = make_agent(0, "primary-listener", false)?;
+            let (_, standby_listener, _) = make_agent(1, "standby-listener", false)?;
+            let (_, _, viewing, _, _) = tokio::try_join!(
+                wait_connected(&owner, None),
+                wait_connected(&encoder, None),
+                wait_connected(&viewer, None),
+                wait_connected(&primary_listener, None),
+                wait_connected(&standby_listener, None),
+            )?;
+            let owner_connection = owner_runtime
+                .snapshot()
+                .connection_id
+                .context("owner connection")?;
+            let encoder_connection = encoder_runtime
+                .snapshot()
+                .connection_id
+                .context("encoder connection")?;
+            let primary = owner.video("camera".into())?.publish(None)?;
+            let standby = encoder.video("camera".into())?.publish(None)?;
+            let primary_input = owner.create_video_input(Default::default()).await?;
+            let standby_input = encoder.create_video_input(Default::default()).await?;
+            let _primary_pipe = primary_input.pipe_to(&primary)?;
+            let _standby_pipe = standby_input.pipe_to(&standby)?;
+            let subscribe = |viewer: &Agent, publisher: &str| -> anyhow::Result<_> {
+                Ok(viewer
+                    .room("standby".into())?
+                    .participant(publisher.into())?
+                    .video("camera".into())?
+                    .subscribe(None)?)
+            };
+            // Warm both encoders with local demand. The remote viewer is the decode oracle.
+            let _warm_primary = subscribe(&primary_listener, "owner")?;
+            let _warm_standby = subscribe(&standby_listener, "encoder")?;
+            let subscription = subscribe(&viewer, "owner")?;
+            let frames = subscription.frames()?;
+            use pulsebeam_testdata::QualityVideoSource::{One, Zero};
+            let pictures = [StandbyPicture::new(Zero)?, StandbyPicture::new(One)?];
+            let pump = async {
+                // Each warm encoder supplies periodic decoder entry points independently of PLI.
+                loop {
+                    primary_input
+                        .submit(pictures[0].input(primary_input.capture_time_us().await?))
+                        .await?;
+                    standby_input
+                        .submit(pictures[1].input(standby_input.capture_time_us().await?))
+                        .await?;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            };
+            let mut controls = std::collections::BTreeMap::new();
+            for _ in 0..3 {
+                let (index, control) = rx.recv().await.context("standby controller startup")?;
+                controls.insert(index, control);
+            }
+            let owner_control = &controls[&0];
+            let encoder_control = &controls[&1];
+            let generation = viewing.generation.context("viewer generation")?;
+            let scenario = async {
+                let (first, second) = tokio::try_join!(
+                    async { wait_publication_admitted(primary.updates()?.as_ref()).await },
+                    async { wait_publication_admitted(standby.updates()?.as_ref()).await }
+                )?;
+                let first_id = first
+                    .admission
+                    .publication_id
+                    .context("primary publication")?;
+                let second_id = second
+                    .admission
+                    .publication_id
+                    .context("standby publication")?;
+                tokio::try_join!(primary.ready(), standby.ready()).context("warm both encoders")?;
+                wait_mixed_video_installed(&subscription)
+                    .await
+                    .context("install primary video")?;
+                let before = decode_standby_picture(|| frames.next(), generation, &pictures, 0)
+                    .await
+                    .context("decode primary")?;
+                let grant = json!({
+                    "operation": "grant",
+                    "publication": {"video": first_id.as_str()},
+                    "encoder": {
+                        "node": identities[1].0,
+                        "generation": identities[1].1,
+                        "connection": encoder_connection.as_str(),
+                        "publication": {"video": second_id.as_str()},
+                        "track": "camera",
+                    },
+                    "expires_at": wall_now + 25,
+                });
+                submit_operator(
+                    owner_control,
+                    &encoder_token,
+                    Some(owner_connection.as_str()),
+                    &grant,
+                    "unauthorized",
+                )
+                .await
+                .context("reject standby encoder as owner")?;
+                let response = submit_operator(
+                    owner_control,
+                    &owner_token,
+                    Some(owner_connection.as_str()),
+                    &grant,
+                    "granted",
+                )
+                .await
+                .context("issue owner grant")?;
+                let delegation = response.get("delegation").context("standby delegation")?;
+                submit_operator(
+                    encoder_control,
+                    &encoder_token,
+                    Some(encoder_connection.as_str()),
+                    &json!({"operation": "advertise", "delegation": delegation}),
+                    "queued",
+                )
+                .await
+                .context("advertise independent encoder")?;
+                let still_primary =
+                    decode_standby_picture(|| frames.next(), generation, &pictures, 0)
+                        .await
+                        .context("primary continues after standby advertisement")?;
+                assert_eq!(before, still_primary);
+                assert_eq!(
+                    subscription.state().source_track_id.as_deref(),
+                    Some(first_id.as_str())
+                );
+                submit_operator(
+                    owner_control,
+                    &owner_token,
+                    Some(owner_connection.as_str()),
+                    &json!({
+                        "operation": "select", "publication": {"video": first_id.as_str()},
+                        "revision": 1, "delegation": delegation,
+                    }),
+                    "queued",
+                )
+                .await
+                .context("select standby")?;
+                // Source changes retire the exact receiver binding, not the logical subscription.
+                tokio::time::timeout(Duration::from_secs(4), async {
+                    while frames.next().await?.is_some() {}
+                    anyhow::Ok(())
+                })
+                .await
+                .context("retire primary frame stream")??;
+                let updates = subscription.updates()?;
+                tokio::time::timeout(Duration::from_secs(4), async {
+                    loop {
+                        let state = updates
+                            .next()
+                            .await?
+                            .context("logical subscription closed")?;
+                        anyhow::ensure!(!state.closed);
+                        if state.execution == core_ffi::PublicationExecution::Failed {
+                            anyhow::bail!("standby execution: {:?}", state.execution_error);
+                        }
+                        if state.execution == core_ffi::PublicationExecution::Installed
+                            && state.source_track_id.as_deref() == Some(second_id.as_str())
+                        {
+                            return anyhow::Ok(());
+                        }
+                    }
+                })
+                .await
+                .context("install selected standby on logical subscription")??;
+                let standby_frames = subscription.frames()?;
+                decode_standby_picture(|| standby_frames.next(), generation, &pictures, 1)
+                    .await
+                    .context("decode selected standby")?;
+                assert_eq!(
+                    subscription.state().source_track_id.as_deref(),
+                    Some(second_id.as_str())
+                );
+                anyhow::Ok(())
+            };
+            tokio::time::timeout(Duration::from_secs(18), async {
+                tokio::select! { result = scenario => result, result = pump => result }
+            })
+            .await
+            .context("standby scenario timed out")??;
+
+            let phase = Cell::new("reserve successor");
+            let bind_deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+            let (_successor, publication, input, _pipe, _warm_successor) =
+                tokio::time::timeout_at(bind_deadline, async {
+                    let prepared = submit_operator(
+                        encoder_control,
+                        &owner_token,
+                        None,
+                        &json!({"operation": "prepare_handoff", "room": "standby"}),
+                        "handoff_prepared",
+                    )
+                    .await?;
+                    let target = prepared.get("successor").context("reserved successor")?;
+                    phase.set("fence predecessor");
+                    submit_operator(
+                        owner_control,
+                        &owner_token,
+                        Some(owner_connection.as_str()),
+                        &json!({"operation": "handoff", "successor": target, "sequence": 1}),
+                        "handoff_completed",
+                    )
+                    .await?;
+                    anyhow::ensure!(!subscription.state().closed);
+                    phase.set("admit reserved successor");
+                    let (successor_runtime, successor, _) = make_agent(1, "owner", true)?;
+                    wait_connected(&successor, None).await?;
+                    let connection = successor_runtime
+                        .snapshot()
+                        .connection_id
+                        .context("successor connection")?;
+                    anyhow::ensure!(
+                        target.get("connection").and_then(Value::as_str)
+                            == Some(connection.as_str()),
+                        "unreserved successor connection"
+                    );
+                    phase.set("publish from successor");
+                    let publication = successor.video("camera".into())?.publish(None)?;
+                    let warm = subscribe(&standby_listener, "owner")?;
+                    let input = successor.create_video_input(Default::default()).await?;
+                    let pipe = input.pipe_to(&publication)?;
+                    anyhow::Ok((successor, publication, input, pipe, warm))
+                })
+                .await
+                .with_context(|| format!("planned handoff deadline: {}", phase.get()))??;
+            let pump = async {
+                loop {
+                    input
+                        .submit(pictures[0].input(input.capture_time_us().await?))
+                        .await?;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            };
+            let receive = async {
+                tokio::time::timeout_at(bind_deadline, async {
+                    let admitted =
+                        wait_publication_admitted(publication.updates()?.as_ref()).await?;
+                    let id = admitted
+                        .admission
+                        .publication_id
+                        .context("successor publication")?;
+                    let updates = subscription.updates()?;
+                    while let Some(state) = updates.next().await? {
+                        anyhow::ensure!(!state.closed);
+                        if state.execution == core_ffi::PublicationExecution::Installed
+                            && state.source_track_id.as_deref() == Some(id.as_str())
+                        {
+                            return anyhow::Ok(());
+                        }
+                    }
+                    anyhow::bail!("logical subscription closed before binding the successor")
+                })
+                .await
+                .context("planned handoff deadline: bind successor to existing subscription")??;
+                let frames = subscription.frames()?;
+                decode_standby_picture(|| frames.next(), generation, &pictures, 0)
+                    .await
+                    .context("decode successor video")?;
+                anyhow::ensure!(
+                    owner_runtime.snapshot().connection_id != Some(owner_connection),
+                    "predecessor still admitted after successor decode"
+                );
+                anyhow::Ok(())
+            };
+            tokio::select! { result = pump => result, result = receive => result }
+        }
+        .await
+        .map_err(|error: anyhow::Error| anyhow::anyhow!("{error:#}").into())
+    });
+    run_sim_or_timeout(&mut sim, Duration::from_secs(20))
+        .map_err(|error| anyhow::anyhow!("WAN standby video simulation failed: {error:#}"))
+}
+
+async fn submit_operator(
+    local: &SimStandbyControl,
+    token: &str,
+    connection: Option<&str>,
+    action: &Value,
+    expected: &str,
+) -> anyhow::Result<Value> {
+    let request =
+        serde_json::to_vec(&json!({"token": token, "connection": connection, "action": action}))?;
+    let response: Value = serde_json::from_slice(&local.submit(&request).await?)?;
+    let status = response.get("status").and_then(Value::as_str);
+    anyhow::ensure!(
+        status == Some(expected),
+        "operator status {status:?}, expected {expected}"
+    );
+    Ok(response)
+}
+
+struct StandbyPicture {
+    access_unit: &'static [u8],
+    luma: Vec<u8>,
+}
+
+impl StandbyPicture {
+    const LUMA_BYTES: usize = 320 * 180;
+
+    fn new(source: pulsebeam_testdata::QualityVideoSource) -> anyhow::Result<Self> {
+        let corpus = pulsebeam_testdata::quality_corpus_video(
+            source,
+            pulsebeam_testdata::QualityVideoLayer::P180,
+        );
+        let access_unit = corpus.frame(0).context("corpus IDR")?.encoded;
+        let decoded = corpus.decode_reference()?;
+        let luma = decoded
+            .get(..Self::LUMA_BYTES)
+            .context("corpus luma")?
+            .to_vec();
+        Ok(Self { access_unit, luma })
+    }
+
+    fn input(&self, timestamp_us: i64) -> InputFrame {
+        InputFrame::H264 {
+            frame: H264Frame {
+                timestamp_us,
+                payload: self.access_unit.to_vec(),
+                width: 320,
+                height: 180,
+                keyframe: true,
+                temporal_index: None,
+                base_layer_sync: false,
+            },
+        }
+    }
+
+    fn luma_error(&self, decoded: &[u8]) -> usize {
+        decoded
+            .iter()
+            .zip(&self.luma)
+            .step_by(16)
+            .map(|(&observed, &expected)| usize::from(observed.abs_diff(expected)))
+            .sum::<usize>()
+            / (Self::LUMA_BYTES / 16)
+    }
+}
+
+async fn decode_standby_picture(
+    next: impl AsyncFnMut() -> Result<
+        Option<pulsebeam_agent_native::ffi::VideoFrame>,
+        pulsebeam_agent_native::ffi::NativeError,
+    >,
+    generation: u64,
+    pictures: &[StandbyPicture; 2],
+    selected: usize,
+) -> anyhow::Result<pulsebeam_agent_native::NativeReceiverInfo> {
+    decode_picture_within(next, generation, pictures, selected, Duration::from_secs(3)).await
+}
+
+async fn decode_picture_within(
+    mut next: impl AsyncFnMut() -> Result<
+        Option<pulsebeam_agent_native::ffi::VideoFrame>,
+        pulsebeam_agent_native::ffi::NativeError,
+    >,
+    generation: u64,
+    pictures: &[StandbyPicture; 2],
+    selected: usize,
+    deadline: Duration,
+) -> anyhow::Result<pulsebeam_agent_native::NativeReceiverInfo> {
+    tokio::time::timeout(deadline, async {
+        let mut first = None;
+        loop {
+            let picture = next().await?.context("WAN video frames closed")?;
+            anyhow::ensure!(picture.track.generation == generation);
+            anyhow::ensure!((picture.frame.width, picture.frame.height) == (320, 180));
+            let luma = picture
+                .frame
+                .data
+                .get(..StandbyPicture::LUMA_BYTES)
+                .context("decoded luma")?;
+            let matched = pictures[selected].luma_error(luma);
+            let other = pictures[1 - selected].luma_error(luma);
+            if matched >= 8 || matched >= other {
+                continue;
+            }
+            let timestamp = picture
+                .metadata
+                .rtp_timestamp
+                .context("decoded RTP timestamp")?;
+            if let Some((track, earlier)) = &first {
+                anyhow::ensure!(track == &picture.track);
+                if *earlier != timestamp {
+                    return Ok(picture.track);
+                }
+            } else {
+                first = Some((picture.track, timestamp));
+            }
+        }
+    })
+    .await
+    .context("fewer than two fresh WAN pictures from selected encoder")?
 }
 
 #[test]
@@ -98,6 +567,26 @@ pub(super) fn install_provisioned_nodes(
     edges: &[(usize, usize)],
     seed: u64,
 ) -> anyhow::Result<Vec<(NodeId, NonZeroU64)>> {
+    install_nodes(
+        sim,
+        root,
+        ips,
+        edges,
+        seed,
+        None,
+        RoutingFixture::StaticTransit,
+    )
+}
+
+fn install_nodes(
+    sim: &mut turmoil::Sim<'_>,
+    root: &std::path::Path,
+    ips: &[IpAddr],
+    edges: &[(usize, usize)],
+    seed: u64,
+    standby: Option<&tokio::sync::mpsc::Sender<(usize, SimStandbyControl)>>,
+    mut routing: RoutingFixture<'_>,
+) -> anyhow::Result<Vec<(NodeId, NonZeroU64)>> {
     let nodes: Vec<_> = ips
         .iter()
         .copied()
@@ -111,6 +600,18 @@ pub(super) fn install_provisioned_nodes(
             anyhow::Ok((ip, data_dir, identity, transport, receipts))
         })
         .collect::<anyhow::Result<_>>()?;
+    let relay_images = matches!(routing, RoutingFixture::StaticTransit);
+    let mut regional_ports = match &mut routing {
+        RoutingFixture::Regional(fixture) => fixture.ports(nodes.len(), edges),
+        _ => (0..nodes.len()).map(|_| Vec::new()).collect(),
+    };
+    let region_tree = match &routing {
+        RoutingFixture::Regional(fixture) => fixture.region_tree(|index| {
+            let (_, _, (node, generation), _, key) = &nodes[index];
+            (*node, *generation, key.public_key())
+        })?,
+        _ => None,
+    };
     let left_id = nodes[0].2;
     let viewer_index = nodes.len().saturating_sub(1);
     for (index, (ip, data_dir, identity, credential, receipt_key)) in nodes.iter().enumerate() {
@@ -141,7 +642,11 @@ pub(super) fn install_provisioned_nodes(
                         class: NetworkClass::Wan,
                     },
                     fabric_wan: true,
-                    relay_from: (index != 0 && index != viewer_index && other == viewer_index)
+                    regional_control: None,
+                    relay_from: (relay_images
+                        && index != 0
+                        && index != viewer_index
+                        && other == viewer_index)
                         .then_some(left_id.0),
                     authority_epoch: [91; 16],
                     receipt_key: receipt_key.clone(),
@@ -157,13 +662,34 @@ pub(super) fn install_provisioned_nodes(
             seeds: Vec::new(),
             data_dir: data_dir.clone(),
             ownership_peers,
+            region_tree: region_tree.clone(),
         };
+        let standby = standby.cloned();
+        let ports = std::cell::RefCell::new(std::mem::take(&mut regional_ports[index]));
+        let identities: Vec<_> = nodes.iter().map(|entry| entry.2.0).collect();
         sim.host(ip, move || {
             let options = options.clone();
+            let standby = standby.clone();
+            let ports = std::mem::take(&mut *ports.borrow_mut())
+                .into_iter()
+                .map(|(remote, roles, cost, lane)| (identities[remote], roles, cost, lane))
+                .collect::<Vec<_>>();
             async move {
-                sfu_node_builder(ip, pulsebeam_runtime::rand::seeded_rng(seed), 1)
-                    .with_cluster(options)
-                    .run(tokio_util::sync::CancellationToken::new())
+                let mut node = sfu_node_builder(ip, pulsebeam_runtime::rand::seeded_rng(seed), 1)
+                    .with_cluster(options);
+                for (peer, roles, cost, lane) in ports {
+                    node = node.with_sim_regional_port(peer, roles, cost, lane);
+                }
+                if let Some(standby) = standby {
+                    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+                    node = node.with_sim_standby_control(tx);
+                    tokio::task::spawn_local(async move {
+                        if let Some(control) = rx.recv().await {
+                            let _ = standby.send((index, control)).await;
+                        }
+                    });
+                }
+                node.run(tokio_util::sync::CancellationToken::new())
                     .await
                     .map_err(Into::into)
             }

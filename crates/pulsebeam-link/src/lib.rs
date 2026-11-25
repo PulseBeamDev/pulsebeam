@@ -11,7 +11,7 @@ pub mod io;
 mod network;
 pub mod wan;
 mod wire;
-pub use control::{CONTROL_FRAME_BYTES, PeerControl};
+pub use control::{CONTROL_FRAME_BYTES, PeerControl, StreamControl, StreamInbound, StreamOutbound};
 pub use network::{
     CodecError, FabricCodec, FabricPath, FabricPeer, LinkError, NetworkClass, NetworkId,
     NetworkPeer, NodeRouteKey, PeerFingerprint, PeerRole, SecretCredential, WireCodec,

@@ -13,7 +13,7 @@ pub use pulsebeam_transport::dtls_srtp::wan::{
     Direction, Limits, MAX_DATAGRAM_BYTES,
     handoff::{Prepared, SocketOutcome, Submission},
     path::{Binding, Lease},
-    session::{Config, Ecn, Fingerprint, LocalIdentity, Purpose, Role, WindowSpec},
+    session::{Config, Ecn, Fingerprint, LiveDeadline, LocalIdentity, Purpose, Role, WindowSpec},
 };
 
 use crate::{CodecError, Fence, LinkTime, Ordering, PeerControl, Shared, control, network};
@@ -73,6 +73,7 @@ impl<W: Copy> Staged<W> {
 
 pub struct Received<P, W> {
     pub route: Staged<W>,
+    pub expires: Instant,
     pub position: u64,
     pub packet: P,
 }
@@ -128,15 +129,27 @@ where
         now: Instant,
         origin: Instant,
     ) -> Result<(Self, PeerControl), Error> {
+        let mut driver = Self::media_only(peer, id, generation, limits, codec, now)?;
+        driver.origin = origin;
+        let control = driver.attach_control()?;
+        Ok((driver, control))
+    }
+
+    pub fn media_only(
+        peer: crate::NetworkPeer,
+        id: crate::NetworkId,
+        generation: std::num::NonZeroU64,
+        limits: Limits,
+        codec: C,
+        now: Instant,
+    ) -> Result<Self, Error> {
         let epoch = std::num::NonZeroU64::new(id.epoch()).ok_or(Error::Scope)?;
         let peer = peer.into_transport();
-        let (mut driver, control) = Self::with_control(
+        Self::new(
             peer.fabric_wan_config(epoch, generation, limits),
             codec,
             now,
-        )?;
-        driver.origin = origin;
-        Ok((driver, control))
+        )
     }
 
     pub fn attach_control(&mut self) -> Result<PeerControl, Error> {
@@ -277,6 +290,20 @@ where
     where
         C: Codec<P, Window = W>,
     {
+        self.stage_with_deadline(now, binding, spec, descriptor, None)
+    }
+
+    pub fn stage_with_deadline<P>(
+        &mut self,
+        now: Instant,
+        binding: Binding,
+        spec: WindowSpec,
+        descriptor: W,
+        deadline: Option<LiveDeadline>,
+    ) -> Result<Staged<W>, Error>
+    where
+        C: Codec<P, Window = W>,
+    {
         let key = (spec.direction, spec.ssrc);
         if self.codec.route(descriptor) != (spec.ssrc, spec.start)
             || self
@@ -286,7 +313,9 @@ where
         {
             return Err(Error::Scope);
         }
-        let route = self.session.stage_window(now, binding, spec)?;
+        let route = self
+            .session
+            .stage_window_with_deadline(now, binding, spec, deadline)?;
         let staged = Staged { route, descriptor };
         self.windows.insert(key, staged);
         Ok(staged)
@@ -428,6 +457,7 @@ where
                 }
                 Ok(Some(Received {
                     route,
+                    expires: opened.expires,
                     position,
                     packet,
                 }))

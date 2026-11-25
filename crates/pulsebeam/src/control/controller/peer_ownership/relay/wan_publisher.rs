@@ -194,11 +194,35 @@ impl PublisherSends {
             .filter(|(expires, _)| now < *expires)
             .filter(|_| actor.receipt_trust.as_ref().is_some_and(Authority::ready))
             .unwrap_or((now, &[]));
+        self.reconcile(
+            actor,
+            peer,
+            acknowledged.iter().filter_map(|&ack| {
+                let &source = sources.iter().find(|source| source.matches_ack(ack))?;
+                Some((source, ack, expires))
+            }),
+            now,
+            false,
+        );
+    }
+
+    pub(in crate::control) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub(in crate::control) fn reconcile(
+        &mut self,
+        actor: &mut ControllerActor,
+        peer: NetworkId,
+        permits: impl IntoIterator<Item = (WanSourceWindow, WanLiveRouteAck, Instant)>,
+        now: Instant,
+        routed: bool,
+    ) {
         let mut desired = BTreeMap::new();
-        for &ack in acknowledged {
-            let Some(&source) = sources.iter().find(|source| source.matches_ack(ack)) else {
+        for (source, ack, expires) in permits {
+            if now >= expires || !source.matches_ack(ack) {
                 continue;
-            };
+            }
             let Some((shard, publisher)) = actor.lifecycle.network_publisher_anchor(
                 source.room,
                 source.publisher.publication,
@@ -207,16 +231,17 @@ impl PublisherSends {
                 continue;
             };
             if publisher == source.publisher {
-                desired.insert(ack.window.ssrc(), Permit { source, ack, shard });
+                desired.insert(ack.window.ssrc(), (Permit { source, ack, shard }, expires));
             }
         }
         self.entries.retain(|ssrc, entry| {
-            let retained = desired
-                .remove(ssrc)
-                .is_some_and(|permit| permit.same_route(entry.permit))
-                && now < entry.expires
-                && entry.cutoff.is_live()
-                && entry.advance(actor, peer);
+            let retained = desired.remove(ssrc).is_some_and(|(permit, expires)| {
+                permit.same_route(entry.permit)
+                    && now < expires.min(entry.expires)
+                    && entry.cutoff.is_live()
+                    && entry.advance(actor, peer)
+                    && (!routed || entry.renew(now, expires))
+            });
             if !retained {
                 entry.retire(actor);
             }
@@ -225,16 +250,21 @@ impl PublisherSends {
         let Some(links) = &mut actor.links else {
             return;
         };
-        for (ssrc, permit) in desired {
+        for (ssrc, (permit, expires)) in desired {
             if self.used.len() >= MAX_EPOCH_WINDOWS {
                 break;
             }
             if self.used.contains(&ssrc) {
                 continue;
             }
-            if let Ok((cutoff, pending)) =
-                links.stage_wan_publisher_transport(peer, permit.source, permit.ack, expires, now)
-            {
+            if let Ok((cutoff, pending)) = links.stage_wan_publisher_transport(
+                peer,
+                permit.source,
+                permit.ack,
+                expires,
+                routed,
+                now,
+            ) {
                 self.used.insert(ssrc);
                 self.entries.insert(
                     ssrc,
@@ -257,6 +287,19 @@ impl Drop for Entry {
 }
 
 impl Entry {
+    fn renew(&mut self, now: Instant, expires: Instant) -> bool {
+        match &self.phase {
+            Phase::Host(_) => return expires >= self.expires,
+            Phase::Installing { route, .. } | Phase::Installed(route) => {
+                if !route.tx.renew(now, expires) {
+                    return false;
+                }
+            }
+        }
+        self.expires = expires;
+        true
+    }
+
     fn advance(&mut self, actor: &mut ControllerActor, peer: NetworkId) -> bool {
         match &mut self.phase {
             Phase::Host(pending) => match pending.poll() {
@@ -272,8 +315,7 @@ impl Entry {
                                 self.permit.ack.window.ssrc().get().to_be_bytes(),
                             ),
                         },
-                        expires_at: self.expires,
-                        tx: tx,
+                        tx,
                     };
                     let change = PublisherSendChange::Install {
                         route: route.clone(),

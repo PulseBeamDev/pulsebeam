@@ -1,12 +1,17 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    num::NonZeroUsize,
+};
 
 use pulsebeam_runtime::time::Instant;
 
 use crate::{
     control::{
+        permissions::{ResourcePermissions, SubscriptionSelector},
         registry::RoomRegistry,
         topology::{
-            Subscriber, TrackAncestry, TrackPlacement, TrackPlacementAllocator, TrackTopology,
+            NamedTrack, Subscriber, TrackAncestry, TrackPlacement, TrackPlacementAllocator,
+            TrackTopology,
         },
     },
     entity::{ConnectionId, EndpointKey, ParticipantId, ProjectRoomKey, PublicationKey},
@@ -21,6 +26,13 @@ use crate::{
     },
     track::{Track, TrackSelector},
 };
+
+const SELECTOR_SCAN_BUDGET: NonZeroUsize = NonZeroUsize::new(32).unwrap();
+
+pub(super) struct SelectorPage {
+    pub(super) sources: Vec<(NamedTrack, PublicationKey)>,
+    pub(super) next: Option<NamedTrack>,
+}
 
 #[derive(Debug, Clone, Copy)]
 struct BoundParticipantLocation {
@@ -247,11 +259,27 @@ struct LocalRtpSource {
     emission: Emission,
 }
 
+#[derive(PartialEq, Eq)]
+struct RoutedIngress {
+    // Absent when this branch borrows an independently owned ingress track.
+    receivers: Option<HashSet<ConnectionId>>,
+    transit: Option<ShardId>,
+}
+
+fn same_ingress_track(existing: &Track, offered: &Track) -> bool {
+    existing.meta().connection_id == offered.meta().connection_id
+        && existing.fabric_data_source() == offered.fabric_data_source()
+        && super::native::track_descriptor(offered).is_some_and(|descriptor| {
+            super::native::track_descriptor(existing).as_ref() == Some(&descriptor)
+        })
+}
+
 pub(crate) struct TrackLifecycle {
     topology: TrackTopology,
     allocator: TrackPlacementAllocator,
     ingress: HashMap<TrackAncestry, pulsebeam_link::NetworkId>,
     transit: HashMap<TrackAncestry, ShardId>,
+    routed_ingress: HashMap<TrackAncestry, RoutedIngress>,
     local_rtp_sources: HashMap<
         TrackAncestry,
         arrayvec::ArrayVec<LocalRtpSource, { crate::track::MAX_SIMULCAST_LAYERS }>,
@@ -272,6 +300,7 @@ impl TrackLifecycle {
             allocator: TrackPlacementAllocator::new(shard_count),
             ingress: HashMap::new(),
             transit: HashMap::new(),
+            routed_ingress: HashMap::new(),
             local_rtp_sources: HashMap::new(),
             placements: HashMap::new(),
             ordered_receivers: HashMap::new(),
@@ -405,9 +434,132 @@ impl TrackLifecycle {
         registry: &RoomRegistry,
         now: Instant,
     ) -> Option<TrackLifecycleOutcome> {
-        let identity = self.topology.publish(track)?;
-        self.ingress.insert(identity, peer);
+        let identity = TrackAncestry::from_track(&track);
+        if let Some(routed) = self.routed_ingress.get_mut(&identity)
+            && routed.receivers.is_some()
+            && self.ingress.get(&identity) == Some(&peer)
+            && self
+                .topology
+                .track(identity)
+                .is_some_and(|existing| same_ingress_track(existing, &track))
+        {
+            routed.receivers = None;
+        } else {
+            self.topology.publish(track)?;
+            self.ingress.insert(identity, peer);
+        }
         Some(self.reconcile(identity, registry, now))
+    }
+
+    /// A routed track is visible only to the connections with verified demand.
+    /// Transit can keep a shard resident without making the source discoverable.
+    pub(super) fn reconcile_routed_ingress(
+        &mut self,
+        track: Track,
+        peer: pulsebeam_link::NetworkId,
+        receivers: HashSet<ConnectionId>,
+        relay: Option<ShardId>,
+        registry: &RoomRegistry,
+        now: Instant,
+    ) -> Option<TrackLifecycleOutcome> {
+        let identity = TrackAncestry::from_track(&track);
+        let endpoint = EndpointKey {
+            room: identity.room_id,
+            participant: identity.publisher,
+        };
+        if registry.get_endpoint(endpoint).is_some() || (receivers.is_empty() && relay.is_none()) {
+            return self.withdraw_routed_ingress(endpoint, identity.publication_id, registry, now);
+        }
+        let scoped = if let Some(existing) = self.topology.track(identity) {
+            if self.ingress.get(&identity) != Some(&peer) || !same_ingress_track(existing, &track) {
+                return None;
+            }
+            self.routed_ingress
+                .get(&identity)
+                .is_some_and(|routed| routed.receivers.is_some())
+        } else {
+            self.topology.publish(track)?;
+            self.ingress.insert(identity, peer);
+            true
+        };
+        let desired = RoutedIngress {
+            receivers: scoped.then_some(receivers),
+            transit: relay,
+        };
+        if self.routed_ingress.get(&identity) == Some(&desired) {
+            return None;
+        }
+        self.routed_ingress.insert(identity, desired);
+        Some(self.reconcile(identity, registry, now))
+    }
+
+    pub(super) fn has_routed_ingress(
+        &self,
+        endpoint: EndpointKey,
+        publication: PublicationKey,
+        publisher: ConnectionId,
+        peer: pulsebeam_link::NetworkId,
+    ) -> bool {
+        let identity = TrackAncestry {
+            room_id: endpoint.room,
+            publisher: endpoint.participant,
+            publication_id: publication,
+        };
+        self.routed_ingress.contains_key(&identity)
+            && self.ingress.get(&identity) == Some(&peer)
+            && self
+                .topology
+                .track(identity)
+                .is_some_and(|track| track.meta().connection_id == publisher)
+    }
+
+    pub(super) fn withdraw_routed_ingress(
+        &mut self,
+        endpoint: EndpointKey,
+        publication: PublicationKey,
+        registry: &RoomRegistry,
+        now: Instant,
+    ) -> Option<TrackLifecycleOutcome> {
+        let identity = TrackAncestry {
+            room_id: endpoint.room,
+            publication_id: publication,
+            publisher: endpoint.participant,
+        };
+        let routed = self.routed_ingress.remove(&identity)?;
+        if routed.receivers.is_some() {
+            self.unpublish(endpoint, publication, registry, now)
+        } else {
+            Some(self.reconcile(identity, registry, now))
+        }
+    }
+
+    pub(super) fn uses_routed_receive(
+        &self,
+        room: ProjectRoomKey,
+        publication: PublicationKey,
+    ) -> bool {
+        self.topology
+            .source(room, publication)
+            .is_some_and(|track| {
+                self.routed_ingress
+                    .contains_key(&TrackAncestry::from_track(track))
+            })
+    }
+
+    fn routed_visible(&self, identity: TrackAncestry, subscriber: Option<ConnectionId>) -> bool {
+        self.routed_ingress
+            .get(&identity)
+            .and_then(|routed| routed.receivers.as_ref())
+            .is_none_or(|receivers| {
+                subscriber.is_some_and(|connection| receivers.contains(&connection))
+            })
+    }
+
+    fn transit_shard(&self, identity: TrackAncestry) -> Option<ShardId> {
+        self.routed_ingress
+            .get(&identity)
+            .and_then(|routed| routed.transit)
+            .or_else(|| self.transit.get(&identity).copied())
     }
 
     /// Add or remove a shard demand for an already authorized network source.
@@ -422,7 +574,8 @@ impl TrackLifecycle {
         now: Instant,
     ) -> Option<TrackLifecycleOutcome> {
         let identity = TrackAncestry::from_track(self.topology.source(room, publication)?);
-        if self.ingress.get(&identity) != Some(&upstream)
+        if self.routed_ingress.contains_key(&identity)
+            || self.ingress.get(&identity) != Some(&upstream)
             || self.transit.get(&identity).copied() == shard
         {
             return None;
@@ -460,8 +613,15 @@ impl TrackLifecycle {
         self.topology
             .sources_by_publisher(endpoint)
             .filter_map(move |track| {
-                let peer = *self.ingress.get(&TrackAncestry::from_track(track))?;
-                Some((track, peer))
+                let identity = TrackAncestry::from_track(track);
+                if self
+                    .routed_ingress
+                    .get(&identity)
+                    .is_some_and(|routed| routed.receivers.is_some())
+                {
+                    return None;
+                }
+                Some((track, *self.ingress.get(&identity)?))
             })
     }
 
@@ -496,6 +656,7 @@ impl TrackLifecycle {
 
         self.local_rtp_sources.remove(&identity);
         self.transit.remove(&identity);
+        self.routed_ingress.remove(&identity);
         let removed = self.topology.unpublish(identity);
         debug_assert!(
             removed.is_some(),
@@ -593,6 +754,10 @@ impl TrackLifecycle {
         self.topology.catalog_version()
     }
 
+    pub(super) fn has_local_subscriber(&self, room: ProjectRoomKey) -> bool {
+        self.topology.has_local_subscriber(room)
+    }
+
     pub(super) fn room_catalog_version(&self, room: ProjectRoomKey) -> u64 {
         self.topology.room_catalog_version(room)
     }
@@ -643,13 +808,14 @@ impl TrackLifecycle {
         publication: PublicationKey,
         registry: &RoomRegistry,
     ) -> Option<(ShardId, crate::shard_update::PublisherAnchor)> {
+        use crate::entity::TrackKind;
         use pulsebeam_core::fabric::Profile;
 
         let shard = self.network_source(room, publication, registry)?;
         let track = self.source_exact(room, publication)?;
         let (incarnation, emission) = match track {
             Track::Data(data) => (data.fabric_source?, Emission::data(data.record_dd)),
-            Track::Audio(_) => {
+            Track::Audio(_) | Track::Video(_) => {
                 let [source] = self
                     .local_rtp_sources
                     .get(&TrackAncestry::from_track(track))?
@@ -657,12 +823,13 @@ impl TrackLifecycle {
                 else {
                     return None;
                 };
-                if source.emission.profile() != Profile::Opus {
-                    return None;
+                match (track.kind(), source.emission.profile()) {
+                    (TrackKind::Audio, Profile::Opus)
+                    | (TrackKind::Video, Profile::H264 | Profile::Av1) => {}
+                    _ => return None,
                 }
                 (source.incarnation, source.emission)
             }
-            Track::Video(_) => return None,
         };
         Some((
             shard,
@@ -719,12 +886,147 @@ impl TrackLifecycle {
         let kind = crate::control::native::track_kind(address.kind)?;
         let publisher = ParticipantId::new(&address.participant_id).ok()?;
         let track_id = crate::entity::TrackId::new(&address.track_id).ok()?;
+        self.resolve_named_source(source_room, subscriber, publisher, kind, track_id, registry)
+    }
+
+    /// `None` rejects the scope. A page with a cursor may be empty: denied,
+    /// stale, and ambiguous names consume scan budget just like live matches.
+    pub(super) fn scan_selector(
+        &self,
+        subscriber: ConnectionId,
+        permissions: &ResourcePermissions,
+        selector: SubscriptionSelector,
+        after: Option<NamedTrack>,
+        registry: &RoomRegistry,
+    ) -> Option<SelectorPage> {
+        let (_, receiver) = registry.get_connection(subscriber)?;
+        let project = receiver.scope.project;
+        if !receiver.materialized || !permissions.admits_selector(project, selector) {
+            return None;
+        }
+        let mut sources = Vec::new();
+        let next = self.topology.scan_named_sources(
+            project,
+            selector,
+            after,
+            SELECTOR_SCAN_BUDGET,
+            |name| {
+                let room = ProjectRoomKey {
+                    project,
+                    room: name.room,
+                };
+                if permissions.allows_selector_match(
+                    project,
+                    selector,
+                    room,
+                    name.participant,
+                    name.kind,
+                    name.track,
+                ) && let Some(source) = self.resolve_named_source(
+                    room,
+                    subscriber,
+                    name.participant,
+                    name.kind,
+                    name.track,
+                    registry,
+                ) {
+                    sources.push((name, source.id()));
+                }
+            },
+        );
+        Some(SelectorPage { sources, next })
+    }
+
+    pub(super) fn scan_owned_subscribe_scope(
+        &self,
+        project: crate::entity::ProjectId,
+        scope: &pulsebeam_core::auth::grants::SubscribeScope,
+        after: Option<NamedTrack>,
+        registry: &RoomRegistry,
+    ) -> (
+        Option<(
+            ProjectRoomKey,
+            ShardId,
+            crate::shard_update::PublisherAnchor,
+        )>,
+        Option<NamedTrack>,
+    ) {
+        use super::permissions::{Component, grant_kind};
+        let mut matched = None;
+        let mut last = None;
+        let next = self.topology.scan_named_sources(
+            project,
+            SubscriptionSelector {
+                project: Component::Literal(project),
+                room: Component::Any,
+                participant: Component::Any,
+                kind: Component::Any,
+                track: Component::Any,
+            },
+            after,
+            SELECTOR_SCAN_BUDGET,
+            |name| {
+                last = Some(name);
+                if matched.is_some()
+                    || !scope.allows(
+                        name.room.as_str(),
+                        name.participant.as_str(),
+                        grant_kind(name.kind),
+                        name.track.as_str(),
+                    )
+                {
+                    return;
+                }
+                let room = ProjectRoomKey {
+                    project,
+                    room: name.room,
+                };
+                let endpoint = EndpointKey {
+                    room,
+                    participant: name.participant,
+                };
+                let Some(track) =
+                    self.current_named_source(endpoint, name.kind, name.track, registry)
+                else {
+                    return;
+                };
+                if let Some((shard, anchor)) =
+                    self.network_publisher_anchor(room, track.id(), registry)
+                {
+                    matched = Some(((room, shard, anchor), name));
+                }
+            },
+        );
+        match matched {
+            Some((source, name)) => (
+                Some(source),
+                (last != Some(name) || next.is_some()).then_some(name),
+            ),
+            None => (None, next),
+        }
+    }
+
+    fn resolve_named_source<'a>(
+        &'a self,
+        room: ProjectRoomKey,
+        subscriber: ConnectionId,
+        publisher: ParticipantId,
+        kind: crate::entity::TrackKind,
+        track_id: crate::entity::TrackId,
+        registry: &'a RoomRegistry,
+    ) -> Option<&'a Track> {
         let endpoint = EndpointKey {
-            room: source_room,
+            room,
             participant: publisher,
         };
-        let track = self.named_source(endpoint, kind, track_id, registry.get_endpoint(endpoint))?;
-        self.source_for_connection(source_room, subscriber, track.id(), registry)
+        let track = self.named_source(
+            endpoint,
+            kind,
+            track_id,
+            registry.get_endpoint(endpoint),
+            Some(subscriber),
+        )?;
+        self.source_for_connection(room, subscriber, track.id(), registry)
     }
 
     pub(super) fn current_named_source(
@@ -739,6 +1041,7 @@ impl TrackLifecycle {
             kind,
             track_id,
             Some(registry.get_endpoint(endpoint)?),
+            None,
         )
     }
 
@@ -748,13 +1051,16 @@ impl TrackLifecycle {
         kind: crate::entity::TrackKind,
         track_id: crate::entity::TrackId,
         local: Option<&super::registry::ParticipantMeta>,
+        subscriber: Option<ConnectionId>,
     ) -> Option<&Track> {
         let mut sources = self
             .topology
             .exact_named_sources(endpoint.room, endpoint.participant, kind, track_id)?
             .filter(|track| {
-                let remote = self.ingress.contains_key(&TrackAncestry::from_track(track));
-                local.map_or(remote, |local| {
+                let identity = TrackAncestry::from_track(track);
+                let remote = self.ingress.contains_key(&identity);
+                let visible = self.routed_visible(identity, subscriber);
+                local.map_or(remote && visible, |local| {
                     !remote
                         && local.materialized
                         && track.meta().connection_id == local.connection_id
@@ -780,10 +1086,11 @@ impl TrackLifecycle {
         if meta.connection_id == subscriber {
             return None;
         }
-        if self
-            .ingress
-            .contains_key(&TrackAncestry::from_track(source))
-        {
+        let identity = TrackAncestry::from_track(source);
+        if self.ingress.contains_key(&identity) {
+            if !self.routed_visible(identity, Some(subscriber)) {
+                return None;
+            }
             return registry
                 .get_endpoint(EndpointKey {
                     room: source_room,
@@ -1041,7 +1348,7 @@ impl TrackLifecycle {
             .map(|origin| origin.shard);
         let mut candidate_shards = origin.into_iter().collect::<HashSet<_>>();
         let mut active_shards = HashSet::new();
-        if let Some(&shard) = self.transit.get(&identity) {
+        if let Some(shard) = self.transit_shard(identity) {
             debug_assert!(origin.is_none());
             candidate_shards.insert(shard);
             active_shards.insert(shard);
@@ -1124,6 +1431,7 @@ impl TrackLifecycle {
                 if location.connection
                     == origin.map_or_else(|| track.meta().connection_id, |origin| origin.connection)
                     || origin.is_none() && publisher_meta.is_some()
+                    || !self.routed_visible(identity, Some(location.connection))
                 {
                     return None;
                 }
@@ -1173,11 +1481,7 @@ impl TrackLifecycle {
         DesiredTrackState {
             track,
             origin,
-            transit: self
-                .transit
-                .get(&identity)
-                .copied()
-                .filter(|_| origin.is_none()),
+            transit: self.transit_shard(identity).filter(|_| origin.is_none()),
             candidates,
             bindings,
             locations,
@@ -3151,6 +3455,180 @@ mod tests {
     }
 
     #[test]
+    fn selector_scan_resolves_future_sources_only_in_current_granted_rooms() {
+        use super::super::permissions::Component;
+
+        let (mut lifecycle, registry) = setup(1, &[(1, 1, 0), (2, 1, 0), (3, 2, 0), (4, 3, 0)]);
+        let connection = |seed, room_seed| {
+            registry
+                .get_endpoint(endpoint(seed, room_seed))
+                .unwrap()
+                .connection_id
+        };
+        let subscriber = connection(1, 1);
+        let selector = SubscriptionSelector {
+            project: Component::Any,
+            room: Component::Any,
+            participant: Component::Any,
+            kind: Component::Literal(TrackKind::Data),
+            track: Component::Any,
+        };
+        let grants = |rooms: &[&str]| ResourcePermissions::Grants {
+            joined_room: Some(room(1).room),
+            grants: serde_json::from_value(serde_json::json!([
+                {"rooms": rooms, "allow": ["subscribe"], "kind": "data", "label": "label"}
+            ]))
+            .unwrap(),
+        };
+        let permitted = grants(&["lifecycle-1", "lifecycle-2"]);
+        let scan = |lifecycle: &TrackLifecycle, permissions| {
+            let page = lifecycle
+                .scan_selector(subscriber, permissions, selector, None, &registry)
+                .unwrap();
+            assert!(page.next.is_none());
+            page.sources
+                .into_iter()
+                .map(|(name, _)| name.room)
+                .collect::<Vec<_>>()
+        };
+        assert!(scan(&lifecycle, &permitted).is_empty());
+        for (seed, room_seed, label) in [
+            (1, 1, "label"),
+            (2, 1, "label"),
+            (3, 2, "label"),
+            (3, 2, "private"),
+            (4, 3, "label"),
+        ] {
+            let conn = connection(seed, room_seed);
+            let mut source = track(TrackKind::Data, seed, room_seed, label);
+            let meta = source.meta_mut();
+            meta.id = conn.fixture_publication(TrackKind::Data, label);
+            meta.connection_id = conn;
+            lifecycle
+                .publish(source, &registry, Instant::now())
+                .unwrap();
+        }
+        assert_eq!(scan(&lifecycle, &permitted), [room(1).room, room(2).room]);
+        assert_eq!(scan(&lifecycle, &grants(&["lifecycle-2"])), [room(2).room]);
+        assert!(
+            lifecycle
+                .scan_selector(
+                    subscriber,
+                    &ResourcePermissions::Denied,
+                    selector,
+                    None,
+                    &registry
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn routed_ingress_visibility_requires_current_demand_and_transit_does_not_grant_access() {
+        use crate::entity::{TrackId, TrackKind};
+        use pulsebeam_link::{LinkControl, LinkTime};
+
+        let room = room(1);
+        let mut registry = RoomRegistry::new();
+        register(&mut registry, 1, room, 0);
+        register(&mut registry, 2, room, 0);
+        let connection = |id| {
+            registry
+                .get_endpoint(EndpointKey {
+                    room,
+                    participant: participant(id),
+                })
+                .unwrap()
+                .connection_id
+        };
+        let one = connection(1);
+        let two = connection(2);
+        let endpoint = EndpointKey {
+            room,
+            participant: ParticipantId::new("regional-source").unwrap(),
+        };
+        let publisher = ConnectionId::new();
+        let publication = publisher.fixture_publication(TrackKind::Data, "feed");
+        let track = Track::data_publication(
+            TrackMeta {
+                room,
+                id: publication,
+                origin: endpoint.participant,
+                connection_id: publisher,
+                track_id: Some(TrackId::new("feed").unwrap()),
+            },
+            DataLane::Latest,
+        );
+        let mut control = LinkControl::<()>::new(|| LinkTime::from_nanos(0)).unwrap();
+        let peer = control.reserve_network_id().unwrap();
+        let now = Instant::now();
+        let mut lifecycle = TrackLifecycle::new(1);
+        lifecycle
+            .reconcile_routed_ingress(
+                track.clone(),
+                peer,
+                HashSet::from([one]),
+                Some(ShardId::new(0)),
+                &registry,
+                now,
+            )
+            .unwrap();
+        assert!(
+            lifecycle
+                .source_for_connection(room, one, publication, &registry)
+                .is_some()
+        );
+        assert!(
+            lifecycle
+                .source_for_connection(room, two, publication, &registry)
+                .is_none()
+        );
+        assert!(lifecycle.ingress_sources(endpoint).next().is_none());
+        assert!(lifecycle.wan_transit_demands().next().is_none());
+        lifecycle
+            .reconcile_routed_ingress(
+                track.clone(),
+                peer,
+                HashSet::new(),
+                Some(ShardId::new(0)),
+                &registry,
+                now,
+            )
+            .unwrap();
+        assert!(
+            lifecycle
+                .source_for_connection(room, one, publication, &registry)
+                .is_none()
+        );
+        assert!(lifecycle.source_exact(room, publication).is_some());
+        lifecycle
+            .withdraw_routed_ingress(endpoint, publication, &registry, now)
+            .unwrap();
+        assert!(lifecycle.source_exact(room, publication).is_none());
+
+        lifecycle
+            .publish_ingress(track.clone(), peer, &registry, now)
+            .unwrap();
+        lifecycle
+            .reconcile_routed_ingress(
+                track,
+                peer,
+                HashSet::new(),
+                Some(ShardId::new(0)),
+                &registry,
+                now,
+            )
+            .unwrap();
+        assert!(lifecycle.uses_routed_receive(room, publication));
+        assert!(lifecycle.ingress_sources(endpoint).next().is_some());
+        lifecycle
+            .withdraw_routed_ingress(endpoint, publication, &registry, now)
+            .unwrap();
+        assert!(!lifecycle.uses_routed_receive(room, publication));
+        assert_eq!(lifecycle.ingress_peer(room, publication), Some(peer));
+    }
+
+    #[test]
     fn indexed_exact_source_lookup_fences_self_stale_and_ambiguous_publications() {
         use crate::{
             control::controller::SignalingProtocol,
@@ -3239,6 +3717,37 @@ mod tests {
         };
         let subscriber_connection = connection_for(subscriber);
         let publisher_connection = connection_for(publisher);
+        use super::super::permissions::Component;
+        let selector = SubscriptionSelector {
+            project: Component::Any,
+            room: Component::Any,
+            participant: Component::Any,
+            kind: Component::Any,
+            track: Component::Any,
+        };
+        let scope = ResourcePermissions::Grants {
+            joined_room: Some(room_id.room),
+            grants: serde_json::from_value(serde_json::json!([
+                {"rooms": ["lifecycle-1"], "allow": ["subscribe"], "participant": "publisher"}
+            ]))
+            .unwrap(),
+        };
+        let scan = |lifecycle: &TrackLifecycle, cursor| {
+            lifecycle
+                .scan_selector(subscriber_connection, &scope, selector, cursor, &registry)
+                .unwrap()
+        };
+        let page = scan(&lifecycle, None);
+        assert!(page.sources.is_empty());
+        assert!(page.next.is_some());
+        let page = scan(&lifecycle, page.next);
+        assert!(page.sources.is_empty());
+        assert!(page.next.is_some());
+        let last_page = page.next;
+        let page = scan(&lifecycle, last_page);
+        assert_eq!(page.sources.len(), 1);
+        assert_eq!(page.sources[0].0.participant, publisher);
+        assert!(page.next.is_none());
         let address = pulsebeam_proto::state::LogicalSourceAddress {
             room: "lifecycle-1".into(),
             participant_id: publisher_external.as_str().into(),
@@ -3264,6 +3773,10 @@ mod tests {
                 .source_by_address(room_id, subscriber_connection, &address, &registry)
                 .is_none()
         );
+
+        let ambiguous = scan(&lifecycle, last_page);
+        assert!(ambiguous.sources.is_empty());
+        assert!(ambiguous.next.is_none());
 
         let replacement = ConnectionId::new();
         registry

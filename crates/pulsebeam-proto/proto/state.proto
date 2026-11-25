@@ -80,6 +80,8 @@ message CatalogPageRecord {
   bytes next_cursor = 6;
   int64 cursor_expires_at_unix_seconds = 7;
   repeated CatalogParticipantFragment fragments = 8;
+  // Some expected owners did not supply fresh scoped coverage. No continuation.
+  bool partial = 9;
 }
 
 // ============================================================================
@@ -293,6 +295,7 @@ message ConfirmedState {
     Track track = 7;
     SourceLookupState source_lookup = 8;
     LogicalSubscriptionState logical_subscription = 9;
+    SubscriptionSelectorState subscription_selector = 10;
   }
 }
 
@@ -437,6 +440,7 @@ message ResourceSpec {
     SubscriptionSpec subscription = 3;
     SourceLookupSpec source_lookup = 4;
     LogicalSubscriptionSpec logical_subscription = 5;
+    SubscriptionSelectorSpec subscription_selector = 6;
   }
 }
 
@@ -457,7 +461,19 @@ message LogicalSubscriptionSpec {
   optional uint32 data_version = 2;
 }
 
-// Publication, lookup and data-subscription settings contain no receive variant.
+// An absent component matches any value. Present components are typed literals,
+// never patterns. Any project is still confined to the authenticated project.
+// This declaration observes eligible logical sources; each installed receiver
+// remains independently authorized and fenced by its exact logical lifetime.
+message SubscriptionSelectorSpec {
+  optional string project_id = 1;
+  optional string room = 2;
+  optional string participant_id = 3;
+  optional TrackKind kind = 4;
+  optional string track_id = 5;
+}
+
+// Publication, lookup, selector and data-subscription settings contain no receive variant.
 // Audio/video subscriptions require their matching variant, even when empty.
 message ResourceSettings {
   // Presence REQUIRED, including false. Pause does not retire the resource.
@@ -589,6 +605,21 @@ message LogicalSubscriptionState {
   // Explicit Fabric DATA selection for this source revision. Absence does not
   // select DATA_V1. The source and branch handles are assigned by the server.
   DataV1ReceiverOffer data_v1 = 6;
+}
+
+// One bounded complete set per declaration, never a partial prefix. Overflow
+// withdraws the set; the declaration can recover as eligible sources leave.
+message SubscriptionSelectorState {
+  ResourceSpec spec = 1;
+  SelectorMatchStatus status = 2;
+  repeated LogicalSourceAddress matches = 3;
+}
+
+enum SelectorMatchStatus {
+  SELECTOR_MATCH_STATUS_UNSPECIFIED = 0;
+  SELECTOR_MATCH_STATUS_PENDING = 1;
+  SELECTOR_MATCH_STATUS_COMPLETE = 2;
+  SELECTOR_MATCH_STATUS_OVERFLOW = 3;
 }
 
 message DataV1ReceiverOffer {

@@ -351,6 +351,7 @@
   let audioPipe;
   let replacementVideoTrack;
   let steadyIterator;
+  let steadySelector;
   let cyclingIterator;
   let audioSubscription;
   let videoSubscription;
@@ -461,11 +462,23 @@
       await delivery;
     };
     const steadyPublisher = sender.data("reuse-steady").publish();
-    steadyIterator = receiver
-      .room(receiver.state().room)
-      .participant("web-sender")
-      .data("reuse-steady")
-      .subscribe();
+    steadySelector = receiver.subscribeSelector({
+      participantId: "web-sender",
+      kind: pulsebeam.SelectorTrackKind.Data,
+      trackId: "reuse-steady",
+    });
+    await until(() => {
+      const match = steadySelector.state()?.matches[0];
+      if (!match) return false;
+      try {
+        steadyIterator = steadySelector.receiveData(match);
+        return true;
+      } catch (error) {
+        if (error?.inner?.info?.code !== pulsebeam.ErrorCode.NotReady)
+          throw error;
+        return false;
+      }
+    }, "selected data source admission");
     await warmOrdered(steadyPublisher, steadyIterator, 0);
     await sendOrdered(steadyPublisher, steadyIterator, 1);
     const steadyChannels = payloadChannels.filter(
@@ -689,6 +702,16 @@
     await deliverDuringView(7);
     await witnessView(video, "remount retains live receiver");
     fixedPresentation = video.srcObject.getVideoTracks()[0];
+    const pendingDataRead = steadyIterator.next();
+    steadySelector.close();
+    await until(
+      () => steadyIterator.state().closed,
+      "selector retires its data cursor",
+    );
+    assert(
+      (await pendingDataRead) === undefined,
+      "selector retirement ends an in-flight data read",
+    );
     await steadyIterator.close();
     steadyIterator = undefined;
 
@@ -998,6 +1021,18 @@
     );
     // Keep the existing H264 witness and exercise one explicit AV1 publication
     // with the same shipping SDK and real browser decoder.
+    const screenSelector = receiver.subscribeSelector({
+      participantId: "web-sender",
+      kind: pulsebeam.SelectorTrackKind.Video,
+      trackId: "av1-screen",
+    });
+    await until(() => {
+      const state = screenSelector.state();
+      return (
+        state?.status === pulsebeam.SelectorStatus.Complete &&
+        state.matches.length === 0
+      );
+    }, "wildcard selector admitted before its source exists");
     const screen = sender.video("av1-screen").publish({
       enabled: true,
       codec: pulsebeam.VideoCodec.Av1,
@@ -1017,20 +1052,37 @@
         .participant("web-sender")
         .video("av1-screen")
         .subscribe();
-      screenAttachment = present(screenSubscription, screenElement);
+      let screenMatch;
+      await until(() => {
+        screenMatch = screenSelector.state()?.matches[0];
+        return screenMatch?.trackId === "av1-screen";
+      }, "future AV1 publication enters the wildcard selector");
+      screenAttachment = await screenSelector.playbackOutput(screenMatch);
+      const outputTrack = screenAttachment.track();
+      assert(
+        outputTrack?.kind === "video",
+        "selector exposes a browser video track",
+      );
+      screenElement.srcObject = new MediaStream([outputTrack]);
+      await screenElement.play();
       await until(async () => {
         const track = presentedTrack(screenElement);
-        const rtpReceiver = track && peerForTrack(track)
-          ?.getReceivers()
-          .find((candidate) => candidate.track === track);
+        const rtpReceiver =
+          track &&
+          peerForTrack(track)
+            ?.getReceivers()
+            .find((candidate) => candidate.track === track);
         if (!rtpReceiver) return false;
         const stats = await rtpReceiver.getStats();
         return (
           [...stats.values()].some(
-            (entry) => entry.type === "inbound-rtp"
-              && entry.framesDecoded > 1
-              && stats.get(entry.codecId)?.mimeType?.toLowerCase() === "video/av1",
-          ) && screenElement.videoWidth > 0 && !screenElement.paused
+            (entry) =>
+              entry.type === "inbound-rtp" &&
+              entry.framesDecoded > 1 &&
+              stats.get(entry.codecId)?.mimeType?.toLowerCase() === "video/av1",
+          ) &&
+          screenElement.videoWidth > 0 &&
+          !screenElement.paused
         );
       }, "rendered AV1 from public VideoCodec.Av1 publication");
       assert(
@@ -1038,7 +1090,13 @@
           screenSubscription.state().sourceFormat?.mimeType === "video/av1",
         "public AV1 endpoints report the applied source format",
       );
+      screenSelector.close();
+      await until(
+        () => outputTrack.readyState === "ended",
+        "selector close retires its playback observation",
+      );
     } finally {
+      screenSelector.close();
       await screenAttachment?.close();
       await screenSubscription?.close();
       await screenPipe?.close();
@@ -1190,6 +1248,7 @@
     MediaStreamTrack.prototype.clone = originalClone;
     await releaseReplacement?.();
     await Promise.allSettled([
+      steadySelector?.close(),
       steadyIterator?.close(),
       cyclingIterator?.close(),
       attachment?.close(),

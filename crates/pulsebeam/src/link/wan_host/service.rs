@@ -116,6 +116,32 @@ impl Provisioner {
             origin.into_std(),
         )
         .map_err(|_| LinkError::Security)?;
+        Ok((self.install(id, driver)?, lane))
+    }
+
+    pub(crate) fn open_media(
+        &self,
+        peer: NetworkPeer,
+        id: NetworkId,
+        generation: NonZeroU64,
+    ) -> Result<Commands, LinkError> {
+        let driver = wan::Driver::media_only(
+            peer,
+            id,
+            generation,
+            LIMITS,
+            FabricWanCodec,
+            Instant::now().into_std(),
+        )
+        .map_err(|_| LinkError::Security)?;
+        self.install(id, driver)
+    }
+
+    fn install(
+        &self,
+        id: NetworkId,
+        driver: wan::Driver<FabricWanCodec, Window>,
+    ) -> Result<Commands, LinkError> {
         let (port, commands, media) = command_channel(id);
         self.0
             .try_send(Open {
@@ -128,6 +154,6 @@ impl Provisioner {
                 pulsebeam_queue::TrySendError::Full(_) => LinkError::Capacity,
                 pulsebeam_queue::TrySendError::Closed(_) => LinkError::Closed,
             })?;
-        Ok((port, lane))
+        Ok(port)
     }
 }

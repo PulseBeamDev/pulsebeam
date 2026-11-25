@@ -214,7 +214,6 @@ impl DataChannel {
 
 struct Peer {
     generation: Generation,
-    single_video_encoding: bool,
     connection: RtcPeerConnection,
     sdp: Option<agent_core::client_sdp::Executor>,
     transceivers: Vec<(MediaSlot, RtcRtpTransceiver)>,
@@ -400,7 +399,6 @@ impl Host for BrowserHost {
 
 struct RuntimeInner {
     actor: RefCell<Option<ActorHandle>>,
-    single_video_encoding: bool,
     agent_state: Rc<agent_core::observer::AgentStateObserver>,
     publication_observers:
         RefCell<BTreeMap<u64, Rc<agent_core::observer::PublicationStateObserver>>>,
@@ -438,7 +436,6 @@ impl BrowserRuntime {
         endpoint: String,
         token: String,
         log_level: LogLevel,
-        single_video_encoding: bool,
     ) -> Result<Self, agent_core::ffi::ErrorInfo> {
         let core_config = AgentConfig {
             endpoint,
@@ -448,7 +445,6 @@ impl BrowserRuntime {
         };
         let inner = Rc::new(RuntimeInner {
             actor: RefCell::new(None),
-            single_video_encoding,
             agent_state: Rc::new(agent_core::observer::AgentStateObserver::new(
                 (&agent_core::Snapshot::default()).into(),
             )),
@@ -475,6 +471,35 @@ impl BrowserRuntime {
             .map_err(|error| agent_core::ffi::ErrorInfo::from(&error))?;
         *inner.actor.borrow_mut() = Some(actor);
         Ok(Self { inner })
+    }
+
+    #[cfg(feature = "uniffi")]
+    pub(crate) fn open_subscription_selector(
+        &self,
+        selector: agent_core::SubscriptionSelector,
+    ) -> Result<agent_core::TrackOwner, agent_core::ffi::ErrorInfo> {
+        self.inner
+            .intent_actor()?
+            .open_subscription_selector(selector)
+    }
+
+    #[cfg(feature = "uniffi")]
+    pub(crate) fn subscription_selector_state(
+        &self,
+        owner: agent_core::TrackOwner,
+    ) -> Option<agent_core::SelectorState> {
+        self.inner
+            .actor
+            .borrow()
+            .as_ref()?
+            .subscription_selector_state(owner)
+    }
+
+    #[cfg(feature = "uniffi")]
+    pub(crate) fn close_subscription_selector(&self, owner: agent_core::TrackOwner) {
+        if let Some(actor) = self.inner.actor.borrow().as_ref() {
+            actor.close_subscription_selector(owner);
+        }
     }
 
     pub(crate) fn join_room(&self, room: String) -> Result<(), agent_core::ffi::ErrorInfo> {
@@ -582,6 +607,21 @@ impl BrowserRuntime {
     }
 
     #[cfg(feature = "uniffi")]
+    pub(crate) fn claim_selector_data(
+        &self,
+        owner: agent_core::TrackOwner,
+        source: agent_core::SelectorMatch,
+    ) -> Result<
+        (u64, Rc<agent_core::observer::DataSubscriptionStateObserver>),
+        agent_core::ffi::ErrorInfo,
+    > {
+        self.claim_observed_resource(
+            agent_core::ResourceCommand::ReceiveSelectorData { owner, source },
+            |owner| self.data_subscription_state_observer(owner),
+        )
+    }
+
+    #[cfg(feature = "uniffi")]
     fn claim_observed_resource<T>(
         &self,
         command: agent_core::ResourceCommand,
@@ -606,7 +646,23 @@ impl BrowserRuntime {
         &self,
         owner: u64,
     ) -> Result<media_observation::BrowserMediaObservation, JsValue> {
-        self.inner.observe_cancellable(owner).await
+        self.inner
+            .observe_cancellable(agent_core::ResourceCommand::BeginMediaObservation { owner })
+            .await
+    }
+
+    #[cfg(feature = "uniffi")]
+    pub(crate) async fn observe_selector_media(
+        &self,
+        owner: agent_core::TrackOwner,
+        source: agent_core::SelectorMatch,
+    ) -> Result<media_observation::BrowserMediaObservation, JsValue> {
+        self.inner
+            .observe_cancellable(agent_core::ResourceCommand::BeginSelectorMediaObservation {
+                owner,
+                source,
+            })
+            .await
     }
 
     #[cfg(feature = "uniffi")]
@@ -1736,7 +1792,6 @@ impl RuntimeInner {
         let bootstrap_reservations = transceivers.iter().map(|(slot, _)| slot.clone()).collect();
         Ok(Peer {
             generation,
-            single_video_encoding: self.single_video_encoding,
             connection,
             sdp: None,
             transceivers,

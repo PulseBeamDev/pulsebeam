@@ -21,9 +21,26 @@ use super::{fabric::WanLiveRouteAck, wan_source::WanSourceWindow};
 
 pub(in crate::control) const SHARD: crate::id::ShardId = crate::id::ShardId::new(0);
 
-pub(in crate::control) struct Export {
+pub(in crate::control) struct Advertisement {
     pub(in crate::control) source: WanSourceWindow,
     pub(in crate::control) endpoint: (EndpointKey, EndpointFact),
+    pub(in crate::control) upstream: NetworkId,
+    pub(in crate::control) upstream_cut: Option<std::num::NonZeroU64>,
+    pub(in crate::control) expires: Instant,
+}
+
+impl Advertisement {
+    pub(in crate::control) fn same_source(&self, other: &Self) -> bool {
+        self.source.same_window(other.source)
+            && self.source.origin == other.source.origin
+            && self.endpoint == other.endpoint
+            && self.upstream == other.upstream
+            && self.upstream_cut == other.upstream_cut
+    }
+}
+
+pub(in crate::control) struct Export {
+    pub(in crate::control) source: WanSourceWindow,
     pub(in crate::control) input: LiveNetworkChild,
     pub(in crate::control) expires: Instant,
 }
@@ -113,13 +130,29 @@ impl Sends {
                 }
             }
         }
+        self.reconcile(actor, peer, desired, now, false);
+    }
+
+    pub(in crate::control) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub(in crate::control) fn reconcile(
+        &mut self,
+        actor: &mut ControllerActor,
+        peer: NetworkId,
+        mut desired: BTreeMap<NonZeroU32, (LiveNetworkChild, WanLiveRouteAck, Instant)>,
+        now: Instant,
+        routed: bool,
+    ) {
         self.entries.retain(|ssrc, entry| {
-            let keep = desired.remove(ssrc).is_some_and(|(input, ack, _)| {
+            let keep = desired.remove(ssrc).is_some_and(|(input, ack, expires)| {
                 entry.input == input
                     && entry.ack == ack
-                    && now < entry.expires
+                    && now < entry.expires.min(expires)
                     && entry.cutoff.is_live()
                     && entry.advance(actor, peer)
+                    && (!routed || entry.renew(now, expires))
             });
             if !keep {
                 entry.retire(actor);
@@ -133,11 +166,11 @@ impl Sends {
             if self.used.len() >= MAX_EPOCH_WINDOWS {
                 break;
             }
-            if self.used.contains(&ssrc) {
+            if now >= expires || self.used.contains(&ssrc) {
                 continue;
             }
             if let Ok((cutoff, pending)) =
-                links.stage_wan_relay_transport(peer, input, ack, expires, now)
+                links.stage_wan_relay_transport(peer, input, ack, expires, routed, now)
             {
                 self.used.insert(ssrc);
                 self.entries.insert(
@@ -162,6 +195,19 @@ impl Drop for Entry {
 }
 
 impl Entry {
+    fn renew(&mut self, now: Instant, expires: Instant) -> bool {
+        match &self.phase {
+            Phase::Host(_) => return expires >= self.expires,
+            Phase::Shard(route, _) | Phase::Active(route) => {
+                if !route.tx.renew(now, expires) {
+                    return false;
+                }
+            }
+        }
+        self.expires = expires;
+        true
+    }
+
     fn advance(&mut self, actor: &mut ControllerActor, peer: NetworkId) -> bool {
         match &mut self.phase {
             Phase::Host(pending) => match pending.poll() {
@@ -176,8 +222,7 @@ impl Entry {
                                 self.ack.window.ssrc().get().to_be_bytes(),
                             ),
                         },
-                        expires_at: self.expires,
-                        tx: tx,
+                        tx,
                     };
                     let Some(receipt) =
                         actor.stage_fabric_relay_change(LiveRelayChange::Install(route.clone()))

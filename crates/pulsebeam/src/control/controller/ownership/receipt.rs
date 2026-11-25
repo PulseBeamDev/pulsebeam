@@ -21,6 +21,7 @@ const MAX_LINEAGES: usize = 4096;
 const SIGNING_DOMAIN: &[u8] = b"pulsebeam.joined.successor.v1\0";
 
 pub(in crate::control) mod epoch;
+pub(in crate::control::controller) mod standby;
 
 pub(in crate::control) enum Authority {
     Local(Box<dyn LineageTrust>),

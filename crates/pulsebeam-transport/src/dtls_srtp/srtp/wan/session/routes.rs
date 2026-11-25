@@ -46,6 +46,13 @@ impl WindowSpec {
     }
 }
 
+#[allow(
+    clippy::disallowed_types,
+    reason = "live authority deadline published across controller, WAN socket and shard owners; the packet path only reads it"
+)]
+mod live_deadline;
+pub use live_deadline::LiveDeadline;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WindowTicket {
     lease: Lease,
@@ -68,6 +75,15 @@ enum WindowPhase {
 struct WindowState {
     ticket: WindowTicket,
     phase: WindowPhase,
+    deadline: Option<LiveDeadline>,
+}
+
+impl WindowState {
+    fn expires(&self) -> Instant {
+        self.deadline
+            .as_ref()
+            .map_or(self.ticket.spec.expires, LiveDeadline::expires)
+    }
 }
 
 #[derive(Default)]
@@ -81,6 +97,7 @@ impl Windows {
 
 pub struct Opened {
     pub window: WindowTicket,
+    pub expires: Instant,
     pub position: u64,
     pub plaintext: Vec<u8>,
 }
@@ -94,7 +111,22 @@ impl Session {
         binding: Binding,
         spec: WindowSpec,
     ) -> Result<WindowTicket, Error> {
-        if binding != self.binding || spec.expires <= now {
+        self.stage_window_with_deadline(now, binding, spec, None)
+    }
+
+    pub fn stage_window_with_deadline(
+        &mut self,
+        now: Instant,
+        binding: Binding,
+        spec: WindowSpec,
+        deadline: Option<LiveDeadline>,
+    ) -> Result<WindowTicket, Error> {
+        if binding != self.binding
+            || spec.expires <= now
+            || deadline.as_ref().is_some_and(|deadline| {
+                spec.purpose != Purpose::Live || deadline.expires() != spec.expires
+            })
+        {
             return Err(Error::Window);
         }
         if let Purpose::Repair { position } = spec.purpose
@@ -108,7 +140,11 @@ impl Session {
         let ticket = WindowTicket { lease, spec };
         let key = (spec.direction, spec.ssrc);
         if let Some(state) = self.windows.0.get(&key) {
-            return if state.ticket == ticket && state.phase != WindowPhase::FeedbackOnly {
+            return if state.ticket == ticket
+                && state.phase != WindowPhase::FeedbackOnly
+                && state.deadline.is_none()
+                && deadline.is_none()
+            {
                 Ok(ticket)
             } else {
                 Err(Error::Window)
@@ -124,6 +160,7 @@ impl Session {
             WindowState {
                 ticket,
                 phase: WindowPhase::Staged,
+                deadline,
             },
         );
         Ok(ticket)
@@ -198,10 +235,8 @@ impl Session {
         plaintext: &[u8],
     ) -> Result<Prepared, Error> {
         self.advance(now)?;
-        if ticket.spec.direction != Direction::Send
-            || !self.active(ticket, now)
-            || plaintext.len() > MAX_DATAGRAM_BYTES
-        {
+        let expires = self.active_deadline(ticket, now).ok_or(Error::Window)?;
+        if ticket.spec.direction != Direction::Send || plaintext.len() > MAX_DATAGRAM_BYTES {
             return Err(Error::Window);
         }
         let header = rtp_header(plaintext, 0).map_err(|err| Error::Protection(err.into()))?;
@@ -214,7 +249,7 @@ impl Session {
         self.protector
             .as_mut()
             .ok_or(Error::Window)?
-            .prepare_rtp(path, now, ticket.spec.expires, plaintext)
+            .prepare_rtp(path, now, expires, plaintext)
             .map_err(|error| match error {
                 PrepareError::Stale => Error::Window,
                 PrepareError::Seal(error) => Error::Protection(error),
@@ -243,7 +278,7 @@ impl Session {
         let Some(position) = ticket.spec.admits(sequence) else {
             return Submission::Dropped(Dropped::Stale);
         };
-        if !self.active(ticket, now) {
+        if self.active_deadline(ticket, now).is_none() {
             return Submission::Dropped(Dropped::Stale);
         }
         let (Some(protector), Some(path)) = (&self.protector, &mut self.path) else {
@@ -317,9 +352,7 @@ impl Session {
             .get(&(Direction::Receive, ssrc))
             .ok_or(Error::Window)?
             .ticket;
-        if !self.active(window, now) {
-            return Err(Error::Window);
-        }
+        let expires = self.active_deadline(window, now).ok_or(Error::Window)?;
         let position = window.spec.admits(header.sequence).ok_or(Error::Window)?;
         let plaintext = self
             .protector
@@ -330,6 +363,7 @@ impl Session {
         self.history.observe(now, ssrc, position, ecn);
         Ok(Opened {
             window,
+            expires,
             position,
             plaintext,
         })
@@ -343,20 +377,27 @@ impl Session {
     ) -> Option<WindowSpec> {
         let state = self.windows.0.get(&(direction, ssrc))?;
         let ticket = state.ticket;
+        let expires = state.expires();
         (state.phase != WindowPhase::Staged
-            && now < ticket.spec.expires
+            && now < expires
             && self.lease(now) == Some(ticket.lease))
-        .then_some(ticket.spec)
+        .then_some(WindowSpec {
+            expires,
+            ..ticket.spec
+        })
     }
 
-    fn active(&self, ticket: WindowTicket, now: Instant) -> bool {
-        now < ticket.spec.expires
+    fn active_deadline(&self, ticket: WindowTicket, now: Instant) -> Option<Instant> {
+        let state = self
+            .windows
+            .0
+            .get(&(ticket.spec.direction, ticket.spec.ssrc))?;
+        let expires = state.expires();
+        (now < expires
             && self.lease(now) == Some(ticket.lease)
-            && self
-                .windows
-                .0
-                .get(&(ticket.spec.direction, ticket.spec.ssrc))
-                .is_some_and(|state| state.phase == WindowPhase::Active && state.ticket == ticket)
+            && state.phase == WindowPhase::Active
+            && state.ticket == ticket)
+            .then_some(expires)
     }
 
     pub(super) fn prune_windows(&mut self) -> Result<(), Error> {
@@ -369,7 +410,7 @@ impl Session {
         let protector = &mut self.protector;
         let history = &mut self.history;
         self.windows.0.retain(|&(direction, ssrc), state| {
-            if now < state.ticket.spec.expires && lease == Some(state.ticket.lease) {
+            if now < state.expires() && lease == Some(state.ticket.lease) {
                 return true;
             }
             if direction == Direction::Send {

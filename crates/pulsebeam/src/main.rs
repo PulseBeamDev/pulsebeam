@@ -78,6 +78,9 @@ struct Args {
     /// Persistent node identity directory, required when [cluster] is configured.
     #[arg(long)]
     data_dir: Option<PathBuf>,
+    /// Enable the private publisher ownership socket under --data-dir/operator.
+    #[arg(long, requires = "data_dir")]
+    operator_socket: bool,
     /// Write newline-delimited JSON instead of compact console logs.
     #[arg(long)]
     json_logs: bool,
@@ -240,6 +243,7 @@ async fn run(
     let rng = rand::os_rng();
     let node_builder = NodeBuilder::new()
         .host_utc_policy(args.host_clock.utc_policy, args.host_clock.unsmeared_utc)
+        .with_operator_socket(args.operator_socket)
         .workers(execution.workers)
         .local_addr(local_addr)
         .external_addrs(external_addrs)

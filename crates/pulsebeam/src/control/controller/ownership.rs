@@ -21,7 +21,7 @@ pub(crate) mod wire;
 #[cfg(test)]
 use super::SignalingProtocol;
 use crate::{
-    entity::{ConnectionId, ParticipantId, ProjectId, RoomId},
+    entity::{ConnectionId, EndpointKey, ParticipantId, ProjectId, RoomId},
     route::NodeTransportAddress,
 };
 pub(crate) use result::ResultBytes;
@@ -44,6 +44,22 @@ pub(crate) struct ClaimRank {
 }
 
 impl ClaimRank {
+    pub(super) fn from_persisted(
+        lineage: ConnectionId,
+        position: u64,
+        connection: ConnectionId,
+    ) -> Option<Self> {
+        (position != 0 || lineage == connection).then_some(Self {
+            root: lineage,
+            position,
+            connection,
+        })
+    }
+
+    pub(super) fn position(self) -> u64 {
+        self.position
+    }
+
     pub(in crate::control) fn root(connection: ConnectionId) -> Self {
         Self {
             root: connection,
@@ -333,6 +349,7 @@ struct Physical {
     incarnation: Incarnation,
     submitted: bool,
     retirement: Retirement,
+    retiring_claim: Option<(EndpointKey, ClaimRank)>,
 }
 
 struct Work {
@@ -779,6 +796,7 @@ impl Authority {
             incarnation,
             submitted: false,
             retirement: Retirement::Live,
+            retiring_claim: None,
         });
         self.incarnations.insert(incarnation, ticket.clone());
         Ok(())
@@ -803,10 +821,23 @@ impl Authority {
         Some(self.work.get(&prior)?.physical.as_ref()?.incarnation)
     }
 
-    pub(super) fn withdraw_incarnation(&mut self, incarnation: Incarnation) {
+    pub(super) fn withdraw_incarnation(
+        &mut self,
+        incarnation: Incarnation,
+        claim: Option<(EndpointKey, ClaimRank)>,
+    ) {
         let Some(ticket) = self.incarnations.get(&incarnation) else {
             return;
         };
+        if let Some(physical) = self
+            .work
+            .get_mut(ticket)
+            .and_then(|work| work.physical.as_mut())
+            && physical.submitted
+            && physical.retiring_claim.is_none()
+        {
+            physical.retiring_claim = claim;
+        }
         if let Some(accepted) = self
             .records
             .get_mut(&ticket.principal)
@@ -816,6 +847,12 @@ impl Authority {
         {
             accepted.withdrawn = true;
         }
+    }
+
+    pub(super) fn retiring_claims(&self) -> impl Iterator<Item = (EndpointKey, ClaimRank)> + '_ {
+        self.work
+            .values()
+            .filter_map(|work| work.physical.as_ref()?.retiring_claim)
     }
 
     pub(super) fn selected(&self, ticket: &Ticket) -> bool {
@@ -948,16 +985,16 @@ impl Authority {
         incarnation: Incarnation,
         success: bool,
         now: Instant,
-    ) {
+    ) -> bool {
         let Some(physical) = self
             .work
             .get_mut(ticket)
             .and_then(|work| work.physical.as_mut())
         else {
-            return;
+            return false;
         };
         if physical.incarnation != incarnation || physical.retirement != Retirement::InFlight {
-            return;
+            return false;
         }
         physical.retirement = if success {
             Retirement::Applied
@@ -967,6 +1004,7 @@ impl Authority {
         if success {
             self.retire(ticket, now);
         }
+        success
     }
 
     // Submitted bindings require a positive applied receipt, even after registry removal.
@@ -1426,6 +1464,7 @@ mod tests {
                 incarnation,
                 submitted: true,
                 retirement: Retirement::Live,
+                retiring_claim: None,
             });
             assert!(
                 authority
@@ -1435,6 +1474,13 @@ mod tests {
             );
         };
         attach(&mut authority, old);
+        let endpoint = EndpointKey {
+            room: crate::entity::ProjectRoomKey::fixture(RoomId::new("retiring").unwrap()),
+            participant: old.participant,
+        };
+        let claim = ClaimRank::root(old.connection);
+        assert!(authority.retiring_claims().next().is_none());
+        authority.withdraw_incarnation(old, Some((endpoint, claim)));
         authority.retry_failed_materialization(&ticket);
         authority.queue_retirement(old);
         authority.retire(&ticket, now);
@@ -1443,7 +1489,15 @@ mod tests {
             Err(Error::QuiescencePending)
         );
         authority.start_retirement(&ticket);
+        authority.finish_retirement(&ticket, old, false, now);
+        assert_eq!(
+            authority.retiring_claims().collect::<Vec<_>>(),
+            vec![(endpoint, claim)]
+        );
+        authority.retry_retirement(old);
+        authority.start_retirement(&ticket);
         authority.finish_retirement(&ticket, old, true, now);
+        assert!(authority.retiring_claims().next().is_none());
         assert_eq!(
             authority.begin(&principal, proof, sequence(1), rtc_binding(2), now),
             Err(Error::ChangedAttempt)

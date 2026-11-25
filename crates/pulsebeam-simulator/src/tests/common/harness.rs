@@ -763,6 +763,12 @@ pub enum Step {
         duration: Duration,
         service: super::native_origin::SourceService,
     },
+    /// Measure simultaneous joins from their request to the first fresh native decode.
+    MeasureJoinToDecode {
+        description: &'static str,
+        viewers: &'static [(&'static str, &'static str)],
+        timeout: Duration,
+    },
     /// Bounded first-visible-output contract, anchored at this step's start.
     WaitForNativeVideo {
         description: &'static str,
@@ -1372,6 +1378,7 @@ struct ParticipantHandle {
     /// not from the start of the plan: the settle steps before a subscription are not time the
     /// viewer spent waiting.
     subscribed_at: Option<Instant>,
+    join_requested_at: Option<Instant>,
     interval_video_baseline: VideoReceiveStats,
     interval_decoded_video_baseline: BTreeMap<String, u64>,
     interval_decoded_size_baseline: BTreeMap<String, DecodedVideoSizes>,
@@ -1871,6 +1878,7 @@ fn step_name(step: &Step) -> &'static str {
         Step::PublishData { .. } => "PublishData",
         Step::BeginNativePlayback { .. } => "BeginNativePlayback",
         Step::WaitForNativeVideo { .. } => "WaitForNativeVideo",
+        Step::MeasureJoinToDecode { .. } => "MeasureJoinToDecode",
         Step::CheckNativePlayback { .. } => "CheckNativePlayback",
         Step::CheckNativeDecodedVideo { .. } => "CheckNativeDecodedVideo",
         Step::CheckNativeVideoDecodedFromInterval { .. } => "CheckNativeVideoDecodedFromInterval",
@@ -2074,6 +2082,90 @@ fn native_source_proof(
         min_frames,
     )?;
     Ok(proof)
+}
+
+async fn measure_join_to_decode(
+    handles: &PlanHandles,
+    description: &str,
+    viewers: &[(&str, &str)],
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !viewers.is_empty(),
+        "join measurement needs at least one viewer"
+    );
+    let mut pending = BTreeMap::new();
+    for &(viewer, publisher) in viewers {
+        let handle = handles
+            .get(viewer)
+            .with_context(|| format!("{description}: unknown viewer {viewer}"))?;
+        let requested = handle
+            .join_requested_at
+            .with_context(|| format!("{description}: no authored join request for {viewer}"))?;
+        anyhow::ensure!(
+            pending.insert(viewer, (publisher, requested)).is_none(),
+            "duplicate measured viewer {viewer}"
+        );
+    }
+    let cohort_size = pending.len();
+    let mut max_elapsed = Duration::ZERO;
+    while !pending.is_empty() {
+        let now = Instant::now();
+        let mut wake_at = now + Duration::from_millis(20);
+        let mut completed = Vec::new();
+        for (&viewer, &(publisher, requested)) in &pending {
+            let sample = (|| {
+                let (origin, generation) = source_context(handles, viewer, publisher)?;
+                let log = handles[viewer].shared.video_rx.lock().unwrap();
+                let (decoded, track) = log
+                    .native_origin
+                    .first_fresh_decode(&origin, generation, requested)?;
+                log.native_decoded
+                    .require_valid_receiver(generation, track.receiver)?;
+                decoded
+                    .checked_duration_since(requested)
+                    .context("decode predates join request")
+            })();
+            match sample {
+                Ok(elapsed) => {
+                    tracing::info!(
+                        description,
+                        viewer,
+                        publisher,
+                        elapsed_us = elapsed.as_micros(),
+                        "join-to-fresh-decode sample"
+                    );
+                    anyhow::ensure!(
+                        elapsed <= timeout,
+                        "{description}: {viewer} decoded too late: {elapsed:?}"
+                    );
+                    max_elapsed = max_elapsed.max(elapsed);
+                    completed.push(viewer);
+                }
+                Err(error) => {
+                    let deadline = requested + timeout;
+                    anyhow::ensure!(
+                        now < deadline,
+                        "{description}: {viewer} did not decode within {timeout:?}: {error:#}"
+                    );
+                    wake_at = wake_at.min(deadline);
+                }
+            }
+        }
+        for viewer in completed {
+            pending.remove(viewer);
+        }
+        if !pending.is_empty() {
+            tokio::time::sleep_until(wake_at.into()).await;
+        }
+    }
+    tracing::info!(
+        description,
+        samples = cohort_size,
+        max_us = max_elapsed.as_micros(),
+        "join-to-fresh-decode cohort"
+    );
+    assert_convergence(handles, description).await
 }
 
 enum ServerCommand {
@@ -2600,6 +2692,7 @@ async fn execute_plan(
                     handle.shared.pending_ops.lock().unwrap().restart();
                 }
                 handle.present = true;
+                handle.join_requested_at = Some(Instant::now());
                 handle.send_command(ParticipantCmd::Reconnect);
                 let (room, external_id) = (handle.room_name, handle.external_id);
                 if let Some(external_id) = external_id {
@@ -3310,6 +3403,13 @@ async fn execute_plan(
                 } else {
                     log.native_decoded.checkpoint()
                 };
+            }
+            Step::MeasureJoinToDecode {
+                description,
+                viewers,
+                timeout,
+            } => {
+                measure_join_to_decode(handles, description, viewers, *timeout).await?;
             }
             Step::WaitForNativeVideo {
                 description,
@@ -6185,26 +6285,28 @@ impl LocalNodeSim {
             self.rng_seed
         );
 
-        let sim_duration = plan
-            .iter()
-            .filter_map(|s| match s {
-                Step::Run { duration, .. } | Step::WaitSinceBootstrapRelease { duration, .. } => {
-                    Some(*duration)
-                }
-                Step::ReleaseHeldReconnect { held_for, .. } => Some(*held_for),
-                Step::MeasureSourceWindow { duration, .. } => {
-                    Some(*duration + Duration::from_secs(5))
-                }
-                Step::WaitForSourceVideo { timeout, .. } => Some(*timeout + Duration::from_secs(2)),
-                Step::BeginHeldReconnect { timeout, .. }
-                | Step::WaitForPublication { timeout, .. }
-                | Step::WaitForVideo { timeout, .. }
-                | Step::WaitForVideoAtResolution { timeout, .. }
-                | Step::MoveRoom { timeout, .. } => Some(*timeout),
-                _ => None,
-            })
-            .sum::<Duration>()
-            + Duration::from_secs(60);
+        let sim_duration =
+            plan.iter()
+                .filter_map(|s| match s {
+                    Step::Run { duration, .. }
+                    | Step::WaitSinceBootstrapRelease { duration, .. } => Some(*duration),
+                    Step::ReleaseHeldReconnect { held_for, .. } => Some(*held_for),
+                    Step::MeasureSourceWindow { duration, .. } => {
+                        Some(*duration + Duration::from_secs(5))
+                    }
+                    Step::WaitForSourceVideo { timeout, .. }
+                    | Step::MeasureJoinToDecode { timeout, .. } => {
+                        Some(*timeout + Duration::from_secs(2))
+                    }
+                    Step::BeginHeldReconnect { timeout, .. }
+                    | Step::WaitForPublication { timeout, .. }
+                    | Step::WaitForVideo { timeout, .. }
+                    | Step::WaitForVideoAtResolution { timeout, .. }
+                    | Step::MoveRoom { timeout, .. } => Some(*timeout),
+                    _ => None,
+                })
+                .sum::<Duration>()
+                + Duration::from_secs(60);
 
         let mut sim = turmoil::Builder::new()
             .ip_version(self.ip_version.clone())
@@ -6350,6 +6452,7 @@ impl LocalNodeSim {
                             .map(|topics| topics.subscribers.clone())
                             .unwrap_or_default(),
                         subscribed_at: None,
+                        join_requested_at: None,
                         interval_video_baseline: VideoReceiveStats::default(),
                         interval_decoded_video_baseline: BTreeMap::new(),
                         interval_decoded_size_baseline: BTreeMap::new(),

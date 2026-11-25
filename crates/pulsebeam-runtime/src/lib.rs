@@ -39,7 +39,7 @@ pub use tokio::{join, main, pin, select, signal, test, try_join};
 
 /// Async I/O operations used at integration boundaries.
 pub mod io {
-    pub use tokio::io::{AsyncWriteExt, copy_bidirectional};
+    pub use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
 }
 
 /// Implementation detail required by the reexported harness macros.

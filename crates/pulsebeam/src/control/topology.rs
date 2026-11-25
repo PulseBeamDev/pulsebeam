@@ -10,6 +10,10 @@ use crate::{
     track::{SelectionPolicy, Track, TrackSelector},
 };
 
+mod named;
+
+pub(crate) use named::NamedTrack;
+
 new_key_type! {
     pub(crate) struct SubscriptionKey;
 }
@@ -104,6 +108,7 @@ struct RoomTrackTopology {
 pub(crate) struct TrackTopology {
     catalog_version: u64,
     publication_ids: HashSet<PublicationKey>,
+    named: named::NamedSources,
     rooms: HashMap<ProjectRoomKey, RoomTrackTopology>,
 }
 
@@ -115,6 +120,10 @@ impl TrackTopology {
             return None;
         }
         let label = track.publication_label();
+        if let Some(name) = named_track(&track) {
+            self.named
+                .insert(identity.room_id.project, name, identity.publication_id);
+        }
         let room = self.rooms.entry(identity.room_id).or_default();
         self.catalog_version = self
             .catalog_version
@@ -140,8 +149,29 @@ impl TrackTopology {
         {
             return None;
         }
+        // Owned exact bindings belong to this source presentation, not to a
+        // future presentation that happens to reuse the physical publication key.
+        let owned = room
+            .by_track
+            .get(&identity.publication_id)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|&id| {
+                room.subscriptions
+                    .get(id)
+                    .is_some_and(|subscription| subscription.owned_ref.is_some())
+            })
+            .collect::<Vec<_>>();
+        for id in owned {
+            room.unsubscribe(id);
+        }
         let publication = room.tracks.remove(&identity.publication_id)?;
         self.publication_ids.remove(&identity.publication_id);
+        if let Some(name) = named_track(&publication.track) {
+            self.named
+                .remove(identity.room_id.project, name, identity.publication_id);
+        }
         self.catalog_version = self
             .catalog_version
             .checked_add(1)
@@ -171,8 +201,6 @@ impl TrackTopology {
         Some(&self.rooms.get(&room_id)?.tracks.get(&track)?.track)
     }
 
-    // Publisher publications are capped at 64 by admission. Logical labels are
-    // metadata; routing-label indexes deliberately omit audio and video.
     pub(crate) fn exact_named_sources(
         &self,
         room_id: ProjectRoomKey,
@@ -181,17 +209,22 @@ impl TrackTopology {
         track_id: crate::entity::TrackId,
     ) -> Option<impl Iterator<Item = &Track>> {
         let room = self.rooms.get(&room_id)?;
-        let publications = room.by_publisher.get(&publisher)?;
-        let kinds = room.by_kind.get(&kind)?;
         Some(
-            publications
-                .iter()
-                .filter(move |track| kinds.contains(track))
-                .filter_map(move |track| {
-                    room.tracks.get(track).map(|publication| &publication.track)
-                })
-                .filter(move |track| track.meta().track_id == Some(track_id)),
+            self.named
+                .exact(room_id, publisher, kind, track_id)
+                .filter_map(move |id| room.tracks.get(&id).map(|publication| &publication.track)),
         )
+    }
+
+    pub(crate) fn scan_named_sources(
+        &self,
+        project: crate::entity::ProjectId,
+        selector: super::permissions::SubscriptionSelector,
+        after: Option<NamedTrack>,
+        budget: std::num::NonZeroUsize,
+        visit: impl FnMut(NamedTrack),
+    ) -> Option<NamedTrack> {
+        self.named.scan(project, selector, after, budget, visit)
     }
 
     pub(super) fn sources_in_room(&self, room_id: ProjectRoomKey) -> impl Iterator<Item = &Track> {
@@ -203,6 +236,12 @@ impl TrackTopology {
 
     pub(crate) fn catalog_version(&self) -> u64 {
         self.catalog_version
+    }
+
+    pub(super) fn has_local_subscriber(&self, room: ProjectRoomKey) -> bool {
+        self.rooms
+            .get(&room)
+            .is_some_and(|room| !room.subscriptions.is_empty())
     }
 
     pub(crate) fn room_catalog_version(&self, room: ProjectRoomKey) -> u64 {
@@ -473,6 +512,16 @@ impl TrackTopology {
             self.unpublish(identity);
         }
     }
+}
+
+fn named_track(track: &Track) -> Option<NamedTrack> {
+    let meta = track.meta();
+    Some(NamedTrack {
+        room: meta.room.room,
+        participant: meta.origin,
+        kind: track.id().kind(),
+        track: meta.track_id?,
+    })
 }
 
 impl RoomTrackTopology {
@@ -940,6 +989,39 @@ mod tests {
     }
 
     #[test]
+    fn owned_exact_binding_does_not_follow_a_republished_key() {
+        let mut topology = TrackTopology::default();
+        let presentation = track(TrackKind::Video, 1, 1, "camera");
+        let mut encoder = presentation.meta().clone();
+        encoder.origin = participant(2);
+        let subscriber = participant(3);
+        let first = topology.publish(presentation).unwrap();
+        assert!(topology.set_owned(first.room_id, subscriber, 1, first.publication_id, true));
+        assert_eq!(topology.active_subscribers(first).count(), 1);
+
+        topology.unpublish(first).unwrap();
+        let second = topology
+            .publish(Track::video(encoder, Vec::new(), None))
+            .unwrap();
+        assert_eq!(first.publication_id, second.publication_id);
+        assert_eq!(topology.candidate_subscribers(second).count(), 0);
+        assert!(
+            topology
+                .remove_owned(
+                    second.room_id,
+                    EndpointKey {
+                        room: second.room_id,
+                        participant: subscriber
+                    },
+                    1
+                )
+                .is_none()
+        );
+        assert!(topology.set_owned(second.room_id, subscriber, 2, second.publication_id, true));
+        assert_eq!(topology.active_subscribers(second).count(), 1);
+    }
+
+    #[test]
     fn a_publication_is_not_visible_in_the_same_room_of_another_project() {
         let mut topology = TrackTopology::default();
         let publication = track(TrackKind::Data, 1, 1, "topic");
@@ -1052,6 +1134,87 @@ mod tests {
                 0
             );
         }
+    }
+
+    #[test]
+    fn named_source_scan_is_bounded_deduplicated_and_project_local() {
+        use crate::control::permissions::{Component, SubscriptionSelector};
+        use std::num::NonZeroUsize;
+
+        let mut topology = TrackTopology::default();
+        let project = room(1).project;
+        let camera = |room, publisher| track(TrackKind::Video, publisher, room, "camera");
+        let first = topology.publish(camera(1, 1)).unwrap();
+        let second = topology.publish(camera(1, 1)).unwrap();
+        topology
+            .publish(track(TrackKind::Audio, 2, 1, "camera"))
+            .unwrap();
+        let mut unnamed = camera(2, 2);
+        unnamed.meta_mut().track_id = None;
+        topology.publish(unnamed).unwrap();
+        let other_project = crate::entity::ProjectId::new();
+        let mut unrelated = camera(1, 1);
+        unrelated.meta_mut().room.project = other_project;
+        topology.publish(unrelated).unwrap();
+
+        let selector = SubscriptionSelector {
+            project: Component::Any,
+            room: Component::Any,
+            participant: Component::Any,
+            kind: Component::Literal(TrackKind::Video),
+            track: Component::Literal(crate::entity::TrackId::new("camera").unwrap()),
+        };
+        let mut names = Vec::new();
+        let budget = NonZeroUsize::MIN;
+        let cursor =
+            topology.scan_named_sources(project, selector, None, budget, |name| names.push(name));
+        assert!(
+            cursor.is_some(),
+            "nonmatching names still count against work budget"
+        );
+        assert_eq!(names.len(), 1);
+        assert!(
+            topology
+                .scan_named_sources(project, selector, cursor, budget, |name| names.push(name))
+                .is_none()
+        );
+        assert_eq!(names.len(), 1, "one logical name despite two publications");
+
+        topology.unpublish(first).unwrap();
+        let name = names[0];
+        let sources = topology
+            .exact_named_sources(room(1), name.participant, name.kind, name.track)
+            .unwrap();
+        assert_eq!(
+            sources.map(Track::id).collect::<Vec<_>>(),
+            [second.publication_id]
+        );
+        topology.unpublish(second).unwrap();
+        topology.publish(camera(2, 1)).unwrap();
+        let exact_room = SubscriptionSelector {
+            room: Component::Literal(room(2).room),
+            participant: Component::Literal(participant(1)),
+            ..selector
+        };
+        names.clear();
+        assert!(
+            topology
+                .scan_named_sources(project, exact_room, None, budget, |name| names.push(name))
+                .is_none()
+        );
+        assert_eq!(names.len(), 1);
+        assert_eq!(names[0].room, room(2).room);
+        let wrong_project = SubscriptionSelector {
+            project: Component::Literal(other_project),
+            ..selector
+        };
+        assert!(
+            topology
+                .scan_named_sources(project, wrong_project, None, budget, |_| panic!(
+                    "cross-project match"
+                ))
+                .is_none()
+        );
     }
 
     #[test]
@@ -1210,16 +1373,18 @@ mod tests {
             })]
         );
         topology.unpublish(identity).unwrap();
-        topology
-            .remove_owned(
-                room(1),
-                EndpointKey {
-                    room: room(1),
-                    participant: other,
-                },
-                1,
-            )
-            .unwrap();
+        assert!(
+            topology
+                .remove_owned(
+                    room(1),
+                    EndpointKey {
+                        room: room(1),
+                        participant: other,
+                    },
+                    1,
+                )
+                .is_none()
+        );
         assert!(topology.rooms[&room(1)].owned.is_empty());
     }
 

@@ -180,7 +180,6 @@ mod tests {
                     peer,
                     key: NodeRouteKey::from_bytes(demand.live.get().to_be_bytes()),
                 },
-                expires_at: expires,
                 tx: tx.clone(),
             }),
             parent: ParentSend {

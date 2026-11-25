@@ -1044,7 +1044,8 @@ pub(super) fn reconcile(
             kind: wire_kind,
             track_id: value.track_id.clone(),
         };
-        let binding = if session.state.binding_profile() == state::validation::BindingProfile::Quic {
+        let binding = if session.state.binding_profile() == state::validation::BindingProfile::Quic
+        {
             let profile = quic_publication_profiles.get(&value.track_id).copied();
             quic_rtp_binding(session, &resource, None, profile, None, ids)
         } else {
@@ -1493,7 +1494,10 @@ pub(super) fn reconcile(
     let removed = session
         .state
         .resources()
-        .filter(|resource| !wanted.contains_key(*resource))
+        .filter(|resource| {
+            !matches!(resource, Resource::SubscriptionSelector(_))
+                && !wanted.contains_key(*resource)
+        })
         .cloned()
         .collect::<Vec<_>>();
     for resource in removed {
@@ -1943,10 +1947,13 @@ impl Agent {
             .active
             .as_ref()
             .map_or(SourceReadiness::Ready, |active| {
-                if active
-                    .media_leases
-                    .get(slot)
-                    .is_some_and(|lease| lease.retirement_failed)
+                if active.state.binding_profile() == state::validation::BindingProfile::Quic
+                    && target.and_then(|track_id| self.resources.publication_video_codec(track_id))
+                        == Some(crate::VideoCodecRequirement::Av1)
+                    || active
+                        .media_leases
+                        .get(slot)
+                        .is_some_and(|lease| lease.retirement_failed)
                     || active
                         .media_wanted
                         .get(slot)
@@ -2179,6 +2186,7 @@ impl Agent {
             );
         }
         let prepared = prepared.ok().flatten();
+        let demand = self.selectors.receiver_demand(&active.state, &self.desired);
         for (slot, want) in pending.wanted {
             let assigned = slots
                 .iter()
@@ -2209,7 +2217,7 @@ impl Agent {
                 )
             });
             let accepted = active.media_wanted.get(&slot) == Some(&want)
-                && media_needed(active, &self.desired, &slot, &want)
+                && media_needed(active, &demand, &slot, &want)
                 && (identity_pending && want.allocation.format.is_none() || complete);
             if let Some(assigned) = assigned {
                 active
@@ -2251,7 +2259,7 @@ impl Agent {
             if !accepted {
                 if let Some(offer) = want.offer
                     && active.media_wanted.get(&slot) == Some(&want)
-                    && media_needed(active, &self.desired, &slot, &want)
+                    && media_needed(active, &demand, &slot, &want)
                 {
                     let _ = active.state.report_logical_receiver(
                         &want.resource,
@@ -2601,7 +2609,7 @@ impl Agent {
             match change {
                 Change::Catalog(record) => {
                     if let Some((owner, state)) = self.catalogs.apply(*record) {
-                        if state.status == crate::ffi::WatchStatus::Failed {
+                        if state.status.is_terminal() {
                             self.notifications.push_back(Notification::CatalogWatchTerminated { owner: owner.id(), state });
                         } else if !self.notifications.iter().any(|notification| matches!(notification, Notification::CatalogWatchChanged { owner: current } if *current == owner.id())) {
                             self.notifications.push_back(Notification::CatalogWatchChanged { owner: owner.id() });
@@ -2717,6 +2725,9 @@ impl Agent {
                     evaluates_current,
                     ..
                 } => {
+                    if matches!(resource, Resource::SubscriptionSelector(_)) {
+                        self.intent_dirty = true;
+                    }
                     if matches!(resource, Resource::LogicalData(_)) {
                         if evaluates_current {
                             self.apply_data_read_failure(&resource, &confirmed)?;

@@ -93,7 +93,7 @@ struct Branch {
 
 impl LiveRelays {
     pub(crate) fn install(&mut self, now: Instant, relay: CompiledLiveRelay) -> bool {
-        if relay.expires_at <= now || !relay.tx.is_live() {
+        if relay.tx.expires() <= now || !relay.tx.is_live() {
             return false;
         }
         let existing = self
@@ -101,7 +101,7 @@ impl LiveRelays {
             .iter()
             .position(|branch| branch.next == relay.next);
         for branch in &mut self.branches {
-            branch.paths.retain(|path| path.expires_at > now);
+            branch.paths.retain(|path| path.tx.expires() > now);
         }
         if let Some(index) = existing
             && let Some(branch) = self.branches.get_mut(index)
@@ -162,7 +162,7 @@ impl LiveRelays {
             && branches.iter().any(|branch| {
                 branch.next == route.next
                     && branch.paths.iter().any(|path| {
-                        path.input == route.input && path.tx == route.tx && now < path.expires_at
+                        path.input == route.input && path.tx == route.tx && now < path.tx.expires()
                     })
             })
     }
@@ -188,7 +188,7 @@ impl LiveRelays {
             if let Some(outcome) = offer_live_network(
                 &mut branch.admissions,
                 &path.tx,
-                path.expires_at,
+                path.tx.expires(),
                 &frozen,
                 now,
             ) {

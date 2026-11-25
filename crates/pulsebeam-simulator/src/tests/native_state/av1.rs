@@ -518,7 +518,9 @@ async fn session(
             }
             // A receiver-local repair can overtake an original datagram on
             // this reordered path. Decode and primary arrival are separate.
-            if udp.saw_all_primary_fragments() && let Some(frame) = decoded.take() {
+            if udp.saw_all_primary_fragments()
+                && let Some(frame) = decoded.take()
+            {
                 return frame;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;

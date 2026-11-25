@@ -33,6 +33,7 @@ export {
   RemoteAudioTrack,
   RemoteDataTrack,
   RoomRef,
+  SelectorSubscription,
   VideoPublication,
   VideoSource,
   VideoSubscription,
@@ -40,6 +41,7 @@ export {
   WebAgentConfig as AgentConfig,
   WebAgentError as AgentError,
   WebAudioOutput,
+  WebSelectorOutput,
   WebVideoOutput,
 } from "./generated/bindings/pulsebeam_agent_web.js";
 export {
@@ -70,6 +72,11 @@ export {
   SubscriptionSourceStatus,
   PublicationConfig,
   PublicationState,
+  SelectorMatch,
+  SelectorState,
+  SelectorStatus,
+  SelectorTrackKind,
+  SubscriptionSelector,
   TrackSelector,
   VideoCodec,
   VideoObservation,

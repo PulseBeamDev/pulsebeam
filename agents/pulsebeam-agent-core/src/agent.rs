@@ -14,7 +14,7 @@ use crate::{
     DataChannelReliability, DataChannelSpec, DesiredState, Effect, Failure, FailureClass,
     Generation, HostEvent, HttpEffect, HttpEvent, HttpHeader, HttpMethod, HttpRequest,
     HttpResponse, MediaSlot, Notification, OfferResources, OperationId, RtcEffect, RtcEvent,
-    SlotBinding, Snapshot, TimerEffect, TimerEvent, TimerId, TopicError, TopicSend,
+    SlotBinding, Snapshot, TimerEffect, TimerEvent, TimerId, TopicError, TopicSend, TrackOwner,
     ValidationError,
     id::IdGenerator,
     signaling::{self, SignalingError},
@@ -50,7 +50,12 @@ pub use admission::placement;
 pub use quic::{QuicRtpPublication, QuicRtpReceiver};
 mod native;
 mod publication;
+mod selectors;
 mod subscription;
+
+pub use selectors::{
+    SelectorMatch, SelectorState, SelectorStatus, SelectorTrackKind, SubscriptionSelector,
+};
 
 use admission::CreateRequest;
 
@@ -339,6 +344,7 @@ pub struct Agent {
     declared: DesiredState,
     resources: crate::TrackResources,
     catalogs: crate::catalog::Catalogs,
+    selectors: selectors::Selectors,
     local_bindings: BTreeMap<MediaSlot, String>,
     snapshot: Snapshot,
     ids: IdGenerator,
@@ -377,6 +383,7 @@ impl Agent {
             declared: DesiredState::default(),
             resources: crate::TrackResources::default(),
             catalogs: crate::catalog::Catalogs::default(),
+            selectors: selectors::Selectors::default(),
             local_bindings: BTreeMap::new(),
             snapshot: Snapshot::default(),
             ids: IdGenerator::new(),
@@ -763,6 +770,18 @@ impl Agent {
                         .begin_audio_source_observation(TrackOwner(owner), source)?,
                 )
             }
+            ResourceCommand::BeginSelectorMediaObservation { owner, source } => {
+                if source.kind == SelectorTrackKind::Data {
+                    return Err(crate::TrackResourceError::WrongKind.into());
+                }
+                if !self.selector_match_current(owner, &source) {
+                    return Err(crate::TrackResourceError::Released.into());
+                }
+                ResourceResult::MediaObservation(
+                    self.resources
+                        .begin_selector_media_observation(owner, source)?,
+                )
+            }
             ResourceCommand::AuthorizeMediaObservation { control } => {
                 return Ok(if self.resources.observation_control_current(&control) {
                     ResourceResult::Updated
@@ -803,6 +822,38 @@ impl Agent {
                 self.resources.receive(owner, &spec, source)?;
                 ResourceResult::Owned { owner: owner.id() }
             }
+            ResourceCommand::ReceiveSelectorData { owner, source } => {
+                if source.kind != SelectorTrackKind::Data {
+                    return Err(crate::TrackResourceError::WrongKind.into());
+                }
+                if !self.selector_match_current(owner, &source) {
+                    return Err(crate::TrackResourceError::Released.into());
+                }
+                let source = source.address();
+                let resource = crate::native_state::Resource::LogicalData(source.clone());
+                let delivery = self
+                    .active
+                    .as_ref()
+                    .and_then(|active| {
+                        let (_, logical) = active.state.logical_offer(&resource)?;
+                        let pulsebeam_proto::state::track::Kind::Data(data) =
+                            logical.source.as_ref()?.kind.as_ref()?
+                        else {
+                            return None;
+                        };
+                        crate::TopicMode::from_delivery(data.delivery)
+                    })
+                    .ok_or_else(|| {
+                        AgentError::OperationFailed(crate::ffi::ErrorInfo::new(
+                            crate::ffi::ErrorCode::NotReady,
+                            "Selected data source is not ready",
+                        ))
+                    })?;
+                let owner = self
+                    .resources
+                    .receive_selector_data(owner, source, delivery)?;
+                ResourceResult::Owned { owner: owner.id() }
+            }
             ResourceCommand::ReadData { owner } => {
                 return Ok(ResourceResult::Event {
                     event: self.resources.read(TrackOwner(owner))?,
@@ -831,7 +882,8 @@ impl Agent {
                 .as_mut()
                 .filter(|active| !active.signaling_terminal)
         {
-            native::fence_unwanted_media(active, &self.desired, &mut self.ids, &mut self.effects)?;
+            let demand = self.selectors.receiver_demand(&active.state, &self.desired);
+            native::fence_unwanted_media(active, &demand, &mut self.ids, &mut self.effects)?;
             if native::project_retired_receivers(active, &mut self.snapshot) {
                 self.snapshot.version = self.snapshot.version.saturating_add(1);
                 self.notifications.push_back(Notification::SnapshotChanged);
@@ -1173,6 +1225,7 @@ impl Agent {
     fn flush_notifications(&mut self) -> Result<(), AgentError> {
         self.project_topic_bindings();
         self.progress_pending_data_sends();
+        self.retire_unmatched_selector_data();
         self.publish_notifications();
         // Failed notification processing must not retain stale input grants.
         self.reconcile_input_controls();
@@ -1234,10 +1287,16 @@ impl Agent {
     fn reconcile_observation_controls(&mut self) {
         for (id, slot) in self.resources.observation_requests() {
             let source = self.resources.audio_observation_source(id);
-            let authorized =
-                source.is_none_or(|source| self.audio_source_authorized(id.owner(), source));
+            let selected = self.resources.selector_observation_match(id);
+            let owner = TrackOwner(id.owner());
+            let authorized = selected
+                .is_none_or(|source| self.selector_match_current(owner, source))
+                && source.is_none_or(|source| self.audio_source_authorized(id.owner(), source));
             let target = if !authorized {
                 None
+            } else if let Some(selected) = selected {
+                self.selector_media_receiver(owner, selected)
+                    .and_then(|(slot, _)| self.media_observation_target(&slot))
             } else if let Some(source) = source {
                 self.audio_source_observation_target(source)
             } else {
@@ -3113,6 +3172,109 @@ impl Agent {
         Some(state)
     }
 
+    pub fn open_subscription_selector(
+        &mut self,
+        selector: SubscriptionSelector,
+    ) -> Result<crate::TrackOwner, crate::ffi::ErrorInfo> {
+        let owner = self.resources.new_owner().map_err(|_| {
+            crate::ffi::ErrorInfo::new(
+                crate::ffi::ErrorCode::CapacityExceeded,
+                "selector owner identity exhausted",
+            )
+        })?;
+        self.selectors.insert(owner, selector)?;
+        self.request_reconciliation();
+        Ok(owner)
+    }
+
+    pub fn subscription_selector_state(&self, owner: crate::TrackOwner) -> Option<SelectorState> {
+        let native = self
+            .active
+            .as_ref()
+            .filter(|active| !active.signaling_terminal)
+            .map(|active| &active.state);
+        self.selectors.state(owner, native)
+    }
+
+    fn selector_match_current(&self, owner: TrackOwner, source: &SelectorMatch) -> bool {
+        self.active
+            .as_ref()
+            .filter(|active| !active.signaling_terminal)
+            .is_some_and(|active| self.selectors.contains_match(owner, source, &active.state))
+    }
+
+    /// Resolve a current media match to its installed receiver coordinate.
+    /// Hosts must attach within the same actor turn, not cache this coordinate.
+    pub fn selector_media_receiver(
+        &self,
+        owner: crate::TrackOwner,
+        source: &SelectorMatch,
+    ) -> Option<(MediaSlot, String)> {
+        let active = self
+            .active
+            .as_ref()
+            .filter(|active| !active.signaling_terminal)?;
+        if !self.selectors.contains_match(owner, source, &active.state) {
+            return None;
+        }
+        let kind = match source.kind {
+            SelectorTrackKind::Audio => pulsebeam_proto::state::TrackKind::Audio,
+            SelectorTrackKind::Video => pulsebeam_proto::state::TrackKind::Video,
+            SelectorTrackKind::Data => return None,
+        };
+        let crate::native_state::Resource::LogicalReception(slot) =
+            native::logical_resource(active, &source.address(), kind)?
+        else {
+            return None;
+        };
+        let track = native::receiver_track(active, slot)?;
+        (track.room_id == source.room
+            && track.participant_id == source.participant_id
+            && track.track_id == source.track_id)
+            .then(|| (slot.clone(), track.publication_id.clone()))
+    }
+
+    fn retire_unmatched_selector_data(&mut self) {
+        let native = self
+            .active
+            .as_ref()
+            .filter(|active| !active.signaling_terminal)
+            .map(|active| &active.state);
+        let retired: Vec<_> = self
+            .resources
+            .selector_data_receivers()
+            .filter_map(|(reader, selector, subscriber)| {
+                (!native.is_some_and(|native| {
+                    self.selectors
+                        .contains_data_match(selector, native, subscriber)
+                }))
+                .then_some(reader)
+            })
+            .collect();
+        if !retired.is_empty() {
+            for &owner in &retired {
+                self.resources.release(owner);
+            }
+            self.notifications.push_back(Notification::DataReady {
+                owners: retired.into_iter().map(TrackOwner::id).collect(),
+            });
+        }
+    }
+
+    pub fn close_subscription_selector(&mut self, owner: crate::TrackOwner) -> bool {
+        if !self.selectors.remove(owner) {
+            return false;
+        }
+        self.retire_unmatched_selector_data();
+        for mut control in self.resources.release_observation_controls(owner) {
+            control.effect = Some(self.ids.operation());
+            self.effects.push_back(Effect::MediaObservation(control));
+        }
+        self.intent_dirty = true;
+        self.request_reconciliation();
+        true
+    }
+
     fn reconcile_current(&mut self) {
         if self.snapshot.terminal_failure.is_some() || self.closing.is_some() {
             return;
@@ -3128,16 +3290,18 @@ impl Agent {
         if let Err(error) = self
             .catalogs
             .reconcile(active.generation, &mut active.state)
+            .and_then(|()| self.selectors.reconcile(&mut active.state))
         {
             self.fail_terminal(Failure::protocol(error.to_string()));
             return;
         }
         if self.intent_dirty {
             self.intent_dirty = false;
+            let demand = self.selectors.receiver_demand(&active.state, &self.desired);
             if let Err(error) = native::reconcile(
                 active,
                 &mut self.logs,
-                &self.desired,
+                &demand,
                 &self.resources,
                 &self.quic_publication_profiles,
                 &mut self.ids,

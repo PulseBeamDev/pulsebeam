@@ -16,10 +16,10 @@ use crate::{
 };
 
 pub(in crate::control) mod fabric;
-pub(super) mod wan_publisher;
+pub(in crate::control::controller) mod wan_publisher;
 pub(super) mod wan_repair;
 pub(in crate::control) mod wan_source;
-pub(super) mod wan_transit;
+pub(in crate::control::controller) mod wan_transit;
 
 pub(in crate::control) const LIMIT: usize = 128;
 
@@ -152,6 +152,7 @@ pub(super) fn reconcile_wan_receives(
     actor: &mut ControllerActor,
     peer: NetworkId,
     session: super::Session,
+    regional_peer: Option<crate::cluster::mesh::Member>,
     remote: Option<(Instant, &[wan_source::WanSourceWindow])>,
     now: Instant,
 ) {
@@ -169,7 +170,24 @@ pub(super) fn reconcile_wan_receives(
         expires = deadline;
         let mut targets = HashMap::new();
         desired.extend(sources.iter().filter_map(|&source| {
+            let selection = if let Some(regional_peer) = regional_peer {
+                source.offer_cut?;
+                let selected = *actor
+                    .regional_mesh
+                    .as_ref()?
+                    .path(source.origin?)?
+                    .first()?;
+                Some((selected, regional_peer == selected))
+            } else {
+                None
+            };
             let publication = source.publisher.publication;
+            if actor
+                .lifecycle
+                .uses_routed_receive(source.room, publication)
+            {
+                return None;
+            }
             let canonical = actor.lifecycle.ingress_peer(source.room, publication)?;
             if canonical != peer
                 && (!links.is_wan_peer(canonical)
@@ -194,29 +212,42 @@ pub(super) fn reconcile_wan_receives(
             let routes = targets
                 .entry(canonical)
                 .or_insert_with(|| links.relay_targets(canonical, LIMIT));
-            Some((
-                source,
-                canonical,
-                routes.as_ref()?.get(&source.scope())?.clone(),
-            ))
+            let addresses = routes.as_ref()?.get(&source.scope())?;
+            let may_stage = selection.is_none_or(|(_, selected)| selected);
+            // The held route chooses where to stage, not when to withdraw the
+            // incumbent. An install ACK alone does not prove remote sending.
+            if let Some((selected, false)) = selection
+                && links.regional_incumbent(source, canonical, addresses, selected, now)
+                    != Some(peer)
+            {
+                return None;
+            }
+            Some((source, canonical, addresses.clone(), may_stage))
         }));
     }
-    links.retain_wan_live_receives(peer, |ack, canonical, children| {
-        if let Some(index) = desired.iter().position(|(source, selected, destinations)| {
-            *selected == canonical
-                && source.matches_ack(ack)
-                && children
-                    .iter()
-                    .map(|child| child.destination)
-                    .eq(destinations.iter().copied())
-        }) {
+    links.retain_wan_live_receives(peer, |ack, canonical, children, regional| {
+        if let Some(index) = desired
+            .iter()
+            .position(|(source, selected, destinations, _)| {
+                *selected == canonical
+                    && source.matches_ack(ack)
+                    && regional.is_none_or(|offered| {
+                        offered.origin == source.origin && offered.same_window(*source)
+                    })
+                    && children
+                        .iter()
+                        .map(|child| child.destination)
+                        .eq(destinations.iter().copied())
+            })
+        {
             desired.swap_remove(index);
             true
         } else {
             false
         }
     });
-    for (source, canonical_ingress, addresses) in desired {
+    desired.retain(|(_, _, _, may_stage)| *may_stage);
+    for (source, canonical_ingress, addresses, _) in desired {
         let _ = actor.stage_peer_wan_live_receive(
             now,
             crate::control::link::wan::WanLiveReceiveSpec {
@@ -234,6 +265,9 @@ pub(super) fn reconcile_wan_receives(
                 canonical_ingress,
                 start: source.window_start,
                 forms: source.forms(),
+                offer_cut: source.offer_cut,
+                regional: regional_peer.map(|member| (member, source)),
+                routed: false,
                 expires,
                 timing: source.window_timing(),
             },

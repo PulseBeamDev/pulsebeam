@@ -1,5 +1,8 @@
 use super::*;
-use crate::entity::{TrackId, TrackKind};
+use crate::{
+    control::permissions::{Component, SubscriptionSelector},
+    entity::{ProjectId, TrackId, TrackKind},
+};
 use pulsebeam_proto::state::CloseReason;
 
 const NATIVE_BUDGET: usize = 32;
@@ -29,17 +32,53 @@ impl SourceLookupKey {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum InterestKey {
+    Exact(SourceLookupKey),
+    Selector(ProjectId, SubscriptionSelector),
+}
+
+impl InterestKey {
+    fn project_selector(self) -> (ProjectId, SubscriptionSelector) {
+        match self {
+            Self::Exact(key) => (
+                key.room.project,
+                SubscriptionSelector {
+                    project: Component::Literal(key.room.project),
+                    room: Component::Literal(key.room.room),
+                    participant: Component::Literal(key.participant),
+                    kind: Component::Literal(key.kind),
+                    track: Component::Literal(key.track_id),
+                },
+            ),
+            Self::Selector(project, selector) => (project, selector),
+        }
+    }
+}
+
+pub(super) type MediaInterestId = (ConnectionId, u64);
+
+/// The owner and revision remain local. Only the project and attenuated
+/// Subscribe scope can be forwarded as an authenticated server assertion.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct MediaInterest {
+    pub(super) owner: MediaInterestId,
+    pub(super) authorization: u64,
+    pub(super) project: ProjectId,
+    pub(super) selector: SubscriptionSelector,
+    pub(super) scope: pulsebeam_core::auth::grants::SubscribeScope,
+}
+
 #[derive(Default)]
 pub(super) struct SourceLookupIndex {
-    by_source: std::collections::BTreeMap<
-        SourceLookupKey,
-        std::collections::BTreeSet<(ConnectionId, u64)>,
-    >,
-    by_owner: std::collections::BTreeMap<(ConnectionId, u64), SourceLookupKey>,
-    wake_queue: std::collections::VecDeque<SourceLookupKey>,
-    wake_queued: std::collections::BTreeSet<SourceLookupKey>,
-    wake_cursor: std::collections::BTreeMap<SourceLookupKey, (ConnectionId, u64)>,
-    wake_again: std::collections::BTreeSet<SourceLookupKey>,
+    by_source:
+        std::collections::BTreeMap<InterestKey, std::collections::BTreeSet<(ConnectionId, u64)>>,
+    by_owner: std::collections::BTreeMap<(ConnectionId, u64), InterestKey>,
+    selector_refs: std::collections::HashMap<ConnectionId, Vec<u64>>,
+    wake_queue: std::collections::VecDeque<InterestKey>,
+    wake_queued: std::collections::BTreeSet<InterestKey>,
+    wake_cursor: std::collections::BTreeMap<InterestKey, (ConnectionId, u64)>,
+    wake_again: std::collections::BTreeSet<InterestKey>,
 }
 
 impl SourceLookupIndex {
@@ -49,42 +88,94 @@ impl SourceLookupIndex {
         source_room: ProjectRoomKey,
         change: crate::control::native::LookupInterestChange,
     ) {
-        let owner = (connection, change.reference);
-        if let Some(previous) = self.by_owner.remove(&owner) {
-            if let Some(owners) = self.by_source.get_mut(&previous) {
-                owners.remove(&owner);
-                if owners.is_empty() {
-                    self.by_source.remove(&previous);
-                }
+        let next = change
+            .active
+            .then(|| SourceLookupKey::from_address(source_room, &change.address))
+            .flatten()
+            .map(InterestKey::Exact);
+        self.set_owner((connection, change.reference), next);
+    }
+
+    fn set_owner(&mut self, owner: (ConnectionId, u64), next: Option<InterestKey>) {
+        if self.by_owner.get(&owner).copied() == next {
+            return;
+        }
+        if let Some(previous) = self.by_owner.remove(&owner)
+            && let Some(owners) = self.by_source.get_mut(&previous)
+        {
+            owners.remove(&owner);
+            if owners.is_empty() {
+                self.by_source.remove(&previous);
             }
         }
-        if change.active
-            && let Some(key) = SourceLookupKey::from_address(source_room, &change.address)
-        {
+        if let Some(key) = next {
             self.by_source.entry(key).or_default().insert(owner);
             self.by_owner.insert(owner, key);
         }
     }
 
+    fn sync_selectors(
+        &mut self,
+        connection: ConnectionId,
+        project: ProjectId,
+        active: impl Iterator<Item = (u64, SubscriptionSelector)>,
+    ) {
+        let mut refs = Vec::new();
+        for (reference, mut selector) in active {
+            // Exact-project and project-any queries have the same authenticated scope.
+            selector.project = Component::Any;
+            self.set_owner(
+                (connection, reference),
+                Some(InterestKey::Selector(project, selector)),
+            );
+            refs.push(reference);
+        }
+        for previous in self.selector_refs.remove(&connection).into_iter().flatten() {
+            if !refs.contains(&previous) {
+                self.set_owner((connection, previous), None);
+            }
+        }
+        if !refs.is_empty() {
+            self.selector_refs.insert(connection, refs);
+        }
+    }
+
     pub(super) fn remove_connection(&mut self, connection: ConnectionId) {
+        self.selector_refs.remove(&connection);
         let owners = self
             .by_owner
             .range((connection, 0)..=(connection, u64::MAX))
             .map(|(owner, _)| *owner)
             .collect::<Vec<_>>();
         for owner in owners {
-            if let Some(key) = self.by_owner.remove(&owner)
-                && let Some(indexed) = self.by_source.get_mut(&key)
-            {
-                indexed.remove(&owner);
-                if indexed.is_empty() {
-                    self.by_source.remove(&key);
+            self.set_owner(owner, None);
+        }
+    }
+
+    fn source_changed(&mut self, source: SourceLookupKey) {
+        self.queue_wake(InterestKey::Exact(source));
+        let project = source.room.project;
+        for room in [Component::Any, Component::Literal(source.room.room)] {
+            for participant in [Component::Any, Component::Literal(source.participant)] {
+                for kind in [Component::Any, Component::Literal(source.kind)] {
+                    for track in [Component::Any, Component::Literal(source.track_id)] {
+                        self.queue_wake(InterestKey::Selector(
+                            project,
+                            SubscriptionSelector {
+                                project: Component::Any,
+                                room,
+                                participant,
+                                kind,
+                                track,
+                            },
+                        ));
+                    }
                 }
             }
         }
     }
 
-    fn source_changed(&mut self, key: SourceLookupKey) {
+    fn queue_wake(&mut self, key: InterestKey) {
         if !self.by_source.contains_key(&key) {
             return;
         }
@@ -103,6 +194,105 @@ pub(super) struct RetiringNative {
 }
 
 impl ControllerActor {
+    fn media_interest_lease(
+        &self,
+        owner: MediaInterestId,
+        wall_now: SystemTime,
+    ) -> Option<(ProjectId, SubscriptionSelector, &AuthorizationLease)> {
+        let (project, selector) = self
+            .source_lookup_index
+            .by_owner
+            .get(&owner)?
+            .project_selector();
+        let native = self.native_connections.get(&owner.0)?;
+        let meta = self
+            .core
+            .registry
+            .get_incarnation(native.handler.participant, owner.0)?;
+        let lease = meta.authorization.as_ref()?;
+        if meta.profile != SignalingProtocol::State
+            || !meta.materialized
+            || meta.scope.project != project
+            || lease.is_expired_at(wall_now)
+            || !lease.allows_current_room()
+            || !lease.matches_scope(meta.scope, native.handler.participant)
+        {
+            return None;
+        }
+        Some((project, selector, lease))
+    }
+
+    fn media_interest(
+        &self,
+        owner: MediaInterestId,
+        wall_now: SystemTime,
+    ) -> Option<MediaInterest> {
+        let (project, selector, lease) = self.media_interest_lease(owner, wall_now)?;
+        Some(MediaInterest {
+            owner,
+            authorization: lease.revision(),
+            project,
+            selector,
+            scope: lease
+                .permissions()
+                .export_subscribe_scope(project, selector)?,
+        })
+    }
+
+    pub(super) fn media_interest_current(
+        &self,
+        sent: &MediaInterest,
+        wall_now: SystemTime,
+    ) -> bool {
+        self.media_interest_lease(sent.owner, wall_now)
+            .is_some_and(|(project, selector, lease)| {
+                (project, selector, lease.revision())
+                    == (sent.project, sent.selector, sent.authorization)
+            })
+    }
+
+    pub(super) fn media_interest_matches(
+        &self,
+        owner: MediaInterestId,
+        revision: u64,
+        endpoint: EndpointKey,
+        kind: TrackKind,
+        track: TrackId,
+        wall_now: SystemTime,
+    ) -> bool {
+        self.media_interest_lease(owner, wall_now)
+            .is_some_and(|(project, selector, lease)| {
+                lease.revision() == revision
+                    && lease.permissions().allows_selector_match(
+                        project,
+                        selector,
+                        endpoint.room,
+                        endpoint.participant,
+                        kind,
+                        track,
+                    )
+            })
+    }
+
+    pub(super) fn media_interest_page(
+        &self,
+        after: Option<MediaInterestId>,
+        wall_now: SystemTime,
+    ) -> (Vec<MediaInterest>, Option<MediaInterestId>) {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let mut owners = self
+            .source_lookup_index
+            .by_owner
+            .range((after.map_or(Unbounded, Excluded), Unbounded));
+        let mut result = Vec::new();
+        let mut last = None;
+        for (&owner, _) in owners.by_ref().take(LOOKUP_WAKE_BUDGET) {
+            last = Some(owner);
+            result.extend(self.media_interest(owner, wall_now));
+        }
+        (result, last.filter(|_| owners.next().is_some()))
+    }
+
     fn source_room(&self, connection: ConnectionId, room: &str) -> Option<ProjectRoomKey> {
         let external = crate::entity::RoomId::new(room).ok()?;
         let (_, meta) = self.core.registry.get_connection(connection)?;
@@ -203,14 +393,21 @@ impl ControllerActor {
                 self.source_lookup_index.wake_cursor.remove(&key);
                 continue;
             };
-            let (connection, _) = owner;
+            let (connection, reference) = owner;
             let Some(service) = self.native_connections.get_mut(&connection) else {
                 self.source_lookup_index.remove_connection(connection);
                 self.source_lookup_index.wake_queue.push_back(key);
                 continue;
             };
-            service.handler.model.source_lookup_changed();
-            service.handler.model.source_wait_changed();
+            match key {
+                InterestKey::Exact(_) => {
+                    service.handler.model.source_lookup_changed();
+                    service.handler.model.source_wait_changed();
+                }
+                InterestKey::Selector(..) => {
+                    service.handler.model.selector_source_changed(reference);
+                }
+            }
             if !service.handler.handoff.schedule() {
                 self.source_lookup_index.wake_queue.push_back(key);
                 continue;
@@ -295,6 +492,7 @@ impl ControllerActor {
             return;
         };
         let room = meta.scope.joined_room();
+        let project = meta.scope.project;
         let wall_now = SystemTime::now();
         let unix_now = wall_now
             .duration_since(UNIX_EPOCH)
@@ -362,6 +560,15 @@ impl ControllerActor {
                             publisher: &track.meta().origin,
                         })
                     },
+                    |permissions, selector, after| {
+                        self.lifecycle.scan_selector(
+                            connection,
+                            permissions,
+                            selector,
+                            after,
+                            &self.core.registry,
+                        )
+                    },
                 )
             }) {
             Ok(wake) => {
@@ -376,6 +583,11 @@ impl ControllerActor {
                             .change(connection, source_room, change);
                     }
                 }
+                self.source_lookup_index.sync_selectors(
+                    connection,
+                    project,
+                    native.model.selector_interests(),
+                );
                 let deadline = native
                     .model
                     .deadline()
@@ -587,6 +799,65 @@ mod source_lookup_index_tests {
     use super::*;
 
     #[test]
+    fn selector_wakes_are_project_scoped_and_match_all_literal_components() {
+        let mut index = SourceLookupIndex::default();
+        let owner = ConnectionId::new();
+        let project = ProjectId::new();
+        let id = TrackId::new("camera").unwrap();
+        let selector = SubscriptionSelector {
+            project: Component::Literal(project),
+            room: Component::Any,
+            participant: Component::Any,
+            kind: Component::Literal(TrackKind::Video),
+            track: Component::Literal(id),
+        };
+        index.sync_selectors(owner, project, [(1, selector)].into_iter());
+        let key = SourceLookupKey {
+            room: ProjectRoomKey {
+                project,
+                room: crate::entity::RoomId::new("stage").unwrap(),
+            },
+            participant: ParticipantId::new("publisher").unwrap(),
+            kind: TrackKind::Video,
+            track_id: id,
+        };
+        index.source_changed(SourceLookupKey {
+            room: ProjectRoomKey {
+                project: ProjectId::new(),
+                ..key.room
+            },
+            ..key
+        });
+        index.source_changed(SourceLookupKey {
+            kind: TrackKind::Audio,
+            ..key
+        });
+        index.source_changed(SourceLookupKey {
+            track_id: TrackId::new("slides").unwrap(),
+            ..key
+        });
+        assert!(index.wake_queue.is_empty());
+        index.source_changed(key);
+        index.source_changed(SourceLookupKey {
+            room: ProjectRoomKey {
+                room: crate::entity::RoomId::new("studio").unwrap(),
+                ..key.room
+            },
+            ..key
+        });
+        assert_eq!(index.wake_queue.len(), 1);
+        assert!(index.wake_again.contains(index.wake_queue.front().unwrap()));
+        assert_eq!(
+            index.by_source.values().next().unwrap().first(),
+            Some(&(owner, 1))
+        );
+        index.sync_selectors(owner, project, std::iter::empty());
+        assert!(index.by_source.is_empty());
+        assert!(index.by_owner.is_empty());
+        assert!(index.selector_refs.is_empty());
+    }
+
+    #[test]
     fn lookup_interest_wakes_coalesce_and_cleanup_with_owner_lifetimes() {
         let mut index = SourceLookupIndex::default();
         let first = ConnectionId::new();
@@ -629,6 +900,12 @@ mod source_lookup_index_tests {
         assert_eq!(index.wake_queue.len(), 1);
         assert!(index.wake_again.contains(index.wake_queue.front().unwrap()));
         assert_eq!(index.by_source.values().next().unwrap().len(), 2);
+        let (project, selector) = index.by_owner[&(first, 1)].project_selector();
+        assert_eq!(project, room.project);
+        assert_eq!(selector.room.literal(), Some(room.room));
+        assert_eq!(selector.participant.literal(), Some(key.participant));
+        assert_eq!(selector.kind.literal(), Some(key.kind));
+        assert_eq!(selector.track.literal(), Some(key.track_id));
 
         index.change(first, room, change(1, false));
         assert_eq!(index.by_source.values().next().unwrap().len(), 1);

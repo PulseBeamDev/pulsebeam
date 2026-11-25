@@ -62,6 +62,7 @@ fn records(
         room: "room".into(),
         revision,
         complete: true,
+        partial: false,
         has_more: false,
         next_cursor: Vec::new(),
         cursor_expires_at_unix_seconds: 0,
@@ -261,6 +262,48 @@ fn pre_admission_watch_scope_capacity_and_close_have_no_closed_owner_history() {
 }
 
 #[test]
+fn partial_empty_page_is_not_live_and_reset_removes_the_projection() {
+    let mut catalogs = Catalogs::default();
+    let mut resources = TrackResources::default();
+    let owner = open(&mut catalogs, &mut resources, "room");
+    catalogs
+        .reconcile(IdGenerator::new().generation(), &mut native())
+        .unwrap();
+    let id = catalogs.watches[&owner].wire.unwrap();
+    let empty = |revision, partial| {
+        page(wire::CatalogPageRecord {
+            watch_id: id,
+            room: "room".into(),
+            revision,
+            complete: true,
+            partial,
+            ..Default::default()
+        })
+    };
+    let (_, partial) = catalogs.apply(empty(1, true)).unwrap();
+    assert_eq!(partial.status, WatchStatus::Partial);
+    assert!(partial.page.unwrap().participants().is_empty());
+    let (_, live) = catalogs.apply(empty(2, false)).unwrap();
+    assert_eq!(live.status, WatchStatus::Live);
+    let (_, reset) = catalogs
+        .apply(wire::CatalogServerRecord {
+            response: Some(wire::catalog_server_record::Response::Error(
+                wire::CatalogWatchError {
+                    watch_id: id,
+                    failure: Some(wire::Failure {
+                        code: wire::FailureCode::ResourceGone as i32,
+                        diagnostic: String::new(),
+                    }),
+                },
+            )),
+        })
+        .unwrap();
+    assert_eq!(reset.status, WatchStatus::ResetRequired);
+    assert!(reset.status.is_terminal() && reset.page.is_none());
+    assert!(catalogs.apply(empty(3, false)).is_none());
+}
+
+#[test]
 fn atomic_replacements_ignore_stale_fragments_and_share_the_published_page() {
     let mut catalogs = Catalogs::default();
     let mut resources = TrackResources::default();
@@ -308,8 +351,15 @@ fn atomic_replacements_ignore_stale_fragments_and_share_the_published_page() {
     observer.close(current).unwrap();
     assert!(observer.state().page.is_none());
     catalogs.disconnect();
-    assert_eq!(catalogs.state(owner).unwrap().status, WatchStatus::Loading);
+    assert_eq!(catalogs.state(owner).unwrap().status, WatchStatus::Stale);
     assert!(catalogs.state(owner).unwrap().page.is_none());
+    catalogs.reconcile(ids.generation(), &mut native()).unwrap();
+    assert_eq!(catalogs.state(owner).unwrap().status, WatchStatus::Stale);
+    let id = catalogs.watches[&owner].wire.unwrap();
+    for record in records(id, 1, "d", 0) {
+        catalogs.apply(page(record));
+    }
+    assert_eq!(catalogs.state(owner).unwrap().status, WatchStatus::Live);
 }
 
 #[test]

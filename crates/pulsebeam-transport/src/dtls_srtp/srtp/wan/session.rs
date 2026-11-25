@@ -14,7 +14,7 @@ use crate::fabric_wan::Capability;
 
 mod history;
 mod routes;
-pub use routes::{Opened, Purpose, WindowSpec, WindowTicket};
+pub use routes::{LiveDeadline, Opened, Purpose, WindowSpec, WindowTicket};
 
 use super::{
     Limits, Protector,

@@ -759,7 +759,6 @@ impl FabricRtpFixture {
                 peer,
                 key: pulsebeam_link::NodeRouteKey::from_bytes(ssrc.get().to_be_bytes()),
             },
-            expires_at,
             tx: tx,
         };
         assert!(
@@ -1526,7 +1525,7 @@ fn quic_data_ingress_fences_owner_association_and_binding_before_admission() {
         .install_track(publication, None, Some(publisher), None);
     let source = execution
         .runtime
-        .install_fabric_source(track, publisher, Emission::DATA, None, None)
+        .install_fabric_source(track, publisher, Emission::data(false), None, None)
         .unwrap();
     let installation = QuicInstallation {
         association: NonZeroU64::MIN,
@@ -1567,7 +1566,7 @@ fn quic_data_ingress_fences_owner_association_and_binding_before_admission() {
             track,
             source,
             other,
-            Emission::DATA,
+            Emission::data(false),
             &crate::shard::router::InstalledTrackPlan {
                 local: vec![other],
                 ..Default::default()
@@ -1951,14 +1950,14 @@ fn shard_data_notice_admits_only_current_exact_receivers() {
     execution.apply_lifecycle_op(&ShardUpdateOp::InstallShardFabricSource {
         binding,
         encoding: None,
-        emission: Emission::DATA,
+        emission: Emission::data(false),
     });
     let source = execution.runtime.shard_fabric_source(binding).unwrap();
     let branch = execution
-        .install_fabric_branch(track, source, receiver_handle, Emission::DATA)
+        .install_fabric_branch(track, source, receiver_handle, Emission::data(false))
         .unwrap();
     execution
-        .install_fabric_branch(track, source, replacement, Emission::DATA)
+        .install_fabric_branch(track, source, replacement, Emission::data(false))
         .unwrap();
 
     let mut links = LinkControl::new(|| LinkTime::from_nanos(0)).unwrap();
@@ -2669,8 +2668,7 @@ async fn wan_publisher_cache_miss_refreshes_only_a_live_exact_route_within_budge
             peer,
             key: NodeRouteKey::from_bytes(window.ssrc().get().to_be_bytes()),
         },
-        expires_at,
-        tx: tx,
+        tx,
     };
     let lookup = MediaRepairLookup {
         parent: MediaRepairParent::Publisher(route.clone()),

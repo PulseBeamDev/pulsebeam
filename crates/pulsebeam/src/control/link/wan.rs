@@ -1,4 +1,4 @@
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroU64};
 
 use pulsebeam_core::fabric::{
     self,
@@ -8,6 +8,7 @@ use pulsebeam_link::{BindError, BindingCutoff, FabricIngress, LinkTx};
 
 use super::*;
 use crate::{
+    cluster::mesh::Member,
     control::controller::peer_ownership::relay::{
         fabric::WanLiveRouteAck, wan_source::WanSourceWindow,
     },
@@ -30,6 +31,9 @@ pub(in crate::control) struct WanLiveReceiveSpec {
     pub canonical_ingress: NetworkId,
     pub start: u64,
     pub forms: u8,
+    pub offer_cut: Option<NonZeroU64>,
+    pub regional: Option<(Member, WanSourceWindow)>,
+    pub routed: bool,
     pub expires: Instant,
     pub timing: Option<crate::route::fabric::WindowTiming>,
 }
@@ -56,7 +60,14 @@ impl From<crate::control::controller::peer_ownership::fabric_data::WanRepairRead
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(in crate::control) enum Carriage {
+    Ownership,
+    Border,
+}
+
 pub(super) struct WanPeer {
+    pub(super) carriage: Carriage,
     commands: Commands,
     next_label: u32,
     receives: HashMap<NonZeroU32, Receive>,
@@ -64,6 +75,7 @@ pub(super) struct WanPeer {
 
 struct Receive {
     expires: Instant,
+    deadline: Option<pulsebeam_link::wan::LiveDeadline>,
     bindings: Vec<Local>,
     window: Window,
     pending: Option<oneshot::Receiver<Result<Window, wan_host::Error>>>,
@@ -80,10 +92,25 @@ struct LiveAdvertisement {
     ack: WanLiveRouteAck,
     canonical_ingress: NetworkId,
     children: Vec<LiveNetworkChild>,
+    regional: Option<RegionalReceive>,
+    routed: bool,
     evidence: Option<RelayEvidence>,
 }
 
+struct RegionalReceive {
+    peer: Member,
+    source: WanSourceWindow,
+    activity: wan_host::ReceiveActivity,
+    warming: bool,
+}
+
 impl Receive {
+    fn expires(&self) -> Instant {
+        self.deadline.as_ref().map_or(self.expires, |deadline| {
+            Instant::from_std(deadline.expires())
+        })
+    }
+
     fn record_removal(&self) {
         if self.pending.is_none()
             && let Some(evidence) = self.live.as_ref().and_then(|live| live.evidence)
@@ -99,7 +126,7 @@ impl Receive {
                     self.pending = None;
                     if let Some(live) = &self.live
                         && let Some(evidence) = live.evidence
-                        && now < self.expires
+                        && now < self.expires()
                         && self.bindings.len() == live.children.len()
                         && self.bindings.iter().all(|(_, tx)| tx.is_live())
                     {
@@ -139,8 +166,9 @@ impl WanPeer {
                 unbind(control, std::mem::take(&mut receive.bindings));
                 return false;
             }
+            let expires = receive.expires();
             receive.bindings.retain(|(binding, tx)| {
-                if now < receive.expires && tx.is_live() {
+                if now < expires && tx.is_live() {
                     true
                 } else {
                     control.unbind(*binding);
@@ -173,6 +201,7 @@ impl Links {
     pub(in crate::control) fn attach_wan_host(
         &mut self,
         commands: Commands,
+        carriage: Carriage,
     ) -> Result<(), BindError> {
         if self.wan.len() >= crate::link::host::PEERS || self.wan.contains_key(&commands.peer()) {
             return Err(BindError::Capacity);
@@ -180,6 +209,7 @@ impl Links {
         self.wan.insert(
             commands.peer(),
             WanPeer {
+                carriage,
                 commands,
                 next_label: 0,
                 receives: HashMap::new(),
@@ -194,6 +224,7 @@ impl Links {
         source: WanSourceWindow,
         ack: WanLiveRouteAck,
         expires: Instant,
+        renewable: bool,
         now: Instant,
     ) -> Result<(BindingCutoff, wan_host::PendingTx), BindError> {
         if now >= expires || !source.matches_ack(ack) {
@@ -216,7 +247,7 @@ impl Links {
             purpose: pulsebeam_link::wan::Purpose::Live,
             expires: expires.into_std(),
         };
-        self.stage_wan_send(peer, expected, ack.window, spec, None)
+        self.stage_wan_send(peer, expected, ack.window, spec, renewable, None)
     }
 
     pub(in crate::control) fn is_wan_peer(&self, peer: NetworkId) -> bool {
@@ -228,6 +259,7 @@ impl Links {
         upstream: NetworkId,
         source: WanSourceWindow,
         shard: ShardId,
+        routed: bool,
         now: Instant,
     ) -> Option<(LiveNetworkChild, Instant)> {
         self.wan
@@ -236,8 +268,9 @@ impl Links {
             .values()
             .find_map(|receive| {
                 let live = receive.live.as_ref()?;
-                if receive.pending.is_some()
-                    || now >= receive.expires
+                if live.routed != routed
+                    || receive.pending.is_some()
+                    || now >= receive.expires()
                     || !source.matches_ack(live.ack)
                 {
                     return None;
@@ -249,7 +282,7 @@ impl Links {
                             .bindings
                             .iter()
                             .any(|(_, tx)| tx.is_live() && tx.local_delivery_tag() == Some(tag)))
-                    .then_some((*child, receive.expires))
+                    .then_some((*child, receive.expires()))
                 })
             })
     }
@@ -262,6 +295,7 @@ impl Links {
         input: LiveNetworkChild,
         ack: WanLiveRouteAck,
         expires: Instant,
+        renewable: bool,
         now: Instant,
     ) -> Result<(BindingCutoff, wan_host::PendingTx), BindError> {
         self.reap();
@@ -283,7 +317,7 @@ impl Links {
         {
             return Err(BindError::Closed);
         }
-        let expires = expires.min(receive.expires);
+        let expires = expires.min(receive.expires());
         if now >= expires {
             return Err(BindError::Closed);
         }
@@ -321,6 +355,7 @@ impl Links {
             expected,
             ack.window,
             spec,
+            renewable,
             Some(wan_host::SendParent::Transit {
                 cutoff: parent,
                 window,
@@ -365,6 +400,7 @@ impl Links {
             expected,
             permit.window,
             spec,
+            false,
             Some(wan_host::SendParent::Repair(parent)),
         )
     }
@@ -375,11 +411,19 @@ impl Links {
         expected: Window,
         acknowledged: Window,
         spec: pulsebeam_link::wan::WindowSpec,
+        renewable: bool,
         parent: Option<wan_host::SendParent>,
     ) -> Result<(BindingCutoff, wan_host::PendingTx), BindError> {
         let commands = &self.wan.get(&peer).ok_or(BindError::Closed)?.commands;
         let cutoff = self.control.reserve_wan_send(peer)?;
-        match commands.install_send(cutoff.clone(), expected, acknowledged, spec, parent) {
+        match commands.install_send(
+            cutoff.clone(),
+            expected,
+            acknowledged,
+            spec,
+            renewable,
+            parent,
+        ) {
             Ok(pending) => Ok((cutoff, pending)),
             Err(error) => {
                 self.control.unbind(cutoff.id());
@@ -447,8 +491,12 @@ impl Links {
         }) {
             return Err(BindError::Closed);
         }
+        let alternatives = spec
+            .regional
+            .map_or(0, |(_, source)| self.regional_receive_count(source));
+        let warming = alternatives != 0;
         let peer = self.wan.get_mut(&live.peer).ok_or(BindError::Closed)?;
-        if peer.receives.len() >= RECEIVE_LIMIT {
+        if alternatives >= 2 || peer.receives.len() >= RECEIVE_LIMIT {
             return Err(BindError::Capacity);
         }
         if peer
@@ -515,9 +563,20 @@ impl Links {
             unbind(&mut self.control, bindings);
             return Err(BindError::Closed);
         };
+        let regional = spec.regional.map(|(member, source)| RegionalReceive {
+            peer: member,
+            source,
+            activity: wan_host::ReceiveActivity::default(),
+            warming,
+        });
+        let deadline = spec
+            .routed
+            .then(|| pulsebeam_link::wan::LiveDeadline::new(spec.expires.into_std()));
         if let Err(error) = peer.commands.try_send(ReceiveCommand::Live {
             expires: spec.expires,
+            deadline: deadline.clone(),
             timing: spec.timing,
+            activity: regional.as_ref().map(|receive| receive.activity.clone()),
             children,
             report,
         }) {
@@ -529,12 +588,14 @@ impl Links {
             publication: live.publication,
             incarnation: live.incarnation,
             sequence_anchor: live.sequence_anchor,
+            offer_cut: spec.offer_cut,
             window,
         };
         peer.receives.insert(
             ssrc,
             Receive {
                 expires: spec.expires,
+                deadline,
                 bindings,
                 window,
                 pending: Some(installed),
@@ -542,6 +603,8 @@ impl Links {
                     ack,
                     canonical_ingress: spec.canonical_ingress,
                     children: live_children,
+                    regional,
+                    routed: spec.routed,
                     evidence: self.node.map(|local| RelayEvidence {
                         local,
                         peer: self.peer_ids.get(&live.peer).copied(),
@@ -585,10 +648,75 @@ impl Links {
         changed
     }
 
+    pub(in crate::control) fn regional_incumbent(
+        &self,
+        source: WanSourceWindow,
+        canonical: NetworkId,
+        addresses: &[crate::route::NodeRouteAddress],
+        selected: Member,
+        now: Instant,
+    ) -> Option<NetworkId> {
+        self.wan
+            .iter()
+            .flat_map(|(&network, wan)| {
+                wan.receives.values().filter_map(move |receive| {
+                    let live = receive.live.as_ref()?;
+                    let regional = live.regional.as_ref()?;
+                    let observed = regional.activity.observed();
+                    (receive.pending.is_none()
+                        && now < receive.expires()
+                        && live.canonical_ingress == canonical
+                        && receive.bindings.len() == live.children.len()
+                        && receive.bindings.iter().all(|(_, tx)| tx.is_live())
+                        && live
+                            .children
+                            .iter()
+                            .map(|child| child.destination)
+                            .eq(addresses.iter().copied())
+                        && regional.source.same_window(source)
+                        && regional.source.origin == source.origin
+                        && (!regional.warming || observed))
+                        .then_some((
+                            network,
+                            regional.peer == selected && observed,
+                            regional.warming,
+                        ))
+                })
+            })
+            .min_by_key(|(network, proven, warming)| (!proven, *warming, network.epoch()))
+            .map(|(network, _, _)| network)
+    }
+
+    fn regional_receive_count(&self, source: WanSourceWindow) -> usize {
+        self.wan
+            .values()
+            .flat_map(|wan| wan.receives.values())
+            .filter(|receive| {
+                receive
+                    .live
+                    .as_ref()
+                    .and_then(|live| live.regional.as_ref())
+                    .is_some_and(|regional| {
+                        let offered = regional.source;
+                        offered.room == source.room
+                            && offered.publisher == source.publisher
+                            && offered.origin == source.origin
+                            && offered.window_start == source.window_start
+                    })
+            })
+            .take(2)
+            .count()
+    }
+
     pub(in crate::control) fn retain_wan_live_receives(
         &mut self,
         peer: NetworkId,
-        mut keep: impl FnMut(WanLiveRouteAck, NetworkId, &[LiveNetworkChild]) -> bool,
+        mut keep: impl FnMut(
+            WanLiveRouteAck,
+            NetworkId,
+            &[LiveNetworkChild],
+            Option<WanSourceWindow>,
+        ) -> bool,
     ) {
         let Some(peer) = self.wan.get_mut(&peer) else {
             return;
@@ -597,8 +725,16 @@ impl Links {
             let Some(live) = &receive.live else {
                 return true;
             };
+            if live.routed {
+                return true;
+            }
             if receive.bindings.len() == live.children.len()
-                && keep(live.ack, live.canonical_ingress, &live.children)
+                && keep(
+                    live.ack,
+                    live.canonical_ingress,
+                    &live.children,
+                    live.regional.as_ref().map(|regional| regional.source),
+                )
             {
                 true
             } else {
@@ -607,6 +743,91 @@ impl Links {
                 false
             }
         });
+    }
+
+    pub(in crate::control) fn retain_routed_wan_receive(
+        &self,
+        peer: NetworkId,
+        window: Window,
+        addresses: &[NodeRouteAddress],
+        expires: Instant,
+        now: Instant,
+    ) -> bool {
+        self.wan
+            .get(&peer)
+            .and_then(|peer| peer.receives.get(&window.ssrc()))
+            .is_some_and(|receive| {
+                receive.window == window
+                    && now < receive.expires()
+                    && receive.bindings.iter().all(|(_, tx)| tx.is_live())
+                    && receive.live.as_ref().is_some_and(|live| {
+                        live.routed
+                            && receive.bindings.len() == live.children.len()
+                            && live
+                                .children
+                                .iter()
+                                .map(|child| child.destination)
+                                .eq(addresses.iter().copied())
+                            && addresses.iter().all(|&address| {
+                                self.allows_live_scope(
+                                    live.canonical_ingress,
+                                    live.ack.room,
+                                    live.ack.publication,
+                                    address,
+                                )
+                            })
+                    })
+                    && if receive.pending.is_some() {
+                        expires >= receive.expires()
+                    } else {
+                        receive.deadline.as_ref().is_some_and(|deadline| {
+                            deadline.renew(now.into_std(), expires.into_std())
+                        })
+                    }
+            })
+    }
+
+    pub(in crate::control) fn routed_wan_ack(
+        &self,
+        peer: NetworkId,
+        window: Window,
+        now: Instant,
+    ) -> Option<WanLiveRouteAck> {
+        let receive = self.wan.get(&peer)?.receives.get(&window.ssrc())?;
+        let live = receive.live.as_ref()?;
+        (live.routed
+            && receive.window == window
+            && now < receive.expires()
+            && receive.pending.is_none()
+            && receive.bindings.len() == live.children.len()
+            && receive.bindings.iter().all(|(_, tx)| tx.is_live())
+            && live.children.iter().all(|child| {
+                self.allows_live_scope(
+                    live.canonical_ingress,
+                    live.ack.room,
+                    live.ack.publication,
+                    child.destination,
+                )
+            }))
+        .then_some(live.ack)
+    }
+
+    pub(in crate::control) fn retire_routed_wan_receive(
+        &mut self,
+        peer: NetworkId,
+        window: Window,
+    ) {
+        let Some(peer) = self.wan.get_mut(&peer) else {
+            return;
+        };
+        let label = window.ssrc();
+        if peer.receives.get(&label).is_some_and(|receive| {
+            receive.window == window && receive.live.as_ref().is_some_and(|live| live.routed)
+        }) && let Some(receive) = peer.receives.remove(&label)
+        {
+            receive.record_removal();
+            unbind(&mut self.control, receive.bindings);
+        }
     }
 
     fn wan_data_receive(
@@ -619,7 +840,7 @@ impl Links {
         let receive = self.wan.get(&peer)?.receives.get(&label)?;
         let live = receive.live.as_ref()?;
         (receive.pending.is_none()
-            && now < receive.expires
+            && now < receive.expires()
             && live.ack.incarnation == scope.source
             && live.ack.window.profile() == fabric::Profile::Data
             && receive.bindings.len() == live.children.len()
@@ -642,7 +863,7 @@ impl Links {
         now: Instant,
     ) -> Option<Instant> {
         self.wan_data_receive(peer, scope, now)
-            .map(|(receive, _)| receive.expires)
+            .map(|(receive, _)| receive.expires())
     }
 
     pub(in crate::control) fn wan_data_expectations(
@@ -652,7 +873,7 @@ impl Links {
         now: Instant,
     ) -> Option<Vec<crate::route::fabric::NetworkDataExpectation>> {
         let (receive, live) = self.wan_data_receive(peer, frame.scope, now)?;
-        let expires = now.checked_add(frame.lease()?)?.min(receive.expires);
+        let expires = now.checked_add(frame.lease()?)?.min(receive.expires());
         Some(
             live.children
                 .iter()
@@ -675,7 +896,8 @@ impl Links {
             .values()
             .filter_map(|receive| {
                 let live = receive.live.as_ref()?;
-                (receive.pending.is_none()
+                (!live.routed
+                    && receive.pending.is_none()
                     && receive.bindings.len() == live.children.len()
                     && live.children.iter().all(|child| {
                         self.allows_live_scope(
@@ -782,6 +1004,7 @@ impl Links {
             ssrc,
             Receive {
                 expires: interest.expires,
+                deadline: None,
                 bindings,
                 window,
                 pending: Some(installed),
@@ -804,7 +1027,7 @@ impl Links {
             .receives
             .get(&window.ssrc())?;
         let live = receive.live.as_ref()?;
-        (now < receive.expires
+        (now < receive.expires()
             && receive.pending.is_none()
             && live.children.contains(&parent)
             && self.allows_live_scope(
@@ -818,7 +1041,7 @@ impl Links {
                     && tx.local_delivery_tag()
                         == Some(crate::link::delivery_tag(parent.destination))
             }))
-        .then_some(receive.expires)
+        .then_some(receive.expires())
     }
 
     pub(in crate::control) fn allows_wan_repair_interest(
@@ -910,6 +1133,7 @@ impl Links {
             label,
             Receive {
                 expires,
+                deadline: None,
                 bindings,
                 window,
                 pending: Some(installed),
@@ -931,7 +1155,7 @@ impl Links {
             .and_then(|peer| peer.receives.get(&child.window.ssrc()))
             .filter(|receive| {
                 matches!(receive.repair.as_ref(), Some(ReceiveRepair::Media(expected)) if *expected == child)
-                    && now < receive.expires
+                    && now < receive.expires()
                     && receive.bindings.iter().any(|(_, tx)| tx.is_live())
             })
         else {
@@ -969,7 +1193,7 @@ impl Links {
             })
             .filter(|receive| {
                 matches!(receive.repair.as_ref(), Some(ReceiveRepair::Data(data)) if **data == (interest, child))
-                    && now < receive.expires
+                    && now < receive.expires()
                     && receive.bindings.iter().any(|(_, tx)| tx.is_live())
             });
         match route {

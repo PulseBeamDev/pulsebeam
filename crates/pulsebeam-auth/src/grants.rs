@@ -241,13 +241,71 @@ impl GrantSet {
     /// Preflight an unresolved subscription, without authorizing receipt.
     /// Call `allows` with the resolved publisher, kind and label before execution.
     pub fn may_subscribe(&self, room: &str, kind: TrackKind) -> bool {
-        valid_scope(room)
-            && !room.contains('*')
-            && self.0.iter().any(|grant| {
-                grant.allow.contains(&Action::Subscribe)
-                    && grant.rooms.iter().any(|pattern| pattern.matches(room))
-                    && grant.kind.is_none_or(|filter| filter == kind)
+        self.may_match_subscription(Some(room), None, Some(kind), None)
+    }
+
+    /// Test whether an unresolved selector can intersect a Subscribe grant.
+    /// `None` denotes an unrestricted component within the authenticated project.
+    /// This grants neither discovery nor receipt; check `allows` on every match.
+    pub fn may_match_subscription(
+        &self,
+        room: Option<&str>,
+        participant: Option<&str>,
+        kind: Option<TrackKind>,
+        label: Option<&str>,
+    ) -> bool {
+        self.subscription_matches(room, participant, kind, label)
+            .next()
+            .is_some()
+    }
+
+    fn subscription_matches<'a>(
+        &'a self,
+        room: Option<&'a str>,
+        participant: Option<&'a str>,
+        kind: Option<TrackKind>,
+        label: Option<&'a str>,
+    ) -> impl Iterator<Item = &'a Grant> {
+        let literal = |value: &str| valid_scope(value) && !value.contains('*');
+        let valid = [room, participant, label]
+            .into_iter()
+            .flatten()
+            .all(literal);
+        self.0.iter().filter(move |grant| {
+            valid
+                && grant.allow.contains(&Action::Subscribe)
+                && room.is_none_or(|room| grant.rooms.iter().any(|pattern| pattern.matches(room)))
+                && compatible(participant, grant.participant.as_deref())
+                && compatible(kind, grant.kind)
+                && compatible(label, grant.label.as_deref())
+        })
+    }
+
+    /// Attenuate to the intersection of the selector and existing Subscribe
+    /// grants. The result conveys no other action or independently verified identity.
+    pub fn subscribe_scope(
+        &self,
+        room: Option<&str>,
+        participant: Option<&str>,
+        kind: Option<TrackKind>,
+        label: Option<&str>,
+    ) -> Option<SubscribeScope> {
+        let grants: Vec<_> = self
+            .subscription_matches(room, participant, kind, label)
+            .map(|grant| Grant {
+                rooms: room.map_or_else(
+                    || grant.rooms.clone(),
+                    |room| vec![RoomPattern(room.to_owned())],
+                ),
+                allow: vec![Action::Subscribe],
+                participant: participant
+                    .map(str::to_owned)
+                    .or_else(|| grant.participant.clone()),
+                kind: kind.or(grant.kind),
+                label: label.map(str::to_owned).or_else(|| grant.label.clone()),
             })
+            .collect();
+        (!grants.is_empty()).then_some(SubscribeScope(GrantSet(grants)))
     }
 
     /// Preflight a catalog scope without authorizing any participant or track.
@@ -258,6 +316,31 @@ impl GrantSet {
                 grant.allow.contains(&Action::Discover)
                     && grant.rooms.iter().any(|pattern| pattern.matches(room))
             })
+    }
+
+    /// Attenuate to Discover in one literal room. The result carries no token
+    /// or other actions and is not an independently authenticated credential.
+    pub fn room_discover(&self, room: &str) -> Option<RoomDiscover> {
+        if !self.may_discover(room) {
+            return None;
+        }
+        let filters = self
+            .0
+            .iter()
+            .filter(|grant| {
+                grant.allow.contains(&Action::Discover)
+                    && grant.rooms.iter().any(|pattern| pattern.matches(room))
+            })
+            .map(|grant| DiscoverFilter {
+                participant: grant.participant.clone(),
+                kind: grant.kind,
+                label: grant.label.clone(),
+            })
+            .collect();
+        Some(RoomDiscover {
+            room: room.to_owned(),
+            filters,
+        })
     }
 
     /// Project room-local publication label scopes for bounded admission compilation.
@@ -311,6 +394,138 @@ impl<'de> Deserialize<'de> for GrantSet {
     {
         let grants = BoundedVec::<Grant, MAX_GRANTS>::deserialize(deserializer)?;
         Self::new(grants.0).map_err(de::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DiscoverFilter {
+    #[serde(
+        default,
+        deserialize_with = "present_filter",
+        skip_serializing_if = "Option::is_none"
+    )]
+    participant: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "present_filter",
+        skip_serializing_if = "Option::is_none"
+    )]
+    kind: Option<TrackKind>,
+    #[serde(
+        default,
+        deserialize_with = "present_filter",
+        skip_serializing_if = "Option::is_none"
+    )]
+    label: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct RoomDiscover {
+    room: String,
+    filters: Vec<DiscoverFilter>,
+}
+
+impl RoomDiscover {
+    pub fn room(&self) -> &str {
+        &self.room
+    }
+
+    pub fn into_grants(self) -> Result<GrantSet, GrantError> {
+        GrantSet::new(
+            self.filters
+                .into_iter()
+                .map(|filter| {
+                    Grant::new(
+                        vec![self.room.clone()],
+                        vec![Action::Discover],
+                        filter.participant,
+                        filter.kind,
+                        filter.label,
+                    )
+                })
+                .collect::<Result<_, _>>()?,
+        )
+    }
+}
+
+impl<'de> Deserialize<'de> for RoomDiscover {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            room: String,
+            filters: BoundedVec<DiscoverFilter, MAX_GRANTS>,
+        }
+        let Wire {
+            room,
+            filters: BoundedVec(filters),
+        } = Wire::deserialize(deserializer)?;
+        if !valid_scope(&room)
+            || room.contains('*')
+            || filters.is_empty()
+            || filters.iter().any(|filter| {
+                filter
+                    .participant
+                    .as_deref()
+                    .is_some_and(|scope| !valid_scope(scope))
+                    || filter
+                        .label
+                        .as_deref()
+                        .is_some_and(|scope| !valid_scope(scope))
+            })
+        {
+            return Err(de::Error::custom(
+                "invalid literal-room Discover projection",
+            ));
+        }
+        Ok(Self { room, filters })
+    }
+}
+
+fn compatible<T: PartialEq>(requested: Option<T>, granted: Option<T>) -> bool {
+    match (requested, granted) {
+        (Some(requested), Some(granted)) => requested == granted,
+        _ => true,
+    }
+}
+
+/// Subscribe-only filters transported as an authenticated server assertion.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct SubscribeScope(GrantSet);
+
+impl SubscribeScope {
+    pub fn allows(&self, room: &str, participant: &str, kind: TrackKind, label: &str) -> bool {
+        self.0.allows(
+            Action::Subscribe,
+            room,
+            Some(participant),
+            Some(kind),
+            Some(label),
+        )
+    }
+}
+
+impl<'de> Deserialize<'de> for SubscribeScope {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::try_from(GrantSet::deserialize(deserializer)?).map_err(de::Error::custom)
+    }
+}
+
+impl TryFrom<GrantSet> for SubscribeScope {
+    type Error = &'static str;
+
+    fn try_from(grants: GrantSet) -> Result<Self, Self::Error> {
+        if grants.0.is_empty()
+            || grants
+                .0
+                .iter()
+                .any(|grant| grant.allow != [Action::Subscribe])
+        {
+            return Err("expected nonempty Subscribe-only grants");
+        }
+        Ok(Self(grants))
     }
 }
 
