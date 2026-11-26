@@ -518,6 +518,10 @@ pub enum ResourceCommand {
         owner: u64,
         muted: bool,
     },
+    ConfigureMediaPublication {
+        owner: u64,
+        options: MediaPublishOptions,
+    },
     ClaimVideo {
         selector: TrackSelector,
     },
@@ -546,6 +550,14 @@ pub enum ResourceCommand {
     BeginSelectorMediaObservation {
         owner: TrackOwner,
         source: crate::SelectorMatch,
+    },
+    OpenMediaCollection {
+        room: String,
+        kind: crate::SelectorTrackKind,
+        filter: crate::TrackFilter,
+    },
+    BeginAdmittedMediaObservation {
+        admission: crate::AdmittedMedia,
     },
     AuthorizeMediaObservation {
         control: MediaObservationControl,

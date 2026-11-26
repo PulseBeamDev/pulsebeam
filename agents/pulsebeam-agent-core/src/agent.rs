@@ -54,7 +54,8 @@ mod selectors;
 mod subscription;
 
 pub use selectors::{
-    SelectorMatch, SelectorState, SelectorStatus, SelectorTrackKind, SubscriptionSelector,
+    AdmittedMedia, AdmittedMediaSnapshot, CollectionStatus, SelectorMatch, SelectorState,
+    SelectorStatus, SelectorTrackKind, SubscriptionSelector, TrackFilter,
 };
 
 use admission::CreateRequest;
@@ -716,6 +717,42 @@ impl Agent {
                     },
                 }
             }
+            ResourceCommand::ConfigureMediaPublication { owner, options } => {
+                use crate::ffi::{ErrorCode, ErrorInfo, VideoCodec};
+                let owner = TrackOwner(owner);
+                let spec = self
+                    .resources
+                    .publication_spec(owner)
+                    .ok_or(TrackResourceError::Released)?;
+                let enabled = match (spec, options) {
+                    (
+                        crate::TrackSpec::Video { track_id },
+                        crate::MediaPublishOptions::Video(options),
+                    ) => {
+                        let requested = options.codec.map(|codec| match codec {
+                            VideoCodec::H264 => crate::VideoCodecRequirement::H264,
+                            VideoCodec::Av1 => crate::VideoCodecRequirement::Av1,
+                        });
+                        if requested.is_some()
+                            && requested != self.resources.publication_video_codec(&track_id)
+                        {
+                            return Err(AgentError::OperationFailed(ErrorInfo::new(
+                                ErrorCode::Unsupported,
+                                "A publication's codec cannot change",
+                            )));
+                        }
+                        options.enabled
+                    }
+                    (
+                        crate::TrackSpec::Audio { .. },
+                        crate::MediaPublishOptions::Audio(options),
+                    ) => options.enabled,
+                    _ => return Err(TrackResourceError::WrongKind.into()),
+                };
+                ResourceResult::PublicationInputState(
+                    self.resources.set_publication_muted(owner, !enabled)?,
+                )
+            }
             ResourceCommand::SetPublicationMuted { owner, muted } => {
                 ResourceResult::PublicationInputState(
                     self.resources
@@ -779,8 +816,27 @@ impl Agent {
                 }
                 ResourceResult::MediaObservation(
                     self.resources
-                        .begin_selector_media_observation(owner, source)?,
+                        .begin_selector_media_observation(owner, source, None)?,
                 )
+            }
+            ResourceCommand::OpenMediaCollection { room, kind, filter } => {
+                let owner = self
+                    .open_media_collection(room, kind, filter)
+                    .map_err(AgentError::OperationFailed)?;
+                return Ok(ResourceResult::Owned { owner: owner.id() });
+            }
+            ResourceCommand::BeginAdmittedMediaObservation { admission } => {
+                if !self.admitted_media_current(&admission) {
+                    return Err(AgentError::OperationFailed(crate::ffi::ErrorInfo::new(
+                        crate::ffi::ErrorCode::Replaced,
+                        "Collection track admission has ended",
+                    )));
+                }
+                ResourceResult::MediaObservation(self.resources.begin_selector_media_observation(
+                    admission.owner,
+                    admission.matched.clone(),
+                    Some(admission),
+                )?)
             }
             ResourceCommand::AuthorizeMediaObservation { control } => {
                 return Ok(if self.resources.observation_control_current(&control) {
@@ -860,6 +916,7 @@ impl Agent {
                 });
             }
             ResourceCommand::Release { owner } => {
+                self.close_subscription_selector(TrackOwner(owner));
                 if let Some(mut control) = self.resources.release_input_control(TrackOwner(owner)) {
                     control.effect = Some(self.ids.operation());
                     self.effects.push_back(Effect::PublicationInput(control));
@@ -1285,23 +1342,29 @@ impl Agent {
     }
 
     fn reconcile_observation_controls(&mut self) {
-        for (id, slot) in self.resources.observation_requests() {
+        for id in self.resources.observation_requests() {
             let source = self.resources.audio_observation_source(id);
             let selected = self.resources.selector_observation_match(id);
+            let admission = self.resources.observation_admission(id);
             let owner = TrackOwner(id.owner());
-            let authorized = selected
-                .is_none_or(|source| self.selector_match_current(owner, source))
-                && source.is_none_or(|source| self.audio_source_authorized(id.owner(), source));
+            let authorized = if let Some(admission) = admission {
+                self.admitted_media_current(admission)
+            } else {
+                selected.is_none_or(|source| self.selector_match_current(owner, source))
+                    && source.is_none_or(|source| self.audio_source_authorized(id.owner(), source))
+            };
             let target = if !authorized {
                 None
+            } else if let Some(admission) = admission {
+                Some(admission.target.clone())
             } else if let Some(selected) = selected {
-                self.selector_media_receiver(owner, selected)
-                    .and_then(|(slot, _)| self.media_observation_target(&slot))
+                self.selector_media_target(owner, selected)
             } else if let Some(source) = source {
                 self.audio_source_observation_target(source)
             } else {
-                slot.as_ref()
-                    .and_then(|slot| self.media_observation_target(slot))
+                self.resources
+                    .video_observation_selector(id)
+                    .and_then(|selector| self.named_video_observation_target(selector))
                     .or_else(|| {
                         self.resources
                             .audio_observation_selector(id)
@@ -3203,13 +3266,73 @@ impl Agent {
             .is_some_and(|active| self.selectors.contains_match(owner, source, &active.state))
     }
 
-    /// Resolve a current media match to its installed receiver coordinate.
-    /// Hosts must attach within the same actor turn, not cache this coordinate.
-    pub fn selector_media_receiver(
+    pub fn open_media_collection(
+        &mut self,
+        room: String,
+        kind: SelectorTrackKind,
+        filter: TrackFilter,
+    ) -> Result<TrackOwner, crate::ffi::ErrorInfo> {
+        self.open_subscription_selector(SubscriptionSelector {
+            project_id: None,
+            room: Some(room),
+            kind: Some(kind),
+            participant_id: filter.participant_id,
+            track_id: filter.track_id,
+        })
+    }
+
+    pub fn admitted_media_snapshot(&self, owner: TrackOwner) -> Option<AdmittedMediaSnapshot> {
+        let SelectorState {
+            status,
+            matches,
+            error,
+        } = self.subscription_selector_state(owner)?;
+        let matching = matches.len();
+        let tracks: Vec<_> = matches
+            .into_iter()
+            .filter_map(|matched| {
+                Some(AdmittedMedia {
+                    owner,
+                    membership: self.selectors.membership(owner, &matched)?,
+                    target: self.selector_media_target(owner, &matched)?,
+                    matched,
+                })
+            })
+            .collect();
+        let status = match status {
+            SelectorStatus::Complete if matching == tracks.len() => CollectionStatus::Live,
+            SelectorStatus::Complete | SelectorStatus::Pending => CollectionStatus::Waiting,
+            SelectorStatus::Overflow => CollectionStatus::Limited,
+            SelectorStatus::Rejected => CollectionStatus::Rejected,
+        };
+        Some(AdmittedMediaSnapshot {
+            observation_revision: 0,
+            status,
+            tracks,
+            error,
+        })
+    }
+
+    pub fn media_collection_state(&self, owner: u64) -> Result<AdmittedMediaSnapshot, AgentError> {
+        self.admitted_media_snapshot(TrackOwner(owner))
+            .ok_or_else(|| crate::TrackResourceError::Released.into())
+    }
+
+    pub fn admitted_media_current(&self, admission: &AdmittedMedia) -> bool {
+        self.selectors
+            .membership(admission.owner, &admission.matched)
+            == Some(admission.membership)
+            && self
+                .selector_media_target(admission.owner, &admission.matched)
+                .as_ref()
+                == Some(&admission.target)
+    }
+
+    fn selector_media_target(
         &self,
-        owner: crate::TrackOwner,
+        owner: TrackOwner,
         source: &SelectorMatch,
-    ) -> Option<(MediaSlot, String)> {
+    ) -> Option<crate::MediaObservationTarget> {
         let active = self
             .active
             .as_ref()
@@ -3228,10 +3351,13 @@ impl Agent {
             return None;
         };
         let track = native::receiver_track(active, slot)?;
-        (track.room_id == source.room
-            && track.participant_id == source.participant_id
-            && track.track_id == source.track_id)
-            .then(|| (slot.clone(), track.publication_id.clone()))
+        if track.room_id != source.room
+            || track.participant_id != source.participant_id
+            || track.track_id != source.track_id
+        {
+            return None;
+        }
+        self.media_observation_target(slot)
     }
 
     fn retire_unmatched_selector_data(&mut self) {

@@ -68,7 +68,7 @@ pub enum SelectorStatus {
     Rejected,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, uniffi::Record)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, uniffi::Record)]
 pub struct SelectorMatch {
     pub room: String,
     pub participant_id: String,
@@ -107,8 +107,86 @@ pub struct SelectorState {
     pub error: Option<ErrorInfo>,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, uniffi::Record)]
+pub struct TrackFilter {
+    #[uniffi(default = None)]
+    pub participant_id: Option<String>,
+    #[uniffi(default = None)]
+    pub track_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdmittedMedia {
+    pub(super) owner: TrackOwner,
+    pub(super) matched: SelectorMatch,
+    pub(super) membership: u64,
+    pub(super) target: crate::MediaObservationTarget,
+}
+
+impl AdmittedMedia {
+    pub fn participant_id(&self) -> &str {
+        &self.matched.participant_id
+    }
+
+    pub fn track_id(&self) -> &str {
+        &self.matched.track_id
+    }
+
+    pub fn publication_id(&self) -> &str {
+        &self.target.source
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
+pub enum CollectionStatus {
+    Waiting,
+    Live,
+    Recovering,
+    Limited,
+    Rejected,
+    Closed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdmittedMediaSnapshot {
+    pub observation_revision: u64,
+    pub status: CollectionStatus,
+    pub tracks: Vec<AdmittedMedia>,
+    pub error: Option<ErrorInfo>,
+}
+
 #[derive(Default)]
-pub(super) struct Selectors(BTreeMap<TrackOwner, wire::ResourceSpec>);
+pub(super) struct Selectors {
+    declarations: BTreeMap<TrackOwner, wire::ResourceSpec>,
+    memberships: BTreeMap<TrackOwner, Memberships>,
+}
+
+#[derive(Default)]
+struct Memberships {
+    last: u64,
+    by_match: BTreeMap<SelectorMatch, u64>,
+}
+
+impl Memberships {
+    fn replace(&mut self, matches: impl Iterator<Item = SelectorMatch>) {
+        let mut old = core::mem::take(&mut self.by_match);
+        for source in matches {
+            if self.by_match.contains_key(&source) {
+                continue;
+            }
+            let key = if let Some(current) = old.remove(&source) {
+                current
+            } else if let Some(next) = self.last.checked_add(1) {
+                self.last = next;
+                next
+            } else {
+                // Fail closed rather than grant previously retired authority.
+                continue;
+            };
+            self.by_match.insert(source, key);
+        }
+    }
+}
 
 impl Selectors {
     pub(super) fn insert(
@@ -116,7 +194,7 @@ impl Selectors {
         owner: TrackOwner,
         selector: SubscriptionSelector,
     ) -> Result<(), ErrorInfo> {
-        if self.0.len() >= validation::MAX_SELECTOR_DECLARATIONS {
+        if self.declarations.len() >= validation::MAX_SELECTOR_DECLARATIONS {
             return Err(ErrorInfo::new(
                 ErrorCode::CapacityExceeded,
                 "too many subscription selectors",
@@ -126,12 +204,30 @@ impl Selectors {
         validation::validate_spec(&spec).map_err(|_| {
             ErrorInfo::new(ErrorCode::InvalidArgument, "invalid subscription selector")
         })?;
-        self.0.insert(owner, spec);
+        self.declarations.insert(owner, spec);
         Ok(())
     }
 
     pub(super) fn remove(&mut self, owner: TrackOwner) -> bool {
-        self.0.remove(&owner).is_some()
+        self.memberships.remove(&owner);
+        self.declarations.remove(&owner).is_some()
+    }
+
+    pub(super) fn observe_memberships(&mut self, owner: TrackOwner, native: &NativeState) {
+        if !self.declarations.contains_key(&owner) {
+            return;
+        }
+        self.memberships.entry(owner).or_default().replace(
+            native
+                .selector_snapshot(owner.id())
+                .into_iter()
+                .flat_map(|snapshot| &snapshot.matches)
+                .filter_map(SelectorMatch::from_wire),
+        );
+    }
+
+    pub(super) fn membership(&self, owner: TrackOwner, source: &SelectorMatch) -> Option<u64> {
+        self.memberships.get(&owner)?.by_match.get(source).copied()
     }
 
     pub(super) fn state(
@@ -139,7 +235,7 @@ impl Selectors {
         owner: TrackOwner,
         native: Option<&NativeState>,
     ) -> Option<SelectorState> {
-        self.0.get(&owner)?;
+        self.declarations.get(&owner)?;
         let mut state = SelectorState {
             status: SelectorStatus::Pending,
             matches: Vec::new(),
@@ -208,7 +304,7 @@ impl Selectors {
         native: &NativeState,
         predicate: impl FnMut(&wire::LogicalSourceAddress) -> bool,
     ) -> bool {
-        self.0.contains_key(&owner)
+        self.declarations.contains_key(&owner)
             && native
                 .selector_snapshot(owner.id())
                 .is_some_and(|snapshot| snapshot.matches.iter().any(predicate))
@@ -220,18 +316,13 @@ impl Selectors {
         explicit: &'a DesiredState,
     ) -> Cow<'a, DesiredState> {
         let mut matches = self
-            .0
+            .declarations
             .keys()
             .filter_map(|owner| native.selector_snapshot(owner.id()))
             .flat_map(|snapshot| &snapshot.matches)
             .filter_map(SelectorMatch::from_wire)
             .peekable();
-        if matches.peek().is_none() {
-            return Cow::Borrowed(explicit);
-        }
-        Cow::Owned(project_receivers(
-            explicit,
-            matches,
+        let previous_video_slots = || {
             native.resources().filter_map(|resource| {
                 let Resource::LogicalReception(MediaSlot::RemoteVideo(slot)) = resource else {
                     return None;
@@ -245,8 +336,19 @@ impl Selectors {
                     SelectorMatch::from_wire(logical.source.as_ref()?)?.address(),
                     *slot,
                 ))
-            }),
-        ))
+            })
+        };
+        if matches.peek().is_none()
+            && (explicit.video.is_empty()
+                || !previous_video_slots().any(|(address, slot)| {
+                    explicit.video.iter().any(|video| {
+                        video.slot != slot && video.selector.as_ref() == Some(&address)
+                    })
+                }))
+        {
+            return Cow::Borrowed(explicit);
+        }
+        Cow::Owned(project_receivers(explicit, matches, previous_video_slots()))
     }
 
     pub(super) fn reconcile(&self, native: &mut NativeState) -> Result<(), SignalingError> {
@@ -254,7 +356,7 @@ impl Selectors {
             .resources()
             .filter_map(|resource| match resource {
                 Resource::SubscriptionSelector(owner)
-                    if !self.0.contains_key(&TrackOwner(*owner)) =>
+                    if !self.declarations.contains_key(&TrackOwner(*owner)) =>
                 {
                     Some(resource.clone())
                 }
@@ -264,7 +366,7 @@ impl Selectors {
         for resource in removed {
             native.stage(resource, None)?;
         }
-        for (owner, spec) in &self.0 {
+        for (owner, spec) in &self.declarations {
             native.stage(
                 Resource::SubscriptionSelector(owner.id()),
                 Some(spec.clone()),
@@ -280,22 +382,35 @@ fn project_receivers(
     previous_video_slots: impl Iterator<Item = (TrackSelector, u32)>,
 ) -> DesiredState {
     let mut projected = explicit.clone();
-    let mut occupied: BTreeSet<_> = explicit.video.iter().map(|video| video.slot).collect();
-    let explicit_video: BTreeSet<_> = explicit
+    projected.video.retain(|video| video.selector.is_none());
+    let mut occupied: BTreeSet<_> = projected.video.iter().map(|video| video.slot).collect();
+    let mut video: BTreeMap<_, _> = explicit
         .video
         .iter()
-        .filter_map(|video| video.selector.clone())
+        .filter_map(|video| Some((video.selector.clone()?, (Some(video.slot), video.clone()))))
         .collect();
-    let mut video = BTreeSet::new();
     let mut audio: BTreeSet<_> = explicit.audio.selected.iter().cloned().collect();
     let mut data: BTreeSet<_> = explicit.topics.subscribers.iter().cloned().collect();
     for source in matches {
         let address = source.address();
         match source.kind {
-            SelectorTrackKind::Video if !explicit_video.contains(&address) => {
-                video.insert(address);
+            SelectorTrackKind::Video => {
+                video.entry(address.clone()).or_insert_with(|| {
+                    (
+                        None,
+                        VideoSubscription {
+                            decode_target: None,
+                            slot: 0,
+                            publication_id: String::new(),
+                            selector: Some(address),
+                            height: 0,
+                            min_height: 0,
+                            min_fps: 0,
+                            priority: 0,
+                        },
+                    )
+                });
             }
-            SelectorTrackKind::Video => {}
             SelectorTrackKind::Audio => {
                 audio.insert(address);
             }
@@ -313,32 +428,36 @@ fn project_receivers(
             }
         }
     }
-    let mut reserved = BTreeMap::new();
+    // A slot is assigned to the logical source, not to the owner that first
+    // required it. Reserve in-use slots before consulting exact owner preferences.
     for (address, slot) in previous_video_slots {
-        if video.contains(&address) && !reserved.contains_key(&address) && occupied.insert(slot) {
-            reserved.insert(address, slot);
+        if !occupied.contains(&slot)
+            && let Some((_, mut subscription)) = video.remove(&address)
+        {
+            occupied.insert(slot);
+            subscription.slot = slot;
+            projected.video.push(subscription);
         }
     }
-    for address in video {
-        let slot = if let Some(slot) = reserved.remove(&address) {
-            slot
+    let mut unassigned = Vec::new();
+    for (preferred, mut subscription) in video.into_values() {
+        if let Some(slot) = preferred.filter(|slot| occupied.insert(*slot)) {
+            subscription.slot = slot;
+            projected.video.push(subscription);
         } else {
-            let Some(slot) = (0..=u32::MAX).find(|slot| occupied.insert(*slot)) else {
-                break;
-            };
-            slot
-        };
-        projected.video.push(VideoSubscription {
-            decode_target: None,
-            slot,
-            publication_id: String::new(),
-            selector: Some(address),
-            height: 0,
-            min_height: 0,
-            min_fps: 0,
-            priority: 0,
-        });
+            unassigned.push(subscription);
+        }
     }
+    for mut subscription in unassigned {
+        let Some(slot) = (0..=u32::MAX).find(|slot| occupied.insert(*slot)) else {
+            break;
+        };
+        subscription.slot = slot;
+        projected.video.push(subscription);
+    }
+    projected
+        .video
+        .sort_by_key(|subscription| subscription.slot);
     projected.audio.selected = audio.into_iter().collect();
     projected.topics.subscribers = data.into_iter().collect();
     projected
@@ -408,6 +527,86 @@ mod tests {
                 .unwrap()
                 .clone()]
         );
+    }
+
+    #[test]
+    fn exact_and_collection_video_share_the_established_slot_in_both_release_orders() {
+        let camera = SelectorMatch {
+            room: "stage".into(),
+            participant_id: "alice".into(),
+            kind: SelectorTrackKind::Video,
+            track_id: "camera".into(),
+        };
+        let exact = DesiredState {
+            video: alloc::vec![VideoSubscription {
+                decode_target: None,
+                slot: 1,
+                publication_id: String::new(),
+                selector: Some(camera.address()),
+                height: 720,
+                min_height: 360,
+                min_fps: 15,
+                priority: 100,
+            }],
+            ..Default::default()
+        };
+        let set_only = DesiredState::default();
+        let slot_from = |demand: &DesiredState| {
+            demand
+                .video
+                .iter()
+                .map(|video| (video.selector.as_ref().unwrap().clone(), video.slot))
+                .collect::<Vec<_>>()
+        };
+        let first_set = project_receivers(&set_only, [camera.clone()].into_iter(), [].into_iter());
+        assert_eq!(first_set.video[0].slot, 0);
+        for first in [&first_set, &exact] {
+            let slots = slot_from(first);
+            let overlap =
+                project_receivers(&exact, [camera.clone()].into_iter(), slots.into_iter());
+            assert_eq!(overlap.video.len(), 1);
+            let mut expected = exact.video[0].clone();
+            expected.slot = first.video[0].slot;
+            assert_eq!(overlap.video, [expected.clone()]);
+            let exact_remains =
+                project_receivers(&exact, [].into_iter(), slot_from(&overlap).into_iter());
+            assert_eq!(exact_remains.video, [expected]);
+            let set_remains = project_receivers(
+                &set_only,
+                [camera.clone()].into_iter(),
+                slot_from(&overlap).into_iter(),
+            );
+            assert_eq!(set_remains.video.len(), 1);
+            assert_eq!(set_remains.video[0].slot, first.video[0].slot);
+            let removed =
+                project_receivers(&set_only, [].into_iter(), slot_from(&overlap).into_iter());
+            assert!(removed.video.is_empty());
+        }
+    }
+
+    #[test]
+    fn collection_memberships_only_refresh_for_sources_that_leave() {
+        let source = |participant: &str| SelectorMatch {
+            room: "stage".into(),
+            participant_id: participant.into(),
+            kind: SelectorTrackKind::Video,
+            track_id: "camera".into(),
+        };
+        let alice = source("alice");
+        let bob = source("bob");
+        let mut all = Memberships::default();
+        let mut exact = Memberships::default();
+        all.replace([alice.clone(), bob.clone()].into_iter());
+        exact.replace([alice.clone()].into_iter());
+        let alice_original = all.by_match[&alice];
+        let bob_original = all.by_match[&bob];
+        let overlapping = exact.by_match[&alice];
+        all.replace([bob.clone()].into_iter());
+        assert!(!all.by_match.contains_key(&alice));
+        all.replace([bob.clone(), alice.clone()].into_iter());
+        assert_ne!(all.by_match[&alice], alice_original);
+        assert_eq!(all.by_match[&bob], bob_original);
+        assert_eq!(exact.by_match[&alice], overlapping);
     }
 
     #[test]

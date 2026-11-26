@@ -1,5 +1,6 @@
 import { useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
+  AudioCollectionRef,
   AudioPublication,
   AudioSource,
   AudioSubscription,
@@ -11,10 +12,13 @@ import {
   RemoteDataTrack,
   RemoteVideoTrack,
   VideoCodec,
+  VideoCollectionRef,
   VideoPublication,
   VideoSource,
   VideoSubscription,
+  type AudioCollection,
   type Catalog,
+  type VideoCollection,
   type DataPublication,
   type DataPublishOptions,
   type DataSubscribeOptions,
@@ -29,6 +33,7 @@ import {
 import { useCommittedRef } from "./committed-ref.js";
 import { useResource } from "./resource.js";
 import { useObservation } from "./observation.js";
+import { useStableTarget } from "./stable-target.js";
 import {
   publicationTrack,
   type PublishableAudioSource,
@@ -48,8 +53,26 @@ type PublishOptions =
   | VideoPublishOptions
   | AudioPublishOptions
   | TopicPublishOptions;
-type Remote = RemoteVideoTrack | RemoteAudioTrack | RemoteDataTrack;
-type Subscription = VideoSubscription | AudioSubscription | DataSubscription;
+type Remote =
+  | RemoteVideoTrack
+  | RemoteAudioTrack
+  | RemoteDataTrack
+  | VideoCollectionRef
+  | AudioCollectionRef;
+type Subscription =
+  | VideoSubscription
+  | AudioSubscription
+  | DataSubscription
+  | VideoCollection
+  | AudioCollection;
+
+function sameSelection(previous: Remote | null, current: Remote | null) {
+  if (previous instanceof VideoCollectionRef && current instanceof VideoCollectionRef)
+    return previous.sameSelection(current);
+  if (previous instanceof AudioCollectionRef && current instanceof AudioCollectionRef)
+    return previous.sameSelection(current);
+  return false;
+}
 
 export function useWatch(
   room: RoomRef | null,
@@ -183,6 +206,8 @@ export function usePublish(
   return usePublication(track, source, options).value;
 }
 
+export function useSubscribe(track: VideoCollectionRef | null): VideoCollection | null;
+export function useSubscribe(track: AudioCollectionRef | null): AudioCollection | null;
 export function useSubscribe(
   track: RemoteVideoTrack | null,
   options?: VideoObservation,
@@ -195,9 +220,10 @@ export function useSubscribe(
   options?: DataSubscribeOptions,
 ): DataSubscription | null;
 export function useSubscribe(
-  track: Remote | null,
+  selection: Remote | null,
   options?: VideoObservation | DataSubscribeOptions,
 ): Subscription | null {
+  const track = useStableTarget(selection, sameSelection);
   const mode =
     track instanceof RemoteDataTrack
       ? ((options as DataSubscribeOptions | undefined)?.delivery ??
@@ -213,7 +239,9 @@ export function useSubscribe(
         ? track.subscribe(options as DataSubscribeOptions | undefined)
         : track instanceof RemoteVideoTrack
           ? track.subscribe(options as VideoObservation | undefined)
-          : track instanceof RemoteAudioTrack
+          : track instanceof RemoteAudioTrack ||
+              track instanceof AudioCollectionRef ||
+              track instanceof VideoCollectionRef
             ? track.subscribe()
             : undefined;
     if (!owner) throw new TypeError("Expected an SDK remote track");

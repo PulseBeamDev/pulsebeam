@@ -1361,56 +1361,40 @@ fn native_claims_h264_and_av1_senders_after_join() {
                 Ok(viewer.room("mixed".into())?.participant("mixed-publisher".into())?
                     .video(label.into())?.subscribe(None)?)
             };
-            use pulsebeam_agent_core::{SelectorStatus, SelectorTrackKind, SubscriptionSelector};
-            let broad = compatible.subscribe_selector(SubscriptionSelector {
+            use pulsebeam_agent_core::{CollectionStatus, TrackFilter};
+            let room = compatible.room("mixed".into())?;
+            let broad = room.video(None).subscribe()?;
+            let narrow = room.video(Some(TrackFilter {
                 participant_id: Some("mixed-publisher".into()),
-                kind: Some(SelectorTrackKind::Video),
-                ..Default::default()
-            })?;
-            let narrow = compatible.subscribe_selector(SubscriptionSelector {
-                room: Some("mixed".into()),
-                participant_id: Some("mixed-publisher".into()),
-                kind: Some(SelectorTrackKind::Video),
                 track_id: Some("camera".into()),
-                ..Default::default()
-            })?;
+            })).subscribe()?;
             let compatible_screen = subscribe(&compatible, "screen")?;
             let late_camera = subscribe(&late, "camera")?;
             wait_mixed_video_installed(&compatible_screen).await.context("install AV1 viewer")?;
             wait_mixed_video_installed(&late_camera).await.context("install H.264 viewer")?;
             let screen_frames = compatible_screen.frames()?;
             let camera_frames = late_camera.frames()?;
-            let wait_matches = async |selector: &pulsebeam_agent_native::ffi::SelectorSubscription, count| {
+            let wait_entries = async |owner: &pulsebeam_agent_native::ffi::VideoCollection, count| {
+                let updates = owner.updates()?;
                 tokio::time::timeout(Duration::from_secs(4), async {
                     loop {
-                        let state = selector.state().context("selector unexpectedly closed")?;
-                        if state.status == SelectorStatus::Complete && state.matches.len() == count {
-                            return anyhow::Ok(state.matches);
+                        let state = updates.next().await?.context("collection unexpectedly closed")?;
+                        if state.status == CollectionStatus::Live && state.tracks.len() == count {
+                            return anyhow::Ok(state.tracks);
                         }
-                        anyhow::ensure!(state.status != SelectorStatus::Rejected, "selector rejected: {:?}", state.error);
-                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        anyhow::ensure!(state.status != CollectionStatus::Rejected, "collection rejected: {:?}", state.error);
                     }
-                }).await.context("selector match set")?
+                }).await.context("usable collection entries")?
             };
-            let broad_matches = wait_matches(&broad, 2).await?;
-            let narrow_matches = wait_matches(&narrow, 1).await?;
-            let camera_match = broad_matches.iter().find(|source| source.track_id == "camera").context("camera in wildcard set")?;
-            anyhow::ensure!(narrow_matches.as_slice() == std::slice::from_ref(camera_match));
-            let matched = async |selector: &pulsebeam_agent_native::ffi::SelectorSubscription| {
-                tokio::time::timeout(Duration::from_secs(4), async {
-                    loop {
-                        match selector.observe(camera_match.clone(), ReceiveMode::Decoded).await {
-                            Ok(receiver) => return anyhow::Ok(receiver),
-                            Err(pulsebeam_agent_native::ffi::NativeError::NotReady) => tokio::time::sleep(Duration::from_millis(10)).await,
-                            Err(error) => return Err(error.into()),
-                        }
-                    }
-                }).await.context("install selector camera")?
-            };
-            let broad_camera = matched(&broad).await?;
-            let narrow_camera = matched(&narrow).await?;
-            anyhow::ensure!(broad_camera.receiver() == narrow_camera.receiver());
-            anyhow::ensure!(broad_camera.source_track_id() == h264.admission.publication_id);
+            let broad_entries = wait_entries(&broad, 2).await?;
+            let narrow_entries = wait_entries(&narrow, 1).await?;
+            let broad_entry = broad_entries.iter().find(|source| source.track_id == "camera").context("camera in wildcard set")?;
+            let narrow_entry = &narrow_entries[0];
+            anyhow::ensure!(narrow_entry.participant_id == "mixed-publisher" && narrow_entry.track_id == "camera");
+            anyhow::ensure!(narrow_entry.publication_id == broad_entry.publication_id);
+            anyhow::ensure!(Some(broad_entry.publication_id.as_str()) == h264.admission.publication_id.as_deref());
+            let broad_camera = broad_entry.track.frames()?;
+            let narrow_camera = narrow_entry.track.frames()?;
             camera.ready().await?;
             let screen_generation = compatible_session.generation.context("screen viewer generation")?;
             let camera_generation = late_session.generation.context("camera viewer generation")?;
@@ -1430,14 +1414,20 @@ fn native_claims_h264_and_av1_senders_after_join() {
                 tokio::try_join!(
                     mixed_decode(|| screen_frames.next(), screen_generation, (640, 360), phase),
                     mixed_decode(|| camera_frames.next(), camera_generation, (320, 180), phase),
-                    mixed_decode(|| next_selector_picture(&broad_camera), screen_generation, (320, 180), phase),
+                    mixed_decode(|| broad_camera.next(), screen_generation, (320, 180), phase),
                 )
             };
             let scenario = async {
             let (first_screen, first_camera, first_wildcard) = exchange(0).await.context("first mixed video exchange")?;
             anyhow::ensure!(first_screen.receiver != first_wildcard.receiver);
+            let first_narrow = mixed_decode(|| narrow_camera.next(), screen_generation, (320, 180), 0).await?;
+            anyhow::ensure!(first_narrow == first_wildcard);
             narrow.close();
-            narrow_camera.close().await;
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while narrow_camera.next().await?.is_some() {}
+                anyhow::Ok(())
+            }).await.context("collection close terminates its frame reader")??;
+            anyhow::ensure!(matches!(narrow_entry.track.frames(), Err(pulsebeam_agent_native::ffi::NativeError::Operation { info }) if info.code == core_ffi::ErrorCode::Replaced));
             anyhow::ensure!(compatible_screen.state().source_track_id == av1.admission.publication_id);
             anyhow::ensure!(compatible_screen.state().source_format == av1.admission.effective_format);
             anyhow::ensure!(late_camera.state().source_track_id == h264.admission.publication_id);
@@ -1457,10 +1447,9 @@ fn native_claims_h264_and_av1_senders_after_join() {
             anyhow::ensure!(next_screen == first_screen && next_camera == first_camera && next_wildcard == first_wildcard);
             broad.close();
             tokio::time::timeout(Duration::from_secs(2), async {
-                loop {
-                    if matches!(broad_camera.next().await, pulsebeam_agent_native::MediaStreamUpdate::Closed) { break; }
-                }
-            }).await.context("last selector withdraws its camera output")?;
+                while broad_camera.next().await?.is_some() {}
+                anyhow::Ok(())
+            }).await.context("last collection withdraws its camera output")??;
             anyhow::Ok((rejected_screen, updates))
             };
             let (_screen_subscription, updates) = tokio::select! { result = pump => result, result = scenario => result }?;
@@ -1555,28 +1544,6 @@ async fn wait_mixed_video_installed(
         }
     })
     .await?
-}
-
-async fn next_selector_picture(
-    receiver: &pulsebeam_agent_native::ffi::RemoteMediaReceiver,
-) -> Result<Option<pulsebeam_agent_native::ffi::VideoFrame>, pulsebeam_agent_native::ffi::NativeError>
-{
-    use pulsebeam_agent_native::{MediaStreamUpdate, OutputFrame};
-    loop {
-        match receiver.next().await {
-            MediaStreamUpdate::Closed => return Ok(None),
-            MediaStreamUpdate::Frame { frame } => {
-                if let OutputFrame::I420 { frame: pixels } = frame.frame {
-                    return Ok(Some(pulsebeam_agent_native::ffi::VideoFrame {
-                        track: frame.track,
-                        metadata: frame.metadata,
-                        frame: pixels,
-                    }));
-                }
-            }
-            _ => {}
-        }
-    }
 }
 
 async fn mixed_decode(

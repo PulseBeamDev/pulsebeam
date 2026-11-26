@@ -10,6 +10,7 @@ import {
   WatchStatus,
   type AgentConfig,
   type DataSendOptions,
+  type VideoCollectionEntry,
   type VideoObservation,
 } from "@pulsebeam/web";
 
@@ -25,6 +26,22 @@ agent.join("demo");
 agent.renew("renewed");
 
 const room = agent.room("demo");
+const grid = room.video({ trackId: "camera" }).subscribe();
+const entries: VideoCollectionEntry[] = grid.state().tracks;
+for (const { publicationId, participantId, trackId, track } of entries) {
+  const output = await track.playbackOutput();
+  const media: MediaStreamTrack | undefined = output.track();
+  void [publicationId, participantId, trackId, media];
+  await output.close();
+  // @ts-expect-error a borrowed track cannot close collection membership
+  track.close();
+}
+const gridUpdates = grid.updates();
+await gridUpdates.next();
+gridUpdates.close();
+await grid.close();
+await room.audio().subscribe().close();
+
 const watch: Catalog = room.watch({ limit: 10, cursor: new Uint8Array() });
 const page = watch.state();
 const participants =

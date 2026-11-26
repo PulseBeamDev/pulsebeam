@@ -1,16 +1,19 @@
 import { createElement, useEffect, useRef, useState } from "react";
 import type * as React from "react";
-import type {
-  AudioSource as WebAudioSource,
-  VideoSource as WebVideoSource,
-  AudioSubscription,
-  VideoSubscription,
+import {
+  AudioTrack,
+  VideoTrack,
+  type AudioSource as WebAudioSource,
+  type VideoSource as WebVideoSource,
+  type AudioSubscription,
+  type VideoSubscription,
 } from "@pulsebeam/web";
 import {
   attachMedia,
   type BorrowedMediaAttachment,
 } from "@pulsebeam/web/internal/react";
 import { useCommittedRef } from "./committed-ref.js";
+import { useStableTarget } from "./stable-target.js";
 import {
   playbackTrack,
   type VideoSource,
@@ -22,17 +25,26 @@ export interface PlaybackError {
   readonly retry: () => Promise<void>;
 }
 type PlaybackErrorCallback = (failure: PlaybackError) => void;
-type VideoInput = VideoSource | WebVideoSource | VideoSubscription;
-type AudioInput = AudioSource | WebAudioSource | AudioSubscription;
+type VideoInput = VideoSource | WebVideoSource | VideoSubscription | VideoTrack;
+type AudioInput = AudioSource | WebAudioSource | AudioSubscription | AudioTrack;
 type Input = VideoInput | AudioInput;
 type Playback = BorrowedMediaAttachment;
 
+function sameAdmission(previous: Input | null, current: Input | null) {
+  if (previous instanceof VideoTrack && current instanceof VideoTrack)
+    return previous.sameAdmission(current);
+  if (previous instanceof AudioTrack && current instanceof AudioTrack)
+    return previous.sameAdmission(current);
+  return false;
+}
+
 function usePlayback(
-  source: Input | null,
+  input: Input | null,
   kind: "video" | "audio",
   autoPlay: boolean,
   onPlaybackError?: PlaybackErrorCallback,
 ) {
+  const source = useStableTarget(input, sameAdmission);
   const element = useRef<HTMLMediaElement>(null);
   const callback = useCommittedRef(onPlaybackError);
   const committedAutoPlay = useCommittedRef(autoPlay);

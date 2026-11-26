@@ -18,8 +18,10 @@ const {
   Agent,
   AgentError,
   AgentStatus,
+  CollectionStatus,
   ErrorCode,
   PipeStatus,
+  VideoCodec,
   VideoSource,
   WatchStatus,
 } = sdk;
@@ -94,6 +96,23 @@ assert.equal(
   "lookup never selects a room",
 );
 
+const videos = room.video({ trackId: "camera" }).subscribe();
+const audio = room.audio().subscribe();
+assert.equal(audio.state().status, CollectionStatus.Waiting);
+assert.deepEqual(audio.state().tracks, []);
+const membership = videos.updates();
+assert.deepEqual(await membership.next(), videos.state());
+const nextMembership = membership.next();
+await videos.close();
+assert.equal((await nextMembership).status, CollectionStatus.Closed);
+assert.equal(await membership.next(), undefined);
+assert.equal(audio.state().status, CollectionStatus.Waiting);
+await audio.close();
+assert.throws(
+  () => room.video({ participantId: "" }).subscribe(),
+  rejectedWith(ErrorCode.InvalidArgument),
+);
+
 const watch = room.watch();
 assert.equal(watch.state().status, WatchStatus.Loading);
 assert.equal(
@@ -139,6 +158,11 @@ assert.throws(() => local.publish(), rejectedWith(ErrorCode.Conflict));
 const pipe = capture.pipeTo(publication);
 const publicationUpdates = publication.updates();
 const published = publication.state();
+assert.throws(
+  () => publication.configure({ enabled: false, codec: VideoCodec.Av1 }),
+  rejectedWith(ErrorCode.Unsupported),
+);
+assert.equal(publication.state(), published, "rejected codec change preserves accepted settings");
 assert.ok(Object.isFrozen(published.configuration));
 assert.deepEqual(await publicationUpdates.next(), published);
 const changing = publicationUpdates.next();

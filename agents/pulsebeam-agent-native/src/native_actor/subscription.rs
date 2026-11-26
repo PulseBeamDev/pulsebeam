@@ -210,19 +210,16 @@ where
         Subscription { inner }
     }
 
-    pub(super) fn observe_subscription(
+    pub(super) fn begin_observation(
         &mut self,
-        owner: u64,
+        command: ResourceCommand,
         mode: ReceiveMode,
         response: oneshot::Sender<Result<RemoteMedia, Error>>,
     ) {
         if response.is_closed() {
             return;
         }
-        match self
-            .core
-            .resource(ResourceCommand::BeginMediaObservation { owner })
-        {
+        match self.core.resource(command) {
             Ok(ResourceResult::MediaObservation(id)) => {
                 self.observations.insert(
                     id,

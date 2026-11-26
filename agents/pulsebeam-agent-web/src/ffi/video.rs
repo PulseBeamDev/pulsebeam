@@ -311,6 +311,8 @@ macro_rules! media_output {
     };
 }
 
+mod collection;
+
 playback_output!(VideoSubscription, WebVideoOutput);
 playback_output!(AudioSubscription, WebAudioOutput);
 media_output!(WebSelectorOutput);

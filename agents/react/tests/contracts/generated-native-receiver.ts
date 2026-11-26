@@ -21,6 +21,7 @@ import {
 import { createElement, useLayoutEffect, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import { useResource } from "../../src/resource.js";
+export { recoveryFixture } from "../application-contract/recovery.js";
 
 function ReceiveVideo({
   camera,

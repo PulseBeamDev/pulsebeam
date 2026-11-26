@@ -386,6 +386,87 @@ async def publish_live(endpoint, token, room, package):
         await agent.close()
 
 
+async def record_recovery(endpoint, token, room, package):
+    core = importlib.import_module(f"{package}.pulsebeam_agent_core")
+    native = importlib.import_module(f"{package}.pulsebeam_agent_native")
+    agent = native.Agent(core.AgentConfig(
+        endpoint=endpoint, token=token,
+        retry=core.RetryPolicy(
+            initial_delay_ms=100, maximum_delay_ms=1000, maximum_attempts=2,
+        ),
+        log_level=core.LogLevel.WARN,
+    ))
+    owner = agent.room(room).video(core.TrackFilter(track_id="camera")).subscribe()
+    updates = owner.updates()
+
+    async def entry():
+        while (state := await updates.next()) is not None:
+            assert state.status != core.CollectionStatus.REJECTED, state.error
+            if state.tracks:
+                assert len(state.tracks) == 1
+                track = state.tracks[0]
+                assert (track.participant_id, track.track_id) == ("collection-publisher", "camera")
+                return track
+        raise AssertionError("collection ended before a usable entry")
+
+    async def picture(frames, bright):
+        while (value := await frames.next()) is not None:
+            pixels = value.frame
+            luma = pixels.data[pixels.width * (pixels.height // 2) + pixels.width // 2]
+            marked = luma > 160 if bright else 15 < luma < 110
+            if marked:
+                return value.track.receiver
+        raise AssertionError("segment ended before its expected decoded frame")
+
+    async def command(kind):
+        line = (await asyncio.to_thread(sys.stdin.readline)).strip().split(maxsplit=1)
+        assert line and line[0] == kind, (kind, line)
+        return line[1] if len(line) == 2 else None
+
+    frames = None
+    try:
+        agent.join(room)
+        first = await asyncio.wait_for(entry(), timeout=10)
+        frames = first.track.frames()
+        receiver = await asyncio.wait_for(picture(frames, False), timeout=8)
+        print(f"segment 1 {first.publication_id}", flush=True)
+        assert await asyncio.wait_for(picture(frames, True), timeout=8) == receiver
+        print("input swapped", flush=True)
+        agent.renew(await command("withdraw"))
+        async def end_segment():
+            while await frames.next() is not None:
+                pass
+        await asyncio.wait_for(end_segment(), timeout=8)
+        frames.close()
+        try:
+            first.track.frames()
+        except native.NativeError.Operation as error:
+            assert error.info.code == core.ErrorCode.REPLACED
+        else:
+            raise AssertionError("retired capability opened a new frame reader")
+        print("segment ended", flush=True)
+        agent.renew(await command("readmit"))
+        updates.close()
+        updates = owner.updates()
+        # Renew is asynchronous: the current snapshot can still be rejected.
+        while (state := await asyncio.wait_for(updates.next(), timeout=8)) is not None:
+            if state.tracks:
+                break
+        assert state and len(state.tracks) == 1
+        successor = state.tracks[0]
+        assert successor.publication_id == first.publication_id
+        frames = successor.track.frames()
+        assert await asyncio.wait_for(picture(frames, True), timeout=8) != receiver
+        print(f"segment 2 {successor.publication_id}", flush=True)
+        await command("stop")
+    finally:
+        if frames is not None:
+            frames.close()
+        updates.close()
+        owner.close()
+        await agent.close()
+
+
 def main():
     if len(sys.argv) == 7 and sys.argv[1] == "--witness":
         package = importlib.import_module("pulsebeam_agent")
@@ -428,6 +509,8 @@ def main():
             assert Path(package.__file__).is_relative_to(site)
             if len(sys.argv) == 5 and sys.argv[1] == "--publish":
                 asyncio.run(asyncio.wait_for(publish_live(sys.argv[2], sys.argv[3], sys.argv[4], package.__name__), timeout=30))
+            elif len(sys.argv) == 5 and sys.argv[1] == "--record-recovery":
+                asyncio.run(record_recovery(sys.argv[2], sys.argv[3], sys.argv[4], package.__name__))
             else:
                 asyncio.run(asyncio.wait_for(witness(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], package.__name__), timeout=25))
 

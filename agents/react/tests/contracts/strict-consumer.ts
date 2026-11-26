@@ -90,7 +90,7 @@ usePublish(actualAgent.audio("audio"), audioSource, videoOptions);
 const dataWithCodec = { delivery: DataDelivery.Latest, codec: VideoCodec.H264 };
 // @ts-expect-error Codec is not a data delivery option.
 usePublish(actualAgent.data("data"), null, dataWithCodec);
-// @ts-expect-error Codec cannot be configured on an existing publication.
+// A caller may restate the original codec. A change is rejected at runtime.
 videoPublication?.configure({ enabled: true, codec: VideoCodec.H264 });
 const av1Publication: VideoPublication | null = usePublish(
   actualAgent.video("screen"),

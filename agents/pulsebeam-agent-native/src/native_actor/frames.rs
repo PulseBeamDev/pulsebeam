@@ -85,10 +85,56 @@ impl FrameChanges {
     }
 }
 
+enum FrameOrigin {
+    Exact {
+        subscription: Subscription,
+        state: FrameState,
+        changes: FrameChanges,
+    },
+    Admitted {
+        room: RoomRef,
+        admission: Box<agent_core::AdmittedMedia>,
+    },
+}
+
+impl FrameOrigin {
+    fn closed(&self) -> bool {
+        match self {
+            Self::Exact {
+                subscription,
+                state,
+                ..
+            } => subscription.is_closed() || state.closed(),
+            Self::Admitted { .. } => false,
+        }
+    }
+
+    async fn observe(&self) -> Result<RemoteMedia, Error> {
+        match self {
+            Self::Exact { subscription, .. } => subscription.observe(ReceiveMode::Decoded).await,
+            Self::Admitted { room, admission } => {
+                room.observe_admitted_media((**admission).clone()).await
+            }
+        }
+    }
+
+    async fn changed(&self) -> Result<(), Error> {
+        match self {
+            Self::Exact {
+                subscription,
+                changes,
+                ..
+            } => tokio::select! {
+                _ = subscription.inner.closed.wait() => Ok(()),
+                result = changes.next() => result,
+            },
+            Self::Admitted { .. } => core::future::pending().await,
+        }
+    }
+}
+
 pub(super) struct FrameReaderLease {
-    subscription: Subscription,
-    state: FrameState,
-    changes: FrameChanges,
+    origin: FrameOrigin,
     remote: std::sync::OnceLock<RemoteMedia>,
     failure: std::sync::OnceLock<ErrorInfo>,
     closed: Signal,
@@ -97,7 +143,9 @@ pub(super) struct FrameReaderLease {
 
 impl FrameReaderLease {
     fn capture_failure(&self) {
-        if let Some(error) = self.state.failure() {
+        if let FrameOrigin::Exact { state, .. } = &self.origin
+            && let Some(error) = state.failure()
+        {
             let _ = self.failure.set(error);
         }
     }
@@ -109,16 +157,22 @@ impl FrameReaderLease {
                 error.clone(),
             )));
         }
-        if self.closed.is_closed() || self.subscription.is_closed() || self.state.closed() {
+        if self.is_closed() {
             return Ok(None);
         }
         Ok(frame)
     }
 
+    fn is_closed(&self) -> bool {
+        self.closed.is_closed() || self.origin.closed()
+    }
+
     pub(super) fn close(&self) {
         self.capture_failure();
         self.closed.close();
-        self.changes.close();
+        if let FrameOrigin::Exact { changes, .. } = &self.origin {
+            changes.close();
+        }
         if let Some(remote) = self.remote.get() {
             remote.lease.close();
             remote.lease.leases_changed.notify_one();
@@ -157,17 +211,36 @@ impl FrameReader {
             ));
         }
         let changes = state.updates()?;
-        let inner = Arc::new(FrameReaderLease {
+        let reader = Self::from_origin(FrameOrigin::Exact {
             subscription: subscription.clone(),
             state,
             changes,
-            remote: std::sync::OnceLock::new(),
-            failure: std::sync::OnceLock::new(),
-            closed: Signal::default(),
-            reading: Mutex::new(()),
         });
-        *slot = Arc::downgrade(&inner);
-        Ok(Self { inner })
+        *slot = Arc::downgrade(&reader.inner);
+        Ok(reader)
+    }
+
+    pub(crate) fn admitted(
+        room: RoomRef,
+        admission: agent_core::AdmittedMedia,
+    ) -> Result<Self, Error> {
+        room.check_admitted_media(&admission)?;
+        Ok(Self::from_origin(FrameOrigin::Admitted {
+            room,
+            admission: Box::new(admission),
+        }))
+    }
+
+    fn from_origin(origin: FrameOrigin) -> Self {
+        Self {
+            inner: Arc::new(FrameReaderLease {
+                origin,
+                remote: std::sync::OnceLock::new(),
+                failure: std::sync::OnceLock::new(),
+                closed: Signal::default(),
+                reading: Mutex::new(()),
+            }),
+        }
     }
 
     pub(crate) fn close(&self) {
@@ -181,27 +254,20 @@ impl FrameReader {
             .try_lock()
             .map_err(|_| operation(ErrorCode::Conflict, "A frame read is already pending"))?;
         self.inner.result(None)?;
-        if self.inner.closed.is_closed()
-            || self.inner.subscription.is_closed()
-            || self.inner.state.closed()
-        {
+        if self.inner.is_closed() {
             return Ok(None);
         }
         if self.inner.remote.get().is_none() {
-            let acquiring = self.inner.subscription.observe(ReceiveMode::Decoded);
+            let acquiring = self.inner.origin.observe();
             tokio::pin!(acquiring);
             loop {
                 self.inner.result(None)?;
-                if self.inner.closed.is_closed()
-                    || self.inner.subscription.is_closed()
-                    || self.inner.state.closed()
-                {
+                if self.inner.is_closed() {
                     return Ok(None);
                 }
                 tokio::select! {
                     _ = self.inner.closed.wait() => return self.inner.result(None),
-                    _ = self.inner.subscription.inner.closed.wait() => return self.inner.result(None),
-                    changed = self.inner.changes.next() => changed?,
+                    changed = self.inner.origin.changed() => changed?,
                     result = &mut acquiring => {
                         match result {
                             Ok(remote) => {
@@ -227,16 +293,12 @@ impl FrameReader {
         };
         loop {
             self.inner.result(None)?;
-            if self.inner.closed.is_closed()
-                || self.inner.subscription.is_closed()
-                || self.inner.state.closed()
-            {
+            if self.inner.is_closed() {
                 return Ok(None);
             }
             tokio::select! {
                 _ = self.inner.closed.wait() => return self.inner.result(None),
-                _ = self.inner.subscription.inner.closed.wait() => return self.inner.result(None),
-                changed = self.inner.changes.next() => changed?,
+                changed = self.inner.origin.changed() => changed?,
                 update = remote.next() => match update {
                     MediaStreamUpdate::Frame { frame } => return self.inner.result(Some(frame)),
                     MediaStreamUpdate::Closed => {

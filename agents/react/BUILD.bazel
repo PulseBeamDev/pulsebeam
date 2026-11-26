@@ -168,7 +168,15 @@ run_binary(
 js_run_binary(
     name = "generated_native_receiver",
     tool = ":quickstart_builder",
-    srcs = [":quickstart_source", ":component_sources", ":installed_generated_web", ":node_modules", "tests/contracts/generated-native-receiver.ts"],
+    srcs = [
+        ":quickstart_source",
+        ":component_sources",
+        ":installed_generated_web",
+        ":node_modules",
+        "tests/application-contract/recovery.tsx",
+        "tests/contracts/generated-native-receiver.ts",
+        "//agents/pulsebeam-agent-web:application_contract_publisher",
+    ],
     args = ["generated_native_receiver", "tests/contracts/generated-native-receiver.ts", "installed-generated-web"],
     chdir = package_name(),
     out_dirs = ["generated_native_receiver"],

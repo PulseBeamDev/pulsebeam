@@ -642,6 +642,44 @@ impl BrowserRuntime {
     }
 
     #[cfg(feature = "uniffi")]
+    pub(crate) fn claim_media_collection(
+        &self,
+        room: String,
+        kind: agent_core::SelectorTrackKind,
+        filter: agent_core::TrackFilter,
+    ) -> Result<(u64, Rc<agent_core::observer::MediaCollectionObserver>), agent_core::ffi::ErrorInfo>
+    {
+        self.claim_observed_resource(
+            agent_core::ResourceCommand::OpenMediaCollection { room, kind, filter },
+            |owner| self.media_collection_observer(owner),
+        )
+    }
+
+    #[cfg(feature = "uniffi")]
+    pub(crate) async fn observe_admitted_media(
+        &self,
+        admission: agent_core::AdmittedMedia,
+    ) -> Result<media_observation::BrowserMediaObservation, agent_core::ffi::ErrorInfo> {
+        use agent_core::ffi::{ErrorCode, ErrorInfo};
+        self.inner
+            .observe_cancellable(agent_core::ResourceCommand::BeginAdmittedMediaObservation {
+                admission: admission.clone(),
+            })
+            .await
+            .or_else(|_| {
+                let actor = self.inner.intent_actor()?;
+                Err(if actor.admitted_media_current(&admission) {
+                    ErrorInfo::new(
+                        ErrorCode::NotReady,
+                        "Collection track output is unavailable",
+                    )
+                } else {
+                    ErrorInfo::new(ErrorCode::Replaced, "Collection track admission has ended")
+                })
+            })
+    }
+
+    #[cfg(feature = "uniffi")]
     pub(crate) async fn observe_exact_media(
         &self,
         owner: u64,
@@ -798,13 +836,14 @@ impl BrowserRuntime {
     pub(crate) fn configure_publication_state(
         &self,
         owner: u64,
-        enabled: bool,
+        options: agent_core::MediaPublishOptions,
     ) -> Result<(), agent_core::ffi::ErrorInfo> {
         let actor = self.inner.intent_actor()?;
-        let result = actor.resource_now(agent_core::ResourceCommand::SetPublicationMuted {
-            owner,
-            muted: !enabled,
-        })?;
+        let result =
+            actor.resource_now(agent_core::ResourceCommand::ConfigureMediaPublication {
+                owner,
+                options,
+            })?;
         let host = BrowserHost::new(&self.inner);
         if let agent_core::ResourceResult::PublicationInputState(state) = result {
             host.publication_input_state(&state);

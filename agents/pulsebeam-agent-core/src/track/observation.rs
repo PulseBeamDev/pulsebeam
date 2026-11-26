@@ -22,6 +22,7 @@ pub struct MediaObservationTarget {
     pub generation: crate::Generation,
     /// The existing receiver-owned resource lifetime, not an allocation operation.
     pub reference: u64,
+    pub(crate) offer: Option<crate::native_state::Offer>,
     pub source: String,
     pub binding: crate::SlotBinding,
 }
@@ -38,6 +39,7 @@ pub struct MediaObservationControl {
 pub(super) struct MediaObservation {
     source: Option<String>,
     selector_match: Option<crate::SelectorMatch>,
+    admission: Option<crate::AdmittedMedia>,
     control: Option<MediaObservationControl>,
     completed: bool,
     attached: bool,
@@ -94,6 +96,7 @@ impl TrackResources {
         &mut self,
         owner: TrackOwner,
         source: crate::SelectorMatch,
+        admission: Option<crate::AdmittedMedia>,
     ) -> Result<MediaObservationId, TrackResourceError> {
         let start = MediaObservationId {
             owner,
@@ -121,6 +124,7 @@ impl TrackResources {
             id,
             MediaObservation {
                 selector_match: Some(source),
+                admission,
                 ..Default::default()
             },
         );
@@ -132,6 +136,13 @@ impl TrackResources {
         id: MediaObservationId,
     ) -> Option<&crate::SelectorMatch> {
         self.observations.get(&id)?.selector_match.as_ref()
+    }
+
+    pub(crate) fn observation_admission(
+        &self,
+        id: MediaObservationId,
+    ) -> Option<&crate::AdmittedMedia> {
+        self.observations.get(&id)?.admission.as_ref()
     }
 
     pub(crate) fn audio_observation_source(&self, id: MediaObservationId) -> Option<&str> {
@@ -146,22 +157,16 @@ impl TrackResources {
         }
     }
 
-    pub(crate) fn observation_requests(
+    pub(crate) fn observation_requests(&self) -> Vec<MediaObservationId> {
+        self.observations.keys().copied().collect()
+    }
+
+    pub(crate) fn video_observation_selector(
         &self,
-    ) -> Vec<(MediaObservationId, Option<crate::MediaSlot>)> {
-        self.observations
-            .keys()
-            .map(|id| {
-                let slot = self.video.get(&id.owner).and_then(|view| {
-                    view.observation
-                        .visible
-                        .then(|| self.video_slots.get(&view.selector).copied())
-                        .flatten()
-                        .map(crate::MediaSlot::RemoteVideo)
-                });
-                (*id, slot)
-            })
-            .collect()
+        id: MediaObservationId,
+    ) -> Option<&TrackSelector> {
+        let view = self.video.get(&id.owner)?;
+        view.observation.visible.then_some(&view.selector)
     }
 
     pub(crate) fn audio_observation_selector(
@@ -180,13 +185,15 @@ impl TrackResources {
         target: Option<MediaObservationTarget>,
     ) -> Option<MediaObservationControl> {
         let observation = self.observations.get(&id)?;
-        let closed = observation.closed
-            || observation.attached
-                && observation
-                    .control
-                    .as_ref()
-                    .and_then(|control| control.target.as_ref())
-                    != target.as_ref();
+        let previous = observation
+            .control
+            .as_ref()
+            .and_then(|control| control.target.as_ref());
+        // Collection observations borrow one admission. Once targeted, even
+        // an unfinished attachment must not silently move to a new admission.
+        let pinned =
+            observation.attached || (observation.selector_match.is_some() && previous.is_some());
+        let closed = observation.closed || pinned && previous != target.as_ref();
         Some(MediaObservationControl {
             effect: None,
             observation: id,

@@ -103,6 +103,22 @@ async def witness():
         await default_publication.close()
         room = agent.room("room")
         assert isinstance(room, native.RoomRef) and room.name() == "room"
+        for collection in (
+            room.video().subscribe(),
+            room.audio(core.TrackFilter(participant_id="remote")).subscribe(),
+            room.video(core.TrackFilter(participant_id="remote", track_id="camera")).subscribe(),
+        ):
+            cursor = collection.updates()
+            initial = await cursor.next()
+            assert initial.status == core.CollectionStatus.WAITING
+            assert initial.tracks == []
+            pending = asyncio.create_task(cursor.next())
+            await asyncio.sleep(0)
+            collection.close()
+            terminal = await asyncio.wait_for(pending, timeout=1)
+            assert terminal.status == core.CollectionStatus.CLOSED
+            assert terminal.observation_revision > initial.observation_revision
+            assert await cursor.next() is None
         watch = room.watch()
         assert isinstance(watch, native.Watch) and not inspect.isawaitable(watch)
         watch_state = watch.state()

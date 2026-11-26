@@ -729,7 +729,11 @@ fn video_views_share_capacity_aggregate_visible_demand_and_preserve_incumbents()
     assert!(
         resources
             .observation_requests()
-            .contains(&(unbounded_request, Some(crate::MediaSlot::RemoteVideo(0))))
+            .contains(&unbounded_request)
+    );
+    assert_eq!(
+        resources.video_observation_selector(unbounded_request),
+        Some(&selector),
     );
     resources.release_observation_controls(second);
     resources
@@ -785,6 +789,70 @@ fn video_views_share_capacity_aggregate_visible_demand_and_preserve_incumbents()
 }
 
 #[test]
+fn collection_observation_does_not_cross_a_readmission_of_the_same_publication() {
+    let mut resources = TrackResources::default();
+    let first_owner = resources.new_owner().unwrap();
+    let second_owner = resources.new_owner().unwrap();
+    let source = crate::SelectorMatch {
+        room: "room".into(),
+        participant_id: "alice".into(),
+        kind: crate::SelectorTrackKind::Video,
+        track_id: "camera".into(),
+    };
+    let first = resources
+        .begin_selector_media_observation(first_owner, source.clone(), None)
+        .unwrap();
+    let second = resources
+        .begin_selector_media_observation(second_owner, source.clone(), None)
+        .unwrap();
+    let mut ids = crate::id::IdGenerator::new();
+    let mut target = MediaObservationTarget {
+        generation: ids.generation(),
+        reference: 11,
+        offer: Some(crate::native_state::Offer {
+            reference: 11,
+            source_revision: 1,
+        }),
+        source: "publication".into(),
+        binding: crate::SlotBinding {
+            slot: crate::MediaSlot::RemoteVideo(0),
+            mid: "receiver".into(),
+            media_index: 1,
+            kind: MediaKind::Video,
+            direction: crate::MediaDirection::ReceiveOnly,
+        },
+    };
+    let mut issue = |resources: &mut TrackResources, request, target| {
+        let mut control = resources.observation_control(request, target).unwrap();
+        assert!(resources.observation_control_changed(&control));
+        control.effect = Some(ids.operation());
+        resources.update_observation_control(&control);
+        control
+    };
+    let unfinished = issue(&mut resources, first, Some(target.clone()));
+    let sibling = issue(&mut resources, second, Some(target.clone()));
+    assert!(resources.complete_observation_control(&sibling, true));
+    let released = resources.release_observation_controls(second_owner);
+    assert_eq!(released.len(), 1);
+    assert_eq!(released[0].observation, second);
+    assert!(resources.observation_control_current(&unfinished));
+
+    // Coalesced loss and readmission can keep both the publication and its
+    // slot. The old request must still terminate before its host completes.
+    target.offer.as_mut().unwrap().source_revision = 3;
+    let retired = issue(&mut resources, first, Some(target.clone()));
+    assert!(retired.closed);
+    assert!(retired.target.is_none());
+    assert!(!resources.complete_observation_control(&unfinished, true));
+    resources.release_observation_controls(TrackOwner(first.request()));
+    let fresh = resources
+        .begin_selector_media_observation(first_owner, source, None)
+        .unwrap();
+    let current = issue(&mut resources, fresh, Some(target));
+    assert!(resources.complete_observation_control(&current, true));
+}
+
+#[test]
 fn hidden_video_demand_does_not_allocate_and_withdrawal_retains_logical_interest() {
     let mut resources = TrackResources::default();
     let owner = resources.new_owner().unwrap();
@@ -801,6 +869,7 @@ fn hidden_video_demand_does_not_allocate_and_withdrawal_retains_logical_interest
     let target = |source: &str, reference, mid: &str| MediaObservationTarget {
         generation,
         reference,
+        offer: None,
         source: source.into(),
         binding: crate::SlotBinding {
             slot: crate::MediaSlot::RemoteVideo(0),

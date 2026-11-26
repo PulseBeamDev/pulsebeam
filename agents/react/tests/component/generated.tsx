@@ -101,6 +101,7 @@ async function handles() {
       priority: 1,
     });
     const audio = useSubscribe(peer.audio("microphone"));
+    const cameras = useSubscribe(room.video({ trackId: "camera" }));
     const microphone = usePublish(agent.audio("microphone"));
     const events = usePublish(agent.data("events"), null, {
       delivery: options.mode,
@@ -108,7 +109,7 @@ async function handles() {
     const receive = useSubscribe(peer.data("events"), {
       delivery: options.mode,
     });
-    return { watch, publication, video, audio, microphone, events, receive };
+    return { watch, publication, video, audio, cameras, microphone, events, receive };
   }
 
   function Owners({ agent }: { agent: Agent }) {

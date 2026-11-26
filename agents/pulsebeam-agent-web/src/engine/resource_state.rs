@@ -6,6 +6,7 @@ pub(crate) enum ResourceKind {
     Audio,
     DataPublication,
     DataSubscription,
+    MediaCollection,
 }
 
 #[derive(Clone, Debug)]
@@ -14,6 +15,7 @@ pub(crate) enum ResourceState {
     Audio(ffi::AudioSubscriptionState),
     DataPublication(ffi::DataPublicationState),
     DataSubscription(ffi::DataSubscriptionState),
+    MediaCollection(agent_core::AdmittedMediaSnapshot),
 }
 
 impl ResourceKind {
@@ -35,6 +37,10 @@ impl ResourceKind {
                 .data_subscription_state(owner)
                 .ok()
                 .map(ResourceState::DataSubscription),
+            Self::MediaCollection => agent
+                .media_collection_state(owner)
+                .ok()
+                .map(ResourceState::MediaCollection),
         }
     }
 }
@@ -46,6 +52,10 @@ impl ResourceState {
             Self::Audio(state) => state.closed = true,
             Self::DataPublication(state) => state.closed = true,
             Self::DataSubscription(state) => state.closed = true,
+            Self::MediaCollection(state) => {
+                state.status = agent_core::CollectionStatus::Closed;
+                state.tracks.clear();
+            }
         }
     }
 }

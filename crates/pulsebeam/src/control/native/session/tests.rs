@@ -3187,7 +3187,19 @@ fn logical_subscription_keeps_one_reservation_across_scoped_receiver_replacement
     offer(&mut model, &second);
     assert_state(&model, 6, 5, Some(&second));
 
-    assert!(input(&mut model, vec![absent(1, 7)]).unwrap().is_empty());
+    // Readmission of the same publication does not revive the retired offer.
+    report(&mut model, 7, 3, 7);
+    assert!(model.take_preparation().unwrap().is_none());
+    report(&mut model, 8, 5, 9);
+    let readmitted = compile(&mut model, &second);
+    assert_eq!(readmitted.scope().binding, 8);
+    released(&mut model, 4);
+    complete(&mut model, readmitted, &second);
+    assert_state(&model, 6, 5, Some(&second));
+
+    assert!(input(&mut model, vec![absent(1, 9)]).unwrap().is_empty());
+    retire(&mut model, 8);
+    released(&mut model, 8);
     assert!(matches!(
         model.rows[&Key::Owned(1)].value.value,
         Some(Value::Absent(_))

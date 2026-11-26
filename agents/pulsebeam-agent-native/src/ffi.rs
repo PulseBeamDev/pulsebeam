@@ -7,7 +7,9 @@ use tokio::sync::Mutex;
 
 mod media;
 pub use media::*;
+mod collection;
 mod frames;
+pub use collection::*;
 pub use frames::*;
 mod resource_state;
 pub use resource_state::*;

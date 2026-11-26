@@ -1889,9 +1889,30 @@ impl Agent {
         Some(crate::MediaObservationTarget {
             generation: active.generation,
             reference: active.state.reference(&lease.resource)?,
+            offer: lease.offer,
             source: track.publication_id.clone(),
             binding: binding.clone(),
         })
+    }
+
+    pub(super) fn named_video_observation_target(
+        &self,
+        selector: &crate::TrackSelector,
+    ) -> Option<crate::MediaObservationTarget> {
+        let active = self.active.as_ref()?;
+        let Resource::LogicalReception(slot) =
+            logical_resource(active, selector, state::TrackKind::Video)?
+        else {
+            return None;
+        };
+        let track = receiver_track(active, slot)?;
+        if track.room_id != selector.room
+            || track.participant_id != selector.participant_id
+            || track.track_id != selector.track_id
+        {
+            return None;
+        }
+        self.media_observation_target(slot)
     }
 
     pub(super) fn audio_observation_target(
@@ -2731,7 +2752,11 @@ impl Agent {
                     evaluates_current,
                     ..
                 } => {
-                    if matches!(resource, Resource::SubscriptionSelector(_)) {
+                    if let Resource::SubscriptionSelector(owner) = &resource {
+                        if let Some(active) = &self.active {
+                            self.selectors
+                                .observe_memberships(crate::TrackOwner(*owner), &active.state);
+                        }
                         self.intent_dirty = true;
                     }
                     if matches!(resource, Resource::LogicalData(_)) {
@@ -2998,6 +3023,8 @@ impl Agent {
                 let revision = renewal.credential.revision;
                 self.snapshot.accepted_credential_revision = Some(revision);
                 active.credential = renewal.credential;
+                // Permission retirement ends the server reference, not the caller's collection.
+                active.state.retry_revoked_selectors();
                 self.bump_snapshot();
                 self.notifications.push_back(Notification::SnapshotChanged);
                 self.credential_accepted(revision);

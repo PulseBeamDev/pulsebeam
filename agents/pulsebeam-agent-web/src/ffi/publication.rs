@@ -71,12 +71,13 @@ macro_rules! media_publication {
 
         #[uniffi::export]
         impl $publication {
-            pub fn configure(&self, options: ffi::PublicationConfig) -> Result<(), WebAgentError> {
+            pub fn configure(&self, options: ffi::$options) -> Result<(), WebAgentError> {
                 #[cfg(target_arch = "wasm32")]
                 {
-                    self.agent
-                        .runtime
-                        .configure_publication_state(self.owner, options.enabled)?;
+                    self.agent.runtime.configure_publication_state(
+                        self.owner,
+                        agent_core::MediaPublishOptions::$kind(options),
+                    )?;
                     Ok(())
                 }
                 #[cfg(not(target_arch = "wasm32"))]

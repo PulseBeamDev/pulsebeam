@@ -528,6 +528,14 @@ impl ActorHandle {
         )
     }
 
+    #[cfg(all(target_arch = "wasm32", feature = "uniffi"))]
+    pub(crate) fn admitted_media_current(&self, admission: &agent_core::AdmittedMedia) -> bool {
+        self.control
+            .agent
+            .borrow()
+            .admitted_media_current(admission)
+    }
+
     pub(crate) fn resource_states(&self) -> Vec<(u64, ResourceState)> {
         let agent = self.control.agent.borrow();
         self.control

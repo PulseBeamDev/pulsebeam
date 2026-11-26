@@ -23,6 +23,15 @@ pub struct VideoFrames {
 }
 
 impl VideoFrames {
+    pub(super) fn admitted(
+        room: crate::RoomRef,
+        admission: agent_core::AdmittedMedia,
+    ) -> Result<Self, NativeError> {
+        Ok(Self {
+            runtime: FrameReader::admitted(room, admission).map_err(operation_error)?,
+        })
+    }
+
     pub(super) fn new(
         subscription: RuntimeSubscription,
         observer: Arc<agent_core::observer::VideoSubscriptionStateObserver>,
@@ -66,6 +75,15 @@ pub struct AudioFrames {
 }
 
 impl AudioFrames {
+    pub(super) fn admitted(
+        room: crate::RoomRef,
+        admission: agent_core::AdmittedMedia,
+    ) -> Result<Self, NativeError> {
+        Ok(Self {
+            runtime: FrameReader::admitted(room, admission).map_err(operation_error)?,
+        })
+    }
+
     pub(super) fn new(
         subscription: RuntimeSubscription,
         observer: Arc<agent_core::observer::AudioSubscriptionStateObserver>,

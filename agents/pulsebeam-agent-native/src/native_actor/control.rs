@@ -531,12 +531,8 @@ impl Control {
         }
     }
 
-    pub(super) fn selector_media_receiver(
-        &self,
-        owner: agent_core::TrackOwner,
-        source: &agent_core::SelectorMatch,
-    ) -> Option<(MediaSlot, String)> {
-        self.with(|core| core.selector_media_receiver(owner, source))
+    pub(super) fn admitted_media_current(&self, admission: &agent_core::AdmittedMedia) -> bool {
+        self.with(|core| core.admitted_media_current(admission))
     }
 
     pub(super) fn subscription_selector_state(

@@ -2,7 +2,7 @@
 strictTypeChecking = true
 strictObjectTypes = true
 strictByteArrays = true
-revisionedSnapshots = ["Agent.state", "VideoSubscription.state", "AudioSubscription.state", "VideoPublication.state", "AudioPublication.state", "Pipe.state", "Catalog.state", "DataPublication.state", "DataSubscription.state"]
+revisionedSnapshots = ["Agent.state", "VideoSubscription.state", "AudioSubscription.state", "VideoPublication.state", "AudioPublication.state", "Pipe.state", "Catalog.state", "DataPublication.state", "DataSubscription.state", "VideoCollection.state", "AudioCollection.state"]
 stableLookups = [
   "Agent.room", "Agent.video", "Agent.audio", "Agent.data",
   "RoomRef.participant",

@@ -194,7 +194,83 @@ pub struct RoomRef {
     finished: Arc<Signal>,
 }
 
+pub(crate) struct MediaCollection {
+    owner: agent_core::TrackOwner,
+    core: Control,
+    pub(crate) observer: Arc<agent_core::observer::MediaCollectionObserver>,
+}
+
+impl MediaCollection {
+    pub(crate) fn close(&self) {
+        self.core
+            .external(|core| core.close_subscription_selector(self.owner));
+    }
+}
+
+impl Drop for MediaCollection {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
 impl RoomRef {
+    pub(crate) fn media_collection(
+        &self,
+        kind: agent_core::SelectorTrackKind,
+        filter: agent_core::TrackFilter,
+    ) -> Result<MediaCollection, Error> {
+        if self.closed.is_closed() || self.finished.is_closed() {
+            return Err(Error::Closed);
+        }
+        let owner = self
+            .core
+            .external(|core| core.open_media_collection(self.name.clone(), kind, filter))
+            .map_err(Error::Operation)?;
+        match self.core.media_collection_observer(owner.id()) {
+            Ok(observer) => Ok(MediaCollection {
+                owner,
+                core: self.core.clone(),
+                observer,
+            }),
+            Err(error) => {
+                self.core
+                    .external(|core| core.close_subscription_selector(owner));
+                Err(error)
+            }
+        }
+    }
+
+    pub(super) fn check_admitted_media(
+        &self,
+        admission: &agent_core::AdmittedMedia,
+    ) -> Result<(), Error> {
+        if self.closed.is_closed() || self.finished.is_closed() {
+            return Err(Error::Closed);
+        }
+        if !self.core.admitted_media_current(admission) {
+            return Err(Error::Operation(agent_core::ffi::ErrorInfo::new(
+                agent_core::ffi::ErrorCode::Replaced,
+                "Collection track admission has ended",
+            )));
+        }
+        Ok(())
+    }
+
+    pub(super) async fn observe_admitted_media(
+        &self,
+        admission: agent_core::AdmittedMedia,
+    ) -> Result<RemoteMedia, Error> {
+        let (response, result) = oneshot::channel();
+        self.commands
+            .send(Command::ObserveAdmittedMedia {
+                admission,
+                response,
+            })
+            .await
+            .map_err(|_| Error::Closed)?;
+        result.await.map_err(|_| Error::Closed)?
+    }
+
     pub fn watch(&self, config: agent_core::ffi::WatchConfig) -> Result<super::Watch, Error> {
         if self.closed.is_closed() || self.finished.is_closed() {
             return Err(Error::Closed);

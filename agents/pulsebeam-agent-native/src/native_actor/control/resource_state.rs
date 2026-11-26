@@ -52,6 +52,7 @@ resource_observations! {
     AudioSubscription => (AudioSubscriptionStateObserver, audio_subscription_state, audio_subscription_observer),
     DataSubscription => (DataSubscriptionStateObserver, data_subscription_state, data_subscription_observer),
     DataPublication => (DataPublicationStateObserver, data_publication_state, data_publication_observer),
+    MediaCollection => (MediaCollectionObserver, media_collection_state, media_collection_observer),
 }
 
 impl Control {

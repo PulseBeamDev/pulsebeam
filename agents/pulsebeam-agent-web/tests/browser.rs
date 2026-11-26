@@ -32,6 +32,100 @@ fn authorization_expiry() -> TestResult<u64> {
         .ok_or_else(|| "test authorization expiry overflow".into())
 }
 
+async fn recovery_slice(
+    bidi: &thirtyfour::bidi::BiDi,
+    context: &thirtyfour::bidi::BrowsingContextId,
+    fixture: &StaticServer,
+    destination: &DestinationServer,
+    expires_at: u64,
+) -> TestResult<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::time::{Duration, timeout};
+
+    let room = RoomId::new("collection-recovery")?;
+    let publisher = mint_development_token(
+        &room,
+        &ParticipantId::new("collection-publisher")?,
+        expires_at,
+    )?;
+    let token = |participant: &str, subscribe: bool| -> TestResult<_> {
+        let allow = if subscribe {
+            vec!["join", "subscribe"]
+        } else {
+            vec!["join"]
+        };
+        Ok(pulsebeam_server::sign_participant_token(
+            &pulsebeam_server::insecure_dev_api_key()?,
+            &serde_json::from_value(
+                serde_json::json!([{ "rooms": [room.as_str()], "allow": allow }]),
+            )?,
+            participant,
+            expires_at,
+        )?)
+    };
+    let viewer = token("collection-viewer", true)?;
+    let viewer_withdraw = token("collection-viewer", false)?;
+    let recorder = token("collection-recorder", true)?;
+    let recorder_withdraw = token("collection-recorder", false)?;
+    let mut child = tokio::process::Command::new(
+        std::env::var_os("PULSEBEAM_FOREIGN_SMOKE").ok_or("missing Python recorder fixture")?,
+    )
+    .arg("--record-recovery")
+    .arg(destination.endpoint())
+    .arg(&recorder.token)
+    .arg(room.as_str())
+    .env_remove("LD_LIBRARY_PATH")
+    .env_remove("LD_PRELOAD")
+    .stdin(std::process::Stdio::piped())
+    .stdout(std::process::Stdio::piped())
+    .kill_on_drop(true)
+    .spawn()?;
+    let mut commands = child.stdin.take().ok_or("missing recorder commands")?;
+    let mut reports =
+        BufReader::new(child.stdout.take().ok_or("missing recorder reports")?).lines();
+    let config = serde_json::json!({
+        "endpoint": destination.endpoint(), "room": room.as_str(),
+        "publisher": publisher, "viewer": viewer.token,
+    });
+    navigate(bidi, context, fixture.url("index.html")).await?;
+    let start = format!(
+        "import('./main.js').then(m => {{ globalThis.recovery = m.recoveryFixture({config}); return recovery.first(); }})"
+    );
+    let (view, recording) = tokio::join!(
+        evaluate_json::<String>(bidi, context, &start),
+        timeout(Duration::from_secs(12), reports.next_line()),
+    );
+    let report = recording??;
+    let publication = view.map_err(|error| format!("{error}; recorder checkpoint: {report:?}"))?;
+    assert_eq!(report, Some(format!("segment 1 {publication}")));
+    let mut expect = async |message: &str| -> TestResult<()> {
+        let line = timeout(Duration::from_secs(12), reports.next_line()).await??;
+        assert_eq!(line.as_deref(), Some(message), "native recorder checkpoint");
+        Ok(())
+    };
+    assert!(evaluate_json::<bool>(bidi, context, "recovery.swap()").await?);
+    expect("input swapped").await?;
+    commands
+        .write_all(format!("withdraw {}\n", recorder_withdraw.token).as_bytes())
+        .await?;
+    let withdraw = serde_json::to_string(&viewer_withdraw.token)?;
+    assert!(evaluate_json::<bool>(bidi, context, &format!("recovery.withdraw({withdraw})")).await?);
+    expect("segment ended").await?;
+    commands
+        .write_all(format!("readmit {}\n", recorder.token).as_bytes())
+        .await?;
+    assert!(evaluate_json::<bool>(bidi, context, "recovery.readmit()").await?);
+    expect(&format!("segment 2 {publication}")).await?;
+    commands.write_all(b"stop\n").await?;
+    assert!(
+        timeout(Duration::from_secs(5), child.wait())
+            .await??
+            .success()
+    );
+    assert!(evaluate_json::<bool>(bidi, context, "recovery.close()").await?);
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn native_platform_smoke() -> TestResult<()> {
     let (destination, quic_endpoint) = quic::start_destination().await?;
@@ -238,6 +332,7 @@ async fn native_platform_smoke() -> TestResult<()> {
             stopped.success(),
             "installed Python producer failed: {stopped}"
         );
+        recovery_slice(&bidi, &context, &generated_react, &destination, expires_at).await?;
         Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
     })
     .await?;

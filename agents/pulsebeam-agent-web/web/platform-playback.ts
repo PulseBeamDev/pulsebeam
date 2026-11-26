@@ -5,9 +5,9 @@ export interface PlaybackLease {
 }
 
 export interface PlaybackReceiver {
-  observe(signal: AbortSignal): Promise<PlaybackLease>;
+  observe(signal: AbortSignal): Promise<PlaybackLease | undefined>;
   isClosed(): boolean;
-  updates(): {
+  updates?(): {
     next(): Promise<unknown | undefined>;
     close(): void;
   };
@@ -56,7 +56,7 @@ export function attachPlayback({
   let observation: PlaybackLease | undefined;
   let pending: Promise<void> | undefined;
   let controller: AbortController | undefined;
-  let cursor: ReturnType<PlaybackReceiver["updates"]> | undefined;
+  let cursor: ReturnType<NonNullable<PlaybackReceiver["updates"]>> | undefined;
   let unwatch = () => {};
   let unlisten = () => {};
   let unview = () => {};
@@ -101,8 +101,8 @@ export function attachPlayback({
     if (!live || !track || track.kind !== kind || track.readyState !== "live")
       return;
     const ended = () => {
-      if ("observe" in source) reconcile();
-      else detach();
+      if ("observe" in source && source.updates) reconcile();
+      else retire();
     };
     track.addEventListener("ended", ended);
     unlisten = () => track.removeEventListener("ended", ended);
@@ -138,6 +138,7 @@ export function attachPlayback({
     pending = source
       .observe(acquisition.signal)
       .then(async (value) => {
+        if (!value) return;
         if (
           !live ||
           acquisition.signal.aborted ||
@@ -172,7 +173,11 @@ export function attachPlayback({
         });
       }
       if ("observe" in source) {
-        cursor = source.updates();
+        cursor = source.updates?.();
+        if (!cursor) {
+          reconcile();
+          return;
+        }
         void (async () => {
           while (live) {
             const state = await cursor!.next();

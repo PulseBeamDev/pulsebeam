@@ -460,7 +460,23 @@ impl NativeState {
         Ok(())
     }
 
-    pub(crate) fn retry(&mut self, resource: &Resource) {
+    pub(crate) fn retry_revoked_selectors(&mut self) {
+        let revoked: Vec<_> = self.targets.iter().filter_map(|(resource, target)| {
+            if !matches!(resource, Resource::SubscriptionSelector(_)) {
+                return None;
+            }
+            let state = target.terminal_evaluation.as_ref()?;
+            let revoked = matches!(&state.value, Some(wire::confirmed_state::Value::Absent(absent))
+                if absent.reason() == wire::AbsenceReason::PermissionRevoked)
+                || state.rejection.as_ref().is_some_and(|error| error.code() == wire::FailureCode::PermissionDenied);
+            revoked.then(|| resource.clone())
+        }).collect();
+        for resource in revoked {
+            self.retry(&resource);
+        }
+    }
+
+    fn retry(&mut self, resource: &Resource) {
         if let Some(target) = self.targets.get_mut(resource) {
             if let Some(state) = target.terminal_evaluation.take() {
                 self.retained_bytes = self.retained_bytes.saturating_sub(state.encoded_len());

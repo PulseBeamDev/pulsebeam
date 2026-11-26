@@ -45,6 +45,64 @@ fn snapshot(
 }
 
 #[test]
+fn renewed_grant_reopens_revoked_selector_on_a_fresh_reference() {
+    let mut client = NativeState::new(64 * 1024, participant()).unwrap();
+    client
+        .apply(&frame(alloc::vec![session(1, 2_000_000_000, None)], true))
+        .unwrap();
+    let resource = Resource::SubscriptionSelector(17);
+    let spec = selector("stage");
+    client.stage(resource.clone(), Some(spec.clone())).unwrap();
+    let (first, desired) = next(&mut client).pop().unwrap();
+    client
+        .apply(&frame(
+            alloc::vec![record(
+                first,
+                snapshot(
+                    desired.revision,
+                    spec.clone(),
+                    SelectorMatchStatus::Complete
+                )
+            )],
+            false,
+        ))
+        .unwrap();
+
+    let revoked = wire::ConfirmedState {
+        evaluated_revision: desired.revision,
+        rejection: None,
+        value: Some(Value::Absent(wire::AbsentState {
+            reason: wire::AbsenceReason::PermissionRevoked as i32,
+        })),
+    };
+    client
+        .apply(&frame(alloc::vec![record(first, revoked)], false))
+        .unwrap();
+    assert!(client.selector_snapshot(17).is_none());
+    assert!(client.next_frame().unwrap().is_none());
+    client.stage(resource, Some(spec.clone())).unwrap();
+    assert!(
+        client.next_frame().unwrap().is_none(),
+        "unchanged intent does not retry a denial"
+    );
+
+    client.retry_revoked_selectors();
+    let (fresh, declared) = next(&mut client).pop().unwrap();
+    assert_ne!(fresh, first);
+    assert!(declared.revision > desired.revision);
+    client
+        .apply(&frame(
+            alloc::vec![record(
+                fresh,
+                snapshot(declared.revision, spec, SelectorMatchStatus::Complete)
+            )],
+            false,
+        ))
+        .unwrap();
+    assert_eq!(client.selector_snapshot(17).unwrap().matches.len(), 1);
+}
+
+#[test]
 fn selector_snapshot_obeys_owned_revision_and_withdrawal_without_discovery() {
     let mut client = NativeState::new(64 * 1024, participant()).unwrap();
     client

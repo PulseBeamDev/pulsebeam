@@ -65,6 +65,7 @@ resource_observations! {
     Audio => (AudioSubscriptionStateObserver, audio_state_observer),
     DataPublication => (DataPublicationStateObserver, data_publication_state_observer),
     DataSubscription => (DataSubscriptionStateObserver, data_subscription_state_observer),
+    MediaCollection => (MediaCollectionObserver, media_collection_observer),
 }
 
 fn data_receive_failure(state: &ffi::DataSubscriptionState) -> Option<ffi::ErrorInfo> {

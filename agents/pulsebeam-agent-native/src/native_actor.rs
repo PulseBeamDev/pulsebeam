@@ -27,6 +27,7 @@ mod control;
 use control::{Control, PublicationControl};
 mod data;
 use data::DataIo;
+pub(crate) use data::MediaCollection;
 pub use data::{
     DataPublication, DataReceiver, LocalDataTrack, Participant, RemoteDataTrack, RoomRef,
 };
@@ -401,6 +402,8 @@ enum Command {
         slot: MediaSlot,
         generation: u64,
         receiver: u64,
+        lease: Weak<StreamLease>,
+        observation: Option<agent_core::MediaObservationControl>,
         response: oneshot::Sender<Result<(), Error>>,
     },
     Disconnect {
@@ -427,6 +430,10 @@ enum Command {
     AudioSubscription {
         selector: agent_core::TrackSelector,
         response: oneshot::Sender<Result<Subscription, Error>>,
+    },
+    ObserveAdmittedMedia {
+        admission: agent_core::AdmittedMedia,
+        response: oneshot::Sender<Result<RemoteMedia, Error>>,
     },
     ObserveSelectorMatch {
         owner: agent_core::TrackOwner,
@@ -971,13 +978,13 @@ impl PhysicalSource {
 struct StreamLease {
     closed: Arc<Signal>,
     leases_changed: Arc<Notify>,
-    receiver: Mutex<broadcast::Receiver<MediaStreamUpdate>>,
+    receiver: Mutex<Option<broadcast::Receiver<MediaStreamUpdate>>>,
 }
 impl StreamLease {
     fn close(&self) {
         self.closed.close();
         if let Ok(mut receiver) = self.receiver.try_lock() {
-            *receiver = receiver.resubscribe();
+            receiver.take();
         }
     }
 }
@@ -986,9 +993,20 @@ impl Drop for StreamLease {
         self.leases_changed.notify_one();
     }
 }
+
+// A cancelled read drops its receiver guard before retrying concurrent close.
+struct StreamRead<'a>(&'a StreamLease);
+
+impl Drop for StreamRead<'_> {
+    fn drop(&mut self) {
+        if self.0.closed.is_closed() {
+            self.0.close();
+        }
+    }
+}
+
 pub struct RemoteMedia {
     observation: Option<agent_core::MediaObservationControl>,
-    selector_source: Option<String>,
     slot: MediaSlot,
     generation: u64,
     receiver: u64,
@@ -997,13 +1015,11 @@ pub struct RemoteMedia {
 }
 impl RemoteMedia {
     pub fn source_track_id(&self) -> Option<&str> {
-        self.selector_source.as_deref().or_else(|| {
-            self.observation
-                .as_ref()?
-                .target
-                .as_ref()
-                .map(|target| target.source.as_str())
-        })
+        self.observation
+            .as_ref()?
+            .target
+            .as_ref()
+            .map(|target| target.source.as_str())
     }
 
     pub fn slot(&self) -> &MediaSlot {
@@ -1016,21 +1032,28 @@ impl RemoteMedia {
         self.receiver
     }
     pub async fn next(&self) -> MediaStreamUpdate {
+        let _read = StreamRead(&self.lease);
         let mut receiver = self.lease.receiver.lock().await;
         if self.lease.closed.is_closed() {
-            *receiver = receiver.resubscribe();
+            receiver.take();
             return MediaStreamUpdate::Closed;
         }
-        let value = tokio::select! {
-            _ = self.lease.closed.wait() => { *receiver = receiver.resubscribe(); return MediaStreamUpdate::Closed; },
-            result = receiver.recv() => result,
+        let Some(subscription) = receiver.as_mut() else {
+            return MediaStreamUpdate::Closed;
         };
-        // Closing a generation invalidates buffered observations as well as
-        // callbacks. Values already returned to the application remain owned.
-        if self.lease.closed.is_closed() {
-            *receiver = receiver.resubscribe();
-            return MediaStreamUpdate::Closed;
-        }
+        let value = tokio::select! {
+            _ = self.lease.closed.wait() => None,
+            result = subscription.recv() => Some(result),
+        };
+        // Closing an observation invalidates buffered values and stops holding
+        // the shared stream's queue open. Returned values remain owned.
+        let value = match value {
+            Some(value) if !self.lease.closed.is_closed() => value,
+            _ => {
+                receiver.take();
+                return MediaStreamUpdate::Closed;
+            }
+        };
         match value {
             Ok(value) => value,
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
@@ -1053,6 +1076,8 @@ impl RemoteMedia {
                 slot: self.slot.clone(),
                 generation: self.generation,
                 receiver: self.receiver,
+                lease: Arc::downgrade(&self.lease),
+                observation: self.observation.clone(),
                 response,
             })
             .await
@@ -1431,8 +1456,23 @@ where
                 slot,
                 generation,
                 receiver,
+                lease,
+                observation,
                 response,
             } => {
+                if lease.upgrade().is_none_or(|lease| lease.closed.is_closed())
+                    || observation.is_some_and(|control| {
+                        !matches!(
+                            self.core.resource(
+                                agent_core::ResourceCommand::AuthorizeMediaObservation { control },
+                            ),
+                            Ok(agent_core::ResourceResult::Updated)
+                        )
+                    })
+                {
+                    let _ = response.send(Err(Error::Closed));
+                    return;
+                }
                 let result = self.peer_mut().and_then(|peer| {
                     if peer.generation.get() != generation
                         || !peer
@@ -1507,31 +1547,38 @@ where
                     let _ = response.send(result);
                 }
             }
+            Command::ObserveAdmittedMedia {
+                admission,
+                response,
+            } => {
+                self.begin_observation(
+                    agent_core::ResourceCommand::BeginAdmittedMediaObservation { admission },
+                    ReceiveMode::Decoded,
+                    response,
+                );
+            }
             Command::ObserveSelectorMatch {
                 owner,
                 source,
                 mode,
                 response,
             } => {
-                if !response.is_closed() {
-                    let result = self
-                        .core
-                        .selector_media_receiver(owner, &source)
-                        .ok_or(Error::NotReady)
-                        .and_then(|(slot, source)| {
-                            let mut receiver = self.observe(slot, mode)?;
-                            receiver.selector_source = Some(source);
-                            Ok(receiver)
-                        });
-                    let _ = response.send(result);
-                }
+                self.begin_observation(
+                    agent_core::ResourceCommand::BeginSelectorMediaObservation { owner, source },
+                    mode,
+                    response,
+                );
             }
             Command::ObserveSubscription {
                 owner,
                 mode,
                 response,
             } => {
-                self.observe_subscription(owner, mode, response);
+                self.begin_observation(
+                    agent_core::ResourceCommand::BeginMediaObservation { owner },
+                    mode,
+                    response,
+                );
             }
             #[cfg(test)]
             Command::PublicationInput { owner, response } => {
@@ -1684,7 +1731,7 @@ where
         let lease = Arc::new(StreamLease {
             closed: Arc::new(Signal::default()),
             leases_changed: self.leases_changed.clone(),
-            receiver: Mutex::new(receiver),
+            receiver: Mutex::new(Some(receiver)),
         });
         stream.leases.push(Arc::downgrade(&lease));
         debug_assert_eq!(stream.generation, track.generation);
@@ -1702,7 +1749,6 @@ where
         }
         Ok(RemoteMedia {
             observation: None,
-            selector_source: None,
             slot,
             generation,
             receiver,
@@ -4234,15 +4280,15 @@ mod tests {
     #[tokio::test]
     async fn retiring_a_stream_clears_queued_frames_without_invalidating_returned_values() {
         let (sender, receiver) = broadcast::channel(STREAM_FRAMES);
+        let mut sibling = sender.subscribe();
         let (commands, _) = mpsc::channel(COMMANDS);
         let lease = Arc::new(StreamLease {
             closed: Arc::new(Signal::default()),
             leases_changed: Arc::new(Notify::new()),
-            receiver: Mutex::new(receiver),
+            receiver: Mutex::new(Some(receiver)),
         });
         let stream = RemoteMedia {
             observation: None,
-            selector_source: None,
             slot: MediaSlot::RemoteAudio(0),
             generation: 1,
             receiver: 7,
@@ -4280,10 +4326,15 @@ mod tests {
             .unwrap();
         stream.close().await;
         assert!(matches!(stream.next().await, MediaStreamUpdate::Closed));
-        assert!(matches!(
-            lease.receiver.lock().await.try_recv(),
-            Err(broadcast::error::TryRecvError::Empty)
-        ));
+        assert!(lease.receiver.lock().await.is_none());
+        assert_eq!(sender.receiver_count(), 1);
+        for _ in 0..2 {
+            assert!(matches!(
+                sibling.recv().await,
+                Ok(MediaStreamUpdate::Frame { .. })
+            ));
+        }
+        assert_eq!(sender.len(), 0);
         assert_eq!(returned, frame);
         assert!(matches!(
             stream.request_keyframe().await,

@@ -93,6 +93,7 @@ impl<T: Clone> Hub<T> {
 
 trait RevisionedState: Clone + PartialEq {
     fn set_revision(&mut self, revision: u64);
+    fn before_publish(&mut self, _previous: &Self) {}
 }
 
 impl RevisionedState for AgentState {
@@ -131,6 +132,22 @@ revisioned_resource_state!(
     crate::ffi::WatchState,
 );
 
+impl RevisionedState for crate::AdmittedMediaSnapshot {
+    fn set_revision(&mut self, revision: u64) {
+        self.observation_revision = revision;
+    }
+
+    fn before_publish(&mut self, previous: &Self) {
+        use crate::CollectionStatus::{Live, Recovering, Waiting};
+        if self.status == Waiting
+            && (previous.status == Recovering
+                || (previous.status == Live && !previous.tracks.is_empty()))
+        {
+            self.status = Recovering;
+        }
+    }
+}
+
 trait ResourceState: RevisionedState {
     fn mark_closed(&mut self);
 }
@@ -145,6 +162,13 @@ impl ResourceState for crate::ffi::PublicationState {
 impl ResourceState for crate::ffi::WatchState {
     fn mark_closed(&mut self) {
         self.close();
+    }
+}
+
+impl ResourceState for crate::AdmittedMediaSnapshot {
+    fn mark_closed(&mut self) {
+        self.status = crate::CollectionStatus::Closed;
+        self.tracks.clear();
     }
 }
 
@@ -217,6 +241,9 @@ impl<T: RevisionedState> Hub<T> {
             return Ok(PublishResult::Unchanged);
         }
         value.set_revision(hub.revision);
+        if !closing {
+            value.before_publish(&hub.value);
+        }
         if !closing && value == hub.value {
             if source_revision.is_some() {
                 hub.source_revision = source_revision;
@@ -578,6 +605,13 @@ resource_observer!(
     WatchUpdates,
     WatchNotification,
     crate::ffi::WatchState
+);
+
+resource_observer!(
+    MediaCollectionObserver,
+    MediaCollectionUpdates,
+    MediaCollectionNotification,
+    crate::AdmittedMediaSnapshot
 );
 
 /// Core-owned bounded latest-state publisher. Main projects actor state into it.
