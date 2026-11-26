@@ -1783,7 +1783,7 @@ fn session_and_owned_absence_have_distinct_failure_and_direction_rules() {
 }
 
 #[test]
-fn selector_snapshot_is_frame_bounded_and_never_contains_partial_or_duplicate_matches() {
+fn selector_slices_bound_geometry_and_validate_membership() {
     let mut spec = ResourceSpec {
         declaration: Some(resource_spec::Declaration::SubscriptionSelector(
             SubscriptionSelectorSpec {
@@ -1796,24 +1796,33 @@ fn selector_snapshot_is_frame_bounded_and_never_contains_partial_or_duplicate_ma
             receive: None,
         }),
     };
-    let batch = |spec: &ResourceSpec, status: SelectorMatchStatus, matches| ServerStateBatch {
-        records: vec![ServerStateRecord {
-            key: Some(ResourceKey {
-                key: Some(resource_key::Key::Owned(u64::MAX)),
-            }),
-            confirmed: Some(ConfirmedState {
-                evaluated_revision: u64::MAX,
-                value: Some(confirmed_state::Value::SubscriptionSelector(Box::new(
-                    SubscriptionSelectorState {
-                        spec: Some(spec.clone()),
-                        status: status as i32,
-                        matches,
-                    },
-                ))),
-                rejection: None,
-            }),
-        }],
-        ..Default::default()
+    let batch = |spec: &ResourceSpec, status: SelectorMatchStatus, offset, total, matches| {
+        ServerStateBatch {
+            records: vec![ServerStateRecord {
+                key: Some(ResourceKey {
+                    key: Some(resource_key::Key::Owned(u64::MAX)),
+                }),
+                confirmed: Some(ConfirmedState {
+                    evaluated_revision: u64::MAX,
+                    value: Some(confirmed_state::Value::SubscriptionSelector(Box::new(
+                        SubscriptionSelectorState {
+                            spec: Some(spec.clone()),
+                            status: status as i32,
+                            membership: (status != SelectorMatchStatus::Pending).then_some(
+                                SelectorMembershipSpan {
+                                    revision: u64::MAX,
+                                    offset,
+                                    total,
+                                },
+                            ),
+                            matches,
+                        },
+                    ))),
+                    rejection: None,
+                }),
+            }],
+            ..Default::default()
+        }
     };
     let addresses = |count| {
         (0..count)
@@ -1826,20 +1835,52 @@ fn selector_snapshot_is_frame_bounded_and_never_contains_partial_or_duplicate_ma
             .collect::<alloc::vec::Vec<_>>()
     };
     let complete = SelectorMatchStatus::Complete;
-    let limit = validation::MAX_SELECTOR_MATCHES;
-    let full = batch(&spec, complete, addresses(limit));
-    assert_eq!(decode_server(&encode_server(&full).unwrap()), Ok(full));
-    assert!(encode_server(&batch(&spec, complete, addresses(limit + 1))).is_err());
+    let total = validation::MAX_SELECTOR_MATCHES;
+    let slice = validation::MAX_SELECTOR_SLICE_MATCHES;
+    for (index, addresses) in addresses(total).chunks(slice).enumerate() {
+        let chunk = batch(
+            &spec,
+            complete,
+            (index * slice) as u32,
+            total as u32,
+            addresses.to_vec(),
+        );
+        let frame = encode_server(&chunk).unwrap();
+        assert!(frame.len() <= MAX_FRAME_SIZE);
+        assert_eq!(decode_server(&frame), Ok(chunk));
+    }
+    assert!(encode_server(&batch(&spec, complete, 0, (total + 1) as u32, addresses(1))).is_err());
+    assert!(
+        encode_server(&batch(
+            &spec,
+            complete,
+            0,
+            total as u32,
+            addresses(slice + 1)
+        ))
+        .is_err()
+    );
+    assert!(encode_server(&batch(&spec, complete, 3, 3, addresses(1))).is_err());
+    assert!(encode_server(&batch(&spec, complete, 0, 1, addresses(0))).is_err());
     let mut duplicate = addresses(1);
     duplicate.push(duplicate[0].clone());
-    assert!(encode_server(&batch(&spec, complete, duplicate)).is_err());
+    assert!(encode_server(&batch(&spec, complete, 0, 2, duplicate)).is_err());
     let mut mismatch = addresses(1);
     mismatch[0].kind = TrackKind::Audio as i32;
-    assert!(encode_server(&batch(&spec, complete, mismatch)).is_err());
-    for status in [SelectorMatchStatus::Pending, SelectorMatchStatus::Overflow] {
-        assert!(encode_server(&batch(&spec, status, addresses(0))).is_ok());
-        assert!(encode_server(&batch(&spec, status, addresses(1))).is_err());
-    }
+    assert!(encode_server(&batch(&spec, complete, 0, 1, mismatch)).is_err());
+    let pending = SelectorMatchStatus::Pending;
+    assert!(encode_server(&batch(&spec, pending, 0, 0, addresses(0))).is_ok());
+    assert!(encode_server(&batch(&spec, pending, 0, 1, addresses(1))).is_err());
+    assert!(
+        encode_server(&batch(
+            &spec,
+            SelectorMatchStatus::Overflow,
+            0,
+            1,
+            addresses(1)
+        ))
+        .is_ok()
+    );
     let Some(resource_spec::Declaration::SubscriptionSelector(selector)) =
         spec.declaration.as_mut()
     else {

@@ -210,7 +210,7 @@ impl NativeSession {
             && !self
                 .pending
                 .as_ref()
-                .is_some_and(|pending| pending.selected.iter().any(|(selected, _)| selected == key))
+                .is_some_and(|pending| pending.selected.iter().any(|selected| &selected.key == key))
         {
             if let Some(row) = self.rows.get_mut(key) {
                 row.dirty = false;

@@ -24,7 +24,8 @@ pub enum ValidationError {
 type Result<T = ()> = core::result::Result<T, ValidationError>;
 
 pub const MAX_SELECTOR_DECLARATIONS: usize = 8;
-pub const MAX_SELECTOR_MATCHES: usize = 16;
+pub const MAX_SELECTOR_MATCHES: usize = 100;
+pub const MAX_SELECTOR_SLICE_MATCHES: usize = 16;
 
 pub fn validate_client_batch(batch: &ClientStateBatch) -> Result {
     validate_client_batch_for(batch, BindingProfile::Rtc)
@@ -543,17 +544,28 @@ fn validate_selector_state(state: &SubscriptionSelectorState) -> Result {
         return Err(ValidationError::Confirmed);
     };
     let enabled = spec.settings.as_ref().and_then(|settings| settings.enabled) == Some(true);
-    match SelectorMatchStatus::try_from(state.status) {
-        Ok(SelectorMatchStatus::Complete) if enabled => {}
-        Ok(SelectorMatchStatus::Pending | SelectorMatchStatus::Overflow)
-            if enabled && state.matches.is_empty() =>
+    match state.status() {
+        SelectorMatchStatus::Pending
+            if enabled && state.matches.is_empty() && state.membership.is_none() =>
         {
             return Ok(());
         }
-        Ok(SelectorMatchStatus::Complete) if state.matches.is_empty() => return Ok(()),
+        SelectorMatchStatus::Complete => {}
+        SelectorMatchStatus::Overflow if enabled => {}
         _ => return Err(ValidationError::Confirmed),
     }
-    if state.matches.len() > MAX_SELECTOR_MATCHES {
+    let span = state
+        .membership
+        .as_ref()
+        .ok_or(ValidationError::Confirmed)?;
+    let total = span.total as usize;
+    if span.revision == 0
+        || total > MAX_SELECTOR_MATCHES
+        || (!enabled && total != 0)
+        || state.matches.len() > MAX_SELECTOR_SLICE_MATCHES
+        || (span.offset as usize).saturating_add(state.matches.len()) > total
+        || (total != 0 && state.matches.is_empty())
+    {
         return Err(ValidationError::Confirmed);
     }
     let mut previous = None;

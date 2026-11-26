@@ -21,7 +21,7 @@ pub enum SelectorTrackKind {
 }
 
 impl SelectorTrackKind {
-    fn wire(self) -> wire::TrackKind {
+    pub(super) fn wire(self) -> wire::TrackKind {
         match self {
             Self::Audio => wire::TrackKind::Audio,
             Self::Video => wire::TrackKind::Video,

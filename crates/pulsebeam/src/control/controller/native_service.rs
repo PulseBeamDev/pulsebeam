@@ -361,6 +361,21 @@ impl ControllerActor {
         }
     }
 
+    pub(super) fn is_regional_selector_interest(&self, owner: MediaInterestId) -> bool {
+        matches!(
+            self.source_lookup_index.by_owner.get(&owner),
+            Some(InterestKey::Selector(..))
+        )
+    }
+
+    pub(super) fn observe_regional_selector_coverage(&mut self, owner: MediaInterestId) {
+        if let Some(key @ InterestKey::Selector(..)) =
+            self.source_lookup_index.by_owner.get(&owner).copied()
+        {
+            self.source_lookup_index.queue_wake(key);
+        }
+    }
+
     fn service_lookup_wakes(&mut self) {
         for _ in 0..LOOKUP_WAKE_BUDGET {
             let Some(key) = self.source_lookup_index.wake_queue.pop_front() else {
@@ -560,14 +575,24 @@ impl ControllerActor {
                             publisher: &track.meta().origin,
                         })
                     },
-                    |permissions, selector, after| {
-                        self.lifecycle.scan_selector(
+                    |reference, permissions, selector, after| {
+                        let mut page = self.lifecycle.scan_selector(
                             connection,
                             permissions,
                             selector,
                             after,
                             &self.core.registry,
-                        )
+                        )?;
+                        let revision = meta
+                            .authorization
+                            .as_ref()
+                            .map_or(0, AuthorizationLease::revision);
+                        page.empty_confirmed = self.regional_selector_empty_confirmed(
+                            (connection, reference),
+                            revision,
+                            now,
+                        );
+                        Some(page)
                     },
                 )
             }) {

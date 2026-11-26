@@ -165,6 +165,7 @@ struct Session {
     media_allocation: Option<native::MediaAllocation>,
     media_wanted: BTreeMap<MediaSlot, native::MediaWant>,
     media_blocked: BTreeMap<MediaSlot, native::MediaWant>,
+    media_capacity: native::MediaCapacity,
 
     quic_owner: Option<String>,
     quic_directional_video_dd: bool,
@@ -218,6 +219,7 @@ impl Session {
             media_allocation: None,
             media_wanted: BTreeMap::new(),
             media_blocked: BTreeMap::new(),
+            media_capacity: native::MediaCapacity::default(),
             quic_owner: None,
             quic_directional_video_dd: false,
             quic_data_record_dd: false,
@@ -3331,6 +3333,10 @@ impl Agent {
             error,
         } = self.subscription_selector_state(owner)?;
         let matching = matches.len();
+        let capacity_limited = self
+            .active
+            .as_ref()
+            .is_some_and(|active| active.media_capacity.limits(&active.state, &matches));
         let tracks: Vec<_> = matches
             .into_iter()
             .filter_map(|matched| {
@@ -3344,6 +3350,7 @@ impl Agent {
             .collect();
         let status = match status {
             SelectorStatus::Complete if matching == tracks.len() => CollectionStatus::Live,
+            SelectorStatus::Complete if capacity_limited => CollectionStatus::Limited,
             SelectorStatus::Complete | SelectorStatus::Pending => CollectionStatus::Waiting,
             SelectorStatus::Overflow => CollectionStatus::Limited,
             SelectorStatus::Rejected => CollectionStatus::Rejected,

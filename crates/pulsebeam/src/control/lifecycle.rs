@@ -32,6 +32,7 @@ const SELECTOR_SCAN_BUDGET: NonZeroUsize = NonZeroUsize::new(32).unwrap();
 pub(super) struct SelectorPage {
     pub(super) sources: Vec<(NamedTrack, PublicationKey)>,
     pub(super) next: Option<NamedTrack>,
+    pub(super) empty_confirmed: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -931,7 +932,11 @@ impl TrackLifecycle {
                 }
             },
         );
-        Some(SelectorPage { sources, next })
+        Some(SelectorPage {
+            sources,
+            next,
+            empty_confirmed: true,
+        })
     }
 
     pub(super) fn scan_owned_subscribe_scope(
@@ -947,9 +952,11 @@ impl TrackLifecycle {
             crate::shard_update::PublisherAnchor,
         )>,
         Option<NamedTrack>,
+        bool,
     ) {
         use super::permissions::{Component, grant_kind};
         let mut matched = None;
+        let mut empty = true;
         let mut last = None;
         let next = self.topology.scan_named_sources(
             project,
@@ -987,6 +994,7 @@ impl TrackLifecycle {
                 else {
                     return;
                 };
+                empty = false;
                 if let Some((shard, anchor)) =
                     self.network_publisher_anchor(room, track.id(), registry)
                 {
@@ -998,8 +1006,9 @@ impl TrackLifecycle {
             Some((source, name)) => (
                 Some(source),
                 (last != Some(name) || next.is_some()).then_some(name),
+                false,
             ),
-            None => (None, next),
+            None => (None, next, empty),
         }
     }
 
@@ -3452,7 +3461,7 @@ mod tests {
     }
 
     #[test]
-    fn selector_scan_resolves_future_sources_only_in_current_granted_rooms() {
+    fn selector_scan_resolves_quiet_sources_in_granted_rooms_but_never_self() {
         use super::super::permissions::Component;
 
         let (mut lifecycle, registry) = setup(1, &[(1, 1, 0), (2, 1, 0), (3, 2, 0), (4, 3, 0)]);
@@ -3485,7 +3494,7 @@ mod tests {
             assert!(page.next.is_none());
             page.sources
                 .into_iter()
-                .map(|(name, _)| name.room)
+                .map(|(name, _)| (name.room, name.participant))
                 .collect::<Vec<_>>()
         };
         assert!(scan(&lifecycle, &permitted).is_empty());
@@ -3505,8 +3514,33 @@ mod tests {
                 .publish(source, &registry, Instant::now())
                 .unwrap();
         }
-        assert_eq!(scan(&lifecycle, &permitted), [room(1).room, room(2).room]);
-        assert_eq!(scan(&lifecycle, &grants(&["lifecycle-2"])), [room(2).room]);
+        // No packet activity is needed for membership, and the same-room match is not self.
+        assert_eq!(
+            scan(&lifecycle, &permitted),
+            [
+                (room(1).room, participant(2)),
+                (room(2).room, participant(3))
+            ]
+        );
+        assert_eq!(
+            scan(&lifecycle, &grants(&["lifecycle-2"])),
+            [(room(2).room, participant(3))]
+        );
+        let self_only = lifecycle
+            .scan_selector(
+                subscriber,
+                &permitted,
+                SubscriptionSelector {
+                    participant: Component::Literal(participant(1)),
+                    ..selector
+                },
+                None,
+                &registry,
+            )
+            .unwrap();
+        assert!(
+            self_only.empty_confirmed && self_only.sources.is_empty() && self_only.next.is_none()
+        );
         assert!(
             lifecycle
                 .scan_selector(

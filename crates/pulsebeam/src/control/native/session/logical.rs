@@ -264,7 +264,12 @@ impl NativeSession {
     ) -> Result<(), OutputError> {
         let reference = work.owned();
         let key = Key::Owned(reference);
-        let current = self.preparation_spec(&work).is_some();
+        let current = self.preparation_spec(&work).is_some_and(|spec| {
+            result.as_ref().map_or(true, |execution| {
+                crate::control::native::receiver_target(spec)
+                    .is_ok_and(|target| target.source == execution.source)
+            })
+        });
         let authorized = self.authorization_current(unix_now);
         let Some(owned) = self.rows.get_mut(&key).and_then(|row| row.owned.as_mut()) else {
             return Ok(());
@@ -373,6 +378,7 @@ impl NativeSession {
                 let needs_evaluation = row.value.evaluated_revision < owned.target.revision;
                 let revision = owned.target.revision;
                 owned.logical_binding = None;
+                owned.receiver_binding = None;
                 self.logical_bindings.remove(&id);
                 self.charge(
                     Binding::bytes().saturating_add(if active { Preparation::bytes() } else { 0 }),

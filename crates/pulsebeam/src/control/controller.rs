@@ -5501,7 +5501,7 @@ mod replacement_tests {
                 |_| None,
                 |_, _| None,
                 |_| None,
-                |_, _, _| None,
+                |_, _, _, _| None,
             )
             .unwrap();
         assert!(handler.model.lookup_refresh_pending());
@@ -5513,7 +5513,7 @@ mod replacement_tests {
                 |_| None,
                 |_, _| None,
                 |_| None,
-                |_, _, _| None,
+                |_, _, _, _| None,
             )
             .unwrap();
         assert!(!handler.model.lookup_refresh_pending());
@@ -5638,7 +5638,7 @@ mod replacement_tests {
                     |_| None,
                     |_, _| None,
                     |_| None,
-                    |_, _, _| None,
+                    |_, _, _, _| None,
                 )
                 .unwrap();
             let initial = endpoint.output().expect("initial session output in flight");

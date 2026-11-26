@@ -53,6 +53,26 @@ export function recoveryFixture(config: {
   publisher: string;
   viewer: string;
 }) {
+  const peers = new Set<RTCPeerConnection>();
+  const rtc = RTCPeerConnection.prototype;
+  const setLocalDescription = rtc.setLocalDescription;
+  rtc.setLocalDescription = function (this: RTCPeerConnection, ...args: unknown[]) {
+    peers.add(this);
+    return Reflect.apply(setLocalDescription, this, args);
+  };
+  const videoStats = async () => Promise.all([...peers].map(async (peer) =>
+    Promise.all(peer.getTransceivers().filter(({ receiver }) => receiver.track.kind === "video")
+      .map(async ({ mid, sender, receiver }) => {
+        const [sent, received] = await Promise.all([sender.getStats(), receiver.getStats()]);
+        const video = (stats: RTCStatsReport, type: string) => [...stats.values()]
+          .filter((entry) => entry.type === type && entry.kind === "video")
+          .map(({ ssrc, packetsSent, packetsReceived, framesEncoded, framesDecoded,
+            keyFramesEncoded, keyFramesDecoded, pliCount }) => ({ ssrc, packetsSent, packetsReceived,
+            framesEncoded, framesDecoded, keyFramesEncoded, keyFramesDecoded, pliCount }));
+        return { mid, sender: sender.track?.id, receiver: receiver.track.id,
+          outbound: video(sent, "outbound-rtp"), inbound: video(received, "inbound-rtp") };
+      })),
+  ));
   const publisher = new Agent({ endpoint: config.endpoint, token: config.publisher });
   const viewer = new Agent({ endpoint: config.endpoint, token: config.viewer });
   const room = viewer.room(config.room);
@@ -129,7 +149,11 @@ export function recoveryFixture(config: {
   const entry = () => collection?.state().tracks.find(({ trackId }) => trackId === "camera");
   return {
     async first() {
-      await picture(false);
+      try {
+        await picture(false);
+      } finally {
+        rtc.setLocalDescription = setLocalDescription;
+      }
       retained = entry();
       if (!retained || retained.participantId !== "collection-publisher")
         throw new Error("missing admitted publication metadata");
@@ -161,7 +185,12 @@ export function recoveryFixture(config: {
             !current.track.sameAdmission(retained.track)) return true;
       }, "viewer did not readmit the same publication with fresh authority");
       render(false);
-      return picture(true);
+      try {
+        return await picture(true);
+      } catch (error) {
+        const stats = await videoStats().then(JSON.stringify, String);
+        throw new Error(`readmitted viewer: ${error}; video RTP stats=${stats}`);
+      }
     },
     async close() {
       exchange();

@@ -2435,6 +2435,11 @@ fn reconnect_posts_a_new_resource_and_swaps_only_after_the_candidate_is_ready() 
                     state::SubscriptionSelectorState {
                         spec: Some(spec.as_ref().clone()),
                         status: state::SelectorMatchStatus::Complete as i32,
+                        membership: Some(state::SelectorMembershipSpan {
+                            revision: 1,
+                            offset: 0,
+                            total: 1,
+                        }),
                         matches: vec![state::LogicalSourceAddress {
                             room: "room".into(),
                             participant_id: "remote".into(),

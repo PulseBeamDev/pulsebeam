@@ -71,6 +71,17 @@ impl Row {
         }
     }
 
+    fn empty_proof() -> Self {
+        Self {
+            descriptor: Box::default(),
+            permit: Box::default(),
+        }
+    }
+
+    pub(super) fn proves_empty(&self) -> bool {
+        self.descriptor.is_empty() && self.permit.is_empty()
+    }
+
     pub(super) fn descriptor(&self) -> Option<Track> {
         Track::decode(self.descriptor.as_ref()).ok()
     }
@@ -172,7 +183,7 @@ impl OwnerReads {
             } else {
                 None
             };
-            let (source, next) = actor.lifecycle.scan_owned_subscribe_scope(
+            let (source, next, empty_confirmed) = actor.lifecycle.scan_owned_subscribe_scope(
                 get.project,
                 &get.scope,
                 after,
@@ -214,7 +225,12 @@ impl OwnerReads {
                     ticket,
                     Reply {
                         id: get.id,
-                        page: Some(Page { next, row: None }),
+                        // The empty proof has no installable descriptor or permit, so older
+                        // clients skip it like an unresolved row but still follow the cursor.
+                        page: Some(Page {
+                            next,
+                            row: empty_confirmed.then(Row::empty_proof),
+                        }),
                     },
                 ));
             }

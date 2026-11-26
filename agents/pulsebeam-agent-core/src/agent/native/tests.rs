@@ -295,6 +295,43 @@ fn media_allocation_fences_callbacks_and_retires_superseded_physical_facts() {
 }
 
 #[test]
+fn capacity_releases_retry_in_fifo_order_and_ignore_replaced_offers() {
+    let mut capacity = MediaCapacity::default();
+    let camera = |index| {
+        let slot = MediaSlot::RemoteVideo(index);
+        let want = MediaWant {
+            resource: Resource::LogicalReception(slot.clone()),
+            source: None,
+            offer: None,
+            allocation: crate::client_sdp::Allocation {
+                slot: slot.clone(),
+                format: None,
+                video_codec: None,
+            },
+        };
+        (slot, want)
+    };
+    let first = camera(3);
+    let second = camera(1);
+    let withdrawn = camera(2);
+    for (slot, want) in [first.clone(), withdrawn, second.clone()] {
+        capacity.wait(slot, want);
+    }
+    let wanted = BTreeMap::from([first.clone(), second.clone()]);
+    capacity.retain(&wanted);
+    assert!(capacity.retry().is_none());
+    capacity.release();
+    assert_eq!(capacity.retry(), Some(first.clone()));
+    capacity.wait(first.0.clone(), first.1.clone());
+    assert!(capacity.retry().is_none());
+    capacity.release();
+    assert_eq!(capacity.retry(), Some(second));
+    assert!(capacity.retry().is_none());
+    capacity.release();
+    assert_eq!(capacity.retry(), Some(first));
+}
+
+#[test]
 fn allocation_claims_a_compatible_bootstrap_mid_without_an_offer() {
     let (mut agent, generation, _) = connected(crate::TopicRegistrations::default());
     let format = state::CodecFormat::from(state::codec_format::Codec::H264(Default::default()));
@@ -1954,6 +1991,78 @@ fn logical_offer_selects_exact_identity_without_discovery_and_gates_pending_disa
             state::TrackKind::Video,
         ),
         None
+    );
+
+    // An unapplied capacity refusal must leave the logical offer reusable.
+    agent.desired = desired;
+    let slot = MediaSlot::RemoteVideo(0);
+    let active = agent.active.as_mut().unwrap();
+    let mut want =
+        media_want(active, resource.clone(), &slot, Some(&track.publication_id)).unwrap();
+    want.offer = active
+        .state
+        .logical_offer(&resource)
+        .map(|(offer, _)| offer);
+    assert!(want.offer.is_some());
+    active.media_wanted.insert(slot.clone(), want.clone());
+    allocate_media(active, &mut agent.ids, &mut agent.effects);
+    let operation = active.media_allocation.as_ref().unwrap().operation;
+    assert!(agent.media_allocated(
+        generation,
+        operation,
+        Vec::new(),
+        crate::client_sdp::ApplyOutcome::NotApplied,
+        Err(crate::client_sdp::Error::Capacity),
+    ));
+    let active = agent.active.as_mut().unwrap();
+    assert!(active.media_capacity.contains(&slot));
+    assert!(!active.media_blocked.contains_key(&slot));
+    assert_eq!(
+        active.state.logical_offer(&resource).unwrap().0,
+        want.offer.unwrap()
+    );
+    allocate_media(active, &mut agent.ids, &mut agent.effects);
+    assert!(
+        active.media_allocation.is_none(),
+        "no retry without release"
+    );
+    let retiring = MediaSlot::RemoteVideo(1);
+    let healthy = MediaSlot::RemoteVideo(2);
+    for (slot, retired, mid) in [(&retiring, true, "retiring"), (&healthy, false, "healthy")] {
+        active.media_leases.insert(
+            slot.clone(),
+            MediaLease {
+                resource: Resource::LogicalReception(slot.clone()),
+                mid: mid.into(),
+                identity_pending: false,
+                retired,
+                retirement_failed: false,
+                wire_retired: retired,
+                source: None,
+                offer: None,
+            },
+        );
+    }
+    retire_media(active, &mut agent.ids, &mut agent.effects);
+    let release = active.media_retirement.as_ref().unwrap().operation;
+    agent.media_retired(
+        generation,
+        release,
+        crate::client_sdp::ApplyOutcome::Applied,
+        Ok(Default::default()),
+    );
+    let active = agent.active.as_mut().unwrap();
+    assert!(!active.media_leases.contains_key(&retiring));
+    assert!(!active.media_leases[&healthy].retired);
+    assert_eq!(active.media_leases[&healthy].mid, "healthy");
+    allocate_media(active, &mut agent.ids, &mut agent.effects);
+    assert_ne!(
+        active.media_allocation.as_ref().unwrap().operation,
+        operation
+    );
+    assert_eq!(
+        active.media_allocation.as_ref().unwrap().wanted[&slot],
+        want
     );
 
     let (disabled_reference, disabled_revision) = stage(&mut agent, false);

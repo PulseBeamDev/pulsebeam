@@ -184,12 +184,29 @@ struct Owned {
     sent_revision: u64,
     sent: wire::ResourceSpec,
     confirmed: Option<wire::ConfirmedState>,
+    selector_revision: u64,
+    selector_assembly: Option<wire::ConfirmedState>,
     execution: Option<Box<wire::ExecutionReport>>,
     reported_offer: Option<(u64, bool)>,
     retiring: bool,
 }
 
 impl Owned {
+    fn assembly_bytes(state: &wire::ConfirmedState) -> usize {
+        let Some(wire::confirmed_state::Value::SubscriptionSelector(selector)) =
+            state.value.as_ref()
+        else {
+            return 0;
+        };
+        let capacity = selector
+            .membership
+            .as_ref()
+            .map_or(0, |span| span.total as usize);
+        state
+            .encoded_len()
+            .saturating_add(capacity * size_of::<wire::LogicalSourceAddress>())
+    }
+
     fn awaiting_evaluation(&self) -> bool {
         self.confirmed
             .as_ref()
@@ -202,6 +219,11 @@ impl Owned {
             .saturating_add(self.resource.retained_bytes())
             .saturating_add(self.sent.encoded_len())
             .saturating_add(self.confirmed.as_ref().map_or(0, Message::encoded_len))
+            .saturating_add(
+                self.selector_assembly
+                    .as_ref()
+                    .map_or(0, Self::assembly_bytes),
+            )
             .saturating_add(self.execution.as_ref().map_or(0, |report| {
                 size_of::<wire::ExecutionReport>().saturating_add(report.encoded_len())
             }))
@@ -440,6 +462,7 @@ impl NativeState {
             if let Some(owned) = self.owned.get_mut(&reference) {
                 owned.retiring = true;
             }
+            self.clear_selector_assembly(reference);
             self.retiring.insert(reference);
             self.retiring_resources.insert(resource.clone(), reference);
         }
@@ -792,6 +815,8 @@ impl NativeState {
                 sent_revision: revision,
                 sent,
                 confirmed: previous.and_then(|owned| owned.confirmed.clone()),
+                selector_revision: previous.map_or(0, |owned| owned.selector_revision),
+                selector_assembly: None,
                 execution: previous.and_then(|owned| owned.execution.clone()),
                 reported_offer: previous.and_then(|owned| owned.reported_offer),
                 retiring: retirement.is_some(),
@@ -863,7 +888,9 @@ impl NativeState {
             let state = record.confirmed.ok_or(SignalingError::MissingPayload)?;
             match key {
                 wire::resource_key::Key::Owned(reference) => {
-                    if let Some(change) = self.apply_owned(reference, state)? {
+                    if let Some(state) = self.stage_selector_slice(reference, state)?
+                        && let Some(change) = self.apply_owned(reference, state)?
+                    {
                         changes.push(change);
                     }
                 }
@@ -976,6 +1003,126 @@ impl NativeState {
             changes.push(Change::InitialComplete);
         }
         Ok(changes)
+    }
+
+    fn clear_selector_assembly(&mut self, reference: u64) {
+        if let Some(assembly) = self
+            .owned
+            .get_mut(&reference)
+            .and_then(|owned| owned.selector_assembly.take())
+        {
+            self.retained_bytes -= Owned::assembly_bytes(&assembly);
+        }
+    }
+
+    fn stage_selector_slice(
+        &mut self,
+        reference: u64,
+        state: wire::ConfirmedState,
+    ) -> Result<Option<wire::ConfirmedState>, SignalingError> {
+        let Some(wire::confirmed_state::Value::SubscriptionSelector(slice)) = state.value.as_ref()
+        else {
+            self.clear_selector_assembly(reference);
+            return Ok(Some(state));
+        };
+        let Some(span) = slice.membership.as_ref() else {
+            self.clear_selector_assembly(reference);
+            return Ok(Some(state));
+        };
+        let owned = self
+            .owned
+            .get(&reference)
+            .ok_or(SignalingError::Invalid("unknown selector reference"))?;
+        if owned.retiring || state.evaluated_revision < owned.sent_revision {
+            return Ok(None);
+        }
+        if state.evaluated_revision > owned.sent_revision
+            || !matches!(owned.resource, Resource::SubscriptionSelector(_))
+            || !slice.spec.as_ref().is_some_and(|spec| {
+                if state.rejection.is_some() {
+                    validation::declarations_equivalent(spec, &owned.sent)
+                } else {
+                    specs_equal(spec, &owned.sent)
+                }
+            })
+            || self
+                .session
+                .as_ref()
+                .and_then(|session| session.authorization.as_ref())
+                .is_none()
+        {
+            return Err(SignalingError::Invalid("selector membership authority"));
+        }
+        let offset = span.offset as usize;
+        let total = span.total as usize;
+        if total > validation::MAX_SELECTOR_MATCHES
+            || offset.saturating_add(slice.matches.len()) > total
+            || (total != 0 && slice.matches.is_empty())
+        {
+            return Err(SignalingError::Invalid("selector membership span"));
+        }
+        if span.revision < owned.selector_revision
+            || (offset == 0 && span.revision == owned.selector_revision)
+        {
+            return Ok(None);
+        }
+        let mut assembly =
+            if offset == 0 {
+                self.clear_selector_assembly(reference);
+                self.owned.get_mut(&reference).unwrap().selector_revision = span.revision;
+                state
+            } else {
+                if span.revision != owned.selector_revision {
+                    self.clear_selector_assembly(reference);
+                    return Ok(None);
+                }
+                let Some(mut assembly) = self
+                    .owned
+                    .get_mut(&reference)
+                    .unwrap()
+                    .selector_assembly
+                    .take()
+                else {
+                    return Ok(None);
+                };
+                self.retained_bytes -= Owned::assembly_bytes(&assembly);
+                let Some(wire::confirmed_state::Value::SubscriptionSelector(base)) =
+                    &mut assembly.value
+                else {
+                    return Err(SignalingError::Invalid("selector assembly value"));
+                };
+                if base.membership.as_ref().map(|base| base.total) != Some(span.total)
+                    || base.status != slice.status
+                    || base.spec != slice.spec
+                    || assembly.evaluated_revision != state.evaluated_revision
+                    || assembly.rejection != state.rejection
+                    || base.matches.len() != offset
+                    || base.matches.last().zip(slice.matches.first()).is_some_and(
+                        |(last, first)| selector_address_key(last) >= selector_address_key(first),
+                    )
+                {
+                    return Ok(None);
+                }
+                let Some(wire::confirmed_state::Value::SubscriptionSelector(slice)) = state.value
+                else {
+                    unreachable!();
+                };
+                base.matches.extend(slice.matches);
+                assembly
+            };
+        let Some(wire::confirmed_state::Value::SubscriptionSelector(base)) = &mut assembly.value
+        else {
+            unreachable!();
+        };
+        if base.matches.len() == total {
+            // Framing geometry is not exposed to projection or evaluated as a new value.
+            base.membership = None;
+            return Ok(Some(assembly));
+        }
+        base.matches.reserve_exact(total - base.matches.len());
+        self.account(0, Owned::assembly_bytes(&assembly))?;
+        self.owned.get_mut(&reference).unwrap().selector_assembly = Some(assembly);
+        Ok(None)
     }
 
     fn apply_owned(
@@ -1551,6 +1698,15 @@ fn source_description(state: &wire::ConfirmedState) -> Option<(&wire::Participan
         }
         _ => None,
     }
+}
+
+fn selector_address_key(address: &wire::LogicalSourceAddress) -> (&str, &str, i32, &str) {
+    (
+        &address.room,
+        &address.participant_id,
+        address.kind,
+        &address.track_id,
+    )
 }
 
 fn specs_equal(left: &wire::ResourceSpec, right: &wire::ResourceSpec) -> bool {

@@ -413,10 +413,26 @@ impl ControllerActor {
         Ok(())
     }
 
+    pub(super) fn regional_selector_empty_confirmed(
+        &self,
+        owner: super::native_service::MediaInterestId,
+        revision: u64,
+        now: Instant,
+    ) -> bool {
+        self.regional_routing.as_ref().is_none_or(|routing| {
+            routing.media_targets.is_empty()
+                || routing.media_client.empty_confirmed(owner, revision, now)
+        })
+    }
+
     pub(super) fn drive_regional_routing(&mut self, now: Instant) {
         if let Some(mut routing) = self.regional_routing.take() {
             routing.drive(self, now);
+            let changes = routing.media_client.take_coverage_changes();
             self.regional_routing = Some(routing);
+            for owner in changes {
+                self.observe_regional_selector_coverage(owner);
+            }
         }
     }
 }

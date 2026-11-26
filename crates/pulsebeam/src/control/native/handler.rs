@@ -156,6 +156,7 @@ impl StateProtocolHandler {
             &pulsebeam_proto::state::LogicalSourceAddress,
         ) -> Option<ResolvedSource<'a>>,
         scan_selector: impl FnOnce(
+            u64,
             &ResourcePermissions,
             SubscriptionSelector,
             Option<NamedTrack>,

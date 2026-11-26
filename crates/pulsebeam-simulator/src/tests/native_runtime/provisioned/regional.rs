@@ -259,10 +259,32 @@ async fn prove_siblings(
     let (viewer_b, runtime_b) = regional_agent(client, ips[6], "viewer-b", &["subscribe"])?;
     let a = subscribe_feed(&viewer_a)?;
     let b = subscribe_feed(&viewer_b)?;
+    let empty = viewer_a
+        .room(ROOM.into())?
+        .video(Some(pulsebeam_agent_core::TrackFilter {
+            participant_id: Some("alice".into()),
+            track_id: Some("no-camera".into()),
+        }))
+        .subscribe()?;
+    anyhow::ensure!(empty.state().status == pulsebeam_agent_core::CollectionStatus::Waiting);
+    let empty_updates = empty.updates()?;
     runtime_a.connect().await?;
     runtime_b.connect().await?;
     warm(&source, &a, b"ready-a").await?;
     warm(&source, &b, b"ready-b").await?;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(state) = empty_updates.next().await? {
+            anyhow::ensure!(state.tracks.is_empty() && state.error.is_none());
+            if state.status == pulsebeam_agent_core::CollectionStatus::Live {
+                return anyhow::Ok(());
+            }
+        }
+        anyhow::bail!("empty collection closed before regional confirmation")
+    })
+    .await
+    .context("confirm authorized empty regional scope")??;
+    empty_updates.close();
+    empty.close();
     let before = counters();
     let primary = match (before[2].0 > 0, before[3].0 > 0) {
         (true, false) => 2,
@@ -370,20 +392,35 @@ async fn prove_video_recovery(
         decode_standby_picture(|| local_frames.next(), local_generation, &pictures, 0)
             .await
             .context("establish live publisher video before remote demand")?;
-        let subscription = subscribe(viewer)?;
-        wait_mixed_video_installed(&subscription)
-            .await
-            .context("install remote sibling camera demand")?;
-        let frames = subscription.frames()?;
-        let before = decode_standby_picture(|| frames.next(), generation, &pictures, 0)
-            .await
-            .context("decode before border failover")?;
+        let collection = viewer
+            .room(ROOM.into())?
+            .video(Some(pulsebeam_agent_core::TrackFilter {
+                participant_id: Some("alice".into()),
+                track_id: Some("camera".into()),
+            }))
+            .subscribe()?;
+        let updates = collection.updates()?;
         let source = publication
             .state()
             .admission
             .publication_id
             .context("camera publication ID")?;
-        anyhow::ensure!(subscription.state().source_track_id.as_ref() == Some(&source));
+        let next_camera = async || {
+            while let Some(state) = updates.next().await? {
+                anyhow::ensure!(state.error.is_none() && state.tracks.len() <= 1);
+                if let Some(camera) = state.tracks.into_iter().next() {
+                    anyhow::ensure!(camera.publication_id == source);
+                    return Ok(camera.track.frames()?);
+                }
+            }
+            anyhow::bail!("collection closed before camera admission")
+        };
+        let frames = tokio::time::timeout(Duration::from_secs(5), next_camera())
+            .await
+            .context("install remote sibling camera collection")??;
+        let before = decode_standby_picture(|| frames.next(), generation, &pictures, 0)
+            .await
+            .context("decode before border failover")?;
         let (from, to) = SIBLING_EDGES[cut];
         turmoil::partition(ips[from], ips[to]);
         controls[cut].disconnect().await;
@@ -398,8 +435,16 @@ async fn prove_video_recovery(
                 if let Some(picture) = frames.next().await? {
                     return Ok(Some(picture));
                 }
-                // The route loss can retire the receiver without closing its logical subscription.
-                rebound.insert(subscription.frames()?).next().await
+                // A retired reader cannot reacquire on its old admission.
+                let reader = next_camera().await.map_err(|error| {
+                    pulsebeam_agent_native::ffi::NativeError::Operation {
+                        info: pulsebeam_agent_core::ffi::ErrorInfo::new(
+                            pulsebeam_agent_core::ffi::ErrorCode::Internal,
+                            &format!("collection readmission: {error:#}"),
+                        ),
+                    }
+                })?;
+                rebound.insert(reader).next().await
             },
             generation,
             &pictures,
@@ -411,8 +456,16 @@ async fn prove_video_recovery(
         if rebound.is_none() {
             anyhow::ensure!(before == after, "active frame stream changed receivers");
         }
-        let state = subscription.state();
-        anyhow::ensure!(!state.closed && state.source_track_id.as_ref() == Some(&source));
+        let state = collection.state();
+        anyhow::ensure!(state.tracks.len() == 1 && state.tracks[0].publication_id == source);
+        collection.close();
+        let active = rebound.as_ref().unwrap_or(&frames);
+        anyhow::ensure!(
+            tokio::time::timeout(Duration::from_secs(1), active.next())
+                .await??
+                .is_none()
+        );
+        updates.close();
         anyhow::Ok(())
     };
     tokio::select! { result = pump => result, result = scenario => result }

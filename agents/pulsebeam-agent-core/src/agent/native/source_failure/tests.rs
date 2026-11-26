@@ -222,13 +222,18 @@ fn data_set_dispatch_checks_each_owner_and_stops_at_withdrawn_membership() {
         kind: state::TrackKind::Data as i32,
         track_id: "events".into(),
     };
-    let report = |matches| state::ConfirmedState {
+    let report = |revision, matches: Vec<state::LogicalSourceAddress>| state::ConfirmedState {
         evaluated_revision: desired.revision,
         rejection: None,
         value: Some(state::confirmed_state::Value::SubscriptionSelector(
             Box::new(state::SubscriptionSelectorState {
                 spec: Some((*spec).clone()),
                 status: state::SelectorMatchStatus::Complete as i32,
+                membership: Some(state::SelectorMembershipSpan {
+                    revision,
+                    offset: 0,
+                    total: matches.len() as u32,
+                }),
                 matches,
             }),
         )),
@@ -261,7 +266,7 @@ fn data_set_dispatch_checks_each_owner_and_stops_at_withdrawn_membership() {
         generation,
         channel,
         record.owned,
-        report(vec![address]),
+        report(1, vec![address]),
     );
     deliver(&mut agent, "bob", 1);
     assert_waiting(&mut agent, owner);
@@ -271,7 +276,7 @@ fn data_set_dispatch_checks_each_owner_and_stops_at_withdrawn_membership() {
         generation,
         channel,
         record.owned,
-        report(vec![]),
+        report(2, vec![]),
     );
     deliver(&mut agent, "alice", 3);
     let mut read = || agent.resource(ResourceCommand::ReadData { owner }).unwrap();

@@ -336,6 +336,60 @@ pub(super) struct MediaWant {
     allocation: crate::client_sdp::Allocation,
 }
 
+#[derive(Default)]
+pub(super) struct MediaCapacity {
+    waiting: VecDeque<(MediaSlot, MediaWant)>,
+    released: usize,
+}
+
+impl MediaCapacity {
+    fn retain(&mut self, wanted: &BTreeMap<MediaSlot, MediaWant>) {
+        self.waiting
+            .retain(|(slot, want)| wanted.get(slot) == Some(want));
+        self.released = self.released.min(self.waiting.len());
+    }
+
+    fn wait(&mut self, slot: MediaSlot, want: MediaWant) {
+        self.waiting.push_back((slot, want));
+    }
+
+    fn release(&mut self) {
+        self.released = self.released.saturating_add(1).min(self.waiting.len());
+    }
+
+    fn retry(&mut self) -> Option<(MediaSlot, MediaWant)> {
+        if self.released == 0 {
+            return None;
+        }
+        let next = self.waiting.pop_front()?;
+        self.released -= 1;
+        Some(next)
+    }
+
+    fn contains(&self, slot: &MediaSlot) -> bool {
+        self.waiting.iter().any(|(waiting, _)| waiting == slot)
+    }
+
+    pub(super) fn limits(&self, state: &NativeState, matches: &[super::SelectorMatch]) -> bool {
+        self.waiting.iter().any(|(_, want)| {
+            let Some(state::resource_spec::Declaration::LogicalSubscription(spec)) = state
+                .target_spec(&want.resource)
+                .and_then(|spec| spec.declaration.as_ref())
+            else {
+                return false;
+            };
+            spec.source.as_ref().is_some_and(|source| {
+                matches.iter().any(|matched| {
+                    matched.room == source.room
+                        && matched.participant_id == source.participant_id
+                        && matched.track_id == source.track_id
+                        && matched.kind.wire() == source.kind()
+                })
+            })
+        })
+    }
+}
+
 pub(super) struct MediaAllocation {
     pub operation: OperationId,
     reserved: Option<SlotBinding>,
@@ -1578,6 +1632,7 @@ pub(super) fn reconcile(
     session
         .media_blocked
         .retain(|slot, blocked| media.get(slot) == Some(blocked));
+    session.media_capacity.retain(&media);
     session.media_wanted = media;
     retire_media(session, ids, effects);
     allocate_media(session, ids, effects);
@@ -1772,15 +1827,18 @@ fn allocate_media(session: &mut Session, ids: &mut IdGenerator, effects: &mut Ve
         return;
     }
     loop {
-        let eligible = session
-            .media_wanted
-            .iter()
-            .filter(|(slot, want)| {
-                !session.media_leases.contains_key(*slot)
-                    && session.media_blocked.get(*slot) != Some(*want)
-            })
-            .map(|(slot, want)| (slot.clone(), want.clone()));
-        let Some((slot, want)) = eligible.into_iter().next() else {
+        let next = session.media_capacity.retry().or_else(|| {
+            session
+                .media_wanted
+                .iter()
+                .find(|(slot, want)| {
+                    !session.media_leases.contains_key(*slot)
+                        && session.media_blocked.get(*slot) != Some(*want)
+                        && !session.media_capacity.contains(slot)
+                })
+                .map(|(slot, want)| (slot.clone(), want.clone()))
+        });
+        let Some((slot, want)) = next else {
             return;
         };
         let allocation = want.allocation.clone();
@@ -2207,6 +2265,9 @@ impl Agent {
                 geometry.insert(slot.slot.clone(), slot.clone());
             }
         }
+        let capacity_wait = outcome == crate::client_sdp::ApplyOutcome::NotApplied
+            && slots.is_empty()
+            && matches!(&preparation, Err(crate::client_sdp::Error::Capacity));
         let prepared = (outcome == crate::client_sdp::ApplyOutcome::Applied && correlated)
             .then(|| {
                 preparation.and_then(|bindings| {
@@ -2228,6 +2289,15 @@ impl Agent {
         let prepared = prepared.ok().flatten();
         let demand = self.selectors.receiver_demand(&active.state, &self.desired);
         for (slot, want) in pending.wanted {
+            if capacity_wait
+                && want.offer.is_some()
+                && active.media_wanted.get(&slot) == Some(&want)
+                && media_needed(active, &demand, &slot, &want)
+            {
+                // Only a confirmed release retries the same unmodified offer.
+                active.media_capacity.wait(slot, want);
+                continue;
+            }
             let assigned = slots
                 .iter()
                 .find(|value| value.slot == slot)
@@ -2361,6 +2431,7 @@ impl Agent {
             {
                 if applied {
                     active.media_leases.remove(&retired.slot);
+                    active.media_capacity.release();
                 } else if let Some(lease) = active.media_leases.get_mut(&retired.slot) {
                     lease.retirement_failed = true;
                 }

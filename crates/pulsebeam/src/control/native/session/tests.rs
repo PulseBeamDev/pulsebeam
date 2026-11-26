@@ -69,12 +69,14 @@ fn selector_declarations_are_bounded_and_retire_without_media_work() {
     ));
 }
 
-#[test]
-fn selector_scan_publishes_only_finished_sets_and_fails_closed_on_overflow() {
+#[pulsebeam_runtime::test(start_paused = true, crate = "pulsebeam_runtime::__harness")]
+async fn selector_scan_publishes_only_finished_sets_and_retains_bounded_membership_on_overflow() {
     use crate::{
         control::{lifecycle::SelectorPage, topology::NamedTrack},
         entity::{ParticipantId, RoomId, TrackId, TrackKind},
     };
+    use pulsebeam_runtime::time::{Instant, advance};
+    use std::time::Duration;
     use wire::SelectorMatchStatus::{Complete, Overflow, Pending};
     let project = ProjectId::new();
     let mut session = NativeSession::default();
@@ -97,7 +99,7 @@ fn selector_scan_publishes_only_finished_sets_and_fails_closed_on_overflow() {
     input(&mut session, vec![present(1, 1, spec)]).unwrap();
     let claimant = ConnectionId::new();
     let source = |index| {
-        let label = format!("camera-{index:02}");
+        let label = format!("camera-{index:03}");
         let name = NamedTrack {
             room: RoomId::new("room").unwrap(),
             participant: ParticipantId::new("publisher").unwrap(),
@@ -115,20 +117,22 @@ fn selector_scan_publishes_only_finished_sets_and_fails_closed_on_overflow() {
         (state.status(), state.matches.len())
     };
     session
-        .refresh_selector(100, |_, _, cursor| {
+        .refresh_selector(100, |_, _, _, cursor| {
             assert!(cursor.is_none());
             Some(SelectorPage {
                 sources: vec![source(0)],
+                empty_confirmed: true,
                 next: Some(source(0).0),
             })
         })
         .unwrap();
     assert_eq!(observed(&session), (Pending, 0));
     session
-        .refresh_selector(100, |_, _, cursor| {
+        .refresh_selector(100, |_, _, _, cursor| {
             assert_eq!(cursor, Some(source(0).0));
             Some(SelectorPage {
                 sources: vec![source(1)],
+                empty_confirmed: true,
                 next: None,
             })
         })
@@ -136,22 +140,50 @@ fn selector_scan_publishes_only_finished_sets_and_fails_closed_on_overflow() {
     assert_eq!(observed(&session), (Complete, 2));
     assert!(!session.selector_scan_pending(100));
     assert_eq!(session.selector_interests().count(), 1);
+    for (empty_confirmed, expected) in [(false, Pending), (true, Complete)] {
+        session.selector_source_changed(1);
+        session
+            .refresh_selector(100, |reference, _, _, _| {
+                assert_eq!(reference, 1);
+                Some(SelectorPage {
+                    sources: Vec::new(),
+                    next: None,
+                    empty_confirmed,
+                })
+            })
+            .unwrap();
+        assert_eq!(observed(&session), (expected, 0));
+        assert!(!session.selector_scan_pending(100));
+    }
     session.selector_source_changed(1);
     session
-        .refresh_selector(100, |_, _, cursor| {
+        .refresh_selector(100, |_, _, _, _| {
+            Some(SelectorPage {
+                sources: vec![source(0), source(1)],
+                next: None,
+                empty_confirmed: false,
+            })
+        })
+        .unwrap();
+    assert_eq!(observed(&session), (Complete, 2));
+    session.selector_source_changed(1);
+    session
+        .refresh_selector(100, |_, _, _, cursor| {
             assert!(cursor.is_none());
             Some(SelectorPage {
                 sources: vec![source(0)],
+                empty_confirmed: true,
                 next: Some(source(0).0),
             })
         })
         .unwrap();
     session.selector_source_changed(1);
     session
-        .refresh_selector(100, |_, _, cursor| {
+        .refresh_selector(100, |_, _, _, cursor| {
             assert_eq!(cursor, Some(source(0).0));
             Some(SelectorPage {
                 sources: Vec::new(),
+                empty_confirmed: true,
                 next: None,
             })
         })
@@ -162,10 +194,11 @@ fn selector_scan_publishes_only_finished_sets_and_fails_closed_on_overflow() {
         "do not publish a cut invalidated mid-scan"
     );
     session
-        .refresh_selector(100, |_, _, cursor| {
+        .refresh_selector(100, |_, _, _, cursor| {
             assert!(cursor.is_none());
             Some(SelectorPage {
                 sources: vec![source(2)],
+                empty_confirmed: true,
                 next: None,
             })
         })
@@ -173,27 +206,150 @@ fn selector_scan_publishes_only_finished_sets_and_fails_closed_on_overflow() {
     assert_eq!(observed(&session), (Complete, 1));
     session.selector_source_changed(1);
     session
-        .refresh_selector(100, |_, _, _| {
+        .refresh_selector(100, |_, _, _, _| {
             Some(SelectorPage {
                 sources: (0..=validation::MAX_SELECTOR_MATCHES).map(source).collect(),
+                empty_confirmed: true,
                 next: None,
             })
         })
         .unwrap();
-    assert_eq!(observed(&session), (Overflow, 0));
+    let limit = validation::MAX_SELECTOR_MATCHES;
+    assert_eq!(observed(&session), (Overflow, limit));
     assert_eq!(session.selector_interests().count(), 1);
+    let opened = Instant::now();
+    session.set_cid(ChannelId::from_value(0), opened);
+    let mut received = Vec::new();
+    let mut version = None;
+    for _ in 0..=limit {
+        if !session.needs_poll() {
+            break;
+        }
+        let batch = output(&mut session).expect("initial snapshot must make progress");
+        for record in batch.records {
+            let Some(wire::confirmed_state::Value::SubscriptionSelector(state)) =
+                record.confirmed.unwrap().value
+            else {
+                continue;
+            };
+            assert_eq!(state.status(), Overflow);
+            let span = state.membership.unwrap();
+            assert_eq!(*version.get_or_insert(span.revision), span.revision);
+            assert_eq!(span.offset as usize, received.len());
+            assert_eq!(span.total as usize, limit);
+            received.extend(state.matches.into_iter().map(|source| source.track_id));
+        }
+        assert!(!batch.initial_complete || received.len() == limit);
+        advance(Duration::from_secs(10)).await;
+        commit_sent(&mut session);
+    }
+    assert!(session.initial_complete);
+    assert!(Instant::now() - opened > Duration::from_secs(30));
+    assert_eq!(
+        received,
+        (0..limit)
+            .map(|index| format!("camera-{index:03}"))
+            .collect::<Vec<_>>()
+    );
     session.selector_source_changed(1);
     session
-        .refresh_selector(100, |_, _, _| {
+        .refresh_selector(100, |_, _, _, _| {
+            Some(SelectorPage {
+                sources: (1..=limit).map(source).collect(),
+                empty_confirmed: true,
+                next: None,
+            })
+        })
+        .unwrap();
+    let selector_span = |batch: &wire::ServerStateBatch| {
+        batch
+            .records
+            .iter()
+            .find_map(|record| {
+                let wire::confirmed_state::Value::SubscriptionSelector(state) =
+                    record.confirmed.as_ref()?.value.as_ref()?
+                else {
+                    return None;
+                };
+                state.membership
+            })
+            .expect("membership slice")
+    };
+    let first = selector_span(&output(&mut session).unwrap());
+    assert_eq!(first.offset, 0);
+    assert!(first.revision > version.unwrap());
+    commit_sent(&mut session);
+    session
+        .fail_catalog(1, wire::FailureCode::ResourceGone)
+        .unwrap();
+    let mixed = output(&mut session).unwrap();
+    assert_eq!(mixed.catalog_records.len(), 1);
+    let continuation = selector_span(&mixed);
+    assert!(continuation.offset > 0);
+    session
+        .fail_catalog(2, wire::FailureCode::ResourceGone)
+        .unwrap();
+    let retried = output(&mut session).unwrap();
+    assert_eq!(selector_span(&retried), continuation);
+    assert_eq!(retried.catalog_records.len(), 2);
+    commit_sent(&mut session);
+    let selector_only = output(&mut session).unwrap();
+    assert!(selector_only.catalog_records.is_empty());
+    assert!(selector_span(&selector_only).offset > continuation.offset);
+    let retained = session.take_output().expect("offered continuation");
+    session.restore_output(retained).unwrap();
+
+    use pulsebeam_core::auth::grants::{Action, Grant, GrantSet};
+    let grant = Grant::new(
+        vec!["room".into()],
+        vec![Action::Subscribe],
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    session
+        .authorization(
+            900,
+            2,
+            ResourcePermissions::Grants {
+                joined_room: Some(RoomId::new("room").unwrap()),
+                grants: GrantSet::new(vec![grant]).unwrap(),
+            },
+        )
+        .unwrap();
+    assert!(!session.selector_scan_pending(100));
+    session
+        .refresh_selector(100, |_, _, _, _| panic!("scan raced the permission reset"))
+        .unwrap();
+    assert!(
+        session.pending.is_none(),
+        "withdraw stale locally retained output"
+    );
+    assert_eq!(session.rows[&Key::Owned(1)].selector_offset, 0);
+    let sent = drain(&mut session);
+    assert!(sent.iter().flat_map(|batch| &batch.records).all(|record| !matches!(
+        record.confirmed.as_ref().and_then(|value| value.value.as_ref()),
+        Some(wire::confirmed_state::Value::SubscriptionSelector(state)) if !state.matches.is_empty()
+    )));
+    assert!(sent.iter().flat_map(|batch| &batch.records).any(|record| matches!(
+        record.confirmed.as_ref().and_then(|value| value.value.as_ref()),
+        Some(wire::confirmed_state::Value::SubscriptionSelector(state))
+            if state.status() == Pending && state.matches.is_empty() && state.membership.is_none()
+    )));
+    assert!(session.selector_scan_pending(100));
+    session
+        .refresh_selector(100, |_, _, _, _| {
             Some(SelectorPage {
                 sources: vec![source(1)],
+                empty_confirmed: true,
                 next: None,
             })
         })
         .unwrap();
     assert_eq!(observed(&session), (Complete, 1));
     session
-        .authorization(900, 2, ResourcePermissions::Denied)
+        .authorization(900, 3, ResourcePermissions::Denied)
         .unwrap();
     // A grant update during the original sweep requests another bounded pass.
     for _ in 0..2 {
@@ -3103,7 +3259,12 @@ fn logical_subscription_keeps_one_reservation_across_scoped_receiver_replacement
             .unwrap();
         assert!(matches!(
             command.into_action(),
-            ExecutionAction::Prepare { .. }
+            ExecutionAction::Prepare {
+                resource: crate::control::native::PreparedResource::Receiver(
+                    crate::control::native::ReceiverPreparation::Ready(plan)
+                ),
+                ..
+            } if plan.source.id() == track.id()
         ));
         work
     };
@@ -3143,6 +3304,17 @@ fn logical_subscription_keeps_one_reservation_across_scoped_receiver_replacement
     report(&mut model, 2, 1, 3);
     let old = compile(&mut model, &first);
     assert_eq!(old.scope().binding, 2);
+    model
+        .observe_resource(
+            crate::participant::policy::ResourceObservation::ReceiverBinding {
+                binding: 2,
+                state: Some(crate::participant::policy::ReceiverBinding {
+                    available: false,
+                    rtp: None,
+                }),
+            },
+        )
+        .unwrap();
     offer(&mut model, &second);
     assert_state(&model, 1, 2, None);
     retire(&mut model, 2);

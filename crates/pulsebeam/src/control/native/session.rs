@@ -172,6 +172,7 @@ struct Row {
     ticket: Option<u64>,
     unavailable: bool,
     represented: bool,
+    selector_offset: usize,
     discovered_tracks: usize,
     self_context: bool,
 }
@@ -190,11 +191,17 @@ struct Pending {
     output: Option<SignalingOutput>,
     sequence: u64,
     cid: ChannelId,
-    selected: Vec<(Key, u64)>,
+    selected: Vec<SelectedRow>,
     initial_cursor: u64,
     initial_complete: bool,
     selected_at: pulsebeam_runtime::time::Instant,
     deadline: pulsebeam_runtime::time::Instant,
+}
+
+struct SelectedRow {
+    key: Key,
+    version: u64,
+    next_selector_offset: Option<usize>,
 }
 
 // Finite local retained-control work, not a stream-count or identity-history ceiling.
@@ -294,10 +301,7 @@ impl NativeSession {
     }
 
     fn put(&mut self, key: Key, value: wire::ConfirmedState) -> Result<(), OutputError> {
-        let record = wire::ServerStateRecord {
-            key: Some(key.wire()),
-            confirmed: Some(value.clone()),
-        };
+        let (record, _) = Self::state_record(&key, &value, u64::MAX, 0);
         self.encode_batch(&wire::ServerStateBatch {
             records: vec![record],
             initial_complete: false,
@@ -330,6 +334,7 @@ impl NativeSession {
             }
             row.value = value;
             row.version = version;
+            row.selector_offset = 0;
             if row.unavailable {
                 row.unavailable = false;
                 self.unavailable = self.unavailable.saturating_sub(1);
@@ -357,12 +362,29 @@ impl NativeSession {
                 ticket: Some(version),
                 unavailable: false,
                 represented: false,
+                selector_offset: 0,
                 discovered_tracks: 0,
                 self_context: false,
             },
         );
         self.dirty.insert(version, key);
         Ok(())
+    }
+
+    fn state_record(
+        key: &Key,
+        value: &wire::ConfirmedState,
+        version: u64,
+        offset: usize,
+    ) -> (wire::ServerStateRecord, Option<usize>) {
+        let (confirmed, next) = selectors::slice(value, version, offset);
+        (
+            wire::ServerStateRecord {
+                key: Some(key.wire()),
+                confirmed: Some(confirmed),
+            },
+            next,
+        )
     }
 
     pub(crate) fn set_cid(&mut self, cid: ChannelId, at: pulsebeam_runtime::time::Instant) {
@@ -596,7 +618,7 @@ impl NativeSession {
             self.reset_selector_scans()?;
         }
         self.grant_revision = revision;
-        self.cancel_unsent_catalog()?;
+        self.cancel_unsent(changed)?;
         self.catalog.invalidate();
         let successor_receipt = self
             .session_state()
@@ -750,6 +772,10 @@ impl NativeSession {
     }
 
     fn cancel_unsent_catalog(&mut self) -> Result<(), OutputError> {
+        self.cancel_unsent(false)
+    }
+
+    fn cancel_unsent(&mut self, invalidate_selectors: bool) -> Result<(), OutputError> {
         let Some(output) = self
             .pending
             .as_ref()
@@ -762,9 +788,24 @@ impl NativeSession {
             validation::BindingProfile::Quic => codec::decode_quic_server(&output.bytes),
         }
         .map_err(|_| OutputError::InvalidObservation)?;
-        if !batch.catalog_records.is_empty() {
-            // Selected resource revisions remain dirty until ACK. Only unsent output is canceled.
-            self.pending = None;
+        if !batch.catalog_records.is_empty()
+            || invalidate_selectors
+                && batch.records.iter().any(|record| {
+                    matches!(
+                        record
+                            .confirmed
+                            .as_ref()
+                            .and_then(|state| state.value.as_ref()),
+                        Some(wire::confirmed_state::Value::SubscriptionSelector(_))
+                    )
+                })
+        {
+            // Locally retained output can be discarded without advancing any send cursor.
+            if let Some(pending) = self.pending.take() {
+                for selected in pending.selected {
+                    self.requeue(&selected.key);
+                }
+            }
             self.catalog.restore_unsent(batch.catalog_records)?;
         }
         Ok(())
@@ -2359,10 +2400,8 @@ impl NativeSession {
                 self.requeue(&key);
                 continue;
             }
-            let record = wire::ServerStateRecord {
-                key: Some(key.wire()),
-                confirmed: Some(row.value.clone()),
-            };
+            let (record, next_offset) =
+                Self::state_record(&key, &row.value, row.version, row.selector_offset);
             let candidate_len = batch
                 .encoded_len()
                 .saturating_add(record.encoded_len())
@@ -2374,7 +2413,11 @@ impl NativeSession {
             if row.ordinal <= cursor && row.ordinal <= end {
                 selected_cursor = selected_cursor.max(row.ordinal);
             }
-            selected.push((key, row.version));
+            selected.push(SelectedRow {
+                key,
+                version: row.version,
+                next_selector_offset: next_offset,
+            });
             batch.records.push(record);
         }
         if !self.catalog_first || session_dirty {
@@ -2390,7 +2433,9 @@ impl NativeSession {
             .take(SELECT_WORK)
             .find(|(_, key)| {
                 self.rows.get(*key).is_some_and(|row| !row.represented)
-                    && !selected.iter().any(|(selected, _)| selected == *key)
+                    && !selected.iter().any(|selected| {
+                        &selected.key == *key && selected.next_selector_offset.is_none()
+                    })
             });
         if let Some((first, _)) = remaining {
             selected_cursor = selected_cursor.min(first.saturating_sub(1));
@@ -2508,7 +2553,23 @@ impl NativeSession {
             self.initial_deadline = None;
         }
         let mut initial_progress = false;
-        for (key, version) in pending.selected {
+        for SelectedRow {
+            key,
+            version,
+            next_selector_offset,
+        } in pending.selected
+        {
+            if let Some(next_offset) = next_selector_offset {
+                if let Some(row) = self.rows.get_mut(&key)
+                    && row.version == version
+                {
+                    initial_progress |=
+                        !row.represented && self.initial_end.is_some_and(|end| row.ordinal <= end);
+                    row.selector_offset = next_offset;
+                    self.requeue(&key);
+                }
+                continue;
+            }
             if let Some(row) = self.rows.get_mut(&key) {
                 initial_progress |=
                     !row.represented && self.initial_end.is_some_and(|end| row.ordinal <= end);

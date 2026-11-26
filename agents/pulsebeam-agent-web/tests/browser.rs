@@ -114,8 +114,12 @@ async fn recovery_slice(
     commands
         .write_all(format!("readmit {}\n", recorder.token).as_bytes())
         .await?;
-    assert!(evaluate_json::<bool>(bidi, context, "recovery.readmit()").await?);
-    expect(&format!("segment 2 {publication}")).await?;
+    let (view, recording) = tokio::join!(
+        evaluate_json::<bool>(bidi, context, "recovery.readmit()"),
+        timeout(Duration::from_secs(12), reports.next_line()),
+    );
+    assert!(view.map_err(|error| format!("{error}; recorder readmission: {recording:?}"))?);
+    assert_eq!(recording??, Some(format!("segment 2 {publication}")));
     commands.write_all(b"stop\n").await?;
     assert!(
         timeout(Duration::from_secs(5), child.wait())

@@ -2,7 +2,7 @@
 //! survives only while its permit and at least one local interest are current.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     num::NonZeroU64,
     time::{Duration, SystemTime},
 };
@@ -38,6 +38,7 @@ struct Query {
     target: usize,
     after: Option<NonZeroU64>,
     retry: u8,
+    empty: bool,
 }
 
 impl Query {
@@ -49,11 +50,17 @@ impl Query {
         }
     }
 
+    fn observe_page(&mut self, empty_confirmed: bool, next: Option<NonZeroU64>) {
+        let valid = next.is_none_or(|cursor| self.after.is_none_or(|after| cursor > after));
+        self.empty &= empty_confirmed && valid;
+        self.advance(next.filter(|_| valid));
+    }
+
     fn failed(&mut self) {
         if self.retry == 0 {
             self.retry = 1;
         } else {
-            self.advance(None);
+            self.observe_page(false, None);
         }
     }
 
@@ -186,9 +193,51 @@ pub(super) struct Client {
     serial: u64,
     attempts: BTreeMap<Member, u8>,
     next_sweep: Option<Instant>,
+    empty: BTreeMap<MediaInterestId, (MediaInterest, Instant)>,
+    changed: BTreeSet<MediaInterestId>,
 }
 
 impl Client {
+    pub(super) fn take_coverage_changes(&mut self) -> BTreeSet<MediaInterestId> {
+        std::mem::take(&mut self.changed)
+    }
+
+    pub(super) fn empty_confirmed(
+        &self,
+        owner: MediaInterestId,
+        revision: u64,
+        now: Instant,
+    ) -> bool {
+        self.empty
+            .get(&owner)
+            .is_some_and(|(interest, expires)| revision == interest.authorization && now < *expires)
+    }
+
+    fn finish(&mut self, actor: &ControllerActor, query: Query, now: Instant) {
+        let Some(expires) = now.checked_add(ROUTED_READ_TTL) else {
+            return;
+        };
+        for interest in query.interests {
+            let owner = interest.owner;
+            if !actor.is_regional_selector_interest(owner) {
+                continue;
+            }
+            if query.empty {
+                if let Some(current) = self.empty.get_mut(&owner) {
+                    if current.0.authorization != interest.authorization {
+                        self.changed.insert(owner);
+                    }
+                    *current = (interest, expires);
+                } else if self.empty.len() < relay::LIMIT {
+                    self.empty.insert(owner, (interest, expires));
+                    self.changed.insert(owner);
+                }
+            } else if self.empty.remove(&owner).is_some() {
+                self.changed.insert(owner);
+            }
+        }
+    }
+
     pub(super) fn demands(&self) -> impl Iterator<Item = &Demand> {
         self.demand.values()
     }
@@ -223,8 +272,10 @@ impl Client {
             return;
         }
         if let Some(page) = reply.page {
+            query.observe_page(page.row.as_ref().is_some_and(Row::proves_empty), page.next);
             if let Some(demand) = page
                 .row
+                .filter(|row| !row.proves_empty())
                 .and_then(|row| Demand::verify(tree, target, &query.interests, row, now, wall))
             {
                 tracing::debug!(
@@ -237,14 +288,9 @@ impl Client {
                 self.attempts.insert(target, attempt);
                 self.record(target, demand);
             }
-            query.advance(
-                page.next
-                    .filter(|&cursor| query.after.is_none_or(|after| cursor > after)),
-            );
         } else {
-            // The owner's continuation expired or was evicted. The next sweep
-            // starts from the beginning; don't loop on the rejected cursor.
-            query.advance(None);
+            // A rejected continuation is not evidence of an empty owner.
+            query.observe_page(false, None);
         }
         self.ready.push_back(query);
     }
@@ -283,6 +329,13 @@ impl Client {
         now: Instant,
         wall: SystemTime,
     ) {
+        self.empty.retain(|owner, (interest, expires)| {
+            let current = actor.media_interest_current(interest, wall);
+            if current && now >= *expires {
+                self.changed.insert(*owner);
+            }
+            current && now < *expires
+        });
         self.demand
             .retain(|_, demand| demand.refresh(actor, now, wall));
         if targets.is_empty() {
@@ -334,6 +387,7 @@ impl Client {
                 continue;
             };
             let Some(&target) = targets.get(query.target) else {
+                self.finish(actor, query, now);
                 continue;
             };
             let Some(id) = self.serial.checked_add(1).and_then(NonZeroU64::new) else {
@@ -388,6 +442,50 @@ fn enqueue(ready: &mut VecDeque<Query>, interest: MediaInterest) {
             target: 0,
             after: None,
             retry: 0,
+            empty: true,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_coverage_requires_every_page_and_target_to_confirm_absence() {
+        let query = || Query {
+            interests: Vec::new(),
+            target: 0,
+            after: None,
+            retry: 0,
+            empty: true,
+        };
+        let after = NonZeroU64::new(1);
+        let mut complete = query();
+        complete.observe_page(true, after);
+        assert_eq!(complete.target, 0);
+        complete.observe_page(true, None);
+        complete.failed();
+        assert_eq!(complete.target, 1);
+        complete.observe_page(true, None);
+        assert_eq!(complete.target, 2);
+        assert!(complete.empty);
+
+        let mut stalled = query();
+        stalled.observe_page(true, after);
+        stalled.observe_page(true, after);
+        assert!(!stalled.empty);
+        assert_eq!(stalled.target, 1);
+
+        let mut unresolved = query();
+        unresolved.observe_page(false, after);
+        unresolved.observe_page(true, None);
+        assert!(!unresolved.empty);
+
+        let mut unreachable = query();
+        unreachable.failed();
+        unreachable.failed();
+        unreachable.observe_page(true, None);
+        assert!(!unreachable.empty);
     }
 }

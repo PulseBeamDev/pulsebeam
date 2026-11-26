@@ -609,12 +609,21 @@ message LogicalSubscriptionState {
   DataV1ReceiverOffer data_v1 = 6;
 }
 
-// One bounded complete set per declaration, never a partial prefix. Overflow
-// withdraws the set; the declaration can recover as eligible sources leave.
+// A slice of a bounded replacement set for an owned selector. Consumers
+// expose only the completed set. Pending has no membership.
 message SubscriptionSelectorState {
   ResourceSpec spec = 1;
   SelectorMatchStatus status = 2;
   repeated LogicalSourceAddress matches = 3;
+  SelectorMembershipSpan membership = 4;
+}
+
+message SelectorMembershipSpan {
+  // Monotonic State row version within the connection. Offset zero starts a
+  // replacement and discards an uncommitted older version for this selector.
+  uint64 revision = 1;
+  uint32 offset = 2;
+  uint32 total = 3;
 }
 
 enum SelectorMatchStatus {
