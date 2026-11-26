@@ -638,7 +638,9 @@ fn reliable_receiver_uses_active_native_signaling_for_expectations_and_receipts(
         ResourceResult::Event {
             event: Some(DataEvent::Message {
                 participant_id: "remote-app-user".into(),
+                track_id: "cursor".into(),
                 publication_id: REMOTE_SOURCE.into(),
+                delivery: crate::ffi::DataDelivery::Reliable,
                 sequence: 2,
                 data: b"x".to_vec(),
                 captured_at: None,
@@ -871,7 +873,9 @@ fn explicit_fabric_offer_delivers_only_on_the_exact_installed_data_v1_channel() 
         ResourceResult::Event {
             event: Some(DataEvent::Message {
                 participant_id: selector.participant_id,
+                track_id: selector.track_id,
                 publication_id: REMOTE_SOURCE.into(),
+                delivery: crate::ffi::DataDelivery::Latest,
                 sequence: 2,
                 data: b"B".to_vec(),
                 captured_at: Some(stamp),

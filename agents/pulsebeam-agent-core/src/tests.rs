@@ -692,7 +692,9 @@ fn assert_data_read(
         ResourceResult::Event {
             event: Some(DataEvent::Message {
                 participant_id: participant.into(),
+                track_id: "state".into(),
                 publication_id: source.into(),
+                delivery: crate::ffi::DataDelivery::Unreliable,
                 sequence,
                 data: bytes.to_vec(),
                 captured_at: None,
@@ -5851,7 +5853,9 @@ fn owned_receive_uses_transport_deduplication_and_last_owner_registration_lifeti
             ResourceResult::Event {
                 event: Some(DataEvent::Message {
                     participant_id: "remote-app-user".into(),
+                    track_id: "events".into(),
                     publication_id: remote.clone(),
+                    delivery: crate::ffi::DataDelivery::Unreliable,
                     sequence: 0,
                     data: vec![255, 0],
                     captured_at: None,

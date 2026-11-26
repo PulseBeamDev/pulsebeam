@@ -83,6 +83,14 @@ for (const match of dataSelector.state()?.matches ?? []) {
   await selectedData.close();
 }
 dataSelector.close();
+const dataSet = room.data({ trackId: "data" }).subscribe();
+const setEvent = await dataSet.next();
+if (setEvent && DataEvent.SourceFailed.instanceOf(setEvent)) {
+  const publicationId: string = setEvent.inner.publicationId;
+  const trackId: string = setEvent.inner.trackId;
+  void [publicationId, trackId, setEvent.inner.error];
+}
+await dataSet.close();
 const data = agent.data("data").publish({ delivery: DataDelivery.Reliable });
 const sends: DataSendOptions = {};
 await data.send(Uint8Array.of(0, 255), sends);

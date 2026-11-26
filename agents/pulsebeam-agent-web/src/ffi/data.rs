@@ -1,5 +1,6 @@
 use super::{
-    Agent, Arc, ErrorCode, ErrorInfo, SelectorSubscription, WebAgentError, video::Participant,
+    Agent, Arc, ErrorCode, ErrorInfo, SelectorSubscription, WebAgentError,
+    video::{Participant, RoomRef},
 };
 use agent_core::{TrackSpec, ffi};
 
@@ -97,10 +98,7 @@ impl RemoteDataTrack {
         #[cfg(target_arch = "wasm32")]
         {
             let (owner, observer) = self.agent.runtime.claim_data_subscription(
-                track_spec(
-                    self.selector.track_id.clone(),
-                    options.and_then(|value| value.delivery).unwrap_or_default(),
-                ),
+                options.and_then(|value| value.delivery),
                 self.selector.clone(),
             )?;
             Ok(Arc::new(DataSubscription {
@@ -114,6 +112,47 @@ impl RemoteDataTrack {
             let _ = options;
             Err(super::browser_required())
         }
+    }
+}
+
+#[uniffi::export]
+impl RoomRef {
+    #[uniffi::method(default(filter = None))]
+    pub fn data(&self, filter: Option<agent_core::TrackFilter>) -> Arc<DataSetRef> {
+        Arc::new(DataSetRef {
+            #[cfg(target_arch = "wasm32")]
+            agent: self.agent.clone(),
+            room: self.room.clone(),
+            filter: filter.unwrap_or_default(),
+        })
+    }
+}
+
+#[derive(uniffi::Object)]
+pub struct DataSetRef {
+    #[cfg(target_arch = "wasm32")]
+    agent: Arc<Agent>,
+    room: String,
+    filter: agent_core::TrackFilter,
+}
+
+#[uniffi::export]
+impl DataSetRef {
+    pub fn subscribe(&self) -> Result<Arc<DataSubscription>, WebAgentError> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let (owner, observer) = self
+                .agent
+                .runtime
+                .claim_data_set(self.room.clone(), self.filter.clone())?;
+            Ok(Arc::new(DataSubscription {
+                agent: self.agent.clone(),
+                owner,
+                observer,
+            }))
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        Err(super::browser_required())
     }
 }
 

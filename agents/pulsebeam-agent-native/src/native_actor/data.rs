@@ -24,7 +24,7 @@ impl DataAddress {
         }
     }
 
-    fn subscribe(&self) -> Result<DataReceiver, Error> {
+    fn subscribe(&self, inherit_delivery: bool) -> Result<DataReceiver, Error> {
         let source = self.source.clone().ok_or_else(|| {
             Error::InvalidInput("local data does not identify a remote source".into())
         })?;
@@ -33,9 +33,13 @@ impl DataAddress {
             &self.commands,
             &self.closed,
             &self.finished,
-            ResourceCommand::ReceiveData {
-                spec: self.spec.clone(),
-                source,
+            if inherit_delivery {
+                ResourceCommand::ReceiveInheritedData { source }
+            } else {
+                ResourceCommand::ReceiveData {
+                    spec: self.spec.clone(),
+                    source,
+                }
             },
         )
     }
@@ -271,6 +275,22 @@ impl RoomRef {
         result.await.map_err(|_| Error::Closed)?
     }
 
+    pub(crate) fn subscribe_data(
+        &self,
+        filter: agent_core::TrackFilter,
+    ) -> Result<DataReceiver, Error> {
+        DataReceiver::subscribe(
+            &self.core,
+            &self.commands,
+            &self.closed,
+            &self.finished,
+            ResourceCommand::OpenDataSet {
+                room: self.name.clone(),
+                filter,
+            },
+        )
+    }
+
     pub fn watch(&self, config: agent_core::ffi::WatchConfig) -> Result<super::Watch, Error> {
         if self.closed.is_closed() || self.finished.is_closed() {
             return Err(Error::Closed);
@@ -350,13 +370,16 @@ pub struct RemoteDataTrack {
 impl RemoteDataTrack {
     pub(crate) fn subscribe_with_delivery(
         &self,
-        delivery: TopicMode,
+        delivery: Option<TopicMode>,
     ) -> Result<DataReceiver, Error> {
-        self.address.with_delivery(delivery).subscribe()
+        match delivery {
+            Some(delivery) => self.address.with_delivery(delivery).subscribe(false),
+            None => self.address.subscribe(true),
+        }
     }
 
     pub fn subscribe(&self) -> Result<DataReceiver, Error> {
-        self.address.subscribe()
+        self.address.subscribe(false)
     }
 }
 

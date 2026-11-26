@@ -118,15 +118,13 @@ impl Agent {
 
     pub fn data_subscription_state(&self, owner: u64) -> Result<DataSubscriptionState, AgentError> {
         let owner = crate::TrackOwner(owner);
-        let (subscriber, failure) = self
+        if self.resources.has_data_set(owner) {
+            return Ok(self.data_set_subscription_state(owner));
+        }
+        let (selector, requested_delivery, failure) = self
             .resources
             .data_receiver(owner)
             .ok_or(crate::TrackResourceError::Released)?;
-        let selector = crate::TrackSelector {
-            room: subscriber.room.clone(),
-            participant_id: subscriber.participant_id.clone(),
-            track_id: subscriber.topic.clone(),
-        };
         let intent_revision = self.resources.intent_revision(owner).unwrap_or(0);
         let (mut source_status, source_track_id, mut error) =
             source_state(self, &selector, wire::TrackKind::Data);
@@ -163,8 +161,10 @@ impl Agent {
             evaluated_revision,
             accepted_revision,
             rejected_revision,
-            selector: selector.into(),
-            delivery: subscriber.mode.into(),
+            delivery: requested_delivery
+                .or_else(|| data_delivery(self, &selector))
+                .map(Into::into),
+            selector: Some(selector.into()),
             local_enabled: true,
             closed: false,
             source_status,
@@ -176,6 +176,61 @@ impl Agent {
             execution_error,
             terminal_error,
         })
+    }
+
+    fn data_set_subscription_state(&self, owner: TrackOwner) -> DataSubscriptionState {
+        let status = self.subscription_selector_state(owner);
+        let terminal_error = self.resources.data_set_error(owner).cloned();
+        let complete = status
+            .as_ref()
+            .is_some_and(|state| state.status == SelectorStatus::Complete);
+        let installed = status.as_ref().is_some_and(|state| {
+            active_agent(self).is_some_and(|active| {
+                state.matches.iter().any(|source| {
+                    super::native::logical_payload_ready(
+                        active,
+                        &Resource::LogicalData(source.address()),
+                    )
+                })
+            })
+        });
+        DataSubscriptionState {
+            observation_revision: 0,
+            intent_revision: self.resources.intent_revision(owner).unwrap_or(0),
+            evaluated_revision: 0,
+            accepted_revision: None,
+            rejected_revision: None,
+            selector: None,
+            delivery: None,
+            local_enabled: true,
+            closed: false,
+            source_status: if terminal_error.is_some() {
+                SubscriptionSourceStatus::Rejected
+            } else if installed {
+                SubscriptionSourceStatus::Available
+            } else if complete {
+                SubscriptionSourceStatus::Unavailable
+            } else {
+                SubscriptionSourceStatus::Pending
+            },
+            source_track_id: None,
+            admission: if terminal_error.is_some() {
+                PublicationAdmissionStatus::Rejected
+            } else if complete {
+                PublicationAdmissionStatus::Admitted
+            } else {
+                PublicationAdmissionStatus::Pending
+            },
+            admission_pending: !complete && terminal_error.is_none(),
+            error: terminal_error.clone(),
+            execution: if installed {
+                PublicationExecution::Installed
+            } else {
+                PublicationExecution::Unavailable
+            },
+            execution_error: None,
+            terminal_error,
+        }
     }
 
     pub fn data_publication_state(&self, owner: u64) -> Result<DataPublicationState, AgentError> {
@@ -346,6 +401,22 @@ fn source_resource(selector: &crate::TrackSelector, kind: wire::TrackKind) -> Re
 fn source_format(agent: &Agent, publication_id: Option<&str>) -> Option<EffectiveMediaFormat> {
     let track = active_agent(agent)?.state.source(publication_id?)?;
     EffectiveMediaFormat::from_track(track)
+}
+
+fn data_delivery(agent: &Agent, selector: &crate::TrackSelector) -> Option<crate::TopicMode> {
+    let active = active_agent(agent)?;
+    let value = active
+        .state
+        .evaluation(&Resource::LogicalData(selector.clone()))?
+        .value
+        .as_ref()?;
+    let wire::confirmed_state::Value::LogicalSubscription(logical) = value else {
+        return None;
+    };
+    let wire::track::Kind::Data(data) = logical.source.as_ref()?.kind.as_ref()? else {
+        return None;
+    };
+    crate::TopicMode::from_delivery(data.delivery)
 }
 
 fn source_state(

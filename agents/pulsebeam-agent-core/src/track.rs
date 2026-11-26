@@ -12,6 +12,7 @@ use crate::{
     model::validate_identifier,
 };
 
+mod data_set;
 mod observation;
 pub use observation::{MediaObservationControl, MediaObservationId, MediaObservationTarget};
 
@@ -157,13 +158,22 @@ pub enum TrackResourceError {
 pub enum DataEvent {
     Message {
         participant_id: String,
+        track_id: String,
         publication_id: String,
+        delivery: crate::ffi::DataDelivery,
         sequence: u64,
         data: Vec<u8>,
         #[uniffi(default = None)]
         captured_at: Option<crate::ffi::CaptureTimestamp>,
         #[uniffi(default = None)]
         fragment_descriptors: Option<Vec<crate::data_v1::DataFragmentDescriptor>>,
+    },
+    SourceFailed {
+        participant_id: String,
+        track_id: String,
+        publication_id: String,
+        delivery: crate::ffi::DataDelivery,
+        error: crate::ffi::ErrorInfo,
     },
     Discontinuity {
         participant_id: String,
@@ -185,23 +195,39 @@ pub enum DataUpdate {
 }
 
 impl DataEvent {
-    fn identity(&self) -> (&str, &str) {
+    fn retained_bytes(&self) -> usize {
         match self {
             Self::Message {
                 participant_id,
+                track_id,
                 publication_id,
+                data,
+                captured_at,
+                fragment_descriptors,
                 ..
+            } => {
+                let descriptors = fragment_descriptors.as_ref().map_or(0, |items| {
+                    items.len() * core::mem::size_of::<crate::data_v1::DataFragmentDescriptor>()
+                        + items.iter().map(|item| item.bytes.len()).sum::<usize>()
+                });
+                participant_id.len()
+                    + track_id.len()
+                    + publication_id.len()
+                    + data.len()
+                    + captured_at.as_ref().map_or(0, |stamp| stamp.clock.id.len())
+                    + descriptors
             }
-            | Self::Discontinuity {
+            Self::SourceFailed { .. } => 0,
+            Self::Discontinuity {
+                participant_id,
+                previous_publication_id,
+                publication_id,
+            } => participant_id.len() + previous_publication_id.len() + publication_id.len(),
+            Self::Gap {
                 participant_id,
                 publication_id,
                 ..
-            }
-            | Self::Gap {
-                participant_id,
-                publication_id,
-                ..
-            } => (participant_id, publication_id),
+            } => participant_id.len() + publication_id.len(),
         }
     }
 }
@@ -366,24 +392,100 @@ impl PublicationOwner {
     }
 }
 
+#[derive(Default)]
+struct DataReadQueue {
+    events: VecDeque<(usize, DataEvent)>,
+    bytes: usize,
+}
+
+impl DataReadQueue {
+    const BYTE_LIMIT: usize = 1024 * 1024;
+
+    fn push(&mut self, mode: TopicMode, event: DataEvent) -> bool {
+        let bytes = event.retained_bytes();
+        if bytes > Self::BYTE_LIMIT {
+            return false;
+        }
+        if mode == TopicMode::Latest {
+            self.clear();
+        }
+        while self.events.len() == DATA_RECEIVE_CAPACITY || self.bytes + bytes > Self::BYTE_LIMIT {
+            if mode != TopicMode::Lossy {
+                return false;
+            }
+            let _ = self.pop();
+        }
+        self.bytes += bytes;
+        self.events.push_back((bytes, event));
+        true
+    }
+
+    fn pop(&mut self) -> Option<DataEvent> {
+        let (bytes, event) = self.events.pop_front()?;
+        self.bytes -= bytes;
+        Some(event)
+    }
+
+    fn clear(&mut self) {
+        self.events.clear();
+        self.bytes = 0;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+}
+
+enum DataReceiveIntent {
+    Explicit(TopicSubscriber),
+    Inherit(TrackSelector),
+}
+
+impl DataReceiveIntent {
+    fn matches(&self, room: &str, participant: &str, track: &str, mode: Option<TopicMode>) -> bool {
+        match self {
+            Self::Explicit(subscriber) => {
+                subscriber.room == room
+                    && subscriber.participant_id == participant
+                    && subscriber.topic == track
+                    && mode.is_none_or(|mode| subscriber.mode == mode)
+            }
+            Self::Inherit(selector) => {
+                selector.room == room
+                    && selector.participant_id == participant
+                    && selector.track_id == track
+            }
+        }
+    }
+}
+
 struct DataReceiver {
-    subscriber: TopicSubscriber,
+    intent: DataReceiveIntent,
     selector_owner: Option<TrackOwner>,
-    source: Option<String>,
+    source: Option<(String, TopicMode)>,
     discontinuity: Option<DataEvent>,
-    queue: VecDeque<DataEvent>,
+    queue: DataReadQueue,
     failure: Option<TrackResourceError>,
 }
 
 impl DataReceiver {
     fn push(&mut self, event: DataEvent) {
-        if self.failure.is_some() || self.subscriber.participant_id != event.identity().0 {
+        if self.failure.is_some() {
             return;
         }
-        let (participant, publication) = event.identity();
-        if self.source.as_deref() != Some(publication) {
-            if let Some(previous) = self.source.take() {
-                if self.subscriber.mode == TopicMode::Ordered {
+        let DataEvent::Message {
+            participant_id: participant,
+            publication_id: publication,
+            delivery,
+            ..
+        } = &event
+        else {
+            return;
+        };
+        let mode = (*delivery).into();
+        if self.source.as_ref().map(|(id, _)| id.as_str()) != Some(publication) {
+            if let Some((previous, previous_mode)) = self.source.take() {
+                if previous_mode == TopicMode::Ordered {
                     self.lose_continuity("Reliable source was replaced");
                     return;
                 }
@@ -396,26 +498,15 @@ impl DataReceiver {
                 };
                 self.queue.clear();
                 self.discontinuity = Some(DataEvent::Discontinuity {
-                    participant_id: participant.into(),
+                    participant_id: participant.clone(),
                     previous_publication_id,
-                    publication_id: publication.into(),
+                    publication_id: publication.clone(),
                 });
             }
-            self.source = Some(publication.into());
+            self.source = Some((publication.clone(), mode));
         }
-        match self.subscriber.mode {
-            TopicMode::Latest => {
-                self.queue
-                    .retain(|queued| queued.identity() != event.identity());
-            }
-            TopicMode::Lossy if self.queue.len() == DATA_RECEIVE_CAPACITY => {
-                self.queue.pop_front();
-            }
-            TopicMode::Lossy | TopicMode::Ordered => {}
-        }
-        self.queue.push_back(event);
-        if self.queue.len() > DATA_RECEIVE_CAPACITY {
-            if self.subscriber.mode == TopicMode::Ordered {
+        if !self.queue.push(mode, event) {
+            if mode == TopicMode::Ordered {
                 self.lose_continuity("Reliable receive buffer was exhausted");
             } else {
                 self.fail(TrackResourceError::ReceiveOverflow);
@@ -576,6 +667,13 @@ pub enum ResourceCommand {
         spec: TrackSpec,
         source: TrackSelector,
     },
+    ReceiveInheritedData {
+        source: TrackSelector,
+    },
+    OpenDataSet {
+        room: String,
+        filter: crate::TrackFilter,
+    },
     ReceiveSelectorData {
         owner: TrackOwner,
         source: crate::SelectorMatch,
@@ -634,6 +732,7 @@ pub struct TrackResources {
     observations: BTreeMap<MediaObservationId, observation::MediaObservation>,
     producers: BTreeSet<TopicPublisher>,
     receivers: BTreeMap<TrackOwner, DataReceiver>,
+    data_sets: BTreeMap<TrackOwner, Result<data_set::DataSetQueue, crate::ffi::ErrorInfo>>,
     intent_revisions: BTreeMap<TrackOwner, u64>,
 }
 
@@ -700,9 +799,24 @@ impl TrackResources {
     pub(crate) fn data_receiver(
         &self,
         owner: TrackOwner,
-    ) -> Option<(&TopicSubscriber, Option<&TrackResourceError>)> {
+    ) -> Option<(
+        TrackSelector,
+        Option<TopicMode>,
+        Option<&TrackResourceError>,
+    )> {
         let receiver = self.receivers.get(&owner)?;
-        Some((&receiver.subscriber, receiver.failure.as_ref()))
+        let (selector, mode) = match &receiver.intent {
+            DataReceiveIntent::Explicit(subscriber) => (
+                TrackSelector {
+                    room: subscriber.room.clone(),
+                    participant_id: subscriber.participant_id.clone(),
+                    track_id: subscriber.topic.clone(),
+                },
+                Some(subscriber.mode),
+            ),
+            DataReceiveIntent::Inherit(selector) => (selector.clone(), None),
+        };
+        Some((selector, mode, receiver.failure.as_ref()))
     }
 
     pub fn new_owner(&mut self) -> Result<TrackOwner, TrackResourceError> {
@@ -1279,6 +1393,7 @@ impl TrackResources {
             && self.video.is_empty()
             && self.producers.is_empty()
             && self.receivers.is_empty()
+            && self.data_sets.is_empty()
     }
 
     pub(crate) fn publication_slots(&self) -> BTreeSet<String> {
@@ -1582,7 +1697,45 @@ impl TrackResources {
         registrations.normalize();
         registrations.subscribers.dedup();
         registrations.validate()?;
-        self.insert_data_receiver(owner, subscriber, None)
+        self.insert_data_receiver(owner, DataReceiveIntent::Explicit(subscriber), None)
+    }
+
+    pub(crate) fn receive_inherited_data(
+        &mut self,
+        source: TrackSelector,
+    ) -> Result<TrackOwner, TrackResourceError> {
+        source.validate()?;
+        if !self
+            .inherited_data_demand()
+            .any(|existing| existing == &source)
+            && self.inherited_data_demand().collect::<BTreeSet<_>>().len()
+                >= crate::MAX_TOPIC_CHANNELS
+        {
+            return Err(TrackResourceError::ReceiveFailed(
+                crate::ffi::ErrorInfo::new(
+                    crate::ffi::ErrorCode::CapacityExceeded,
+                    "Exact data source capacity exceeded",
+                ),
+            ));
+        }
+        let owner = self.new_owner()?;
+        self.insert_data_receiver(owner, DataReceiveIntent::Inherit(source), None)?;
+        Ok(owner)
+    }
+
+    pub(crate) fn is_inherited_data_reader(&self, owner: TrackOwner) -> bool {
+        self.receivers
+            .get(&owner)
+            .is_some_and(|receiver| matches!(receiver.intent, DataReceiveIntent::Inherit(_)))
+    }
+
+    pub(crate) fn inherited_data_demand(&self) -> impl Iterator<Item = &TrackSelector> {
+        self.receivers
+            .values()
+            .filter_map(|receiver| match &receiver.intent {
+                DataReceiveIntent::Inherit(source) if receiver.failure.is_none() => Some(source),
+                _ => None,
+            })
     }
 
     pub(crate) fn receive_selector_data(
@@ -1599,32 +1752,39 @@ impl TrackResources {
         };
         if self.receivers.values().any(|receiver| {
             receiver.selector_owner == Some(selector_owner)
-                && receiver.subscriber.room == subscriber.room
-                && receiver.subscriber.participant_id == subscriber.participant_id
-                && receiver.subscriber.topic == subscriber.topic
+                && receiver.intent.matches(
+                    &subscriber.room,
+                    &subscriber.participant_id,
+                    &subscriber.topic,
+                    None,
+                )
         }) {
             return Err(TrackResourceError::AlreadyOwned);
         }
         let owner = self.new_owner()?;
-        self.insert_data_receiver(owner, subscriber, Some(selector_owner))?;
+        self.insert_data_receiver(
+            owner,
+            DataReceiveIntent::Explicit(subscriber),
+            Some(selector_owner),
+        )?;
         Ok(owner)
     }
 
     fn insert_data_receiver(
         &mut self,
         owner: TrackOwner,
-        subscriber: TopicSubscriber,
+        intent: DataReceiveIntent,
         selector_owner: Option<TrackOwner>,
     ) -> Result<(), TrackResourceError> {
         self.begin_intent(owner)?;
         self.receivers.insert(
             owner,
             DataReceiver {
-                subscriber,
+                intent,
                 selector_owner,
                 source: None,
                 discontinuity: None,
-                queue: VecDeque::new(),
+                queue: DataReadQueue::default(),
                 failure: None,
             },
         );
@@ -1635,12 +1795,48 @@ impl TrackResources {
         &self,
     ) -> impl Iterator<Item = (TrackOwner, TrackOwner, &TopicSubscriber)> {
         self.receivers.iter().filter_map(|(&owner, receiver)| {
-            Some((owner, receiver.selector_owner?, &receiver.subscriber))
+            let DataReceiveIntent::Explicit(subscriber) = &receiver.intent else {
+                return None;
+            };
+            Some((owner, receiver.selector_owner?, subscriber))
         })
     }
 
     pub fn release_receiver(&mut self, owner: TrackOwner) -> bool {
-        self.receivers.remove(&owner).is_some()
+        self.receivers.remove(&owner).is_some() || self.data_sets.remove(&owner).is_some()
+    }
+
+    pub(crate) fn open_data_set(&mut self, owner: TrackOwner) -> Result<(), TrackResourceError> {
+        self.begin_intent(owner)?;
+        self.data_sets
+            .insert(owner, Ok(data_set::DataSetQueue::default()));
+        Ok(())
+    }
+
+    pub(crate) fn has_data_set(&self, owner: TrackOwner) -> bool {
+        self.data_sets.contains_key(&owner)
+    }
+
+    pub(crate) fn data_set_error(&self, owner: TrackOwner) -> Option<&crate::ffi::ErrorInfo> {
+        self.data_sets.get(&owner)?.as_ref().err()
+    }
+
+    pub(crate) fn failed_data_set_owners(&self) -> impl Iterator<Item = TrackOwner> + '_ {
+        self.data_sets
+            .iter()
+            .filter_map(|(&owner, set)| set.is_err().then_some(owner))
+    }
+
+    pub(crate) fn terminate_data_set(
+        &mut self,
+        owner: TrackOwner,
+        error: crate::ffi::ErrorInfo,
+    ) -> bool {
+        let Some(reader @ Ok(_)) = self.data_sets.get_mut(&owner) else {
+            return false;
+        };
+        *reader = Err(error);
+        true
     }
 
     pub fn registrations(&self) -> TopicRegistrations {
@@ -1662,7 +1858,10 @@ impl TrackResources {
                 .receivers
                 .values()
                 .filter(|receiver| receiver.failure.is_none() && receiver.selector_owner.is_none())
-                .map(|receiver| receiver.subscriber.clone())
+                .filter_map(|receiver| match &receiver.intent {
+                    DataReceiveIntent::Explicit(subscriber) => Some(subscriber.clone()),
+                    DataReceiveIntent::Inherit(_) => None,
+                })
                 .collect(),
         };
         registrations.normalize();
@@ -1671,6 +1870,12 @@ impl TrackResources {
     }
 
     pub fn read(&mut self, owner: TrackOwner) -> Result<Option<DataEvent>, TrackResourceError> {
+        if let Some(reader) = self.data_sets.get_mut(&owner) {
+            return match reader {
+                Ok(reader) => Ok(reader.pop()),
+                Err(error) => Err(TrackResourceError::ReceiveFailed(error.clone())),
+            };
+        }
         let receiver = self
             .receivers
             .get_mut(&owner)
@@ -1681,7 +1886,7 @@ impl TrackResources {
         Ok(receiver
             .discontinuity
             .take()
-            .or_else(|| receiver.queue.pop_front()))
+            .or_else(|| receiver.queue.pop()))
     }
 
     pub(crate) fn fail_receivers_for_source(
@@ -1692,12 +1897,14 @@ impl TrackResources {
     ) -> ReceiveUpdate {
         let mut update = ReceiveUpdate::default();
         for (owner, receiver) in &mut self.receivers {
-            let subscriber = &receiver.subscriber;
             if receiver.failure.is_some()
-                || subscriber.room != source.room
-                || subscriber.participant_id != source.participant_id
-                || subscriber.topic != source.track_id
-                || mode.is_some_and(|mode| subscriber.mode != mode)
+                || (mode.is_some() && matches!(receiver.intent, DataReceiveIntent::Inherit(_)))
+                || !receiver.intent.matches(
+                    &source.room,
+                    &source.participant_id,
+                    &source.track_id,
+                    mode,
+                )
             {
                 continue;
             }
@@ -1708,49 +1915,156 @@ impl TrackResources {
         update
     }
 
+    pub(crate) fn retire_inherited_data_source(
+        &mut self,
+        source: &TrackSelector,
+        replacement: Option<&str>,
+    ) -> Vec<TrackOwner> {
+        self.receivers.iter_mut().filter_map(|(&owner, reader)| {
+            if reader.failure.is_some()
+                || !matches!(&reader.intent, DataReceiveIntent::Inherit(selected) if selected == source)
+                || !reader.source.as_ref().is_some_and(|(publication, mode)| {
+                    *mode == TopicMode::Ordered && Some(publication.as_str()) != replacement
+                })
+            {
+                return None;
+            }
+            reader.lose_continuity("Reliable source was retired");
+            Some(owner)
+        }).collect()
+    }
+
+    pub(crate) fn retire_data_sets_for_source(
+        &mut self,
+        source: &TrackSelector,
+        replacement: Option<&str>,
+    ) -> Vec<TrackOwner> {
+        self.update_data_sets(|_, reader| reader.retire(source, replacement))
+    }
+
+    pub(crate) fn revoke_data_set_memberships(
+        &mut self,
+        owner: TrackOwner,
+        current: impl FnMut(&TrackSelector) -> bool,
+    ) -> bool {
+        let Some(Ok(reader)) = self.data_sets.get_mut(&owner) else {
+            return false;
+        };
+        match reader.revoke_unmatched(current) {
+            Ok(ready) => ready,
+            Err(error) => self.terminate_data_set(owner, error),
+        }
+    }
+
+    fn update_data_sets(
+        &mut self,
+        mut update: impl FnMut(
+            TrackOwner,
+            &mut data_set::DataSetQueue,
+        ) -> Result<bool, crate::ffi::ErrorInfo>,
+    ) -> Vec<TrackOwner> {
+        self.data_sets
+            .iter_mut()
+            .filter_map(|(&owner, entry)| {
+                let Ok(reader) = entry else { return None };
+                match update(owner, reader) {
+                    Ok(ready) => ready.then_some(owner),
+                    Err(error) => {
+                        *entry = Err(error);
+                        Some(owner)
+                    }
+                }
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
     pub(crate) fn receive_data_v1(
         &mut self,
         subscriber: &TopicSubscriber,
         publication_id: &str,
         unit: crate::data_v1::AssembledUnit,
     ) -> Vec<u64> {
+        self.receive_admitted_data_v1(subscriber, publication_id, unit, |_| false)
+    }
+
+    pub(crate) fn receive_admitted_data_v1(
+        &mut self,
+        subscriber: &TopicSubscriber,
+        publication_id: &str,
+        unit: crate::data_v1::AssembledUnit,
+        mut set_contains_source: impl FnMut(TrackOwner) -> bool,
+    ) -> Vec<u64> {
         let event = DataEvent::Message {
             participant_id: subscriber.participant_id.clone(),
+            track_id: subscriber.topic.clone(),
             publication_id: publication_id.to_owned(),
+            delivery: subscriber.mode.into(),
             sequence: unit.unit_seq,
             data: unit.bytes,
             captured_at: unit.captured_at,
             fragment_descriptors: (!unit.fragment_descriptors.is_empty())
                 .then_some(unit.fragment_descriptors),
         };
-        self.receivers
+        let mut ready: Vec<_> = self
+            .receivers
             .iter_mut()
             .filter(|(_, receiver)| {
-                receiver.failure.is_none() && receiver.subscriber == *subscriber
+                receiver.failure.is_none()
+                    && receiver.intent.matches(
+                        &subscriber.room,
+                        &subscriber.participant_id,
+                        &subscriber.topic,
+                        Some(subscriber.mode),
+                    )
             })
             .map(|(owner, receiver)| {
                 receiver.push(event.clone());
                 owner.id()
             })
-            .collect()
+            .collect();
+        if !self.data_sets.is_empty() {
+            let source = TrackSelector {
+                room: subscriber.room.clone(),
+                participant_id: subscriber.participant_id.clone(),
+                track_id: subscriber.topic.clone(),
+            };
+            ready.extend(
+                self.update_data_sets(|owner, reader| {
+                    if !set_contains_source(owner) {
+                        return Ok(false);
+                    }
+                    reader.push(&source, publication_id, subscriber.mode, event.clone())
+                })
+                .into_iter()
+                .map(TrackOwner::id),
+            );
+        }
+        ready
     }
 
     /// Feed only notifications already validated and deduplicated by the topic transport.
     pub fn notify(&mut self, notification: &TopicNotification) -> ReceiveUpdate {
         let mut update = ReceiveUpdate::default();
         for (owner, receiver) in &mut self.receivers {
+            let DataReceiveIntent::Explicit(subscriber) = &receiver.intent else {
+                continue;
+            };
             if receiver.failure.is_some() {
                 continue;
             }
             match notification {
                 TopicNotification::Message(message)
-                    if receiver.subscriber.room == message.room
-                        && receiver.subscriber.topic == message.topic
-                        && receiver.subscriber.mode == message.mode =>
+                    if subscriber.room == message.room
+                        && subscriber.participant_id == message.participant_id
+                        && subscriber.topic == message.topic
+                        && subscriber.mode == message.mode =>
                 {
                     receiver.push(DataEvent::Message {
                         participant_id: message.participant_id.clone(),
+                        track_id: message.topic.clone(),
                         publication_id: message.publication_id.clone(),
+                        delivery: message.mode.into(),
                         sequence: message.sequence,
                         data: message.payload.clone(),
                         captured_at: None,
@@ -1758,15 +2072,19 @@ impl TrackResources {
                     });
                 }
                 TopicNotification::RecoveryGap { subscriber, .. }
-                    if &receiver.subscriber == subscriber
-                        && subscriber.mode == TopicMode::Ordered =>
+                    if receiver.intent.matches(
+                        &subscriber.room,
+                        &subscriber.participant_id,
+                        &subscriber.topic,
+                        Some(TopicMode::Ordered),
+                    ) && subscriber.mode == TopicMode::Ordered =>
                 {
                     receiver.lose_continuity("Reliable transport recovery was exhausted");
                 }
                 TopicNotification::ChannelFailed {
-                    channel: TopicChannel::Subscriber(subscriber),
+                    channel: TopicChannel::Subscriber(failed),
                     message,
-                } if &receiver.subscriber == subscriber => {
+                } if subscriber == failed => {
                     receiver.fail(TrackResourceError::ReceiveChannelFailed(message.clone()));
                 }
                 _ => continue,

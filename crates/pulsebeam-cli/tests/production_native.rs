@@ -186,6 +186,14 @@ async fn foreign_witness(
                 Ok(DataUpdate::Event {
                     event: DataEvent::Discontinuity { .. },
                 }) => bail!("owned data stream unexpectedly changed source"),
+                Ok(DataUpdate::Event {
+                    event:
+                        DataEvent::SourceFailed {
+                            publication_id,
+                            error,
+                            ..
+                        },
+                }) => bail!("source {publication_id} failed: {error:?}"),
             }
         }
     });

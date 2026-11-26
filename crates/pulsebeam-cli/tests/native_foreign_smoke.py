@@ -119,8 +119,7 @@ async def witness(endpoint, token, reader_token, catalog_token, room, package):
         assert wrong_scope.error.code == core.ErrorCode.INVALID_ARGUMENT
 
         data = agent.data("foreign-bytes").publish()
-        room_cursor = reader.room(room).participant("foreign").data(
-            "foreign-bytes").subscribe()
+        room_cursor = reader.room(room).data(core.TrackFilter(track_id="foreign-bytes")).subscribe()
         participant_cursor = reader.room(room).participant("foreign").data(
             "foreign-bytes").subscribe()
         reader.join(room)
@@ -184,12 +183,54 @@ async def witness(endpoint, token, reader_token, catalog_token, room, package):
         )
         assert room_message.data == payload == participant_message.data
         assert room_message.sequence == participant_message.sequence
-        await room_cursor.close()
-        assert await room_cursor.next() is None
-        assert not participant_cursor.is_closed()
-        await data.send(payload[::-1])
-        assert (await message(participant_cursor, payload[::-1])).data == payload[::-1]
+        assert room_message.delivery == core.DataDelivery.RELIABLE
+        assert room_message.track_id == "foreign-bytes"
+        old_publication = room_message.publication_id
+        await data.close()
+        while True:
+            failure = await room_cursor.next()
+            assert failure is not None and failure.publication_id == old_publication, failure
+            if failure.is_SOURCE_FAILED():
+                break
+            # Setup sends can finish after the observed payload; already queued
+            # units still belong to the retired publication, not its replacement.
+            assert failure.is_MESSAGE() and failure.data == setup, failure
+            assert failure.delivery == core.DataDelivery.RELIABLE
+        assert failure.error.code == core.ErrorCode.CONTINUITY_LOST
+        try:
+            unexpected = await participant_cursor.next()
+        except native.NativeError.Operation as error:
+            assert error.info.code == core.ErrorCode.CONTINUITY_LOST
+        else:
+            raise AssertionError(f"reliable exact reader survived publication retirement: {unexpected!r}")
         await participant_cursor.close()
+
+        latest = agent.data("foreign-bytes").publish(
+            core.DataPublishOptions(delivery=core.DataDelivery.LATEST))
+        updates = latest.updates()
+        try:
+            while latest.state().execution != core.PublicationExecution.INSTALLED:
+                assert await updates.next() is not None
+        finally:
+            updates.close()
+
+        async def publish_latest():
+            while True:
+                await latest.send(payload[::-1])
+                await asyncio.sleep(0.2)
+
+        producer = asyncio.create_task(publish_latest())
+        try:
+            replacement = await message(room_cursor, payload[::-1])
+            assert replacement.delivery == core.DataDelivery.LATEST
+            assert replacement.track_id == "foreign-bytes"
+            assert replacement.publication_id != old_publication
+        finally:
+            producer.cancel()
+            await asyncio.gather(producer, return_exceptions=True)
+            await room_cursor.close()
+            await latest.close()
+        assert await room_cursor.next() is None
         await admitted_publication(core, publication)
         exchange = agent.data("foreign-exchange").publish()
         replies = agent.room(room).participant("publisher").data(

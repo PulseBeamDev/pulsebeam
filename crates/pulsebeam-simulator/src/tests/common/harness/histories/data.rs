@@ -270,6 +270,13 @@ impl DataLane {
                 DataEvent::Discontinuity { .. } => {
                     anyhow::bail!("unexpected DATA source change in a fixed-source history")
                 }
+                DataEvent::SourceFailed {
+                    publication_id,
+                    error,
+                    ..
+                } => {
+                    anyhow::bail!("source {publication_id} failed: {error:?}")
+                }
             }
         }
         anyhow::bail!("data events exceeded bounded supplied history")

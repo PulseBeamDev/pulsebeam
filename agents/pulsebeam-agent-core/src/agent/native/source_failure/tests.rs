@@ -154,7 +154,7 @@ fn rejected_exact_source_fails_only_its_cohort_with_a_durable_typed_cause() {
             first_state.error.as_ref().map(|value| value.code),
             Some(expected)
         );
-        assert_eq!(other_state.selector.room, "other");
+        assert_eq!(other_state.selector.unwrap().room, "other");
         assert_eq!(
             other_state.source_status,
             crate::ffi::SubscriptionSourceStatus::Pending
@@ -180,6 +180,203 @@ fn rejected_exact_source_fails_only_its_cohort_with_a_durable_typed_cause() {
         assert_eq!(ready, vec![first, second]);
         assert_eq!(agent.snapshot().topics.subscribers.len(), 2);
     }
+}
+
+#[test]
+fn data_set_dispatch_checks_each_owner_and_stops_at_withdrawn_membership() {
+    let (mut agent, generation, channel) = connected(crate::TopicRegistrations::default());
+    let ResourceResult::Owned { owner } = agent
+        .resource(ResourceCommand::OpenDataSet {
+            room: "room".into(),
+            filter: crate::TrackFilter {
+                track_id: Some("events".into()),
+                ..Default::default()
+            },
+        })
+        .unwrap()
+    else {
+        panic!("data set owner")
+    };
+    let Effect::DataChannel(DataChannelEffect::Send {
+        operation, payload, ..
+    }) = agent.next_effect_after_turn().expect("selector request")
+    else {
+        panic!("selector request")
+    };
+    agent
+        .handle(HostEvent::DataChannel(DataChannelEvent::Sent {
+            operation,
+            generation,
+            channel,
+        }))
+        .unwrap();
+    let mut batch = codec::decode_client(&payload).unwrap();
+    let record = batch.records.pop().unwrap();
+    let desired = record.desired.unwrap();
+    let Some(state::desired_state::Value::Present(spec)) = desired.value else {
+        panic!("selector declaration")
+    };
+    let address = state::LogicalSourceAddress {
+        room: "room".into(),
+        participant_id: "alice".into(),
+        kind: state::TrackKind::Data as i32,
+        track_id: "events".into(),
+    };
+    let report = |matches| state::ConfirmedState {
+        evaluated_revision: desired.revision,
+        rejection: None,
+        value: Some(state::confirmed_state::Value::SubscriptionSelector(
+            Box::new(state::SubscriptionSelectorState {
+                spec: Some((*spec).clone()),
+                status: state::SelectorMatchStatus::Complete as i32,
+                matches,
+            }),
+        )),
+    };
+    let deliver = |agent: &mut Agent, participant: &str, sequence| {
+        Agent::deliver_completed_data(
+            &mut agent.resources,
+            &agent.selectors,
+            &agent.active.as_ref().unwrap().state,
+            &mut agent.notifications,
+            &crate::TopicSubscriber {
+                room: "room".into(),
+                participant_id: participant.into(),
+                topic: "events".into(),
+                mode: TopicMode::Ordered,
+            },
+            "publication",
+            crate::data_v1::AssembledUnit {
+                unit_seq: sequence,
+                captured_at: None,
+                bytes: vec![42],
+                fragment_descriptors: vec![],
+            },
+        );
+    };
+    deliver(&mut agent, "alice", 0);
+    assert_waiting(&mut agent, owner);
+    reply(
+        &mut agent,
+        generation,
+        channel,
+        record.owned,
+        report(vec![address]),
+    );
+    deliver(&mut agent, "bob", 1);
+    assert_waiting(&mut agent, owner);
+    deliver(&mut agent, "alice", 2);
+    reply(
+        &mut agent,
+        generation,
+        channel,
+        record.owned,
+        report(vec![]),
+    );
+    deliver(&mut agent, "alice", 3);
+    let mut read = || agent.resource(ResourceCommand::ReadData { owner }).unwrap();
+    assert!(matches!(
+        read(),
+        ResourceResult::Event {
+            event: Some(crate::DataEvent::Message { sequence: 2, .. }),
+        }
+    ));
+    assert!(matches!(read(), ResourceResult::Event {
+        event: Some(crate::DataEvent::SourceFailed { publication_id, .. }),
+    } if publication_id == "publication"));
+    assert_eq!(read(), ResourceResult::Event { event: None });
+}
+
+#[test]
+fn inherited_exact_source_loses_reliable_continuity_on_confirmed_replacement() {
+    let (mut agent, generation, channel) = connected(crate::TopicRegistrations::default());
+    let source = crate::TrackSelector {
+        room: "room".into(),
+        participant_id: "alice".into(),
+        track_id: "events".into(),
+    };
+    let ResourceResult::Owned { owner } = agent
+        .resource(ResourceCommand::ReceiveInheritedData {
+            source: source.clone(),
+        })
+        .unwrap()
+    else {
+        panic!("inherited exact owner")
+    };
+    assert_eq!(agent.data_subscription_state(owner).unwrap().delivery, None);
+    let (reference, revision, spec) = take_lookup(&mut agent, generation, channel);
+    let confirmed = |publication_id: &str, source_revision, delivery: state::DataDelivery| {
+        state::ConfirmedState {
+            evaluated_revision: revision,
+            rejection: None,
+            value: Some(state::confirmed_state::Value::LogicalSubscription(
+                Box::new(state::LogicalSubscriptionState {
+                    spec: Some((*spec).clone()),
+                    source_revision,
+                    execution: None,
+                    data_v1: None,
+                    source: Some(state::Track {
+                        publication_id: publication_id.into(),
+                        participant_id: source.participant_id.clone(),
+                        room_id: source.room.clone(),
+                        track_id: source.track_id.clone(),
+                        kind: Some(state::track::Kind::Data(state::DataTrack {
+                            capture_clock: None,
+                            delivery: delivery as i32,
+                            record_dd: false,
+                        })),
+                    }),
+                }),
+            )),
+        }
+    };
+    reply(
+        &mut agent,
+        generation,
+        channel,
+        reference,
+        confirmed("original", 1, state::DataDelivery::Ordered),
+    );
+    assert_eq!(
+        agent.data_subscription_state(owner).unwrap().delivery,
+        Some(crate::ffi::TopicMode::Ordered)
+    );
+    let registration = crate::TopicSubscriber {
+        room: source.room.clone(),
+        participant_id: source.participant_id.clone(),
+        topic: source.track_id.clone(),
+        mode: TopicMode::Ordered,
+    };
+    assert_eq!(
+        agent.resources.receive_data_v1(
+            &registration,
+            "original",
+            crate::data_v1::AssembledUnit {
+                unit_seq: 7,
+                captured_at: None,
+                bytes: b"old".to_vec(),
+                fragment_descriptors: vec![],
+            }
+        ),
+        [owner]
+    );
+    assert!(
+        matches!(agent.resource(ResourceCommand::ReadData { owner }), Ok(ResourceResult::Event {
+        event: Some(crate::DataEvent::Message { publication_id, delivery: crate::ffi::DataDelivery::Reliable, .. }),
+    }) if publication_id == "original")
+    );
+    reply(
+        &mut agent,
+        generation,
+        channel,
+        reference,
+        confirmed("replacement", 2, state::DataDelivery::Latest),
+    );
+    assert_eq!(
+        read_error(&mut agent, owner).code,
+        ErrorCode::ContinuityLost
+    );
+    assert!(agent.resources.inherited_data_demand().next().is_none());
 }
 
 #[test]
@@ -220,8 +417,9 @@ fn delivery_mismatch_fails_only_incompatible_receivers_and_revocation_keeps_the_
     );
     let ordered_state = agent.data_subscription_state(ordered).unwrap();
     let latest_state = agent.data_subscription_state(latest).unwrap();
-    assert_eq!(ordered_state.selector.room, "room");
-    assert_eq!(ordered_state.selector.participant_id, "alice");
+    let ordered_selector = ordered_state.selector.as_ref().unwrap();
+    assert_eq!(ordered_selector.room, "room");
+    assert_eq!(ordered_selector.participant_id, "alice");
     assert_eq!(
         ordered_state.source_track_id.as_deref(),
         Some("opaque-source")

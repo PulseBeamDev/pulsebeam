@@ -122,15 +122,16 @@ fn named_resources_project_their_own_prejoin_configuration() {
     else {
         panic!("expected data subscription projection")
     };
+    let selector = state.selector.unwrap();
     assert_eq!(
         (
-            state.selector.room.as_str(),
-            state.selector.participant_id.as_str(),
-            state.selector.track_id.as_str()
+            selector.room.as_str(),
+            selector.participant_id.as_str(),
+            selector.track_id.as_str()
         ),
         ("room", "alice", "chat")
     );
-    assert_eq!(state.delivery, agent_core::ffi::TopicMode::Ordered);
+    assert_eq!(state.delivery, Some(agent_core::ffi::TopicMode::Ordered));
     assert!(!state.closed);
     assert!(ResourceKind::Video.state(&agent, audio).is_none());
     assert!(ResourceKind::Audio.state(&agent, video).is_none());

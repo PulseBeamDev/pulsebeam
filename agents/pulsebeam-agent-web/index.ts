@@ -26,6 +26,7 @@ export {
   CatalogWatchState as WatchState,
   DataPublication,
   DataPublicationUpdates,
+  DataSetRef,
   DataSubscription,
   DataSubscriptionUpdates,
   LocalAudioTrack,

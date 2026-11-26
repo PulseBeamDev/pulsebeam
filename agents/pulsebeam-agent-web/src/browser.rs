@@ -594,14 +594,38 @@ impl BrowserRuntime {
     #[cfg(feature = "uniffi")]
     pub(crate) fn claim_data_subscription(
         &self,
-        spec: agent_core::TrackSpec,
+        delivery: Option<agent_core::ffi::DataDelivery>,
         source: agent_core::TrackSelector,
     ) -> Result<
         (u64, Rc<agent_core::observer::DataSubscriptionStateObserver>),
         agent_core::ffi::ErrorInfo,
     > {
         self.claim_observed_resource(
-            agent_core::ResourceCommand::ReceiveData { spec, source },
+            match delivery {
+                Some(delivery) => agent_core::ResourceCommand::ReceiveData {
+                    spec: agent_core::TrackSpec::Data {
+                        track_id: source.track_id.clone(),
+                        delivery: delivery.into(),
+                    },
+                    source,
+                },
+                None => agent_core::ResourceCommand::ReceiveInheritedData { source },
+            },
+            |owner| self.data_subscription_state_observer(owner),
+        )
+    }
+
+    #[cfg(feature = "uniffi")]
+    pub(crate) fn claim_data_set(
+        &self,
+        room: String,
+        filter: agent_core::TrackFilter,
+    ) -> Result<
+        (u64, Rc<agent_core::observer::DataSubscriptionStateObserver>),
+        agent_core::ffi::ErrorInfo,
+    > {
+        self.claim_observed_resource(
+            agent_core::ResourceCommand::OpenDataSet { room, filter },
             |owner| self.data_subscription_state_observer(owner),
         )
     }

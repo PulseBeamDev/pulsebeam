@@ -342,6 +342,12 @@ async def witness():
             raise AssertionError("closed data publication accepted a send")
         replacement_data = local.publish()
         await replacement_data.close()
+        data_set = room.data(core.TrackFilter(track_id="control")).subscribe()
+        assert data_set.state().selector is None and data_set.state().delivery is None
+        pending_set_read = asyncio.create_task(data_set.next())
+        await asyncio.sleep(0)
+        await data_set.close()
+        assert await pending_set_read is None and data_set.state().closed
         closed_cursor = remote.subscribe()
         independent_cursor = remote.subscribe()
         participant_cursor = remote.subscribe()

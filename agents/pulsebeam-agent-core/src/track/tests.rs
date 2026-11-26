@@ -1170,7 +1170,9 @@ fn unreliable_receive_owners_filter_participants_rebind_and_keep_independent_byt
             resources.read(alice).unwrap(),
             Some(DataEvent::Message {
                 participant_id: "alice".into(),
+                track_id: "events".into(),
                 publication_id: track.into(),
+                delivery: crate::ffi::DataDelivery::Unreliable,
                 sequence: 1,
                 data: vec![255, 0],
                 captured_at: None,
@@ -1224,7 +1226,9 @@ fn exact_receive_references_share_until_the_last_owner_and_rooms_stay_distinct()
         resources.read(second).unwrap(),
         Some(DataEvent::Message {
             participant_id: "alice".into(),
+            track_id: "events".into(),
             publication_id: "a-track".into(),
+            delivery: crate::ffi::DataDelivery::Reliable,
             sequence: 0,
             data: b"a".to_vec(),
             captured_at: None,
@@ -1285,6 +1289,145 @@ fn selector_data_cursors_share_delivery_without_registering_exact_interest() {
     );
 }
 
+fn data_set_unit(sequence: u64) -> crate::data_v1::AssembledUnit {
+    crate::data_v1::AssembledUnit {
+        unit_seq: sequence,
+        captured_at: None,
+        bytes: vec![42],
+        fragment_descriptors: vec![],
+    }
+}
+
+fn data_set_source(participant: &str, mode: TopicMode) -> TopicSubscriber {
+    TopicSubscriber {
+        room: "room".into(),
+        participant_id: participant.into(),
+        topic: "events".into(),
+        mode,
+    }
+}
+
+#[test]
+fn data_set_keeps_queued_attribution_and_fences_only_the_retired_publication() {
+    use crate::ffi::{DataDelivery, ErrorCode};
+
+    let mut resources = TrackResources::default();
+    let owner = resources.new_owner().unwrap();
+    let unrelated = resources.new_owner().unwrap();
+    resources.open_data_set(owner).unwrap();
+    resources.open_data_set(unrelated).unwrap();
+    let old = data_set_source("alice", TopicMode::Ordered);
+    let replacement = data_set_source("alice", TopicMode::Latest);
+    let sibling = data_set_source("bob", TopicMode::Ordered);
+    for (source, publication, sequence) in [
+        (&old, "A", 7),
+        (&old, "A", 8),
+        (&sibling, "C", 1),
+        (&sibling, "C", 2),
+        (&replacement, "B", 1),
+        (&replacement, "B", 2),
+    ] {
+        assert_eq!(
+            resources.receive_admitted_data_v1(
+                source,
+                publication,
+                data_set_unit(sequence),
+                |target| target == owner,
+            ),
+            [owner.id()]
+        );
+    }
+    assert!(
+        resources
+            .receive_admitted_data_v1(&old, "A", data_set_unit(9), |target| target == owner,)
+            .is_empty()
+    );
+    let label = |event: DataEvent| match event {
+        DataEvent::Message {
+            publication_id,
+            track_id,
+            sequence,
+            delivery,
+            ..
+        } => {
+            assert_eq!(track_id, "events");
+            assert_eq!(
+                delivery,
+                if publication_id == "B" {
+                    DataDelivery::Latest
+                } else {
+                    DataDelivery::Reliable
+                }
+            );
+            (publication_id, Some(sequence))
+        }
+        DataEvent::SourceFailed {
+            publication_id,
+            track_id,
+            error,
+            ..
+        } => {
+            assert_eq!(track_id, "events");
+            assert_eq!(error.code, ErrorCode::ContinuityLost);
+            (publication_id, None)
+        }
+        other => panic!("unexpected read: {other:?}"),
+    };
+    let events: Vec<_> = core::iter::from_fn(|| resources.read(owner).unwrap())
+        .map(label)
+        .collect();
+    assert_eq!(
+        events,
+        [
+            ("A".into(), Some(7)),
+            ("C".into(), Some(1)),
+            ("B".into(), Some(2)),
+            ("A".into(), Some(8)),
+            ("C".into(), Some(2)),
+            ("A".into(), None),
+        ]
+    );
+    assert_eq!(resources.read(unrelated).unwrap(), None);
+    assert!(
+        resources
+            .receive_admitted_data_v1(&old, "A", data_set_unit(10), |target| target == owner,)
+            .is_empty()
+    );
+    assert_eq!(resources.read(owner).unwrap(), None);
+}
+
+#[test]
+fn data_set_failure_retention_is_bounded_even_after_drain() {
+    let mut resources = TrackResources::default();
+    let owner = resources.new_owner().unwrap();
+    resources.open_data_set(owner).unwrap();
+    let source = data_set_source("alice", TopicMode::Ordered);
+    for index in 0..=DATA_RECEIVE_CAPACITY {
+        let publication = format!("publication-{index}");
+        assert_eq!(
+            resources
+                .receive_admitted_data_v1(&source, &publication, data_set_unit(0), |target| target
+                    == owner,),
+            [owner.id()]
+        );
+        while resources.read(owner).unwrap().is_some() {}
+    }
+    assert_eq!(
+        resources.receive_admitted_data_v1(&source, "overflow", data_set_unit(0), |target| target
+            == owner,),
+        [owner.id()]
+    );
+    assert!(
+        matches!(resources.read(owner), Err(TrackResourceError::ReceiveFailed(error))
+        if error.code == crate::ffi::ErrorCode::ContinuityLost)
+    );
+    assert!(
+        resources
+            .receive_admitted_data_v1(&source, "fresh", data_set_unit(0), |target| target == owner,)
+            .is_empty()
+    );
+}
+
 #[test]
 fn latest_coalesces_per_track_and_lossy_drops_oldest() {
     for mode in [TopicMode::Latest, TopicMode::Lossy] {
@@ -1318,38 +1461,47 @@ fn latest_coalesces_per_track_and_lossy_drops_oldest() {
 
 #[test]
 fn reliable_overflow_terminates_only_the_slow_subscription() {
-    let mut resources = TrackResources::default();
-    let slow = TrackOwner(1);
-    let fast = TrackOwner(2);
-    for owner in [slow, fast] {
-        resources
-            .receive(
-                owner,
-                &data(TopicMode::Ordered),
-                TrackSelector {
-                    room: "room".into(),
-                    participant_id: "alice".into(),
-                    track_id: "events".into(),
-                },
-            )
-            .unwrap();
-    }
-    for sequence in 0..=DATA_RECEIVE_CAPACITY as u64 {
-        resources.notify(&message(
-            TopicMode::Ordered,
-            "alice",
-            "track",
-            sequence,
-            &[],
-        ));
+    let full_unit = vec![0; crate::MAX_TOPIC_PAYLOAD_BYTES];
+    for (payload, boundary) in [
+        (&[][..], DATA_RECEIVE_CAPACITY),
+        (
+            full_unit.as_slice(),
+            DataReadQueue::BYTE_LIMIT / full_unit.len(),
+        ),
+    ] {
+        let mut resources = TrackResources::default();
+        let slow = TrackOwner(1);
+        let fast = TrackOwner(2);
+        for owner in [slow, fast] {
+            resources
+                .receive(
+                    owner,
+                    &data(TopicMode::Ordered),
+                    TrackSelector {
+                        room: "room".into(),
+                        participant_id: "alice".into(),
+                        track_id: "events".into(),
+                    },
+                )
+                .unwrap();
+        }
+        for sequence in 0..=boundary as u64 {
+            resources.notify(&message(
+                TopicMode::Ordered,
+                "alice",
+                "track",
+                sequence,
+                payload,
+            ));
+            assert!(
+                matches!(resources.read(fast), Ok(Some(DataEvent::Message { sequence: observed, .. })) if observed == sequence)
+            );
+        }
         assert!(
-            matches!(resources.read(fast), Ok(Some(DataEvent::Message { sequence: observed, .. })) if observed == sequence)
+            matches!(resources.read(slow), Err(TrackResourceError::ReceiveFailed(error)) if error.code == crate::ffi::ErrorCode::ContinuityLost)
         );
+        assert_eq!(resources.registrations().subscribers.len(), 1);
     }
-    assert!(
-        matches!(resources.read(slow), Err(TrackResourceError::ReceiveFailed(error)) if error.code == crate::ffi::ErrorCode::ContinuityLost)
-    );
-    assert_eq!(resources.registrations().subscribers.len(), 1);
 }
 
 #[test]

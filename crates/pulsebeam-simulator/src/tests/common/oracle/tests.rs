@@ -412,12 +412,12 @@ fn subscriber_bindings_follow_declared_room_topic_and_mode() {
         evaluated_revision: 1,
         accepted_revision: Some(1),
         rejected_revision: None,
-        selector: TrackSelector {
+        selector: Some(TrackSelector {
             room: registration.room.clone(),
             participant_id: registration.participant_id.clone(),
             track_id: registration.topic.clone(),
-        },
-        delivery: registration.mode.into(),
+        }),
+        delivery: Some(registration.mode.into()),
         local_enabled: true,
         closed: false,
         source_status: SubscriptionSourceStatus::Available,

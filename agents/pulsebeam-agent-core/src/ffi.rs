@@ -187,6 +187,16 @@ pub enum TopicMode {
     Ordered,
 }
 
+impl From<crate::TopicMode> for DataDelivery {
+    fn from(value: crate::TopicMode) -> Self {
+        match value {
+            crate::TopicMode::Ordered => Self::Reliable,
+            crate::TopicMode::Lossy => Self::Unreliable,
+            crate::TopicMode::Latest => Self::Latest,
+        }
+    }
+}
+
 impl From<DataDelivery> for crate::TopicMode {
     fn from(value: DataDelivery) -> Self {
         match value {

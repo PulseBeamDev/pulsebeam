@@ -971,7 +971,9 @@ fn qualification_rejects_missing_payload_sequential_peers_and_unretired_graphs()
         "gap without a complete DATA unit qualified"
     );
     let message = DataEvent::Message {
+        track_id: TOPIC.into(),
         publication_id: "publication".into(),
+        delivery: TopicMode::Latest.into(),
         sequence: 0,
         participant_id: "v4".into(),
         data: A_TO_B.to_vec(),

@@ -458,6 +458,35 @@ impl RoomRef {
     }
 }
 
+#[uniffi::export]
+impl RoomRef {
+    #[uniffi::method(default(filter = None))]
+    pub fn data(&self, filter: Option<agent_core::TrackFilter>) -> Arc<DataSetRef> {
+        Arc::new(DataSetRef {
+            room: self.runtime.clone(),
+            filter: filter.unwrap_or_default(),
+        })
+    }
+}
+
+#[derive(uniffi::Object)]
+pub struct DataSetRef {
+    room: crate::RoomRef,
+    filter: agent_core::TrackFilter,
+}
+
+#[uniffi::export]
+impl DataSetRef {
+    pub fn subscribe(&self) -> Result<Arc<DataSubscription>, NativeError> {
+        Ok(Arc::new(DataSubscription {
+            runtime: self
+                .room
+                .subscribe_data(self.filter.clone())
+                .map_err(operation_error)?,
+        }))
+    }
+}
+
 #[derive(uniffi::Object)]
 pub struct Watch {
     runtime: crate::Watch,
@@ -598,10 +627,7 @@ impl RemoteDataTrack {
     ) -> Result<Arc<DataSubscription>, NativeError> {
         Ok(Arc::new(DataSubscription {
             runtime: self.runtime.subscribe_with_delivery(
-                options
-                    .and_then(|value| value.delivery)
-                    .unwrap_or_default()
-                    .into(),
+                options.and_then(|value| value.delivery).map(Into::into),
             )?,
         }))
     }

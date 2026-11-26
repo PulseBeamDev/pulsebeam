@@ -1272,7 +1272,7 @@ pub(super) fn reconcile(
         wanted.insert(resource, spec);
     }
     let mut data = BTreeMap::new();
-    let subscribers: BTreeMap<_, Vec<_>> = desired
+    let mut subscribers: BTreeMap<_, (BTreeSet<_>, bool)> = desired
         .topics
         .subscribers
         .iter()
@@ -1284,10 +1284,16 @@ pub(super) fn reconcile(
                     participant_id: subscriber.participant_id.clone(),
                     track_id: subscriber.topic.clone(),
                 })
-                .or_default()
-                .push(subscriber);
+                .or_insert_with(|| (BTreeSet::new(), false))
+                .0
+                .insert(subscriber.mode);
             by_source
         });
+    if session.capabilities.data_v1 {
+        for selector in resources.inherited_data_demand() {
+            subscribers.entry(selector.clone()).or_default().1 = true;
+        }
+    }
     for publisher in desired
         .topics
         .publishers
@@ -1302,7 +1308,7 @@ pub(super) fn reconcile(
             crate::TopicChannel::Publisher(publisher.clone()),
         );
     }
-    for (selector, registrations) in subscribers {
+    for (selector, (explicit_modes, inherit)) in subscribers {
         let resource = Resource::LogicalData(selector.clone());
         wanted.insert(
             resource.clone(),
@@ -1331,12 +1337,19 @@ pub(super) fn reconcile(
         {
             continue;
         }
-        let Some(registration) = registrations.into_iter().find(|subscriber| {
-            crate::TopicMode::from_delivery(format.delivery) == Some(subscriber.mode)
-        }) else {
+        let Some(delivery) = crate::TopicMode::from_delivery(format.delivery) else {
             continue;
         };
-        let Some(mode) = data_v1_delivery(registration.mode, session.reliable_data_enabled) else {
+        if !inherit && !explicit_modes.contains(&delivery) {
+            continue;
+        }
+        let registration = crate::TopicSubscriber {
+            room: selector.room,
+            participant_id: selector.participant_id,
+            topic: selector.track_id,
+            mode: delivery,
+        };
+        let Some(mode) = data_v1_delivery(delivery, session.reliable_data_enabled) else {
             continue;
         };
         if let Some(channel) = session.payload_resources.get(&resource).copied() {
@@ -2473,13 +2486,15 @@ impl Agent {
         }) = receiver.handle_control(generation, signaling, control, self.data_now)
         {
             if let Some(unit) = assembled {
-                let owners =
-                    self.resources
-                        .receive_data_v1(subscriber, &source.publication_id, unit);
-                if !owners.is_empty() {
-                    self.notifications
-                        .push_back(Notification::DataReady { owners });
-                }
+                Self::deliver_completed_data(
+                    &mut self.resources,
+                    &self.selectors,
+                    &active.state,
+                    &mut self.notifications,
+                    subscriber,
+                    &source.publication_id,
+                    unit,
+                );
             }
             // The parent retries expectations; never queue a stale outcome behind State.
             if self.pending_signal.is_none() && self.signal_retry.is_none() {
@@ -2756,6 +2771,38 @@ impl Agent {
                         if let Some(active) = &self.active {
                             self.selectors
                                 .observe_memberships(crate::TrackOwner(*owner), &active.state);
+                        }
+                        let owner = crate::TrackOwner(*owner);
+                        if self.resources.has_data_set(owner)
+                            && let Some(active) = &self.active
+                        {
+                            let selector = self.selectors.state(owner, Some(&active.state));
+                            let failure = selector.and_then(|selector| match selector.status {
+                                crate::SelectorStatus::Overflow => {
+                                    Some(crate::ffi::ErrorInfo::new(
+                                        crate::ffi::ErrorCode::CapacityExceeded,
+                                        "Data set selector capacity exceeded",
+                                    ))
+                                }
+                                crate::SelectorStatus::Rejected => selector.error,
+                                _ => None,
+                            });
+                            let ready = if let Some(error) = failure {
+                                self.resources.terminate_data_set(owner, error)
+                            } else {
+                                self.resources.revoke_data_set_memberships(owner, |source| {
+                                    self.selectors.contains_data_source(
+                                        owner,
+                                        &active.state,
+                                        source,
+                                    )
+                                })
+                            };
+                            if ready {
+                                self.notifications.push_back(Notification::DataReady {
+                                    owners: vec![owner.id()],
+                                });
+                            }
                         }
                         self.intent_dirty = true;
                     }

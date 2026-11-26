@@ -4439,6 +4439,21 @@ impl ClientContext {
                     Ok(DataUpdate::Event {
                         event: DataEvent::Discontinuity { .. },
                     }) => (),
+                    Ok(DataUpdate::Event {
+                        event:
+                            DataEvent::SourceFailed {
+                                publication_id,
+                                error,
+                                ..
+                            },
+                    }) => {
+                        log.failure.get_or_insert_with(|| {
+                            format!(
+                                "source {publication_id} for {registration:?} failed: {error:?}"
+                            )
+                        });
+                        break;
+                    }
                     Ok(DataUpdate::Closed) => break,
                     Err(error) => {
                         log.failure.get_or_insert_with(|| {

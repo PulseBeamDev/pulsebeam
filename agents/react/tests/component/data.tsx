@@ -1,14 +1,16 @@
 import assert from "node:assert/strict";
 import { StrictMode, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { Data, useAgent, type Agent, DataEvent } from "../../src/index.js";
+import { Data, DataDelivery, useAgent, type Agent, DataEvent } from "../../src/index.js";
 import { deferred, flush } from "./platform.js";
 import { captureDataReads } from "./scripted.js";
 
 const message = (sequence: bigint) =>
   DataEvent.Message.new({
     participantId: "alice",
+    trackId: "chat",
     publicationId: "chat-id",
+    delivery: DataDelivery.Reliable,
     sequence,
     data: Uint8Array.of(Number(sequence)),
   });

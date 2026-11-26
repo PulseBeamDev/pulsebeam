@@ -295,10 +295,11 @@ impl ApplicationStateOracle {
         }
         for (subscriber, state) in &observation.data_subscribers {
             ensure!(
-                state.selector.room == subscriber.room
-                    && state.selector.participant_id == subscriber.participant_id
-                    && state.selector.track_id == subscriber.topic
-                    && state.delivery == subscriber.mode.into(),
+                state.selector.as_ref().is_some_and(|selector| {
+                    selector.room == subscriber.room
+                        && selector.participant_id == subscriber.participant_id
+                        && selector.track_id == subscriber.topic
+                }) && state.delivery == Some(subscriber.mode.into()),
                 "wrong DATA subscription selector for {subscriber:?}: {state:?}"
             );
             let registration = pulsebeam_agent_native::agent_core::TopicPublisher {

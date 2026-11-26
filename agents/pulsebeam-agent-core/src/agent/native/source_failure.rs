@@ -48,24 +48,53 @@ impl Agent {
         let Resource::LogicalData(source) = resource else {
             return Ok(());
         };
-        let update = if let Some(error) = data_subscription_failure(confirmed) {
+        let replacement = match &confirmed.value {
+            Some(state::confirmed_state::Value::LogicalSubscription(subscription)) => Some(
+                subscription
+                    .source
+                    .as_ref()
+                    .map(|track| track.publication_id.as_str()),
+            ),
+            Some(state::confirmed_state::Value::Absent(absent))
+                if matches!(
+                    absent.reason(),
+                    state::AbsenceReason::SourceEnded
+                        | state::AbsenceReason::Gone
+                        | state::AbsenceReason::Removed
+                ) =>
+            {
+                Some(None)
+            }
+            _ => None,
+        };
+        let source_failure = data_subscription_failure(confirmed);
+        let mut retired = replacement.map_or_else(Vec::new, |replacement| {
+            self.resources
+                .retire_inherited_data_source(source, replacement)
+        });
+        if let Some(replacement) = replacement.or_else(|| source_failure.as_ref().map(|_| None)) {
+            retired.extend(
+                self.resources
+                    .retire_data_sets_for_source(source, replacement),
+            );
+        }
+        let mut update = if let Some(error) = source_failure {
             self.resources
                 .fail_receivers_for_source(source, None, &error)
         } else {
-            let Some(state::confirmed_state::Value::LogicalSubscription(subscription)) =
-                &confirmed.value
-            else {
-                return Ok(());
-            };
-            let Some(state::track::Kind::Data(data)) = subscription
-                .source
-                .as_ref()
-                .and_then(|track| track.kind.as_ref())
-            else {
-                return Ok(());
-            };
-            let Some(delivery) = crate::TopicMode::from_delivery(data.delivery) else {
-                return Ok(());
+            let delivery = match &confirmed.value {
+                Some(state::confirmed_state::Value::LogicalSubscription(subscription)) => {
+                    subscription
+                        .source
+                        .as_ref()
+                        .and_then(|track| match &track.kind {
+                            Some(state::track::Kind::Data(data)) => {
+                                crate::TopicMode::from_delivery(data.delivery)
+                            }
+                            _ => None,
+                        })
+                }
+                _ => None,
             };
             let error = ErrorInfo::new(
                 ErrorCode::InvalidArgument,
@@ -77,7 +106,7 @@ impl Agent {
                 crate::TopicMode::Lossy,
                 crate::TopicMode::Ordered,
             ] {
-                if mode == delivery {
+                if delivery.is_none_or(|delivery| mode == delivery) {
                     continue;
                 }
                 let rejected = self
@@ -88,6 +117,7 @@ impl Agent {
             }
             update
         };
+        update.ready.extend(retired);
         if update.registrations_changed {
             self.refresh_resources()?;
         }

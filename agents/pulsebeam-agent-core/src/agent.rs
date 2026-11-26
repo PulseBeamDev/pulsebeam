@@ -878,6 +878,22 @@ impl Agent {
                 self.resources.receive(owner, &spec, source)?;
                 ResourceResult::Owned { owner: owner.id() }
             }
+            ResourceCommand::OpenDataSet { room, filter } => {
+                let owner = self
+                    .open_media_collection(room, SelectorTrackKind::Data, filter)
+                    .map_err(AgentError::OperationFailed)?;
+                if let Err(error) = self.resources.open_data_set(owner) {
+                    self.close_subscription_selector(owner);
+                    return Err(error.into());
+                }
+                ResourceResult::Owned { owner: owner.id() }
+            }
+            ResourceCommand::ReceiveInheritedData { source } => {
+                let owner = self.resources.receive_inherited_data(source)?;
+                self.intent_dirty = true;
+                self.request_reconciliation();
+                ResourceResult::Owned { owner: owner.id() }
+            }
             ResourceCommand::ReceiveSelectorData { owner, source } => {
                 if source.kind != SelectorTrackKind::Data {
                     return Err(crate::TrackResourceError::WrongKind.into());
@@ -928,7 +944,12 @@ impl Agent {
                     control.effect = Some(self.ids.operation());
                     self.effects.push_back(Effect::MediaObservation(control));
                 }
+                let inherited_data = self.resources.is_inherited_data_reader(TrackOwner(owner));
                 self.resources.release(TrackOwner(owner));
+                if inherited_data {
+                    self.intent_dirty = true;
+                    self.request_reconciliation();
+                }
                 ResourceResult::Updated
             }
         };
@@ -1221,6 +1242,24 @@ impl Agent {
         control
     }
 
+    fn deliver_completed_data(
+        resources: &mut crate::track::TrackResources,
+        selectors: &selectors::Selectors,
+        state: &NativeState,
+        notifications: &mut VecDeque<Notification>,
+        subscriber: &crate::TopicSubscriber,
+        publication_id: &str,
+        unit: crate::data_v1::AssembledUnit,
+    ) {
+        let owners =
+            resources.receive_admitted_data_v1(subscriber, publication_id, unit, |owner| {
+                selectors.contains_data_match(owner, state, subscriber)
+            });
+        if !owners.is_empty() {
+            notifications.push_back(Notification::DataReady { owners });
+        }
+    }
+
     fn project_topic_bindings(&mut self) {
         let session = self.active.as_ref().filter(|session| {
             self.closing.is_none() && !session.signaling_terminal && session.capabilities.data_v1
@@ -1283,6 +1322,10 @@ impl Agent {
         self.project_topic_bindings();
         self.progress_pending_data_sends();
         self.retire_unmatched_selector_data();
+        let failed_sets: Vec<_> = self.resources.failed_data_set_owners().collect();
+        for owner in failed_sets {
+            self.close_subscription_selector(owner);
+        }
         self.publish_notifications();
         // Failed notification processing must not retain stale input grants.
         self.reconcile_input_controls();
@@ -2775,15 +2818,15 @@ impl Agent {
                             && let Ok(Some(unit)) =
                                 receiver.offer_binary(generation, channel, &payload, self.data_now)
                         {
-                            let owners = self.resources.receive_data_v1(
+                            Self::deliver_completed_data(
+                                &mut self.resources,
+                                &self.selectors,
+                                &active.state,
+                                &mut self.notifications,
                                 subscriber,
                                 &source.publication_id,
                                 unit,
                             );
-                            if !owners.is_empty() {
-                                self.notifications
-                                    .push_back(Notification::DataReady { owners });
-                            }
                         }
                         return Ok(());
                     }

@@ -876,12 +876,12 @@ mod tests {
             evaluated_revision: 0,
             accepted_revision: None,
             rejected_revision: None,
-            selector: TrackSelector {
+            selector: Some(TrackSelector {
                 room: "source-room".into(),
                 participant_id: "publisher-endpoint".into(),
                 track_id: "events".into(),
-            },
-            delivery: TopicMode::Ordered,
+            }),
+            delivery: Some(TopicMode::Ordered),
             local_enabled: true,
             closed: false,
             source_status: crate::ffi::SubscriptionSourceStatus::Unavailable,

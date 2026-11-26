@@ -298,6 +298,20 @@ impl Selectors {
         })
     }
 
+    pub(super) fn contains_data_source(
+        &self,
+        owner: TrackOwner,
+        native: &NativeState,
+        source: &TrackSelector,
+    ) -> bool {
+        self.any_match(owner, native, |matched| {
+            matched.kind() == wire::TrackKind::Data
+                && matched.room == source.room
+                && matched.participant_id == source.participant_id
+                && matched.track_id == source.track_id
+        })
+    }
+
     fn any_match(
         &self,
         owner: TrackOwner,

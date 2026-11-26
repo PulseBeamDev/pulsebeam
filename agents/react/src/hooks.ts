@@ -226,8 +226,7 @@ export function useSubscribe(
   const track = useStableTarget(selection, sameSelection);
   const mode =
     track instanceof RemoteDataTrack
-      ? ((options as DataSubscribeOptions | undefined)?.delivery ??
-        DataDelivery.Reliable)
+      ? (options as DataSubscribeOptions | undefined)?.delivery
       : undefined;
   const target = useMemo(() => track && { track, mode }, [track, mode]);
   const committed = useCommittedRef(options);
