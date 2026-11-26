@@ -6,7 +6,6 @@ type ReadResponse = oneshot::Sender<Result<DataUpdate, Error>>;
 #[derive(Clone)]
 struct DataAddress {
     spec: TrackSpec,
-    source: Option<agent_core::TrackSelector>,
     commands: mpsc::Sender<Command>,
     core: Control,
     closed: Arc<Signal>,
@@ -22,26 +21,6 @@ impl DataAddress {
             },
             ..self.clone()
         }
-    }
-
-    fn subscribe(&self, inherit_delivery: bool) -> Result<DataReceiver, Error> {
-        let source = self.source.clone().ok_or_else(|| {
-            Error::InvalidInput("local data does not identify a remote source".into())
-        })?;
-        DataReceiver::subscribe(
-            &self.core,
-            &self.commands,
-            &self.closed,
-            &self.finished,
-            if inherit_delivery {
-                ResourceCommand::ReceiveInheritedData { source }
-            } else {
-                ResourceCommand::ReceiveData {
-                    spec: self.spec.clone(),
-                    source,
-                }
-            },
-        )
     }
 }
 
@@ -260,14 +239,16 @@ impl RoomRef {
         Ok(())
     }
 
-    pub(super) async fn observe_admitted_media(
+    pub(crate) async fn observe_admitted_media(
         &self,
         admission: agent_core::AdmittedMedia,
+        mode: ReceiveMode,
     ) -> Result<RemoteMedia, Error> {
         let (response, result) = oneshot::channel();
         self.commands
             .send(Command::ObserveAdmittedMedia {
                 admission,
+                mode,
                 response,
             })
             .await
@@ -346,40 +327,38 @@ impl Participant {
         }
     }
 
-    pub fn data(&self, track_id: String, delivery: TopicMode) -> Result<RemoteDataTrack, Error> {
-        let source = self.source(track_id.clone());
+    pub fn data(&self, track_id: String) -> Result<RemoteDataTrack, Error> {
+        if self.closed.is_closed() || self.finished.is_closed() {
+            return Err(Error::Closed);
+        }
+        let source = self.source(track_id);
+        source
+            .validate()
+            .map_err(|error| Error::Core(agent_core::AgentError::InvalidResource(error.into())))?;
         Ok(RemoteDataTrack {
-            address: data_address(
-                &self.commands,
-                &self.core,
-                &self.closed,
-                &self.finished,
-                track_id,
-                delivery,
-                Some(source),
-            )?,
+            participant: self.clone(),
+            source,
         })
     }
 }
 
 #[derive(Clone)]
 pub struct RemoteDataTrack {
-    address: DataAddress,
+    participant: Participant,
+    source: agent_core::TrackSelector,
 }
 
 impl RemoteDataTrack {
-    pub(crate) fn subscribe_with_delivery(
-        &self,
-        delivery: Option<TopicMode>,
-    ) -> Result<DataReceiver, Error> {
-        match delivery {
-            Some(delivery) => self.address.with_delivery(delivery).subscribe(false),
-            None => self.address.subscribe(true),
-        }
-    }
-
     pub fn subscribe(&self) -> Result<DataReceiver, Error> {
-        self.address.subscribe(false)
+        DataReceiver::subscribe(
+            &self.participant.core,
+            &self.participant.commands,
+            &self.participant.closed,
+            &self.participant.finished,
+            ResourceCommand::ReceiveInheritedData {
+                source: self.source.clone(),
+            },
+        )
     }
 }
 
@@ -390,7 +369,6 @@ fn data_address(
     finished: &Arc<Signal>,
     track_id: String,
     delivery: TopicMode,
-    source: Option<agent_core::TrackSelector>,
 ) -> Result<DataAddress, Error> {
     if closed.is_closed() || finished.is_closed() {
         return Err(Error::Closed);
@@ -398,14 +376,8 @@ fn data_address(
     let spec = TrackSpec::Data { track_id, delivery };
     spec.validate()
         .map_err(|error| Error::Core(agent_core::AgentError::InvalidResource(error.into())))?;
-    if let Some(source) = &source {
-        source
-            .validate()
-            .map_err(|error| Error::Core(agent_core::AgentError::InvalidResource(error.into())))?;
-    }
     Ok(DataAddress {
         spec,
-        source,
         commands: commands.clone(),
         core: core.clone(),
         closed: closed.clone(),
@@ -414,20 +386,6 @@ fn data_address(
 }
 
 impl Agent {
-    pub fn receive_selector_data(
-        &self,
-        owner: agent_core::TrackOwner,
-        source: agent_core::SelectorMatch,
-    ) -> Result<DataReceiver, Error> {
-        DataReceiver::subscribe(
-            &self.core,
-            &self.commands,
-            &self.lease.close,
-            &self.lease.finished,
-            ResourceCommand::ReceiveSelectorData { owner, source },
-        )
-    }
-
     pub fn data(&self, track_id: String, delivery: TopicMode) -> Result<LocalDataTrack, Error> {
         if self.is_closed() {
             return Err(Error::Closed);
@@ -440,7 +398,6 @@ impl Agent {
                 &self.lease.finished,
                 track_id,
                 delivery,
-                None,
             )?,
         })
     }
@@ -463,7 +420,6 @@ impl Agent {
 
 struct DataLease {
     owner: u64,
-    selector_owned: bool,
     core: Control,
     observer: Arc<agent_core::observer::DataSubscriptionStateObserver>,
     closed: Arc<Signal>,
@@ -475,10 +431,6 @@ struct DataLease {
 }
 
 impl DataLease {
-    fn match_retired(&self) -> bool {
-        self.selector_owned && self.observer.state().closed
-    }
-
     fn read_result(&self, result: Result<DataUpdate, Error>) -> Result<DataUpdate, Error> {
         self.failure
             .get()
@@ -512,7 +464,6 @@ impl DataReceiver {
         if closed.is_closed() || finished.is_closed() {
             return Err(Error::Closed);
         }
-        let selector_owned = matches!(command, ResourceCommand::ReceiveSelectorData { .. });
         let ResourceResult::Owned { owner } = core.resource(command)? else {
             return Err(Error::Rtc(
                 "Core did not reserve a data subscription".into(),
@@ -524,7 +475,6 @@ impl DataReceiver {
             commands.clone(),
             finished.clone(),
             core.changed.clone(),
-            selector_owned,
         )?;
         if closed.is_closed() || finished.is_closed() {
             return Err(Error::Closed);
@@ -547,7 +497,6 @@ impl DataReceiver {
         commands: mpsc::Sender<Command>,
         finished: Arc<Signal>,
         changed: Arc<Notify>,
-        selector_owned: bool,
     ) -> Result<Self, Error> {
         let observer = match core.data_subscription_observer(owner) {
             Ok(observer) => observer,
@@ -559,7 +508,6 @@ impl DataReceiver {
         Ok(Self {
             inner: Arc::new(DataLease {
                 owner,
-                selector_owned,
                 core,
                 observer,
                 commands,
@@ -586,9 +534,7 @@ impl DataReceiver {
     }
 
     pub fn is_closed(&self) -> bool {
-        self.inner.closed.is_closed()
-            || self.inner.finished.is_closed()
-            || self.inner.match_retired()
+        self.inner.closed.is_closed() || self.inner.finished.is_closed()
     }
 
     pub async fn next(&self) -> Result<DataUpdate, Error> {
@@ -678,7 +624,6 @@ where
             self.command_tx.clone(),
             self.finished.clone(),
             self.leases_changed.clone(),
-            false,
         )?;
         self.register_data_receiver(receiver.clone());
         Ok(receiver)
@@ -726,13 +671,6 @@ where
                     let _ = response.send(Ok(DataUpdate::Event { event }));
                 }
                 Ok(ResourceResult::Event { event: None }) => io.pending = Some(response),
-                Err(agent_core::AgentError::InvalidResource(
-                    agent_core::TrackResourceError::Released,
-                )) if lease.selector_owned => {
-                    lease.closed.close();
-                    self.leases_changed.notify_one();
-                    let _ = response.send(Ok(DataUpdate::Closed));
-                }
                 result => {
                     let error = result.err().map(Error::Core).unwrap_or_else(|| {
                         Error::Rtc("Core did not return a data receive event".into())
@@ -751,7 +689,7 @@ where
             if io
                 .lease
                 .upgrade()
-                .is_some_and(|lease| !lease.closed.is_closed() && !lease.match_retired())
+                .is_some_and(|lease| !lease.closed.is_closed())
             {
                 return true;
             }

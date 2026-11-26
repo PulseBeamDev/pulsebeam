@@ -64,11 +64,8 @@ and streams bounded live pages through the shared State batch budgets. Logical s
 (`sub`) in an explicit room. There is no legacy codec export or fallback decoder. The signaling
 data-channel label is unchanged; it does not select a different wire protocol.
 
-The private `SourceLookupSpec`/`SourceLookupState` contract describes an owned,
-non-forwarding lookup with an atomic optional participant/track pair, not an
-accepted receiver or transport binding. Lookup-only observation creates no
-receiver, forwarding candidate, placement or dataplane residency. Live scoped
-catalogs use separate directional batch records, not owned forwarding resources.
+Live scoped catalogs use separate directional batch records, not owned
+forwarding resources.
 
 ## Prepared media reception and failure
 

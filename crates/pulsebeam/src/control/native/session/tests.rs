@@ -1435,8 +1435,9 @@ fn rejected_update_preserves_acceptance_and_publication_reservation() {
             enabled: Some(true),
             receive: None,
         }),
-        declaration: Some(wire::resource_spec::Declaration::SourceLookup(
-            wire::SourceLookupSpec {
+        declaration: Some(wire::resource_spec::Declaration::LogicalSubscription(
+            wire::LogicalSubscriptionSpec {
+                data_version: None,
                 source: Some(wire::LogicalSourceAddress {
                     room: "room".into(),
                     participant_id: "Owner".into(),
@@ -1454,7 +1455,7 @@ fn rejected_update_preserves_acceptance_and_publication_reservation() {
     assert!(owned(&session, 16).rejection.is_none());
     assert!(matches!(
         owned(&session, 16).value,
-        Some(wire::confirmed_state::Value::SourceLookup(_))
+        Some(wire::confirmed_state::Value::LogicalSubscription(_))
     ));
     assert!(session.take_preparation().unwrap().is_none());
     assert_eq!(owned(&session, 1).value, accepted);
@@ -2626,7 +2627,7 @@ fn public_revision_and_private_counter_exhaustion_never_wrap() {
 }
 
 #[test]
-fn denied_source_lookup_never_resolves_or_prepares_even_in_another_room() {
+fn denied_logical_subscription_never_resolves_or_prepares_even_in_another_room() {
     use pulsebeam_core::auth::grants::{Action, Grant, GrantSet, TrackKind};
 
     let mut model = session();
@@ -2656,8 +2657,9 @@ fn denied_source_lookup_never_resolves_or_prepares_even_in_another_room() {
                 enabled: Some(true),
                 receive: None,
             }),
-            declaration: Some(wire::resource_spec::Declaration::SourceLookup(
-                wire::SourceLookupSpec {
+            declaration: Some(wire::resource_spec::Declaration::LogicalSubscription(
+                wire::LogicalSubscriptionSpec {
+                    data_version: None,
                     source: Some(wire::LogicalSourceAddress {
                         room: room.into(),
                         participant_id: "denied-publisher".into(),
@@ -2694,7 +2696,7 @@ fn denied_source_lookup_never_resolves_or_prepares_even_in_another_room() {
 }
 
 #[test]
-fn source_lookup_is_owned_nonforwarding_and_updates_atomic_borrowed_descriptors() {
+fn logical_subscription_resolves_without_discover_and_tracks_replacement() {
     use crate::entity::{ConnectionId, ParticipantId, RoomId, TrackKind};
     use crate::track::{DataLane, TrackMeta};
 
@@ -2733,8 +2735,9 @@ fn source_lookup_is_owned_nonforwarding_and_updates_atomic_borrowed_descriptors(
             enabled: Some(enabled),
             receive: None,
         }),
-        declaration: Some(wire::resource_spec::Declaration::SourceLookup(
-            wire::SourceLookupSpec {
+        declaration: Some(wire::resource_spec::Declaration::LogicalSubscription(
+            wire::LogicalSubscriptionSpec {
+                data_version: None,
                 source: Some(address.clone()),
             },
         )),
@@ -2760,10 +2763,10 @@ fn source_lookup_is_owned_nonforwarding_and_updates_atomic_borrowed_descriptors(
     );
     assert!(model.preparations.is_empty());
     let state = &model.rows[&Key::Owned(51)].value;
-    let Some(wire::confirmed_state::Value::SourceLookup(initial)) = &state.value else {
+    let Some(wire::confirmed_state::Value::LogicalSubscription(initial)) = &state.value else {
         panic!("lookup must be projected immediately")
     };
-    assert!(initial.participant.is_none() && initial.track.is_none());
+    assert!(initial.source.is_none());
     let initial_revision = state.evaluated_revision;
 
     let first = data_track(connection);
@@ -2802,23 +2805,24 @@ fn source_lookup_is_owned_nonforwarding_and_updates_atomic_borrowed_descriptors(
         })
         .unwrap();
     let state = &model.rows[&Key::Owned(51)].value;
-    let Some(wire::confirmed_state::Value::SourceLookup(available)) = &state.value else {
+    let Some(wire::confirmed_state::Value::LogicalSubscription(available)) = &state.value else {
         panic!("lookup state")
     };
     assert_eq!(state.evaluated_revision, initial_revision);
     assert_eq!(
-        available.participant.as_ref().unwrap().participant_id,
+        available.source.as_ref().unwrap().participant_id,
         "publisher"
     );
     assert_eq!(
-        available.track.as_ref().unwrap().publication_id,
+        available.source.as_ref().unwrap().publication_id,
         first.id().as_str()
     );
 
     let invalid = wire::ResourceSpec {
         settings: None,
-        declaration: Some(wire::resource_spec::Declaration::SourceLookup(
-            wire::SourceLookupSpec {
+        declaration: Some(wire::resource_spec::Declaration::LogicalSubscription(
+            wire::LogicalSubscriptionSpec {
+                data_version: None,
                 source: Some(address.clone()),
             },
         )),
@@ -2831,16 +2835,16 @@ fn source_lookup_is_owned_nonforwarding_and_updates_atomic_borrowed_descriptors(
     );
     assert!(matches!(
         &rejected.value,
-        Some(wire::confirmed_state::Value::SourceLookup(state))
-            if state.participant.is_some() && state.track.is_some()
+        Some(wire::confirmed_state::Value::LogicalSubscription(state))
+            if state.source.is_some()
     ));
 
     input(&mut model, vec![present(51, 53, lookup(false))]).unwrap();
     let state = &model.rows[&Key::Owned(51)].value;
-    let Some(wire::confirmed_state::Value::SourceLookup(disabled)) = &state.value else {
+    let Some(wire::confirmed_state::Value::LogicalSubscription(disabled)) = &state.value else {
         panic!("disabled lookup state")
     };
-    assert!(disabled.participant.is_none() && disabled.track.is_none());
+    assert!(disabled.source.is_none());
 
     input(&mut model, vec![present(51, 54, lookup(true))]).unwrap();
     let replacement_connection = ConnectionId::new();
@@ -2854,11 +2858,11 @@ fn source_lookup_is_owned_nonforwarding_and_updates_atomic_borrowed_descriptors(
         })
         .unwrap();
     let state = &model.rows[&Key::Owned(51)].value;
-    let Some(wire::confirmed_state::Value::SourceLookup(republished)) = &state.value else {
+    let Some(wire::confirmed_state::Value::LogicalSubscription(republished)) = &state.value else {
         panic!("republished lookup state")
     };
     assert_eq!(
-        republished.track.as_ref().unwrap().publication_id,
+        republished.source.as_ref().unwrap().publication_id,
         replacement.id().as_str()
     );
 
@@ -2866,10 +2870,10 @@ fn source_lookup_is_owned_nonforwarding_and_updates_atomic_borrowed_descriptors(
         .refresh_source_lookups(32, 100, &DataBranchIds::default(), |_| None)
         .unwrap();
     let state = &model.rows[&Key::Owned(51)].value;
-    let Some(wire::confirmed_state::Value::SourceLookup(unpublished)) = &state.value else {
+    let Some(wire::confirmed_state::Value::LogicalSubscription(unpublished)) = &state.value else {
         panic!("unpublished lookup state")
     };
-    assert!(unpublished.participant.is_none() && unpublished.track.is_none());
+    assert!(unpublished.source.is_none());
     assert!(input(&mut model, vec![absent(51, 55)]).unwrap().is_empty());
     assert!(matches!(
         model.rows[&Key::Owned(51)].value.value,
@@ -3381,7 +3385,8 @@ fn logical_subscription_keeps_one_reservation_across_scoped_receiver_replacement
 }
 
 #[test]
-fn source_lookup_revocation_and_close_finish_locally_without_execution_commands() {
+fn unresolved_logical_subscription_revocation_and_close_finish_locally_without_execution_commands()
+{
     let mut model = NativeSession::default();
     model
         .authorization(10_000, 1, ResourcePermissions::RoomBound)
@@ -3391,8 +3396,9 @@ fn source_lookup_revocation_and_close_finish_locally_without_execution_commands(
             enabled: Some(true),
             receive: None,
         }),
-        declaration: Some(wire::resource_spec::Declaration::SourceLookup(
-            wire::SourceLookupSpec {
+        declaration: Some(wire::resource_spec::Declaration::LogicalSubscription(
+            wire::LogicalSubscriptionSpec {
+                data_version: None,
                 source: Some(wire::LogicalSourceAddress {
                     room: "room".into(),
                     participant_id: "publisher".into(),
@@ -3447,8 +3453,9 @@ fn source_lookup_revocation_and_close_finish_locally_without_execution_commands(
                     enabled: Some(true),
                     receive: None,
                 }),
-                declaration: Some(wire::resource_spec::Declaration::SourceLookup(
-                    wire::SourceLookupSpec {
+                declaration: Some(wire::resource_spec::Declaration::LogicalSubscription(
+                    wire::LogicalSubscriptionSpec {
+                        data_version: None,
                         source: Some(wire::LogicalSourceAddress {
                             room: "room".into(),
                             participant_id: "publisher".into(),
@@ -3473,7 +3480,7 @@ fn source_lookup_revocation_and_close_finish_locally_without_execution_commands(
 }
 
 #[test]
-fn source_lookup_work_is_cursor_bounded_and_authorized_for_other_rooms() {
+fn logical_subscription_work_is_cursor_bounded_and_authorized_for_other_rooms() {
     use crate::entity::RoomId;
     use pulsebeam_core::auth::grants::{Action, Grant, GrantSet, TrackKind as GrantKind};
 
@@ -3488,8 +3495,9 @@ fn source_lookup_work_is_cursor_bounded_and_authorized_for_other_rooms() {
             enabled: Some(true),
             receive: None,
         }),
-        declaration: Some(wire::resource_spec::Declaration::SourceLookup(
-            wire::SourceLookupSpec {
+        declaration: Some(wire::resource_spec::Declaration::LogicalSubscription(
+            wire::LogicalSubscriptionSpec {
+                data_version: None,
                 source: Some(address()),
             },
         )),
@@ -3545,7 +3553,7 @@ fn source_lookup_work_is_cursor_bounded_and_authorized_for_other_rooms() {
         )
         .unwrap();
     let mut other_room = spec();
-    let Some(wire::resource_spec::Declaration::SourceLookup(lookup)) =
+    let Some(wire::resource_spec::Declaration::LogicalSubscription(lookup)) =
         other_room.declaration.as_mut()
     else {
         panic!("source lookup declaration")
@@ -3554,9 +3562,9 @@ fn source_lookup_work_is_cursor_bounded_and_authorized_for_other_rooms() {
     input(&mut scoped, vec![present(1, 1, other_room)]).unwrap();
     assert!(matches!(
         &scoped.rows[&Key::Owned(1)].value.value,
-        Some(wire::confirmed_state::Value::SourceLookup(lookup))
+        Some(wire::confirmed_state::Value::LogicalSubscription(lookup))
             if lookup.spec.as_ref().and_then(|spec| match spec.declaration.as_ref() {
-                Some(wire::resource_spec::Declaration::SourceLookup(value)) => value.source.as_ref(),
+                Some(wire::resource_spec::Declaration::LogicalSubscription(value)) => value.source.as_ref(),
                 _ => None,
             }).is_some_and(|source| source.room == "other")
     ));
@@ -3575,7 +3583,7 @@ fn source_lookup_work_is_cursor_bounded_and_authorized_for_other_rooms() {
         .unwrap();
     for (reference, room) in [(1, "current"), (2, "other")] {
         let mut request = spec();
-        let Some(wire::resource_spec::Declaration::SourceLookup(lookup)) =
+        let Some(wire::resource_spec::Declaration::LogicalSubscription(lookup)) =
             request.declaration.as_mut()
         else {
             panic!("source lookup declaration")

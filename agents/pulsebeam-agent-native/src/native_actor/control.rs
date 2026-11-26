@@ -535,13 +535,6 @@ impl Control {
         self.with(|core| core.admitted_media_current(admission))
     }
 
-    pub(super) fn subscription_selector_state(
-        &self,
-        owner: agent_core::TrackOwner,
-    ) -> Option<agent_core::SelectorState> {
-        self.with(|core| core.subscription_selector_state(owner))
-    }
-
     pub(super) fn external<T>(&self, operation: impl FnOnce(&mut agent_core::Agent) -> T) -> T {
         let result = self.update(operation);
         self.changed.notify_one();

@@ -271,9 +271,66 @@ async def witness(endpoint, token, reader_token, catalog_token, room, package):
         assert len(pixels.data) == 160 * 96 + 2 * 80 * 48
         assert isinstance(pixels.timestamp_us, int)
         retained = bytes(pixels.data)
+        publication_id = received_interest.state().source_track_id
+        assert publication_id
         received.close()
         await received_interest.close()
+        assert await received.next() is None
         assert bytes(frame.frame.data) == retained, "owned pixels changed after reader and subscription close"
+
+        # Use a distinct receiver; changing modes on a live native binding is not supported.
+        encoded_interest = reader.room(room).video(core.TrackFilter(
+            participant_id="publisher", track_id="production-camera",
+        )).subscribe()
+        admissions = encoded_interest.updates()
+        try:
+            while True:
+                state = await admissions.next()
+                assert state is not None and state.error is None, state
+                if state.tracks:
+                    (entry,) = state.tracks
+                    break
+            assert (entry.participant_id, entry.track_id, entry.publication_id) == (
+                "publisher", "production-camera", publication_id,
+            )
+            encoded = await entry.track.observe(native.ReceiveMode.ENCODED)
+            assert encoded.source_track_id() == publication_id
+            try:
+                await encoded.request_keyframe()
+                while True:
+                    update = await encoded.next()
+                    assert not update.is_CLOSED()
+                    if not update.is_FRAME():
+                        continue
+                    assert update.frame.track.receiver == encoded.receiver()
+                    assert update.frame.track.generation == encoded.generation()
+                    assert update.frame.track.mid and update.frame.track.publication_id
+                    access_unit = update.frame.frame
+                    assert access_unit.is_H264(), access_unit
+                    if access_unit.keyframe:
+                        payload = bytes(access_unit.payload)
+                        assert payload.startswith((b"\x00\x00\x01", b"\x00\x00\x00\x01"))
+                        break
+            finally:
+                await encoded.close()
+            assert (await encoded.next()).is_CLOSED()
+            assert bytes(access_unit.payload) == payload
+            try:
+                await encoded.request_keyframe()
+            except native.NativeError.Closed:
+                pass
+            else:
+                raise AssertionError("closed encoded observer accepted keyframe feedback")
+        finally:
+            admissions.close()
+            encoded_interest.close()
+        try:
+            await entry.track.observe(native.ReceiveMode.ENCODED)
+        except native.NativeError.Operation as error:
+            assert error.info.code == core.ErrorCode.REPLACED, error
+        else:
+            raise AssertionError("retired collection admitted an encoded observer")
+
         interest = agent.room(room).participant("absent-publisher").audio("microphone").subscribe()
         video_preferences = core.VideoObservation(
             visible=True, height=720, min_height=0, min_fps=0, priority=1,
@@ -291,7 +348,16 @@ async def witness(endpoint, token, reader_token, catalog_token, room, package):
         await sibling_audio.close()
         assert sibling_audio.state().closed, "second exact audio interest did not close"
         assert not interest.is_closed(), "audio close ended an independent named audio interest"
-        await interest.close()
+        waiting_frames = interest.frames()
+        try:
+            async with asyncio.TaskGroup() as group:
+                waiting = group.create_task(waiting_frames.next())
+                await asyncio.sleep(0)
+                assert not waiting.done(), "absent source returned a frame or terminated"
+                await interest.close()
+                assert await waiting is None
+        finally:
+            waiting_frames.close()
         assert interest.is_closed(), "foreign audio interest did not close"
         try:
             await interest.observe(native.ReceiveMode.DECODED)

@@ -35,10 +35,6 @@ impl ResourcePermissions {
             Some(wire::resource_spec::Declaration::Subscription(subscription)) => {
                 self.may_subscribe_in_room(&subscription.source_room, subscription.kind)
             }
-            Some(wire::resource_spec::Declaration::SourceLookup(lookup)) => lookup
-                .source
-                .as_ref()
-                .is_some_and(|source| self.can_lookup_source(source)),
             Some(wire::resource_spec::Declaration::LogicalSubscription(subscription)) => {
                 subscription
                     .source

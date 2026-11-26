@@ -113,7 +113,8 @@ impl FrameOrigin {
         match self {
             Self::Exact { subscription, .. } => subscription.observe(ReceiveMode::Decoded).await,
             Self::Admitted { room, admission } => {
-                room.observe_admitted_media((**admission).clone()).await
+                room.observe_admitted_media((**admission).clone(), ReceiveMode::Decoded)
+                    .await
             }
         }
     }

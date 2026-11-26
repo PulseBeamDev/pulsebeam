@@ -22,12 +22,6 @@ pub(crate) enum Resource {
     LogicalReception(MediaSlot),
     LogicalData(TrackSelector),
     SubscriptionSelector(u64),
-    SourceLookup {
-        room: String,
-        participant_id: String,
-        kind: wire::TrackKind,
-        track_id: String,
-    },
 }
 
 impl Resource {
@@ -36,7 +30,6 @@ impl Resource {
             Self::Publication { .. } => "publication",
             Self::Reception(_) | Self::LogicalReception(_) => "media_subscription",
             Self::DataSubscription(_) | Self::LogicalData(_) => "data_subscription",
-            Self::SourceLookup { .. } => "source_lookup",
             Self::SubscriptionSelector(_) => "subscription_selector",
         }
     }
@@ -100,20 +93,6 @@ impl Resource {
                 Self::SubscriptionSelector(owner),
                 Some(wire::resource_spec::Declaration::SubscriptionSelector(_)),
             ) => *owner != 0,
-            (
-                Self::SourceLookup {
-                    room,
-                    participant_id,
-                    kind,
-                    track_id,
-                },
-                Some(wire::resource_spec::Declaration::SourceLookup(lookup)),
-            ) => lookup.source.as_ref().is_some_and(|source| {
-                room == &source.room
-                    && participant_id == &source.participant_id
-                    && *kind as i32 == source.kind
-                    && track_id == &source.track_id
-            }),
             _ => false,
         }
     }
@@ -132,19 +111,6 @@ impl Resource {
                 .len()
                 .saturating_add(selector.participant_id.len())
                 .saturating_add(selector.track_id.len()),
-            Self::SourceLookup {
-                room,
-                participant_id,
-                track_id,
-                ..
-            } => {
-                // Target, pending work, retirement, cursor and owned keys can retain the address.
-                return size_of::<Self>()
-                    .saturating_add(room.len())
-                    .saturating_add(participant_id.len())
-                    .saturating_add(track_id.len())
-                    .saturating_mul(5);
-            }
         };
         size_of::<Self>().saturating_add(text)
     }
@@ -538,6 +504,13 @@ impl NativeState {
             return Err(SignalingError::Invalid("failure without admitted receiver"));
         }
         self.queue_execution(reference, wire::execution_report::Outcome::Failure(failure))
+    }
+
+    pub(crate) fn logical_receiver_reported(&self, offer: Offer) -> bool {
+        self.owned
+            .get(&offer.reference)
+            .and_then(|owned| owned.reported_offer)
+            .is_some_and(|(revision, _)| revision == offer.source_revision)
     }
 
     pub(crate) fn report_logical_receiver(
@@ -1512,28 +1485,6 @@ impl NativeState {
             .then_some(state)
     }
 
-    pub(crate) fn lookup(&self, resource: &Resource) -> Option<&wire::SourceLookupState> {
-        if self.terminal || self.session.as_ref()?.authorization.is_none() {
-            return None;
-        }
-        let target = self.targets.get(resource)?;
-        if target.spec.settings.as_ref()?.enabled != Some(true) {
-            return None;
-        }
-        let owned = self.owned.get(&target.reference?)?;
-        if owned.retiring || owned.awaiting_evaluation() {
-            return None;
-        }
-        match owned.confirmed.as_ref()?.value.as_ref()? {
-            wire::confirmed_state::Value::SourceLookup(lookup)
-                if lookup.spec.as_ref()?.settings.as_ref()?.enabled == Some(true) =>
-            {
-                Some(lookup)
-            }
-            _ => None,
-        }
-    }
-
     pub(crate) fn selector_snapshot(&self, owner: u64) -> Option<&wire::SubscriptionSelectorState> {
         if self.terminal || self.session.as_ref()?.authorization.is_none() {
             return None;
@@ -1670,7 +1621,6 @@ fn desired_record(
 fn accepted_spec(state: &wire::ConfirmedState) -> Option<&wire::ResourceSpec> {
     match state.value.as_ref()? {
         wire::confirmed_state::Value::Owned(live) => live.spec.as_ref(),
-        wire::confirmed_state::Value::SourceLookup(lookup) => lookup.spec.as_ref(),
         wire::confirmed_state::Value::SubscriptionSelector(selector) => selector.spec.as_ref(),
         wire::confirmed_state::Value::LogicalSubscription(subscription) => {
             subscription.spec.as_ref()
@@ -1692,9 +1642,6 @@ fn source_description(state: &wire::ConfirmedState) -> Option<(&wire::Participan
     match state.value.as_ref()? {
         wire::confirmed_state::Value::Owned(live) => {
             Some((live.participant.as_ref()?, live.track.as_ref()?))
-        }
-        wire::confirmed_state::Value::SourceLookup(lookup) => {
-            Some((lookup.participant.as_ref()?, lookup.track.as_ref()?))
         }
         _ => None,
     }

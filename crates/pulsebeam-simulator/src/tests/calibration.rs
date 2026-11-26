@@ -120,9 +120,7 @@ async fn peer(ip: IpAddr, server: IpAddr, name: &str, publishes: bool) -> anyhow
                 .room(ROOM.into())?
                 .participant("source".into())?
                 .data(TOPIC.into())?
-                .subscribe(Some(api::DataSubscribeOptions {
-                    delivery: Some(delivery),
-                }))?,
+                .subscribe()?,
         )
     };
     agent.join(ROOM.into())?;

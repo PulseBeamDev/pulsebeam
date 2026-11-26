@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
 import { StrictMode, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { Data, DataDelivery, useAgent, type Agent, DataEvent } from "../../src/index.js";
+import {
+  Data,
+  DataDelivery,
+  useAgent,
+  type Agent,
+  DataEvent,
+} from "../../src/index.js";
 import { deferred, flush } from "./platform.js";
 import { captureDataReads } from "./scripted.js";
 

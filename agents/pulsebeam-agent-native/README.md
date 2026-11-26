@@ -167,8 +167,7 @@ Retain a named subscription instead of selecting a receiver slot. With a spawned
 ID and immutable publication label. Create the reference with the explicit room
 name supplied to `join`; the examples use `"room"`. References remain pinned
 when the Agent joins another room. Creating a room or participant reference
-performs no network operation. Cross-room source lookup is currently unsupported,
-even with an authorizing grant:
+performs no network operation. Receiving from another room requires a Subscribe grant for that room and source:
 
 ```rust
 use pulsebeam_agent_native::{
@@ -249,7 +248,7 @@ injection does not turn its bookkeeping into an application observation.
 
 Call `publish()` on a local handle to synchronously reserve an owned `DataPublication`. Send bytes through that publication's async `send(bytes)` and close it when publishing ends. Sending requires connected intent and resolves on transport admission, not remote delivery or durable acknowledgment. Generated operation failures expose the shared `ErrorInfo` classification.
 
-Call `subscribe()` on a participant's data handle for that exact room, participant and label. It synchronously returns an owned subscription, even before joining or publication. Local data handles do not receive; there is no room-wide data receive factory. Each call owns an independent bounded subscription (`DataReceiver` in Rust, `DataSubscription` in generated bindings). Its async `next` returns `DataUpdate::Event` containing a core `DataEvent::Message` or `Gap`, or terminal `DataUpdate::Closed`. Message bytes are owned. No Agent-global event filtering or manual topic registration is required. Ordered reception starts at a live frontier, not historical replay; local send admission does not prove that a remote cursor is ready.
+Call `subscribe()` on a participant's data handle for that exact room, participant and label. The call returns an owned subscription immediately, even before joining or publication. To consume several matching publications, subscribe to a room data set. Exact readers and sets inherit each publication's delivery mode. Local data handles only publish. Each call owns an independent bounded subscription (`DataReceiver` in Rust, `DataSubscription` in generated bindings). Its async `next` returns `DataUpdate::Event` containing a core `DataEvent::Message` or `Gap`, or terminal `DataUpdate::Closed`. Message bytes are owned. No Agent-global event filtering or manual topic registration is required. Ordered reception starts at a live frontier, not historical replay; local send admission does not prove that a remote cursor is ready.
 
 Core owns buffering and delivery policy: latest coalesces by publisher track, lossy evicts at capacity, and ordered delivery represents loss inline as gaps or terminates with a typed receive-overflow error when it cannot preserve that representation. Channel failures also terminate the affected cursor. After a terminal read error, subsequent reads return `Closed`.
 

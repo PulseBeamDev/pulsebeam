@@ -4389,7 +4389,7 @@ impl ClientContext {
             .agent
             .room(registration.room.clone())?
             .participant(registration.participant_id.clone())?
-            .data(registration.topic.clone(), registration.mode)?
+            .data(registration.topic.clone())?
             .subscribe()?;
         self.data_subscribers
             .insert(registration.clone(), receiver.clone());

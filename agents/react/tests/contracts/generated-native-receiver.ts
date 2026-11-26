@@ -625,6 +625,27 @@ export async function receiveGenerated(config: {
       listening.uniffiDestroy();
       microphone.uniffiDestroy();
     }
+    const forbiddenRoster = room.watch();
+    const forbiddenUpdates = forbiddenRoster.updates();
+    try {
+      while (true) {
+        const state = await forbiddenUpdates.next();
+        if (state?.status === WatchStatus.Loading) continue;
+        if (
+          state?.status !== WatchStatus.Failed ||
+          state.error?.code !== ErrorCode.PermissionDenied ||
+          state.participants !== undefined
+        ) {
+          throw new Error("Subscribe-only token gained catalog access");
+        }
+        break;
+      }
+    } finally {
+      forbiddenUpdates.close();
+      await forbiddenRoster.close();
+      forbiddenUpdates.uniffiDestroy();
+      forbiddenRoster.uniffiDestroy();
+    }
     const viewer = new Agent({
       endpoint: config.endpoint,
       token: config.catalogToken,
@@ -649,6 +670,7 @@ export async function receiveGenerated(config: {
           await roster.close();
           const cameraRef = publisher.video("camera");
           const interest = cameraRef.subscribe();
+          const states = interest.updates();
           try {
             const { selector } = interest.state();
             if (
@@ -660,7 +682,19 @@ export async function receiveGenerated(config: {
                 "generated catalog entry did not retain its exact track address",
               );
             }
+            while (true) {
+              const state = await states.next();
+              if (!state || state.closed || state.sourceTrackId)
+                throw new Error("Discover-only token gained video reception");
+              if (state.error) {
+                if (state.error.code !== ErrorCode.PermissionDenied)
+                  throw new Error("Unexpected Discover-only reception error");
+                break;
+              }
+            }
           } finally {
+            states.close();
+            states.uniffiDestroy();
             await interest.close();
             interest.uniffiDestroy();
             cameraRef.uniffiDestroy();

@@ -12,7 +12,9 @@ use noq_proto::ClientConfig;
 use pulsebeam_agent_core::{
     Agent as CoreAgent, AgentCommand, AgentConfig, AgentError, Effect, Failure, FailureClass,
     Generation, HostEvent, HttpEffect, HttpEvent, HttpMethod, HttpRequest, HttpResponse, MediaKind,
-    Notification, OperationId, QuicEffect, QuicEvent, Snapshot, TimerEffect, TimerEvent, TimerId,
+    Notification, OperationId, QuicEffect, QuicEvent, SelectorMatch, SelectorState,
+    SelectorTrackKind, Snapshot, TimerEffect, TimerEvent, TimerId, TrackFilter, TrackOwner,
+    ffi::ErrorInfo,
 };
 use pulsebeam_core::{
     fabric::{
@@ -80,6 +82,15 @@ pub enum H264SendError {
     Busy,
     InvalidAccessUnit,
     Size,
+}
+
+/// Installed transport for one concrete match of a media selector.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SelectedRtp<'a> {
+    pub binding: Binding,
+    pub incarnation: u64,
+    pub publication_id: &'a str,
+    pub mime_type: &'a str,
 }
 
 struct PendingVideo {
@@ -293,6 +304,50 @@ impl Agent {
     fn report_at(&self, binding: Binding, now: std::time::Instant) -> Option<SenderReport> {
         let (at, report) = self.sender_reports.get(&binding)?;
         (now.checked_duration_since(*at)? <= Duration::from_secs(3)).then_some(*report)
+    }
+
+    pub fn open_media_selector(
+        &mut self,
+        room: String,
+        kind: MediaKind,
+        filter: TrackFilter,
+    ) -> Result<TrackOwner, ErrorInfo> {
+        let kind = match kind {
+            MediaKind::Audio => SelectorTrackKind::Audio,
+            MediaKind::Video => SelectorTrackKind::Video,
+        };
+        self.core.open_media_collection(room, kind, filter)
+    }
+
+    /// Membership can be available before any RTP binding is installed.
+    /// A closed owner has no state. Connection failure is in Agent's snapshot.
+    pub fn media_selector_state(&self, owner: TrackOwner) -> Option<SelectorState> {
+        self.core.subscription_selector_state(owner)
+    }
+
+    /// Neither buffered packets nor another owner's membership make a stale match current.
+    pub fn selected_rtp(
+        &self,
+        owner: TrackOwner,
+        matched: &SelectorMatch,
+    ) -> Result<Option<SelectedRtp<'_>>, ErrorInfo> {
+        Ok(self
+            .core
+            .quic_selector_receiver(owner, matched)?
+            .map(|live| SelectedRtp {
+                binding: Binding {
+                    generation: live.generation,
+                    id: live.binding,
+                },
+                incarnation: live.incarnation,
+                publication_id: live.publication_id,
+                mime_type: live.mime_type,
+            }))
+    }
+
+    /// Release the selector, not the shared binding used by other owners.
+    pub fn close_media_selector(&mut self, owner: TrackOwner) -> bool {
+        self.core.close_subscription_selector(owner)
     }
 
     /// Get the current installed receiver identity for a pinned publication.

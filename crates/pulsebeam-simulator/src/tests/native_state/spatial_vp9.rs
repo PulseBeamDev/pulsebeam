@@ -355,40 +355,6 @@ pub(in crate::tests) async fn receive(
     }
 }
 
-async fn bind_logical_video(
-    viewer: &mut WirePeer,
-    publication: &str,
-    binding: &wire::TrackBinding,
-    report_revision: u64,
-    previous_source: u64,
-) -> anyhow::Result<u64> {
-    use wire::logical_subscription_state::Execution;
-    let offer = viewer
-        .logical_when(1, |state| {
-            state.source_revision > previous_source && state.source.is_some()
-        })
-        .await?;
-    anyhow::ensure!(
-        offer
-            .source
-            .as_ref()
-            .is_some_and(|source| source.publication_id == publication),
-        "logical VP9 intent resolved to a different publication: {offer:?}"
-    );
-    viewer.report_prepared_receiver(offer.source_revision, report_revision, binding.clone());
-    let settled = viewer
-        .logical_when(1, |state| {
-            state.source_revision >= offer.source_revision && state.execution.is_some()
-        })
-        .await?;
-    anyhow::ensure!(
-        settled.source_revision == offer.source_revision
-            && settled.execution == Some(Execution::Installed(binding.clone())),
-        "logical VP9 receiver did not install: {settled:?}"
-    );
-    Ok(offer.source_revision)
-}
-
 async fn install(
     viewer: &mut WirePeer,
     reference: u64,

@@ -280,20 +280,6 @@ pub(super) fn confirm_missing_lookups(
                 Some(state::desired_state::Value::Present(spec))
                     if matches!(
                         spec.declaration,
-                        Some(state::resource_spec::Declaration::SourceLookup(_))
-                    ) =>
-                {
-                    state::confirmed_state::Value::SourceLookup(Box::new(
-                        state::SourceLookupState {
-                            spec: Some(spec.as_ref().clone()),
-                            participant: None,
-                            track: None,
-                        },
-                    ))
-                }
-                Some(state::desired_state::Value::Present(spec))
-                    if matches!(
-                        spec.declaration,
                         Some(state::resource_spec::Declaration::LogicalSubscription(_))
                     ) =>
                 {

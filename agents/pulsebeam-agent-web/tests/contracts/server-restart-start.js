@@ -13,7 +13,7 @@
     .room("web-adapter-restart")
     .participant("publisher")
     .data("chat")
-    .subscribe(options);
+    .subscribe();
   const events = [];
   let probe = 0;
   let observedProbe = 0;

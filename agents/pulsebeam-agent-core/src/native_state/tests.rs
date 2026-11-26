@@ -2,7 +2,6 @@ use super::*;
 
 mod execution;
 mod selectors;
-mod source_lookup;
 
 #[test]
 fn participant_withdrawal_is_scoped_to_exact_room() {
@@ -511,61 +510,6 @@ fn bounded_batches_emit_current_targets_for_mixed_resources() {
 }
 
 #[test]
-fn owned_lookup_waits_for_authorization_not_roster_completion() {
-    let mut client = NativeState::new(1024 * 1024, participant()).unwrap();
-    let resource = Resource::SourceLookup {
-        room: "source-room".into(),
-        participant_id: "alice".into(),
-        kind: wire::TrackKind::Data,
-        track_id: "updates".into(),
-    };
-    let spec = wire::ResourceSpec {
-        settings: Some(wire::ResourceSettings {
-            enabled: Some(true),
-            receive: None,
-        }),
-        declaration: Some(wire::resource_spec::Declaration::SourceLookup(
-            wire::SourceLookupSpec {
-                source: Some(wire::LogicalSourceAddress {
-                    room: "source-room".into(),
-                    participant_id: "alice".into(),
-                    kind: wire::TrackKind::Data as i32,
-                    track_id: "updates".into(),
-                }),
-            },
-        )),
-    };
-    client.stage(resource.clone(), Some(spec.clone())).unwrap();
-    let reference = next(&mut client)[0].0;
-    let lookup = wire::SourceLookupState {
-        spec: Some(spec),
-        participant: None,
-        track: None,
-    };
-    client
-        .apply(&frame(
-            alloc::vec![record(
-                reference,
-                wire::ConfirmedState {
-                    evaluated_revision: 1,
-                    rejection: None,
-                    value: Some(wire::confirmed_state::Value::SourceLookup(Box::new(
-                        lookup.clone(),
-                    ))),
-                },
-            )],
-            false,
-        ))
-        .unwrap();
-    assert!(client.lookup(&resource).is_none());
-    client
-        .apply(&frame(alloc::vec![session(1, 2_000_000_000, None)], false))
-        .unwrap();
-    assert!(!client.initial_complete());
-    assert_eq!(client.lookup(&resource), Some(&lookup));
-}
-
-#[test]
 fn ordered_session_and_latest_evaluation_gate_media_without_discarding_rejected_acceptance() {
     let mut client = NativeState::new(1024 * 1024, participant()).unwrap();
     client.stage(resource(), Some(spec(true, 1))).unwrap();
@@ -587,8 +531,9 @@ fn ordered_session_and_latest_evaluation_gate_media_without_discarding_rejected_
     let accepted = client.confirmed(&resource()).unwrap().clone();
     let retained = client.retained_bytes;
     let mut lookup = spec(true, 1);
-    lookup.declaration = Some(wire::resource_spec::Declaration::SourceLookup(
-        wire::SourceLookupSpec {
+    lookup.declaration = Some(wire::resource_spec::Declaration::LogicalSubscription(
+        wire::LogicalSubscriptionSpec {
+            data_version: None,
             source: Some(wire::LogicalSourceAddress {
                 room: "room".into(),
                 participant_id: "alice".into(),
@@ -600,11 +545,10 @@ fn ordered_session_and_latest_evaluation_gate_media_without_discarding_rejected_
     let lookup = wire::ConfirmedState {
         evaluated_revision: 1,
         rejection: None,
-        value: Some(wire::confirmed_state::Value::SourceLookup(Box::new(
-            wire::SourceLookupState {
+        value: Some(wire::confirmed_state::Value::LogicalSubscription(Box::new(
+            wire::LogicalSubscriptionState {
                 spec: Some(lookup),
-                participant: None,
-                track: None,
+                ..Default::default()
             },
         ))),
     };

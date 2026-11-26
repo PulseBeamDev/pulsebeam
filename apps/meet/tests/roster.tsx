@@ -5,7 +5,8 @@ export function Roster({ room }: { room: RoomRef }) {
   const [cursor, setCursor] = useState<Uint8Array>();
   const roster = useWatch(room, { limit: 2, cursor });
   const page = roster?.state();
-  if (!page || page.status === WatchStatus.Loading) return <p>Loading roster</p>;
+  if (!page || page.status === WatchStatus.Loading)
+    return <p>Loading roster</p>;
   if (page.status !== WatchStatus.Live) return <p>Roster unavailable</p>;
 
   return (

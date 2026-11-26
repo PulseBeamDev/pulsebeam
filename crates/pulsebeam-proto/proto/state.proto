@@ -287,6 +287,9 @@ message ConfirmedState {
   // A spontaneous execution failure uses LiveResource.execution_failure instead.
   Failure rejection = 2;
 
+  reserved 8;
+  reserved "source_lookup";
+
   // Exactly one complete value, matching ResourceKey. Absence is idempotent;
   // after applying terminal owned absence, do not resurrect that owned ref.
   oneof value {
@@ -295,7 +298,6 @@ message ConfirmedState {
     SessionState session = 5;
     Participant participant = 6;
     Track track = 7;
-    SourceLookupState source_lookup = 8;
     LogicalSubscriptionState logical_subscription = 9;
     SubscriptionSelectorState subscription_selector = 10;
   }
@@ -435,22 +437,17 @@ message ResourceSpec {
   // Required complete mutable block; omitted options reset documented defaults.
   ResourceSettings settings = 1;
 
+  reserved 4;
+  reserved "source_lookup";
+
   // Exactly one immutable declaration, fixed by the first proposal, including
   // while preparation is pending. Changing it requires a new lifetime.
   oneof declaration {
     PublicationSpec publication = 2;
     SubscriptionSpec subscription = 3;
-    SourceLookupSpec source_lookup = 4;
     LogicalSubscriptionSpec logical_subscription = 5;
     SubscriptionSelectorSpec subscription_selector = 6;
   }
-}
-
-// Owned, non-forwarding observation of the current exact logical source.
-// Address is immutable for the owned lifetime; it is not a receiver or publisher.
-message SourceLookupSpec {
-  // Required exact logical address. enabled=false permits no descriptor.
-  LogicalSourceAddress source = 1;
 }
 
 // The immutable source address for one admitted subscription. The exact
@@ -573,17 +570,6 @@ message LiveResource {
   // Authenticated source incarnation for an admitted DATA_V1 publication.
   // Never inferred from the publication ID or SCTP stream.
   optional fixed64 data_v1_source = 8;
-}
-
-// Read-only observation attached to an owned lookup declaration. Participant
-// and track are an atomic optional pair and may change as the address resolves.
-// This is not an accepted receiver, transport binding or execution state.
-message SourceLookupState {
-  // Required accepted lookup spec, never a publication/subscription spec.
-  ResourceSpec spec = 1;
-  // Both descriptor fields are absent while unresolved or disabled.
-  Participant participant = 2;
-  Track track = 3;
 }
 
 // Accepted logical intent and current authorized source offer.

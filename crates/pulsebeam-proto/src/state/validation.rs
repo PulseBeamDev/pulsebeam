@@ -176,12 +176,6 @@ fn validate_confirmed(
             }
             validate_live_for(live, profile)
         }
-        (Key::Owned(reference), Some(Value::SourceLookup(lookup))) => {
-            if confirmed.evaluated_revision < *reference {
-                return Err(ValidationError::Confirmed);
-            }
-            validate_source_lookup(lookup)
-        }
         (Key::Owned(reference), Some(Value::LogicalSubscription(subscription))) => {
             if confirmed.evaluated_revision < *reference {
                 return Err(ValidationError::Confirmed);
@@ -280,13 +274,6 @@ pub fn validate_spec_for(spec: &ResourceSpec, profile: BindingProfile) -> Result
                     validate_data_binding(data.binding.as_ref(), data.delivery, profile)
                 }
             }
-        }
-        resource_spec::Declaration::SourceLookup(lookup) => {
-            if settings.receive.is_some() {
-                return Err(ValidationError::Settings);
-            }
-            let source = lookup.source.as_ref().ok_or(ValidationError::Identity)?;
-            crate::catalog::validate_address(source).map_err(|_| ValidationError::Identity)
         }
         resource_spec::Declaration::LogicalSubscription(subscription) => {
             let source = subscription
@@ -401,8 +388,7 @@ fn validate_live_for(live: &LiveResource, profile: BindingProfile) -> Result {
     if matches!(
         spec.declaration,
         Some(
-            resource_spec::Declaration::SourceLookup(_)
-                | resource_spec::Declaration::LogicalSubscription(_)
+            resource_spec::Declaration::LogicalSubscription(_)
                 | resource_spec::Declaration::SubscriptionSelector(_)
         )
     ) {
@@ -442,8 +428,7 @@ fn validate_live_for(live: &LiveResource, profile: BindingProfile) -> Result {
                 _ => return Err(ValidationError::Identity),
             }
         }
-        resource_spec::Declaration::SourceLookup(_)
-        | resource_spec::Declaration::LogicalSubscription(_)
+        resource_spec::Declaration::LogicalSubscription(_)
         | resource_spec::Declaration::SubscriptionSelector(_) => {
             return Err(ValidationError::Confirmed);
         }
@@ -594,35 +579,6 @@ fn validate_selector_state(state: &SubscriptionSelectorState) -> Result {
         previous = Some(key);
     }
     Ok(())
-}
-
-pub fn validate_source_lookup(lookup: &SourceLookupState) -> Result {
-    let spec = lookup.spec.as_ref().ok_or(ValidationError::Confirmed)?;
-    validate_spec(spec)?;
-    let source = match spec.declaration.as_ref() {
-        Some(resource_spec::Declaration::SourceLookup(lookup)) => {
-            lookup.source.as_ref().ok_or(ValidationError::Identity)?
-        }
-        _ => return Err(ValidationError::Confirmed),
-    };
-    match (&lookup.participant, &lookup.track) {
-        (None, None) => Ok(()),
-        (Some(participant), Some(track)) => {
-            if spec.settings.as_ref().and_then(|settings| settings.enabled) != Some(true) {
-                return Err(ValidationError::Confirmed);
-            }
-            validate_participant(participant)?;
-            validate_track(track)?;
-            if participant.participant_id != track.participant_id
-                || participant.room_id != track.room_id
-                || !matches_source_address(track, source)
-            {
-                return Err(ValidationError::Identity);
-            }
-            Ok(())
-        }
-        _ => Err(ValidationError::Confirmed),
-    }
 }
 
 pub fn validate_logical_subscription(subscription: &LogicalSubscriptionState) -> Result {
@@ -1055,9 +1011,6 @@ pub fn declarations_equivalent(left: &ResourceSpec, right: &ResourceSpec) -> boo
                 && left.kind == right.kind
                 && left.source_room == right.source_room
                 && bindings_equivalent(left.binding.as_ref(), right.binding.as_ref())
-        }
-        (Some(Declaration::SourceLookup(left)), Some(Declaration::SourceLookup(right))) => {
-            left.source == right.source
         }
         (
             Some(Declaration::LogicalSubscription(left)),

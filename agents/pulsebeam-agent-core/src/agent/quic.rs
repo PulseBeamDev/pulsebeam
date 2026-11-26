@@ -53,10 +53,60 @@ pub struct QuicRtpReceiver<'a> {
     pub video_dd: Option<i32>,
     pub generation: Generation,
     pub binding: core::num::NonZeroU16,
+    pub incarnation: u64,
     pub ssrc: u32,
     pub payload_type: u8,
     pub ready: bool,
     pub publication_id: &'a str,
+}
+
+impl<'a> QuicRtpReceiver<'a> {
+    fn new(
+        session: &Session,
+        binding: &'a state::TrackBinding,
+        publication_id: &'a str,
+        track: Option<&state::Track>,
+        ready: bool,
+    ) -> Option<Self> {
+        let state::track_binding::Transport::QuicRtp(parameters) = binding.transport.as_ref()?
+        else {
+            return None;
+        };
+        let codec = parameters.codec.as_ref()?;
+        Some(Self {
+            av1_whole_source: track.is_some_and(|track| {
+                matches!(track.kind.as_ref(), Some(state::track::Kind::Video(video)) if video.av1_whole_source)
+            }),
+            mime_type: &codec.format.as_ref()?.mime_type,
+            video_dd: parameters.video_dd,
+            ready,
+            generation: session.generation,
+            binding: core::num::NonZeroU16::new(u16::try_from(parameters.binding_id).ok()?)?,
+            incarnation: parameters.incarnation,
+            ssrc: parameters.primary_ssrc,
+            payload_type: u8::try_from(codec.payload_type?).ok()?,
+            publication_id,
+        })
+    }
+}
+
+fn logical_rtp_receiver<'a>(
+    session: &'a Session,
+    resource: &crate::native_state::Resource,
+) -> Option<QuicRtpReceiver<'a>> {
+    let (_, logical) = session.state.logical_offer(resource)?;
+    if !validation::declarations_equivalent(
+        session.state.target_spec(resource)?,
+        logical.spec.as_ref()?,
+    ) {
+        return None;
+    }
+    let Some(state::logical_subscription_state::Execution::Installed(binding)) = &logical.execution
+    else {
+        return None;
+    };
+    let track = logical.source.as_ref()?;
+    QuicRtpReceiver::new(session, binding, &track.publication_id, Some(track), true)
 }
 
 struct QuicFeatures {
@@ -88,12 +138,13 @@ impl Agent {
         &self,
         kind: crate::MediaKind,
     ) -> impl Iterator<Item = QuicRtpReceiver<'_>> {
-        use state::{resource_spec::Declaration, track_binding::Transport};
+        use crate::native_state::Resource;
+        use state::resource_spec::Declaration;
         self.active_quic_media()
             .into_iter()
             .flat_map(move |session| {
-                session.state.owned().filter_map(move |(resource, live)| {
-                    use crate::{MediaKind, MediaSlot, native_state::Resource};
+                let owned = session.state.owned().filter_map(move |(resource, live)| {
+                    use crate::{MediaKind, MediaSlot};
                     if !matches!(
                         (kind, resource),
                         (
@@ -111,13 +162,6 @@ impl Agent {
                     else {
                         return None;
                     };
-                    let Some(Transport::QuicRtp(parameters)) =
-                        &subscription.binding.as_ref()?.transport
-                    else {
-                        return None;
-                    };
-                    let binding =
-                        core::num::NonZeroU16::new(u16::try_from(parameters.binding_id).ok()?)?;
                     let ready = live.execution == state::ExecutionStatus::Installed as i32
                         && session.state.target_spec(resource).is_some_and(|target| {
                             validation::declarations_equivalent(target, spec)
@@ -127,23 +171,81 @@ impl Agent {
                                     .and_then(|settings| settings.enabled)
                                     == Some(true)
                         });
-                    let codec = parameters.codec.as_ref()?;
-                    let av1_whole_source = live.track.as_ref().is_some_and(|track| {
-                        matches!(track.kind.as_ref(), Some(state::track::Kind::Video(video)) if video.av1_whole_source)
-                    });
-                    Some(QuicRtpReceiver {
-                        av1_whole_source,
-                        mime_type: &codec.format.as_ref()?.mime_type,
-                        video_dd: parameters.video_dd,
+                    QuicRtpReceiver::new(
+                        session,
+                        subscription.binding.as_ref()?,
+                        &subscription.publication_id,
+                        live.track.as_ref(),
                         ready,
-                        generation: session.generation,
-                        binding,
-                        ssrc: parameters.primary_ssrc,
-                        payload_type: u8::try_from(codec.payload_type?).ok()?,
-                        publication_id: &subscription.publication_id,
-                    })
-                })
+                    )
+                });
+                let logical = session.state.resources().filter_map(move |resource| {
+                    use crate::{MediaKind, MediaSlot};
+                    if !matches!(
+                        (kind, resource),
+                        (
+                            MediaKind::Audio,
+                            Resource::LogicalReception(MediaSlot::RemoteAudio(_))
+                        ) | (
+                            MediaKind::Video,
+                            Resource::LogicalReception(MediaSlot::RemoteVideo(_))
+                        )
+                    ) {
+                        return None;
+                    }
+                    logical_rtp_receiver(session, resource)
+                });
+                owned.chain(logical)
             })
+    }
+
+    #[doc(hidden)]
+    pub fn quic_selector_receiver(
+        &self,
+        owner: crate::TrackOwner,
+        source: &super::SelectorMatch,
+    ) -> Result<Option<QuicRtpReceiver<'_>>, crate::ffi::ErrorInfo> {
+        let Some(session) = self.active_quic_media() else {
+            return Ok(None);
+        };
+        if !self.selectors.contains_match(owner, source, &session.state) {
+            return Ok(None);
+        }
+        let kind = match source.kind {
+            super::SelectorTrackKind::Audio => state::TrackKind::Audio,
+            super::SelectorTrackKind::Video => state::TrackKind::Video,
+            super::SelectorTrackKind::Data => return Ok(None),
+        };
+        let Some(resource) = native::logical_resource(session, &source.address(), kind) else {
+            return Ok(None);
+        };
+        if let Some(confirmed) = session.state.confirmed(resource) {
+            use state::logical_subscription_state::Execution;
+            let failure =
+                confirmed
+                    .rejection
+                    .as_ref()
+                    .or_else(
+                        || match &crate::native_state::logical_state(confirmed)?.execution {
+                            Some(Execution::Failure(failure)) => Some(failure),
+                            _ => None,
+                        },
+                    );
+            if let Some(failure) = failure {
+                use crate::ffi::{ErrorCode, ErrorInfo};
+                use state::FailureCode;
+                let code = match failure.code() {
+                    FailureCode::CapacityExceeded => ErrorCode::CapacityExceeded,
+                    FailureCode::Incompatible | FailureCode::Unsupported => ErrorCode::Unsupported,
+                    FailureCode::InvalidConfiguration => ErrorCode::InvalidArgument,
+                    FailureCode::PermissionDenied => ErrorCode::PermissionDenied,
+                    FailureCode::ResourceGone => ErrorCode::Closed,
+                    _ => ErrorCode::Internal,
+                };
+                return Err(ErrorInfo::new(code, "QUIC media reception failed"));
+            }
+        }
+        Ok(logical_rtp_receiver(session, resource))
     }
 
     #[doc(hidden)]

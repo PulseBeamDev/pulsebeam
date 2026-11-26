@@ -93,23 +93,35 @@ async function handles() {
       options.source === null ? null : inputs[options.source],
       { enabled: options.enabled },
     );
-    const video = useSubscribe(peer.video("camera"), {
-      visible: true,
-      height: options.high ? 720 : 360,
-      minHeight: 0,
-      minFps: 0,
-      priority: 1,
-    });
+    const video = useSubscribe(
+      peer.video("camera"),
+      Object.freeze({
+        visible: true,
+        height: options.high ? 720 : 360,
+        minHeight: 0,
+        minFps: 0,
+        priority: 1,
+      }),
+    );
     const audio = useSubscribe(peer.audio("microphone"));
     const cameras = useSubscribe(room.video({ trackId: "camera" }));
     const microphone = usePublish(agent.audio("microphone"));
     const events = usePublish(agent.data("events"), null, {
       delivery: options.mode,
     });
-    const receive = useSubscribe(peer.data("events"), {
-      delivery: options.mode,
-    });
-    return { watch, publication, video, audio, cameras, microphone, events, receive };
+    const receive = useSubscribe(peer.data("events"));
+    const set = useSubscribe(room.data({ trackId: "events" }));
+    return {
+      watch,
+      publication,
+      video,
+      audio,
+      cameras,
+      microphone,
+      events,
+      receive,
+      set,
+    };
   }
 
   function Owners({ agent }: { agent: Agent }) {
@@ -183,14 +195,17 @@ async function handles() {
     assert.equal(secondPipe.state().status, PipeStatus.Closed);
     assert.equal(handles!.publication, first.publication);
 
-    await flush(() =>
-      setOptions({
-        ...preferences,
-        source: null,
-        room: "second",
-        mode: DataDelivery.Latest,
-      }),
-    );
+    const latest = { ...preferences, source: null, mode: DataDelivery.Latest };
+    await flush(() => setOptions(latest));
+    assert.notEqual(handles!.events, first.events);
+    assert.equal(first.events.state().closed, true);
+    assert.equal(handles!.receive, first.receive);
+    assert.equal(first.receive.state().closed, false);
+    assert.equal(handles!.set, first.set);
+    assert.equal(handles!.watch, first.watch);
+    await flush(() => setOptions({ ...latest, room: "second" }));
+    assert.notEqual(handles!.set, first.set);
+    assert.equal(first.set!.state().closed, true);
     assert.ok(renderedAbsent, "new watch scope never reads an old watch");
     assert.equal(first.watch.state().status, WatchStatus.Closed);
     assert.equal(handles!.watch!.state().room, "second");

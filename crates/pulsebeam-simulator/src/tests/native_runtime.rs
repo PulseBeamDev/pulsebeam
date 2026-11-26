@@ -423,9 +423,7 @@ impl LatestData {
                 .room(room.as_str().into())?
                 .participant(remote.into())?
                 .data("latest-state".into())?
-                .subscribe(Some(core_ffi::DataSubscribeOptions {
-                    delivery: Some(core_ffi::DataDelivery::Latest),
-                }))?,
+                .subscribe()?,
         })
     }
 
@@ -560,11 +558,8 @@ impl OwnedData {
             .room(room.as_str().into())?
             .participant(remote.clone())?
             .data("owned-bytes".into())?;
-        let options = Some(core_ffi::DataSubscribeOptions {
-            delivery: Some(core_ffi::DataDelivery::Unreliable),
-        });
-        let room = source.subscribe(options.clone())?;
-        let participant = source.subscribe(options)?;
+        let room = source.subscribe()?;
+        let participant = source.subscribe()?;
         Ok(Self {
             sender,
             room,
@@ -914,9 +909,7 @@ async fn prove_joined_recovery(
         .room(room.into())?
         .participant("alice".into())?
         .data("feed".into())?
-        .subscribe(Some(core_ffi::DataSubscribeOptions {
-            delivery: Some(core_ffi::DataDelivery::Latest),
-        }))?;
+        .subscribe()?;
     let feed_updates = feed.updates()?;
     use anyhow::Context as _;
     tokio::time::timeout(Duration::from_secs(3), subscriber.connect())
@@ -1681,9 +1674,7 @@ async fn roomless_presence_scenario(client_ip: IpAddr, server_ip: IpAddr) -> any
         .room("stage".into())?
         .participant("present-publisher".into())?
         .data("replacement".into())?
-        .subscribe(Some(core_ffi::DataSubscribeOptions {
-            delivery: Some(core_ffi::DataDelivery::Unreliable),
-        }))?;
+        .subscribe()?;
     replacement_transport.connect().await?;
     let updates = &replacement_receiver.updates()?;
     let await_source = |present| async move {
@@ -1781,9 +1772,7 @@ async fn roomless_presence_scenario(client_ip: IpAddr, server_ip: IpAddr) -> any
         .room("stage".into())?
         .participant("present-publisher".into())?
         .data("events".into())?
-        .subscribe(Some(core_ffi::DataSubscribeOptions {
-            delivery: Some(core_ffi::DataDelivery::Latest),
-        }))?;
+        .subscribe()?;
     let local = viewer
         .audio("microphone".into())?
         .publish(Default::default())?;

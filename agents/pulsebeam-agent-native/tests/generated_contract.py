@@ -16,10 +16,9 @@ async def witness():
     assert core.DataPublishOptions().capture_clock is None
     assert core.DataPublishOptions().record_dd is None
     assert core.DataPublishOptions(record_dd=True).record_dd is True
-    assert core.DataSubscribeOptions().delivery is None
+    assert not hasattr(core, "DataSubscribeOptions")
     for delivery in (core.DataDelivery.UNRELIABLE, core.DataDelivery.LATEST):
         assert core.DataPublishOptions(delivery=delivery).delivery is delivery
-        assert core.DataSubscribeOptions(delivery=delivery).delivery is delivery
     assert core.DataSendOptions().captured_at is None
     assert core.DataSendOptions().fragment_descriptors is None
     assert list(inspect.signature(core.DataSendOptions).parameters) == [

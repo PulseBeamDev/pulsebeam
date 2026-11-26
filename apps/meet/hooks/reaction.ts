@@ -24,7 +24,12 @@ export function useReaction(agent: Agent) {
     Reactions,
     reactions,
     onEvent(event: DataEvent) {
-      if (!DataEvent.Message.instanceOf(event)) return;
+      if (
+        !DataEvent.Message.instanceOf(event) ||
+        event.inner.participantId === agent.state().participantId ||
+        event.inner.delivery !== DataDelivery.Unreliable
+      )
+        return;
       const emoji = decodeText(event.inner.data);
       if (emoji !== null && reactionEmojis.includes(emoji)) {
         add({

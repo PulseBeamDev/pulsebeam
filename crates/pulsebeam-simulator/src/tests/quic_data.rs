@@ -1262,9 +1262,7 @@ async fn mixed_exchange(
         .room("stage".into())?
         .participant("alice".into())?
         .data("events".into())?
-        .subscribe(Some(wire::DataSubscribeOptions {
-            delivery: Some(native_mode),
-        }))?;
+        .subscribe()?;
     let sender = sctp
         .data("return".into())?
         .publish(Some(wire::DataPublishOptions {
@@ -2194,7 +2192,7 @@ async fn mixed_opus_exchange(
     use pulsebeam_agent_core::{
         AgentCommand, AgentConfig, AudioSubscription, DataEvent, DesiredState, MediaKind,
         PublicationIntent, ResourceCommand, TopicMode, TrackSpec,
-        ffi::{DataDelivery, DataSubscribeOptions, PublicationExecution},
+        ffi::{DataDelivery, PublicationExecution},
     };
     use pulsebeam_agent_native::{
         Agent as RuntimeAgent, AudioInput, Config, Host, InputFrame, MediaStreamUpdate,
@@ -2238,9 +2236,7 @@ async fn mixed_opus_exchange(
             rtc.room("stage".into())?
                 .participant("alice".into())?
                 .data("bulk".into())?
-                .subscribe(Some(DataSubscribeOptions {
-                    delivery: Some(DataDelivery::Reliable),
-                }))?,
+                .subscribe()?,
         )
     } else {
         None
@@ -2537,12 +2533,17 @@ async fn mixed_h264_exchange(
     let cross_shard = native_receiver_token.is_none();
     use super::common::{client::create_http_client, native::NativeHost};
     use pulsebeam_agent_core::{
-        AgentCommand, AgentConfig, DesiredState, MediaKind, PublicationIntent,
+        AgentCommand, AgentConfig, DesiredState, MediaKind, PublicationIntent, SelectorStatus,
+        TrackFilter,
         ffi::{PublicationExecution, VideoObservation},
     };
     use pulsebeam_agent_native::{
         Agent as RuntimeAgent, Config, H264Frame, Host, InputFrame, MediaStreamUpdate, OutputFrame,
         ReceiveMode, VideoInput, ffi::Agent,
+    };
+    use pulsebeam_agent_quic::{
+        executor::timed::{Policy, Receive},
+        media::units::Event,
     };
     let mut quic = sim_quic_agent(address, edge, roots.clone(), quic_token)?;
     let camera = PublicationIntent {
@@ -2792,34 +2793,90 @@ async fn mixed_h264_exchange(
         .admission
         .publication_id
         .context("WebRTC video publication ID")?;
-    let revision = quic
-        .snapshot()
-        .desired_revision
-        .checked_add(1)
-        .context("QUIC desired revision exhausted")?;
-    quic.command(AgentCommand::ReplaceDesired(DesiredState {
-        revision,
-        connected: true,
-        publications: vec![camera],
-        video: vec![pinned_video(reverse_id.clone())],
-        rtp_sources: vec![stage_h264_source(&reverse_id)],
-        ..Default::default()
-    }))?;
-    pulsebeam_runtime::time::timeout(Duration::from_secs(2), async {
-        while !quic.h264_receiver_ready(&reverse_id) {
+    let selector_error = |error| anyhow::anyhow!("QUIC media selector: {error:?}");
+    let selector = quic
+        .open_media_selector(
+            "stage".into(),
+            MediaKind::Video,
+            TrackFilter {
+                participant_id: Some("bob".into()),
+                track_id: Some("return".into()),
+            },
+        )
+        .map_err(selector_error)?;
+    let sibling = quic
+        .open_media_selector(
+            "stage".into(),
+            MediaKind::Video,
+            TrackFilter {
+                participant_id: None,
+                track_id: Some("return".into()),
+            },
+        )
+        .map_err(selector_error)?;
+    let (matched, binding) = pulsebeam_runtime::time::timeout(Duration::from_secs(2), async {
+        loop {
             ensure!(
                 quic.snapshot().terminal_failure.is_none(),
                 "QUIC video subscription: {:?}",
                 quic.snapshot().terminal_failure
             );
+            let state = quic
+                .media_selector_state(selector)
+                .context("selector closed")?;
+            let sibling_state = quic
+                .media_selector_state(sibling)
+                .context("sibling closed")?;
+            ensure!(
+                state.error.is_none() && sibling_state.error.is_none(),
+                "selector rejected"
+            );
+            if state.status == SelectorStatus::Complete
+                && let [matched] = state.matches.as_slice()
+                && let Some(primary) = quic
+                    .selected_rtp(selector, matched)
+                    .map_err(selector_error)?
+                && let Some(sibling_rtp) = quic
+                    .selected_rtp(sibling, matched)
+                    .map_err(selector_error)?
+            {
+                ensure!(
+                    primary == sibling_rtp,
+                    "overlap allocated a second RTP binding"
+                );
+                ensure!(
+                    matched.room == "stage"
+                        && matched.participant_id == "bob"
+                        && matched.track_id == "return"
+                );
+                ensure!(primary.publication_id == reverse_id && primary.mime_type == "video/h264");
+                ensure!(primary.incarnation != 0);
+                break anyhow::Ok((matched.clone(), primary.binding));
+            }
             quic.turn()
                 .await
                 .map_err(|error| anyhow::anyhow!("QUIC video subscription: {error:?}"))?;
         }
-        anyhow::Ok(())
     })
     .await
     .context("QUIC video subscription did not install")??;
+    let policy = Policy::Recording {
+        reorder: Duration::from_millis(20),
+    };
+    quic.attach_encoded(binding, policy)
+        .map_err(|error| anyhow::anyhow!("attach timed H.264 reader: {error:?}"))?;
+    ensure!(quic.close_media_selector(selector));
+    ensure!(quic.media_selector_state(selector).is_none());
+    ensure!(
+        quic.selected_rtp(selector, &matched)
+            .map_err(selector_error)?
+            .is_none()
+    );
+    ensure!(
+        quic.selected_rtp(sibling, &matched)
+            .map_err(selector_error)?
+            .is_some_and(|live| live.binding == binding)
+    );
     while !reverse.state().forwarding_requested {
         demand
             .next()
@@ -2841,10 +2898,13 @@ async fn mixed_h264_exchange(
         .await?;
     pulsebeam_runtime::time::timeout(Duration::from_secs(2), async {
         loop {
-            if let Some(frame) = quic.next_h264() {
+            if let Some(event) = quic.next_encoded(binding) {
+                let Receive::Media(Event::Unit(frame)) = event else {
+                    anyhow::bail!("unexpected timed H.264 event: {event:?}");
+                };
                 ensure!(
-                    frame.publication_id == reverse_id && frame.access_unit == unit.data,
-                    "unexpected QUIC encoded video access unit"
+                    frame.source == binding && frame.data == unit.data,
+                    "timed QUIC reader did not preserve the access unit"
                 );
                 return Ok(());
             }
@@ -2857,7 +2917,7 @@ async fn mixed_h264_exchange(
     .context("QUIC did not receive WebRTC H.264")??;
     pulsebeam_runtime::time::sleep(Duration::from_millis(600)).await;
     loop {
-        match quic.request_h264_keyframe(&reverse_id) {
+        match quic.request_rtp_keyframe(binding) {
             Ok(()) => break,
             Err(DatagramAdmission::Full | DatagramAdmission::ControlTurn) => {}
             Err(error) => anyhow::bail!("QUIC keyframe request: {error:?}"),
@@ -2898,6 +2958,9 @@ async fn mixed_h264_exchange(
         result = pulsebeam_runtime::time::timeout(Duration::from_secs(2), wait_feedback) => result.context("WebRTC publisher did not receive QUIC PLI")??,
         error = async { loop { if let Err(error) = quic.turn().await { break error; } } } => anyhow::bail!("QUIC keyframe request drive: {error:?}"),
     }
+    ensure!(quic.detach_encoded(binding));
+    ensure!(quic.next_encoded(binding).is_none());
+    ensure!(quic.close_media_selector(sibling));
     let revision = quic
         .snapshot()
         .desired_revision
@@ -2919,7 +2982,7 @@ async fn mixed_h264_exchange(
     })
     .await
     .context("QUIC video bindings did not retire")??;
-    ensure!(quic.request_h264_keyframe(&reverse_id) == Err(DatagramAdmission::Unsupported));
+    ensure!(quic.request_rtp_keyframe(binding) == Err(DatagramAdmission::Unsupported));
     ensure!(!quic.take_h264_keyframe_request("camera"));
     ensure!(quic.next_h264().is_none());
     ensure!(

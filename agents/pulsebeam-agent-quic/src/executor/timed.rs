@@ -6,12 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use pulsebeam_agent_core::MediaKind;
-
-use super::{
-    host::Agent,
-    rtp::{Binding, ReceivedPacket},
-};
+use super::rtp::{Binding, ReceivedPacket};
 use crate::{
     media::{
         jitter::{self, GapReason},
@@ -104,47 +99,6 @@ pub struct Stats {
     pub refresh_sent: u64,
     pub refresh_backpressure: u64,
     pub residence_max: Duration,
-}
-
-/// A pinned reader that reattaches to the current binding after reconnect.
-/// The application owns subscription intent and drives Agent turns.
-pub struct Reader {
-    kind: MediaKind,
-    publication: String,
-    policy: Policy,
-    binding: Option<Binding>,
-}
-
-impl Reader {
-    pub fn new(kind: MediaKind, publication: String, policy: Policy) -> Self {
-        Self {
-            kind,
-            publication,
-            policy,
-            binding: None,
-        }
-    }
-
-    /// Attach the current lifetime even if a downstream sink cannot read yet.
-    pub fn sync(&mut self, agent: &mut Agent) -> Result<Option<Binding>, AttachError> {
-        let current = agent.rtp_subscription(self.kind, &self.publication);
-        if current != self.binding {
-            if let Some(previous) = self.binding.take() {
-                agent.detach_encoded(previous);
-            }
-            if let Some(binding) = current {
-                agent.attach_encoded(binding, self.policy)?;
-                self.binding = Some(binding);
-            }
-        }
-        Ok(self.binding)
-    }
-
-    pub fn next(&mut self, agent: &mut Agent) -> Result<Option<(Binding, Receive)>, AttachError> {
-        Ok(self
-            .sync(agent)?
-            .and_then(|binding| agent.next_encoded(binding).map(|event| (binding, event))))
-    }
 }
 
 pub(super) struct Track {

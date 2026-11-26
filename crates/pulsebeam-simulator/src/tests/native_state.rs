@@ -49,6 +49,40 @@ enum VideoBootstrap<'a> {
     Vp9Receiver,
 }
 
+async fn bind_logical_video(
+    viewer: &mut WirePeer,
+    publication: &str,
+    binding: &wire::TrackBinding,
+    report_revision: u64,
+    previous_source: u64,
+) -> anyhow::Result<u64> {
+    use wire::logical_subscription_state::Execution;
+    let offer = viewer
+        .logical_when(1, |state| {
+            state.source_revision > previous_source && state.source.is_some()
+        })
+        .await?;
+    anyhow::ensure!(
+        offer
+            .source
+            .as_ref()
+            .is_some_and(|source| source.publication_id == publication),
+        "logical video intent resolved to a different publication: {offer:?}"
+    );
+    viewer.report_prepared_receiver(offer.source_revision, report_revision, binding.clone());
+    let settled = viewer
+        .logical_when(1, |state| {
+            state.source_revision >= offer.source_revision && state.execution.is_some()
+        })
+        .await?;
+    anyhow::ensure!(
+        settled.source_revision == offer.source_revision
+            && settled.execution == Some(Execution::Installed(binding.clone())),
+        "logical video receiver did not install: {settled:?}"
+    );
+    Ok(offer.source_revision)
+}
+
 impl WirePeer {
     async fn connect(
         ip: IpAddr,
@@ -469,19 +503,14 @@ impl WirePeer {
         Ok(None)
     }
 
-    async fn wait_for_video_publication(
-        &mut self,
-        room: &str,
-        publisher: &str,
-        track: &str,
-        publication: &str,
-    ) -> anyhow::Result<()> {
+    fn subscribe_video(&self, room: &str, publisher: &str, track: &str) {
         self.desire(
             1,
             1,
             Some(wire::ResourceSpec {
-                declaration: Some(wire::resource_spec::Declaration::SourceLookup(
-                    wire::SourceLookupSpec {
+                declaration: Some(wire::resource_spec::Declaration::LogicalSubscription(
+                    wire::LogicalSubscriptionSpec {
+                        data_version: None,
                         source: Some(wire::LogicalSourceAddress {
                             room: room.into(),
                             participant_id: publisher.into(),
@@ -496,23 +525,6 @@ impl WirePeer {
                 }),
             }),
         );
-        loop {
-            let state = self.confirmed(1, 1).await?;
-            anyhow::ensure!(
-                state.rejection.is_none(),
-                "video source lookup rejected: {state:?}"
-            );
-            let Some(wire::confirmed_state::Value::SourceLookup(lookup)) = state.value else {
-                anyhow::bail!("video source lookup absent: {state:?}");
-            };
-            if let Some(track) = lookup.track {
-                anyhow::ensure!(
-                    track.publication_id == publication,
-                    "unexpected video publication: {track:?}"
-                );
-                return Ok(());
-            }
-        }
     }
 
     fn desire(&self, reference: u64, revision: u64, spec: Option<wire::ResourceSpec>) {

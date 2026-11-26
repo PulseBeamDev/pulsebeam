@@ -433,11 +433,6 @@ enum Command {
     },
     ObserveAdmittedMedia {
         admission: agent_core::AdmittedMedia,
-        response: oneshot::Sender<Result<RemoteMedia, Error>>,
-    },
-    ObserveSelectorMatch {
-        owner: agent_core::TrackOwner,
-        source: agent_core::SelectorMatch,
         mode: ReceiveMode,
         response: oneshot::Sender<Result<RemoteMedia, Error>>,
     },
@@ -755,46 +750,6 @@ impl Agent {
     }
     pub async fn send_topic(&self, send: TopicSend) -> Result<(), Error> {
         self.command(AgentCommand::SendTopic(send)).await
-    }
-    pub fn open_subscription_selector(
-        &self,
-        selector: agent_core::SubscriptionSelector,
-    ) -> Result<agent_core::TrackOwner, Error> {
-        self.core.external(|core| {
-            if self.is_closed() {
-                return Err(Error::Closed);
-            }
-            core.open_subscription_selector(selector)
-                .map_err(Error::Operation)
-        })
-    }
-    pub fn subscription_selector_state(
-        &self,
-        owner: agent_core::TrackOwner,
-    ) -> Option<agent_core::SelectorState> {
-        self.core.subscription_selector_state(owner)
-    }
-    pub async fn observe_selector_match(
-        &self,
-        owner: agent_core::TrackOwner,
-        source: agent_core::SelectorMatch,
-        mode: ReceiveMode,
-    ) -> Result<RemoteMedia, Error> {
-        let (response, result) = oneshot::channel();
-        self.commands
-            .send(Command::ObserveSelectorMatch {
-                owner,
-                source,
-                mode,
-                response,
-            })
-            .await
-            .map_err(|_| Error::Closed)?;
-        result.await.map_err(|_| Error::Closed)?
-    }
-    pub fn close_subscription_selector(&self, owner: agent_core::TrackOwner) -> bool {
-        self.core
-            .external(|core| core.close_subscription_selector(owner))
     }
     pub fn join(&self, room: String) -> Result<(), Error> {
         self.intent(AgentCommand::Join(room))
@@ -1549,22 +1504,11 @@ where
             }
             Command::ObserveAdmittedMedia {
                 admission,
-                response,
-            } => {
-                self.begin_observation(
-                    agent_core::ResourceCommand::BeginAdmittedMediaObservation { admission },
-                    ReceiveMode::Decoded,
-                    response,
-                );
-            }
-            Command::ObserveSelectorMatch {
-                owner,
-                source,
                 mode,
                 response,
             } => {
                 self.begin_observation(
-                    agent_core::ResourceCommand::BeginSelectorMediaObservation { owner, source },
+                    agent_core::ResourceCommand::BeginAdmittedMediaObservation { admission },
                     mode,
                     response,
                 );
@@ -2981,9 +2925,7 @@ mod tests {
             .unwrap();
         assert_eq!(remote.source("control".into()).room, "room");
         assert_eq!(other.source("control".into()).room, "other");
-        let _remote = remote
-            .data("control".into(), agent_core::TopicMode::Ordered)
-            .unwrap();
+        let _remote = remote.data("control".into()).unwrap();
         assert_eq!(actor.core.snapshot(), initial);
         assert!(actor.data_receivers.is_empty());
         assert!(actor.core.next_effect().is_none());

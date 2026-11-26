@@ -351,7 +351,6 @@
   let audioPipe;
   let replacementVideoTrack;
   let steadyIterator;
-  let steadySelector;
   let cyclingIterator;
   let audioSubscription;
   let videoSubscription;
@@ -462,23 +461,13 @@
       await delivery;
     };
     const steadyPublisher = sender.data("reuse-steady").publish();
-    steadySelector = receiver.subscribeSelector({
-      participantId: "web-sender",
-      kind: pulsebeam.SelectorTrackKind.Data,
-      trackId: "reuse-steady",
-    });
-    await until(() => {
-      const match = steadySelector.state()?.matches[0];
-      if (!match) return false;
-      try {
-        steadyIterator = steadySelector.receiveData(match);
-        return true;
-      } catch (error) {
-        if (error?.inner?.info?.code !== pulsebeam.ErrorCode.NotReady)
-          throw error;
-        return false;
-      }
-    }, "selected data source admission");
+    steadyIterator = receiver
+      .room(receiver.state().room)
+      .data({
+        participantId: "web-sender",
+        trackId: "reuse-steady",
+      })
+      .subscribe();
     await warmOrdered(steadyPublisher, steadyIterator, 0);
     await sendOrdered(steadyPublisher, steadyIterator, 1);
     const steadyChannels = payloadChannels.filter(
@@ -703,16 +692,11 @@
     await witnessView(video, "remount retains live receiver");
     fixedPresentation = video.srcObject.getVideoTracks()[0];
     const pendingDataRead = steadyIterator.next();
-    steadySelector.close();
-    await until(
-      () => steadyIterator.state().closed,
-      "selector retires its data cursor",
-    );
+    await steadyIterator.close();
     assert(
       (await pendingDataRead) === undefined,
-      "selector retirement ends an in-flight data read",
+      "data set close ends an in-flight read",
     );
-    await steadyIterator.close();
     steadyIterator = undefined;
 
     const previousSsrc = await receiverSsrc(fixedPeer, fixedReceiver);
@@ -1021,18 +1005,20 @@
     );
     // Keep the existing H264 witness and exercise one explicit AV1 publication
     // with the same shipping SDK and real browser decoder.
-    const screenSelector = receiver.subscribeSelector({
-      participantId: "web-sender",
-      kind: pulsebeam.SelectorTrackKind.Video,
-      trackId: "av1-screen",
-    });
+    const screens = receiver
+      .room(receiver.state().room)
+      .video({
+        participantId: "web-sender",
+        trackId: "av1-screen",
+      })
+      .subscribe();
     await until(() => {
-      const state = screenSelector.state();
+      const state = screens.state();
       return (
-        state?.status === pulsebeam.SelectorStatus.Complete &&
-        state.matches.length === 0
+        state.status === pulsebeam.CollectionStatus.Live &&
+        state.tracks.length === 0
       );
-    }, "wildcard selector admitted before its source exists");
+    }, "video collection live before its source exists");
     const screen = sender.video("av1-screen").publish({
       enabled: true,
       codec: pulsebeam.VideoCodec.Av1,
@@ -1052,16 +1038,16 @@
         .participant("web-sender")
         .video("av1-screen")
         .subscribe();
-      let screenMatch;
+      let admittedScreen;
       await until(() => {
-        screenMatch = screenSelector.state()?.matches[0];
-        return screenMatch?.trackId === "av1-screen";
-      }, "future AV1 publication enters the wildcard selector");
-      screenAttachment = await screenSelector.playbackOutput(screenMatch);
+        admittedScreen = screens.state().tracks[0];
+        return admittedScreen?.trackId === "av1-screen";
+      }, "future AV1 publication enters the collection");
+      screenAttachment = await admittedScreen.track.playbackOutput();
       const outputTrack = screenAttachment.track();
       assert(
         outputTrack?.kind === "video",
-        "selector exposes a browser video track",
+        "borrowed capability exposes a browser video track",
       );
       screenElement.srcObject = new MediaStream([outputTrack]);
       await screenElement.play();
@@ -1090,13 +1076,13 @@
           screenSubscription.state().sourceFormat?.mimeType === "video/av1",
         "public AV1 endpoints report the applied source format",
       );
-      screenSelector.close();
+      await screens.close();
       await until(
         () => outputTrack.readyState === "ended",
-        "selector close retires its playback observation",
+        "collection close retires its playback observation",
       );
     } finally {
-      screenSelector.close();
+      await screens.close();
       await screenAttachment?.close();
       await screenSubscription?.close();
       await screenPipe?.close();
@@ -1248,7 +1234,6 @@
     MediaStreamTrack.prototype.clone = originalClone;
     await releaseReplacement?.();
     await Promise.allSettled([
-      steadySelector?.close(),
       steadyIterator?.close(),
       cyclingIterator?.close(),
       attachment?.close(),

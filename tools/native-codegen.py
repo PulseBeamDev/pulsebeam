@@ -84,7 +84,7 @@ def main():
     signatures = {
         native: (
             "`publish`(`options`: DataPublishOptions? = null)",
-            "`subscribe`(`options`: DataSubscribeOptions? = null)",
+            "`subscribe`(): DataSubscription",
             "`send`(`data`: kotlin.ByteArray, `options`: DataSendOptions? = null)",
         ),
         core: (
@@ -95,7 +95,7 @@ def main():
         ),
         output / "PulseBeamAgent.swift": (
             "publish(options: DataPublishOptions? = nil)",
-            "subscribe(options: DataSubscribeOptions? = nil)",
+            "subscribe() throws -> DataSubscription",
             "send(data: Data, options: DataSendOptions? = nil)",
         ),
         output / "pulsebeam_agent_core.swift": (

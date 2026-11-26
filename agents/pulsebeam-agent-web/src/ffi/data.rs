@@ -1,5 +1,5 @@
 use super::{
-    Agent, Arc, ErrorCode, ErrorInfo, SelectorSubscription, WebAgentError,
+    Agent, Arc, ErrorCode, ErrorInfo, WebAgentError,
     video::{Participant, RoomRef},
 };
 use agent_core::{TrackSpec, ffi};
@@ -90,61 +90,13 @@ impl RemoteDataTrack {
         self.selector.clone().into()
     }
 
-    #[uniffi::method(default(options = None))]
-    pub fn subscribe(
-        &self,
-        options: Option<ffi::DataSubscribeOptions>,
-    ) -> Result<Arc<DataSubscription>, WebAgentError> {
-        #[cfg(target_arch = "wasm32")]
-        {
-            let (owner, observer) = self.agent.runtime.claim_data_subscription(
-                options.and_then(|value| value.delivery),
-                self.selector.clone(),
-            )?;
-            Ok(Arc::new(DataSubscription {
-                agent: self.agent.clone(),
-                owner,
-                observer,
-            }))
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let _ = options;
-            Err(super::browser_required())
-        }
-    }
-}
-
-#[uniffi::export]
-impl RoomRef {
-    #[uniffi::method(default(filter = None))]
-    pub fn data(&self, filter: Option<agent_core::TrackFilter>) -> Arc<DataSetRef> {
-        Arc::new(DataSetRef {
-            #[cfg(target_arch = "wasm32")]
-            agent: self.agent.clone(),
-            room: self.room.clone(),
-            filter: filter.unwrap_or_default(),
-        })
-    }
-}
-
-#[derive(uniffi::Object)]
-pub struct DataSetRef {
-    #[cfg(target_arch = "wasm32")]
-    agent: Arc<Agent>,
-    room: String,
-    filter: agent_core::TrackFilter,
-}
-
-#[uniffi::export]
-impl DataSetRef {
     pub fn subscribe(&self) -> Result<Arc<DataSubscription>, WebAgentError> {
         #[cfg(target_arch = "wasm32")]
         {
             let (owner, observer) = self
                 .agent
                 .runtime
-                .claim_data_set(self.room.clone(), self.filter.clone())?;
+                .claim_data_subscription(self.selector.clone())?;
             Ok(Arc::new(DataSubscription {
                 agent: self.agent.clone(),
                 owner,
@@ -157,25 +109,46 @@ impl DataSetRef {
 }
 
 #[uniffi::export]
-impl SelectorSubscription {
-    pub fn receive_data(
-        &self,
-        source: agent_core::SelectorMatch,
-    ) -> Result<Arc<DataSubscription>, WebAgentError> {
+impl RoomRef {
+    #[uniffi::method(default(filter = None))]
+    pub fn data(self: Arc<Self>, filter: Option<agent_core::TrackFilter>) -> Arc<DataSetRef> {
+        Arc::new(DataSetRef {
+            room: self,
+            filter: filter.unwrap_or_default(),
+        })
+    }
+}
+
+#[derive(uniffi::Object)]
+pub struct DataSetRef {
+    room: Arc<RoomRef>,
+    filter: agent_core::TrackFilter,
+}
+
+#[uniffi::export]
+impl DataSetRef {
+    pub fn same_selection(&self, other: Arc<Self>) -> bool {
+        Arc::ptr_eq(&self.room.agent, &other.room.agent)
+            && self.room.room == other.room.room
+            && self.filter == other.filter
+    }
+
+    pub fn subscribe(&self) -> Result<Arc<DataSubscription>, WebAgentError> {
         #[cfg(target_arch = "wasm32")]
         {
-            let (owner, observer) = self.agent.runtime.claim_selector_data(self.owner, source)?;
+            let (owner, observer) = self
+                .room
+                .agent
+                .runtime
+                .claim_data_set(self.room.room.clone(), self.filter.clone())?;
             Ok(Arc::new(DataSubscription {
-                agent: self.agent.clone(),
+                agent: self.room.agent.clone(),
                 owner,
                 observer,
             }))
         }
         #[cfg(not(target_arch = "wasm32"))]
-        {
-            let _ = source;
-            Err(super::browser_required())
-        }
+        Err(super::browser_required())
     }
 }
 

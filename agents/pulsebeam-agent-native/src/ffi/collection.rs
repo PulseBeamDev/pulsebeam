@@ -105,13 +105,26 @@ macro_rules! media_collection {
             admission: agent_core::AdmittedMedia,
         }
 
-        #[uniffi::export]
+        #[uniffi::export(async_runtime = "tokio")]
         impl $track {
             pub fn frames(&self) -> Result<Arc<$frames>, NativeError> {
                 Ok(Arc::new($frames::admitted(
                     self.room.clone(),
                     self.admission.clone(),
                 )?))
+            }
+
+            pub async fn observe(
+                &self,
+                mode: ReceiveMode,
+            ) -> Result<Arc<RemoteMediaReceiver>, NativeError> {
+                Ok(Arc::new(RemoteMediaReceiver {
+                    runtime: self
+                        .room
+                        .observe_admitted_media(self.admission.clone(), mode)
+                        .await
+                        .map_err(operation_error)?,
+                }))
             }
         }
 

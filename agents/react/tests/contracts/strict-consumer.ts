@@ -215,11 +215,12 @@ const remoteAudio = participant.audio("microphone");
 const remoteChat = participant.data("chat");
 // @ts-expect-error Participant descriptor lookup was removed.
 participant.track({ kind: "video", trackId: "camera" });
-// @ts-expect-error Delivery belongs on the owner.
+// @ts-expect-error The publisher selects delivery.
 participant.data("chat", "ordered");
+// @ts-expect-error Exact readers inherit delivery.
+remoteChat.subscribe({ delivery: DataDelivery.Latest });
 Data({
   track: participant.data("live"),
-  options: { delivery: DataDelivery.Unreliable },
   async onEvent(event) {
     if (!DataEvent.Message.instanceOf(event)) return;
     const bytes: Uint8Array = event.inner.data;
@@ -230,7 +231,6 @@ Data({
 });
 Data({
   track: participant.data("state"),
-  options: { delivery: DataDelivery.Latest },
   onEvent(event) {
     if (DataEvent.Discontinuity.instanceOf(event))
       void event.inner.previousPublicationId;

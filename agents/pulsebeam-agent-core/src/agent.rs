@@ -809,18 +809,6 @@ impl Agent {
                         .begin_audio_source_observation(TrackOwner(owner), source)?,
                 )
             }
-            ResourceCommand::BeginSelectorMediaObservation { owner, source } => {
-                if source.kind == SelectorTrackKind::Data {
-                    return Err(crate::TrackResourceError::WrongKind.into());
-                }
-                if !self.selector_match_current(owner, &source) {
-                    return Err(crate::TrackResourceError::Released.into());
-                }
-                ResourceResult::MediaObservation(
-                    self.resources
-                        .begin_selector_media_observation(owner, source, None)?,
-                )
-            }
             ResourceCommand::OpenMediaCollection { room, kind, filter } => {
                 let owner = self
                     .open_media_collection(room, kind, filter)
@@ -834,11 +822,9 @@ impl Agent {
                         "Collection track admission has ended",
                     )));
                 }
-                ResourceResult::MediaObservation(self.resources.begin_selector_media_observation(
-                    admission.owner,
-                    admission.matched.clone(),
-                    Some(admission),
-                )?)
+                ResourceResult::MediaObservation(
+                    self.resources.begin_admitted_media_observation(admission)?,
+                )
             }
             ResourceCommand::AuthorizeMediaObservation { control } => {
                 return Ok(if self.resources.observation_control_current(&control) {
@@ -894,38 +880,6 @@ impl Agent {
                 let owner = self.resources.receive_inherited_data(source)?;
                 self.intent_dirty = true;
                 self.request_reconciliation();
-                ResourceResult::Owned { owner: owner.id() }
-            }
-            ResourceCommand::ReceiveSelectorData { owner, source } => {
-                if source.kind != SelectorTrackKind::Data {
-                    return Err(crate::TrackResourceError::WrongKind.into());
-                }
-                if !self.selector_match_current(owner, &source) {
-                    return Err(crate::TrackResourceError::Released.into());
-                }
-                let source = source.address();
-                let resource = crate::native_state::Resource::LogicalData(source.clone());
-                let delivery = self
-                    .active
-                    .as_ref()
-                    .and_then(|active| {
-                        let (_, logical) = active.state.logical_offer(&resource)?;
-                        let pulsebeam_proto::state::track::Kind::Data(data) =
-                            logical.source.as_ref()?.kind.as_ref()?
-                        else {
-                            return None;
-                        };
-                        crate::TopicMode::from_delivery(data.delivery)
-                    })
-                    .ok_or_else(|| {
-                        AgentError::OperationFailed(crate::ffi::ErrorInfo::new(
-                            crate::ffi::ErrorCode::NotReady,
-                            "Selected data source is not ready",
-                        ))
-                    })?;
-                let owner = self
-                    .resources
-                    .receive_selector_data(owner, source, delivery)?;
                 ResourceResult::Owned { owner: owner.id() }
             }
             ResourceCommand::ReadData { owner } => {
@@ -1323,7 +1277,6 @@ impl Agent {
     fn flush_notifications(&mut self) -> Result<(), AgentError> {
         self.project_topic_bindings();
         self.progress_pending_data_sends();
-        self.retire_unmatched_selector_data();
         let failed_sets: Vec<_> = self.resources.failed_data_set_owners().collect();
         for owner in failed_sets {
             self.close_subscription_selector(owner);
@@ -1389,21 +1342,16 @@ impl Agent {
     fn reconcile_observation_controls(&mut self) {
         for id in self.resources.observation_requests() {
             let source = self.resources.audio_observation_source(id);
-            let selected = self.resources.selector_observation_match(id);
             let admission = self.resources.observation_admission(id);
-            let owner = TrackOwner(id.owner());
             let authorized = if let Some(admission) = admission {
                 self.admitted_media_current(admission)
             } else {
-                selected.is_none_or(|source| self.selector_match_current(owner, source))
-                    && source.is_none_or(|source| self.audio_source_authorized(id.owner(), source))
+                source.is_none_or(|source| self.audio_source_authorized(id.owner(), source))
             };
             let target = if !authorized {
                 None
             } else if let Some(admission) = admission {
                 Some(admission.target.clone())
-            } else if let Some(selected) = selected {
-                self.selector_media_target(owner, selected)
             } else if let Some(source) = source {
                 self.audio_source_observation_target(source)
             } else {
@@ -3304,13 +3252,6 @@ impl Agent {
         self.selectors.state(owner, native)
     }
 
-    fn selector_match_current(&self, owner: TrackOwner, source: &SelectorMatch) -> bool {
-        self.active
-            .as_ref()
-            .filter(|active| !active.signaling_terminal)
-            .is_some_and(|active| self.selectors.contains_match(owner, source, &active.state))
-    }
-
     pub fn open_media_collection(
         &mut self,
         room: String,
@@ -3340,12 +3281,9 @@ impl Agent {
         let tracks: Vec<_> = matches
             .into_iter()
             .filter_map(|matched| {
-                Some(AdmittedMedia {
-                    owner,
-                    membership: self.selectors.membership(owner, &matched)?,
-                    target: self.selector_media_target(owner, &matched)?,
-                    matched,
-                })
+                let membership = self.selectors.membership(owner, &matched)?;
+                let target = self.selector_media_target(owner, &matched)?;
+                Some(AdmittedMedia::new(owner, matched, membership, target))
             })
             .collect();
         let status = match status {
@@ -3410,38 +3348,10 @@ impl Agent {
         self.media_observation_target(slot)
     }
 
-    fn retire_unmatched_selector_data(&mut self) {
-        let native = self
-            .active
-            .as_ref()
-            .filter(|active| !active.signaling_terminal)
-            .map(|active| &active.state);
-        let retired: Vec<_> = self
-            .resources
-            .selector_data_receivers()
-            .filter_map(|(reader, selector, subscriber)| {
-                (!native.is_some_and(|native| {
-                    self.selectors
-                        .contains_data_match(selector, native, subscriber)
-                }))
-                .then_some(reader)
-            })
-            .collect();
-        if !retired.is_empty() {
-            for &owner in &retired {
-                self.resources.release(owner);
-            }
-            self.notifications.push_back(Notification::DataReady {
-                owners: retired.into_iter().map(TrackOwner::id).collect(),
-            });
-        }
-    }
-
     pub fn close_subscription_selector(&mut self, owner: crate::TrackOwner) -> bool {
         if !self.selectors.remove(owner) {
             return false;
         }
-        self.retire_unmatched_selector_data();
         for mut control in self.resources.release_observation_controls(owner) {
             control.effect = Some(self.ids.operation());
             self.effects.push_back(Effect::MediaObservation(control));

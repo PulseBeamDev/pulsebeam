@@ -132,7 +132,7 @@ async fn foreign_witness(
     let messages = publisher
         .room(ROOM.into())?
         .participant(participant.into())?
-        .data("foreign-exchange".into(), TopicMode::Ordered)?
+        .data("foreign-exchange".into())?
         .subscribe()?;
     let expected = expected.to_vec();
     let (received_tx, mut received_rx) = tokio::sync::oneshot::channel();

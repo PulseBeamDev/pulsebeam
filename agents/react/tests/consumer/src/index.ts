@@ -1,4 +1,4 @@
-import { DataDelivery, DataEvent } from "@pulsebeam/react";
+import { DataEvent } from "@pulsebeam/react";
 import {
   Audio,
   Data,
@@ -39,7 +39,6 @@ const remote = agent.room("selected-room").participant("alice");
 const messages = remote.data("messages");
 Data({
   track: messages,
-  options: { delivery: DataDelivery.Unreliable },
   async onEvent(event) {
     if (!DataEvent.Message.instanceOf(event)) return;
     const bytes: Uint8Array = event.inner.data;

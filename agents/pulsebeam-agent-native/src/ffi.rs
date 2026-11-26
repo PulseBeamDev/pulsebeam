@@ -255,16 +255,6 @@ impl Agent {
     pub fn is_closed(&self) -> bool {
         self.runtime.is_closed()
     }
-    pub fn subscribe_selector(
-        &self,
-        selector: agent_core::SubscriptionSelector,
-    ) -> Result<Arc<SelectorSubscription>, NativeError> {
-        let owner = self.runtime.open_subscription_selector(selector)?;
-        Ok(Arc::new(SelectorSubscription {
-            runtime: self.runtime.clone(),
-            owner,
-        }))
-    }
     pub fn join(&self, room: String) -> Result<(), NativeError> {
         self.runtime.join(room).map_err(operation_error)
     }
@@ -302,51 +292,6 @@ impl Agent {
 fn operation_error(error: RuntimeError) -> NativeError {
     NativeError::Operation {
         info: error.error_info(),
-    }
-}
-
-#[derive(uniffi::Object)]
-pub struct SelectorSubscription {
-    runtime: RuntimeAgent,
-    owner: agent_core::TrackOwner,
-}
-
-#[uniffi::export(async_runtime = "tokio")]
-impl SelectorSubscription {
-    pub fn state(&self) -> Option<agent_core::SelectorState> {
-        self.runtime.subscription_selector_state(self.owner)
-    }
-
-    pub async fn observe(
-        &self,
-        source: agent_core::SelectorMatch,
-        mode: ReceiveMode,
-    ) -> Result<Arc<RemoteMediaReceiver>, NativeError> {
-        Ok(Arc::new(RemoteMediaReceiver {
-            runtime: self
-                .runtime
-                .observe_selector_match(self.owner, source, mode)
-                .await?,
-        }))
-    }
-
-    pub fn receive_data(
-        &self,
-        source: agent_core::SelectorMatch,
-    ) -> Result<Arc<DataSubscription>, NativeError> {
-        Ok(Arc::new(DataSubscription {
-            runtime: self.runtime.receive_selector_data(self.owner, source)?,
-        }))
-    }
-
-    pub fn close(&self) {
-        self.runtime.close_subscription_selector(self.owner);
-    }
-}
-
-impl Drop for SelectorSubscription {
-    fn drop(&mut self) {
-        self.close();
     }
 }
 
@@ -606,9 +551,7 @@ impl Participant {
     }
     pub fn data(&self, track_id: String) -> Result<Arc<RemoteDataTrack>, NativeError> {
         Ok(Arc::new(RemoteDataTrack {
-            runtime: self
-                .runtime
-                .data(track_id, agent_core::TopicMode::Ordered)?,
+            runtime: self.runtime.data(track_id)?,
         }))
     }
 }
@@ -620,15 +563,9 @@ pub struct RemoteDataTrack {
 
 #[uniffi::export]
 impl RemoteDataTrack {
-    #[uniffi::method(default(options = None))]
-    pub fn subscribe(
-        &self,
-        options: Option<core_ffi::DataSubscribeOptions>,
-    ) -> Result<Arc<DataSubscription>, NativeError> {
+    pub fn subscribe(&self) -> Result<Arc<DataSubscription>, NativeError> {
         Ok(Arc::new(DataSubscription {
-            runtime: self.runtime.subscribe_with_delivery(
-                options.and_then(|value| value.delivery).map(Into::into),
-            )?,
+            runtime: self.runtime.subscribe()?,
         }))
     }
 }

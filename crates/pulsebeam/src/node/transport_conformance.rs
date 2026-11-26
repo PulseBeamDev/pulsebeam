@@ -339,7 +339,7 @@ impl DataLeg {
             receiver: agent
                 .room(ROOM.into())?
                 .participant(remote.into())?
-                .data(topic.into(), mode)?
+                .data(topic.into())?
                 .subscribe()?,
         })
     }

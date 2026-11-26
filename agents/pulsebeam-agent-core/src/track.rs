@@ -461,7 +461,6 @@ impl DataReceiveIntent {
 
 struct DataReceiver {
     intent: DataReceiveIntent,
-    selector_owner: Option<TrackOwner>,
     source: Option<(String, TopicMode)>,
     discontinuity: Option<DataEvent>,
     queue: DataReadQueue,
@@ -638,10 +637,6 @@ pub enum ResourceCommand {
         owner: u64,
         source: String,
     },
-    BeginSelectorMediaObservation {
-        owner: TrackOwner,
-        source: crate::SelectorMatch,
-    },
     OpenMediaCollection {
         room: String,
         kind: crate::SelectorTrackKind,
@@ -673,10 +668,6 @@ pub enum ResourceCommand {
     OpenDataSet {
         room: String,
         filter: crate::TrackFilter,
-    },
-    ReceiveSelectorData {
-        owner: TrackOwner,
-        source: crate::SelectorMatch,
     },
     ReadData {
         owner: u64,
@@ -1697,7 +1688,7 @@ impl TrackResources {
         registrations.normalize();
         registrations.subscribers.dedup();
         registrations.validate()?;
-        self.insert_data_receiver(owner, DataReceiveIntent::Explicit(subscriber), None)
+        self.insert_data_receiver(owner, DataReceiveIntent::Explicit(subscriber))
     }
 
     pub(crate) fn receive_inherited_data(
@@ -1719,7 +1710,7 @@ impl TrackResources {
             ));
         }
         let owner = self.new_owner()?;
-        self.insert_data_receiver(owner, DataReceiveIntent::Inherit(source), None)?;
+        self.insert_data_receiver(owner, DataReceiveIntent::Inherit(source))?;
         Ok(owner)
     }
 
@@ -1738,50 +1729,16 @@ impl TrackResources {
             })
     }
 
-    pub(crate) fn receive_selector_data(
-        &mut self,
-        selector_owner: TrackOwner,
-        source: TrackSelector,
-        mode: TopicMode,
-    ) -> Result<TrackOwner, TrackResourceError> {
-        let subscriber = TopicSubscriber {
-            room: source.room,
-            participant_id: source.participant_id,
-            topic: source.track_id,
-            mode,
-        };
-        if self.receivers.values().any(|receiver| {
-            receiver.selector_owner == Some(selector_owner)
-                && receiver.intent.matches(
-                    &subscriber.room,
-                    &subscriber.participant_id,
-                    &subscriber.topic,
-                    None,
-                )
-        }) {
-            return Err(TrackResourceError::AlreadyOwned);
-        }
-        let owner = self.new_owner()?;
-        self.insert_data_receiver(
-            owner,
-            DataReceiveIntent::Explicit(subscriber),
-            Some(selector_owner),
-        )?;
-        Ok(owner)
-    }
-
     fn insert_data_receiver(
         &mut self,
         owner: TrackOwner,
         intent: DataReceiveIntent,
-        selector_owner: Option<TrackOwner>,
     ) -> Result<(), TrackResourceError> {
         self.begin_intent(owner)?;
         self.receivers.insert(
             owner,
             DataReceiver {
                 intent,
-                selector_owner,
                 source: None,
                 discontinuity: None,
                 queue: DataReadQueue::default(),
@@ -1789,17 +1746,6 @@ impl TrackResources {
             },
         );
         Ok(())
-    }
-
-    pub(crate) fn selector_data_receivers(
-        &self,
-    ) -> impl Iterator<Item = (TrackOwner, TrackOwner, &TopicSubscriber)> {
-        self.receivers.iter().filter_map(|(&owner, receiver)| {
-            let DataReceiveIntent::Explicit(subscriber) = &receiver.intent else {
-                return None;
-            };
-            Some((owner, receiver.selector_owner?, subscriber))
-        })
     }
 
     pub fn release_receiver(&mut self, owner: TrackOwner) -> bool {
@@ -1840,30 +1786,29 @@ impl TrackResources {
     }
 
     pub fn registrations(&self) -> TopicRegistrations {
-        let mut registrations = TopicRegistrations {
-            publishers: self
-                .producers
-                .iter()
-                .cloned()
-                .chain(
-                    self.data_publications
-                        .iter()
-                        .map(|(topic, publication)| TopicPublisher {
+        let mut registrations =
+            TopicRegistrations {
+                publishers: self
+                    .producers
+                    .iter()
+                    .cloned()
+                    .chain(self.data_publications.iter().map(|(topic, publication)| {
+                        TopicPublisher {
                             topic: topic.clone(),
                             mode: publication.delivery,
-                        }),
-                )
-                .collect(),
-            subscribers: self
-                .receivers
-                .values()
-                .filter(|receiver| receiver.failure.is_none() && receiver.selector_owner.is_none())
-                .filter_map(|receiver| match &receiver.intent {
-                    DataReceiveIntent::Explicit(subscriber) => Some(subscriber.clone()),
-                    DataReceiveIntent::Inherit(_) => None,
-                })
-                .collect(),
-        };
+                        }
+                    }))
+                    .collect(),
+                subscribers: self
+                    .receivers
+                    .values()
+                    .filter(|receiver| receiver.failure.is_none())
+                    .filter_map(|receiver| match &receiver.intent {
+                        DataReceiveIntent::Explicit(subscriber) => Some(subscriber.clone()),
+                        DataReceiveIntent::Inherit(_) => None,
+                    })
+                    .collect(),
+            };
         registrations.normalize();
         registrations.subscribers.dedup();
         registrations
@@ -1910,7 +1855,7 @@ impl TrackResources {
             }
             receiver.fail(TrackResourceError::ReceiveFailed(error.clone()));
             update.ready.push(*owner);
-            update.registrations_changed |= receiver.selector_owner.is_none();
+            update.registrations_changed = true;
         }
         update
     }

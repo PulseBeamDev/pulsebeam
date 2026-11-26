@@ -124,6 +124,24 @@ pub struct AdmittedMedia {
 }
 
 impl AdmittedMedia {
+    pub(crate) fn new(
+        owner: TrackOwner,
+        matched: SelectorMatch,
+        membership: u64,
+        target: crate::MediaObservationTarget,
+    ) -> Self {
+        Self {
+            owner,
+            matched,
+            membership,
+            target,
+        }
+    }
+
+    pub(crate) fn owner(&self) -> TrackOwner {
+        self.owner
+    }
+
     pub fn participant_id(&self) -> &str {
         &self.matched.participant_id
     }

@@ -423,55 +423,6 @@ impl ActorHandle {
         self.control.agent.borrow().snapshot().clone()
     }
 
-    #[cfg(all(target_arch = "wasm32", feature = "uniffi"))]
-    pub(crate) fn open_subscription_selector(
-        &self,
-        selector: agent_core::SubscriptionSelector,
-    ) -> Result<agent_core::TrackOwner, ErrorInfo> {
-        if !self.control.accepting.get() || self.sender.is_closed() {
-            return Err(ErrorInfo::new(
-                ErrorCode::Closed,
-                "Browser runtime is closed",
-            ));
-        }
-        let owner = self
-            .control
-            .agent
-            .borrow_mut()
-            .open_subscription_selector(selector)?;
-        if let Err(error) = self.schedule_core_change() {
-            self.control
-                .agent
-                .borrow_mut()
-                .close_subscription_selector(owner);
-            return Err(error);
-        }
-        Ok(owner)
-    }
-
-    #[cfg(all(target_arch = "wasm32", feature = "uniffi"))]
-    pub(crate) fn subscription_selector_state(
-        &self,
-        owner: agent_core::TrackOwner,
-    ) -> Option<agent_core::SelectorState> {
-        self.control
-            .agent
-            .borrow()
-            .subscription_selector_state(owner)
-    }
-
-    #[cfg(all(target_arch = "wasm32", feature = "uniffi"))]
-    pub(crate) fn close_subscription_selector(&self, owner: agent_core::TrackOwner) {
-        if self
-            .control
-            .agent
-            .borrow_mut()
-            .close_subscription_selector(owner)
-        {
-            let _ = self.schedule_core_change();
-        }
-    }
-
     pub(crate) fn join(&self, room: String) -> Result<(), ErrorInfo> {
         self.intent(AgentCommand::Join(room))
     }

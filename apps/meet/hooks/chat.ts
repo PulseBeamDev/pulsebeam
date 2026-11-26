@@ -1,5 +1,10 @@
 import { useRef, useState } from "react";
-import { usePublish, type Agent, DataEvent } from "@pulsebeam/react";
+import {
+  usePublish,
+  type Agent,
+  DataDelivery,
+  DataEvent,
+} from "@pulsebeam/react";
 import { decodeText, encodeText } from "@/lib/data-codec";
 
 type LocalMessage = {
@@ -31,7 +36,20 @@ export function useChat(agent: Agent) {
     error,
     clearError: () => setError(null),
     onEvent(event: DataEvent) {
-      if (!DataEvent.Message.instanceOf(event)) return;
+      if (
+        DataEvent.SourceFailed.instanceOf(event) &&
+        event.inner.participantId !== participantId &&
+        event.inner.delivery === DataDelivery.Reliable
+      ) {
+        setError(`Chat from ${event.inner.participantId} was interrupted.`);
+        return;
+      }
+      if (
+        !DataEvent.Message.instanceOf(event) ||
+        event.inner.participantId === participantId ||
+        event.inner.delivery !== DataDelivery.Reliable
+      )
+        return;
       const value = decodeText(event.inner.data);
       if (value === null) return;
       setMessages((current) => [

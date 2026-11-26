@@ -82,39 +82,6 @@ pub struct Agent {
     runtime: crate::BrowserRuntime,
 }
 
-#[derive(uniffi::Object)]
-pub struct SelectorSubscription {
-    #[cfg(target_arch = "wasm32")]
-    agent: Arc<Agent>,
-    #[cfg(target_arch = "wasm32")]
-    owner: agent_core::TrackOwner,
-}
-
-#[uniffi::export]
-impl SelectorSubscription {
-    pub fn state(&self) -> Option<agent_core::SelectorState> {
-        #[cfg(target_arch = "wasm32")]
-        {
-            self.agent.runtime.subscription_selector_state(self.owner)
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            None
-        }
-    }
-
-    pub fn close(&self) {
-        #[cfg(target_arch = "wasm32")]
-        self.agent.runtime.close_subscription_selector(self.owner);
-    }
-}
-
-impl Drop for SelectorSubscription {
-    fn drop(&mut self) {
-        self.close();
-    }
-}
-
 #[cfg(not(target_arch = "wasm32"))]
 fn browser_required() -> WebAgentError {
     ErrorInfo::new(ErrorCode::Internal, "This SDK requires a browser runtime").into()
@@ -184,22 +151,6 @@ impl Agent {
 
     pub fn audio(self: Arc<Self>, label: String) -> Result<Arc<LocalAudioTrack>, WebAgentError> {
         LocalAudioTrack::new(self, label)
-    }
-
-    pub fn subscribe_selector(
-        self: Arc<Self>,
-        selector: agent_core::SubscriptionSelector,
-    ) -> Result<Arc<SelectorSubscription>, WebAgentError> {
-        #[cfg(target_arch = "wasm32")]
-        {
-            let owner = self.runtime.open_subscription_selector(selector)?;
-            Ok(Arc::new(SelectorSubscription { agent: self, owner }))
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let _ = selector;
-            Err(browser_required())
-        }
     }
 
     pub fn room(self: Arc<Self>, name: String) -> Result<Arc<RoomRef>, WebAgentError> {

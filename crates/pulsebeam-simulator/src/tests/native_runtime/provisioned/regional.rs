@@ -533,9 +533,7 @@ fn subscribe_feed(viewer: &Agent) -> anyhow::Result<Arc<DataSubscription>> {
         .room(ROOM.into())?
         .participant("alice".into())?
         .data("feed".into())?
-        .subscribe(Some(core_ffi::DataSubscribeOptions {
-            delivery: Some(core_ffi::DataDelivery::Latest),
-        }))?)
+        .subscribe()?)
 }
 
 async fn prove_weighted(

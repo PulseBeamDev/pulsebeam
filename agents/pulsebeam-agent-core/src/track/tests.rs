@@ -799,12 +799,6 @@ fn collection_observation_does_not_cross_a_readmission_of_the_same_publication()
         kind: crate::SelectorTrackKind::Video,
         track_id: "camera".into(),
     };
-    let first = resources
-        .begin_selector_media_observation(first_owner, source.clone(), None)
-        .unwrap();
-    let second = resources
-        .begin_selector_media_observation(second_owner, source.clone(), None)
-        .unwrap();
     let mut ids = crate::id::IdGenerator::new();
     let mut target = MediaObservationTarget {
         generation: ids.generation(),
@@ -822,6 +816,22 @@ fn collection_observation_does_not_cross_a_readmission_of_the_same_publication()
             direction: crate::MediaDirection::ReceiveOnly,
         },
     };
+    let first = resources
+        .begin_admitted_media_observation(crate::AdmittedMedia::new(
+            first_owner,
+            source.clone(),
+            1,
+            target.clone(),
+        ))
+        .unwrap();
+    let second = resources
+        .begin_admitted_media_observation(crate::AdmittedMedia::new(
+            second_owner,
+            source.clone(),
+            2,
+            target.clone(),
+        ))
+        .unwrap();
     let mut issue = |resources: &mut TrackResources, request, target| {
         let mut control = resources.observation_control(request, target).unwrap();
         assert!(resources.observation_control_changed(&control));
@@ -846,7 +856,12 @@ fn collection_observation_does_not_cross_a_readmission_of_the_same_publication()
     assert!(!resources.complete_observation_control(&unfinished, true));
     resources.release_observation_controls(TrackOwner(first.request()));
     let fresh = resources
-        .begin_selector_media_observation(first_owner, source, None)
+        .begin_admitted_media_observation(crate::AdmittedMedia::new(
+            first_owner,
+            source,
+            3,
+            target.clone(),
+        ))
         .unwrap();
     let current = issue(&mut resources, fresh, Some(target));
     assert!(resources.complete_observation_control(&current, true));
@@ -1238,55 +1253,6 @@ fn exact_receive_references_share_until_the_last_owner_and_rooms_stay_distinct()
     resources.release_receiver(second);
     assert_eq!(resources.registrations().subscribers.len(), 1);
     assert_eq!(resources.registrations().subscribers[0].room, "room-b");
-}
-
-#[test]
-fn selector_data_cursors_share_delivery_without_registering_exact_interest() {
-    let mut resources = TrackResources::default();
-    let broad = resources.new_owner().unwrap();
-    let narrow = resources.new_owner().unwrap();
-    let source = TrackSelector {
-        room: "room".into(),
-        participant_id: "alice".into(),
-        track_id: "events".into(),
-    };
-    let mode = TopicMode::Ordered;
-    let first = resources
-        .receive_selector_data(broad, source.clone(), mode)
-        .unwrap();
-    let second = resources
-        .receive_selector_data(narrow, source.clone(), mode)
-        .unwrap();
-    assert_eq!(
-        resources.receive_selector_data(broad, source.clone(), mode),
-        Err(TrackResourceError::AlreadyOwned)
-    );
-    assert!(resources.registrations().subscribers.is_empty());
-    let subscriber = data(mode).subscriber(&source).unwrap();
-    let unit = |unit_seq| crate::data_v1::AssembledUnit {
-        unit_seq,
-        captured_at: None,
-        bytes: b"event".to_vec(),
-        fragment_descriptors: Vec::new(),
-    };
-    assert_eq!(
-        resources.receive_data_v1(&subscriber, "publication", unit(0)),
-        [first.id(), second.id()]
-    );
-    assert!(matches!(
-        resources.read(first).unwrap(),
-        Some(DataEvent::Message { sequence: 0, .. })
-    ));
-    resources.release(first);
-    assert_eq!(resources.read(first), Err(TrackResourceError::Released));
-    assert!(matches!(
-        resources.read(second).unwrap(),
-        Some(DataEvent::Message { sequence: 0, .. })
-    ));
-    assert_eq!(
-        resources.receive_data_v1(&subscriber, "publication", unit(1)),
-        [second.id()]
-    );
 }
 
 fn data_set_unit(sequence: u64) -> crate::data_v1::AssembledUnit {

@@ -1198,14 +1198,6 @@ impl NativeSession {
             return Ok(());
         }
         let projected = match spec.declaration.as_ref() {
-            Some(Declaration::SourceLookup(_)) => {
-                let mut next = match current {
-                    Some(Value::SourceLookup(previous)) if is_enabled => previous.as_ref().clone(),
-                    _ => wire::SourceLookupState::default(),
-                };
-                next.spec = Some(spec);
-                Value::SourceLookup(Box::new(next))
-            }
             Some(Declaration::LogicalSubscription(_)) => {
                 let mut next = match current {
                     Some(Value::LogicalSubscription(previous)) => previous.as_ref().clone(),
@@ -1261,7 +1253,6 @@ impl NativeSession {
                 value.value,
                 Some(
                     wire::confirmed_state::Value::Owned(_)
-                        | wire::confirmed_state::Value::SourceLookup(_)
                         | wire::confirmed_state::Value::LogicalSubscription(_)
                         | wire::confirmed_state::Value::SubscriptionSelector(_)
                 )
@@ -1484,13 +1475,13 @@ impl NativeSession {
                 source(address).and_then(|source| {
                     let fabric_source = source.track.fabric_data_source();
                     let track = track_descriptor(source.track)?;
-                    if let Some(wire::resource_spec::Declaration::LogicalSubscription(logical)) =
-                        &spec.declaration
-                    {
-                        let requested = logical.data_version.is_some();
-                        if requested != fabric_source.is_some() {
-                            return None;
-                        }
+                    let wire::resource_spec::Declaration::LogicalSubscription(logical) =
+                        spec.declaration.as_ref()?
+                    else {
+                        return None;
+                    };
+                    if logical.data_version.is_some() != fabric_source.is_some() {
+                        return None;
                     }
                     validation::matches_source_address(&track, address)
                         .then_some((track, fabric_source))
@@ -1498,22 +1489,13 @@ impl NativeSession {
             } else {
                 None
             };
-            use wire::confirmed_state::Value;
             let mut value = row.value.clone();
-            match &mut value.value {
-                Some(Value::SourceLookup(lookup)) => {
-                    let resolved = resolved.map(|(track, _)| track);
-                    lookup.participant = resolved.as_ref().map(|track| wire::Participant {
-                        participant_id: track.participant_id.clone(),
-                        room_id: track.room_id.clone(),
-                    });
-                    lookup.track = resolved;
-                }
-                Some(Value::LogicalSubscription(subscription)) => {
-                    self.reconcile_logical_source(reference, subscription, resolved, branches)?;
-                }
-                _ => return Err(OutputError::InvalidObservation),
-            }
+            let Some(wire::confirmed_state::Value::LogicalSubscription(subscription)) =
+                &mut value.value
+            else {
+                return Err(OutputError::InvalidObservation);
+            };
+            self.reconcile_logical_source(reference, subscription, resolved, branches)?;
             self.put(Key::Owned(reference), value)?;
         }
         self.lookup_refresh_pending = self
@@ -2818,7 +2800,6 @@ fn confirmed_bytes(value: &wire::ConfirmedState) -> usize {
 
 fn observed_spec(value: &wire::confirmed_state::Value) -> Option<&wire::ResourceSpec> {
     match value {
-        wire::confirmed_state::Value::SourceLookup(lookup) => lookup.spec.as_ref(),
         wire::confirmed_state::Value::LogicalSubscription(subscription) => {
             subscription.spec.as_ref()
         }
@@ -2829,7 +2810,6 @@ fn observed_spec(value: &wire::confirmed_state::Value) -> Option<&wire::Resource
 fn observed_address(spec: &wire::ResourceSpec) -> Option<&wire::LogicalSourceAddress> {
     use wire::resource_spec::Declaration;
     match spec.declaration.as_ref()? {
-        Declaration::SourceLookup(lookup) => lookup.source.as_ref(),
         Declaration::LogicalSubscription(subscription) => subscription.source.as_ref(),
         _ => None,
     }

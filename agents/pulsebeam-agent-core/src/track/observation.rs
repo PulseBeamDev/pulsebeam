@@ -38,7 +38,6 @@ pub struct MediaObservationControl {
 #[derive(Default)]
 pub(super) struct MediaObservation {
     source: Option<String>,
-    selector_match: Option<crate::SelectorMatch>,
     admission: Option<crate::AdmittedMedia>,
     control: Option<MediaObservationControl>,
     completed: bool,
@@ -92,12 +91,11 @@ impl TrackResources {
         Ok(id)
     }
 
-    pub(crate) fn begin_selector_media_observation(
+    pub(crate) fn begin_admitted_media_observation(
         &mut self,
-        owner: TrackOwner,
-        source: crate::SelectorMatch,
-        admission: Option<crate::AdmittedMedia>,
+        admission: crate::AdmittedMedia,
     ) -> Result<MediaObservationId, TrackResourceError> {
+        let owner = admission.owner();
         let start = MediaObservationId {
             owner,
             request: TrackOwner(0),
@@ -108,7 +106,7 @@ impl TrackResources {
         };
         let mut count = 0_usize;
         for (_, observation) in self.observations.range(start..=end) {
-            if observation.selector_match.as_ref() == Some(&source) {
+            if !observation.closed && observation.admission.as_ref() == Some(&admission) {
                 return Err(TrackResourceError::AlreadyOwned);
             }
             count = count.saturating_add(1);
@@ -123,19 +121,11 @@ impl TrackResources {
         self.observations.insert(
             id,
             MediaObservation {
-                selector_match: Some(source),
-                admission,
+                admission: Some(admission),
                 ..Default::default()
             },
         );
         Ok(id)
-    }
-
-    pub(crate) fn selector_observation_match(
-        &self,
-        id: MediaObservationId,
-    ) -> Option<&crate::SelectorMatch> {
-        self.observations.get(&id)?.selector_match.as_ref()
     }
 
     pub(crate) fn observation_admission(
@@ -192,7 +182,7 @@ impl TrackResources {
         // Collection observations borrow one admission. Once targeted, even
         // an unfinished attachment must not silently move to a new admission.
         let pinned =
-            observation.attached || (observation.selector_match.is_some() && previous.is_some());
+            observation.attached || (observation.admission.is_some() && previous.is_some());
         let closed = observation.closed || pinned && previous != target.as_ref();
         Some(MediaObservationControl {
             effect: None,

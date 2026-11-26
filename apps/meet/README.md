@@ -89,30 +89,27 @@ page controls. Loading and failure are distinct from an empty page. Presence-onl
 participants remain visible. An expired continuation is an error with a First
 page recovery, not an automatic scan or silent reset.
 
-The token needs Discover for roster metadata. Subscribe independently authorizes
-media/data reception; page size is not receive capacity. Meet retains its
-receive-selection policy and excludes self-subscription. Mounted consumers own
-subscriptions for selected publications on the displayed page. Moving pages can
-unmount and release those UI owners; closing/replacing a watch never closes a
-subscription held independently elsewhere. There is no receive-all or automatic
-all-page traversal.
+The token needs Discover for roster metadata and Subscribe for media and data.
+Meet owns media collections and chat and reaction readers for the joined room,
+independent of the displayed roster page. Paging does not restart these readers
+or detach playback. The SDK admits a bounded set of tracks; a roster page is
+not a measure of receive capacity.
 
 ## Media and data tracks
 
-Application identities come from admission. Remote video demand follows mounted
-consumers. Reconnect retains logical media consumers, receive policies, local
-publications, and data subscriptions; replacement receivers restore playback
-without remounting.
+Application identities come from admission. Meet renders admitted remote media
+by publication ID. It previews the local camera directly and does not play its
+own received audio or video. Reconnect retains room interest and local
+publications; replacement receivers can restore playback for the same publication.
 
 Camera and microphone controls enable or disable media handles rather than
 detaching sources. Ordinary room interactions retry audio playback if the browser
 has blocked it. Meet has no separate audio-unlock control.
 
-Meet uses `ordered` chat and `lossy` reactions. Chat uses finite, receiver-driven
-recovery and renders skipped ranges as inline notices before later messages;
-a failed subscription resumes only after the
-participant rejoins. Reactions are distinct transient events and may be lost or
-reordered.
+Meet accepts reliable chat and unreliable reactions, and ignores its own data
+loopback because it renders successful sends locally. If a chat source loses
+continuity, Meet shows an interruption without stopping other chat sources.
+Reactions are transient and may be lost or reordered.
 
 Meet encodes text as UTF-8 JSON strings and validates decoded values at the
 application boundary. Malformed UTF-8, invalid JSON, and non-string values are

@@ -211,7 +211,11 @@ export async function playbackLifetimes() {
     await flush(() => root.render(tile(1)));
     const retainedTile = host.querySelector("video")!;
     await flush(() => root.render(tile(1)));
-    assert.equal(requests.length, initial + 1, "reprojecting an admission keeps the attachment");
+    assert.equal(
+      requests.length,
+      initial + 1,
+      "reprojecting an admission keeps the attachment",
+    );
     await flush(() => root.render(tile(2)));
     assert.equal(host.querySelector("video"), retainedTile);
     assert.equal(requests[initial]!.signal?.aborted, true);
@@ -219,8 +223,14 @@ export async function playbackLifetimes() {
     await flush();
     const obsolete = complete(requests[initial]!, "video");
     await flush();
-    assert.equal(obsolete.closes, 1, "late completion cannot resurrect the old admission");
-    assert.deepEqual((retainedTile.srcObject as MediaStream).getTracks(), [revived.track]);
+    assert.equal(
+      obsolete.closes,
+      1,
+      "late completion cannot resurrect the old admission",
+    );
+    assert.deepEqual((retainedTile.srcObject as MediaStream).getTracks(), [
+      revived.track,
+    ]);
     await flush(() => root.render(null));
     assert.equal(revived.closes, 1);
 

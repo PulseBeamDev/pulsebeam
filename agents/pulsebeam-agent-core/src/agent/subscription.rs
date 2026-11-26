@@ -389,15 +389,6 @@ fn publication_revisions(agent: &Agent, track_id: &str) -> (u64, Option<u64>, Op
     )
 }
 
-fn source_resource(selector: &crate::TrackSelector, kind: wire::TrackKind) -> Resource {
-    Resource::SourceLookup {
-        room: selector.room.clone(),
-        participant_id: selector.participant_id.clone(),
-        kind,
-        track_id: selector.track_id.clone(),
-    }
-}
-
 fn source_format(agent: &Agent, publication_id: Option<&str>) -> Option<EffectiveMediaFormat> {
     let track = active_agent(agent)?.state.source(publication_id?)?;
     EffectiveMediaFormat::from_track(track)
@@ -427,9 +418,9 @@ fn source_state(
     let Some(active) = active_agent(agent) else {
         return (SubscriptionSourceStatus::Pending, None, None);
     };
-    let legacy = source_resource(selector, kind);
-    let resource = super::native::logical_resource(active, selector, kind).unwrap_or(&legacy);
-    let Some(evaluation) = active.state.evaluation(resource) else {
+    let Some(evaluation) = super::native::logical_resource(active, selector, kind)
+        .and_then(|resource| active.state.evaluation(resource))
+    else {
         return (SubscriptionSourceStatus::Pending, None, None);
     };
     if let Some(failure) = evaluation.rejection.as_ref() {
@@ -451,24 +442,6 @@ fn source_state(
                     )
                 },
             )
-        }
-        Some(wire::confirmed_state::Value::SourceLookup(lookup)) => {
-            let source = lookup.track.as_ref();
-            let participant = lookup.participant.as_ref();
-            if let (Some(source), Some(participant)) = (source, participant)
-                && source.participant_id == participant.participant_id
-                && participant.room_id == selector.room
-                && participant.participant_id == selector.participant_id
-                && source.track_id == selector.track_id
-                && Agent::native_track_kind(source) == Some(kind)
-            {
-                return (
-                    SubscriptionSourceStatus::Available,
-                    Some(source.publication_id.clone()),
-                    None,
-                );
-            }
-            (SubscriptionSourceStatus::Unavailable, None, None)
         }
         Some(wire::confirmed_state::Value::Absent(absent)) => {
             if absent.reason() == wire::AbsenceReason::PermissionRevoked {
@@ -782,16 +755,6 @@ fn receive_failure(failure: &crate::TrackResourceError) -> Option<ErrorInfo> {
             "Data receive buffer capacity was exceeded",
         )),
         _ => None,
-    }
-}
-
-impl Agent {
-    fn native_track_kind(track: &wire::Track) -> Option<wire::TrackKind> {
-        Some(match track.kind.as_ref()? {
-            wire::track::Kind::Audio(_) => wire::TrackKind::Audio,
-            wire::track::Kind::Video(_) => wire::TrackKind::Video,
-            wire::track::Kind::Data(_) => wire::TrackKind::Data,
-        })
     }
 }
 

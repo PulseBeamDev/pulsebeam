@@ -5467,16 +5467,19 @@ mod replacement_tests {
                                     enabled: Some(true),
                                     receive: None,
                                 }),
-                                declaration: Some(wire::resource_spec::Declaration::SourceLookup(
-                                    wire::SourceLookupSpec {
-                                        source: Some(wire::LogicalSourceAddress {
-                                            room: "handler-room".into(),
-                                            participant_id: "publisher".into(),
-                                            kind: wire::TrackKind::Data as i32,
-                                            track_id: "label".into(),
-                                        }),
-                                    },
-                                )),
+                                declaration: Some(
+                                    wire::resource_spec::Declaration::LogicalSubscription(
+                                        wire::LogicalSubscriptionSpec {
+                                            data_version: None,
+                                            source: Some(wire::LogicalSourceAddress {
+                                                room: "handler-room".into(),
+                                                participant_id: "publisher".into(),
+                                                kind: wire::TrackKind::Data as i32,
+                                                track_id: "label".into(),
+                                            }),
+                                        },
+                                    ),
+                                ),
                             },
                         ))),
                     }),

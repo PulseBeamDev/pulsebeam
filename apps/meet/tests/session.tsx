@@ -2,7 +2,12 @@ import assert from "node:assert/strict";
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { MeetApp } from "../components/MeetApp";
-import { AgentStatus, WatchStatus, CatalogDelivery } from "@pulsebeam/react";
+import {
+  AgentStatus,
+  WatchStatus,
+  CatalogDelivery,
+  DataDelivery,
+} from "@pulsebeam/react";
 import { AgentError, ErrorCode, type CatalogParticipant } from "@pulsebeam/web";
 import {
   captures,
@@ -288,66 +293,34 @@ assert.match(
   /Room admitted-room/,
 );
 await flush(() => sdk.changeAgent({ room: "selected-room" }));
+await flush(() => sdk.changeMedia());
+const dataOwners = sdk.dataOwners().map(([owner]) => owner);
+assert.equal(dataOwners.length, 2, "chat and reactions each own one set");
+const mediaOwners = sdk.mediaOwners();
+assert.ok(mediaOwners.length >= 2);
+assert.equal(sdk.attachments.get("remote-camera"), 1);
+assert.equal(sdk.attachments.get("remote-screen"), 1);
+assert.equal(sdk.attachments.get("remote-audio"), 1);
+assert.equal(sdk.attachments.has("self-audio"), false, "no playback echo");
 assert.equal(
-  sdk.dataOwners().length,
-  2,
-  "room-pinned chat and reaction tracks attach for each discovered endpoint",
+  sdk.attachments.has("self-video"),
+  false,
+  "local preview uses capture",
 );
-assert.deepEqual(
-  sdk.audios().map(({ selector }) => selector),
-  [{ room: "selected-room", participantId: "bob", trackId: "microphone" }],
-);
-assert.deepEqual(
-  sdk
-    .videos()
-    .map(({ selector, configuration }) => ({
-      selector,
-      minFps: configuration.minFps,
-      priority: configuration.priority,
-    }))
-    .sort((a, b) => a.selector.trackId.localeCompare(b.selector.trackId)),
-  [
-    {
-      selector: {
-        room: "selected-room",
-        participantId: "bob",
-        trackId: "camera",
-      },
-      minFps: 15,
-      priority: 200,
-    },
-    {
-      selector: {
-        room: "selected-room",
-        participantId: "bob",
-        trackId: "screen",
-      },
-      minFps: 15,
-      priority: 10,
-    },
-  ],
-  "page-derived remote videos preserve spotlight/FPS/playout policy and exclude self",
-);
+const spotlight = document.querySelector("video");
+assert.ok(spotlight);
 const initialWatch = activeWatch();
 await click("Next page");
 assert.equal(initialWatch.state().status, WatchStatus.Closed);
 assert.deepEqual(Array.from(activeWatch().state().cursor), continuation);
 assert.match(document.body.textContent!, /Loading participants/);
-assert.equal(
-  sdk.dataOwners().length,
-  0,
-  "page replacement releases UI-owned subscriptions",
+assert.deepEqual(
+  sdk.dataOwners().map(([owner]) => owner),
+  dataOwners,
 );
-assert.equal(
-  sdk.videos().length,
-  0,
-  "page replacement releases UI-owned video reception",
-);
-assert.equal(
-  sdk.audios().length,
-  0,
-  "page replacement releases UI-owned audio reception",
-);
+assert.deepEqual(sdk.mediaOwners(), mediaOwners);
+assert.equal(document.querySelector("video"), spotlight);
+assert.equal(sdk.attachments.get("remote-audio"), 1);
 await page([{ id: "last-presence", publications: [] }], false);
 assert.match(document.body.textContent!, /last-presence/);
 assert.doesNotMatch(document.body.textContent!, /quiet-observer/);
@@ -376,11 +349,12 @@ assert.equal(button("First page").disabled, false);
 await click("First page");
 assert.deepEqual(Array.from(activeWatch().state().cursor), []);
 await page();
-assert.equal(
-  sdk.dataOwners().length,
-  2,
-  "First-page recovery restores only non-self UI subscriptions",
+assert.deepEqual(
+  sdk.dataOwners().map(([owner]) => owner),
+  dataOwners,
 );
+assert.deepEqual(sdk.mediaOwners(), mediaOwners);
+assert.equal(document.querySelector("video"), spotlight);
 const abandoned = stream();
 await flush(() => captures[0].resolve(abandoned));
 assert.ok(
@@ -473,6 +447,27 @@ await flush(() => {
     });
   }
 });
+await flush(() => {
+  const data = new TextEncoder().encode(
+    JSON.stringify("ignore wrong delivery or local echo"),
+  );
+  sdk.deliver(
+    "chat",
+    {
+      publicationId: "remote-chat",
+      participantId: "bob",
+      sequence: 6n,
+      data,
+    },
+    DataDelivery.Unreliable,
+  );
+  deliver({
+    publicationId: "self-chat",
+    participantId: "admitted-alice",
+    sequence: 0n,
+    data,
+  });
+});
 const transcriptEntries = Array.from(transcript.children);
 assert.equal(transcriptEntries.length, 4);
 assert.match(
@@ -526,9 +521,9 @@ assert.equal(
 );
 const chatOwners = sdk
   .dataOwners()
-  .filter(([owner]) => owner.state().selector.trackId === "chat");
+  .filter(([, source]) => source.trackId === "chat");
 assert.equal(chatOwners.length, 1);
-const [[chatOwner, chatReads]] = chatOwners;
+const [[chatOwner, { reads: chatReads }]] = chatOwners;
 await flush(() =>
   chatReads.fail(
     AgentError.Operation.new({

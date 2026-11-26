@@ -8,17 +8,12 @@ import {
   useSubscribe,
   useWatch,
   WatchStatus,
-  CatalogDelivery,
-  DataDelivery,
   Video,
   useAgent,
   useCapture,
   type Agent,
   type VideoProps,
-  type VideoObservation,
-  type RemoteAudioTrack,
-  type RemoteDataTrack,
-  type RemoteVideoTrack,
+  type VideoCollectionEntry,
 } from "@pulsebeam/react";
 import {
   Alert,
@@ -40,44 +35,6 @@ import { useMeetMedia } from "./MeetMediaProvider";
 import { useChat } from "@/hooks/chat";
 import { reactionEmojis, useReaction } from "@/hooks/reaction";
 import { useVideoLayout } from "@/hooks/video-layout";
-
-function RoomVideo({
-  track,
-  local,
-  preferences,
-  onPlaybackError,
-  className,
-}: {
-  track: RemoteVideoTrack | null;
-  local: VideoProps["source"];
-  preferences?: VideoObservation;
-  onPlaybackError: VideoProps["onPlaybackError"];
-  className: string;
-}) {
-  const subscription = useSubscribe(track, preferences);
-  return (
-    <Video
-      source={track ? subscription : local}
-      autoPlay
-      mirror={!track}
-      className={className}
-      onPlaybackError={onPlaybackError}
-    />
-  );
-}
-
-function RoomAudio({
-  track,
-  onPlaybackError,
-}: {
-  track: RemoteAudioTrack;
-  onPlaybackError: VideoProps["onPlaybackError"];
-}) {
-  const subscription = useSubscribe(track);
-  return (
-    <Audio source={subscription} autoPlay onPlaybackError={onPlaybackError} />
-  );
-}
 
 export function Room(props: {
   token: string;
@@ -176,52 +133,15 @@ function ActiveRoom({
     dismiss: dismissReaction,
     send: sendReaction,
   } = useReaction(agent);
-  const {
-    remoteVideoTracks,
-    remoteAudioTracks,
-    remoteChatTracks,
-    remoteReactionTracks,
-  } = useMemo(() => {
-    const videos: RemoteVideoTrack[] = [];
-    const audios: RemoteAudioTrack[] = [];
-    const chats: RemoteDataTrack[] = [];
-    const reactions: RemoteDataTrack[] = [];
-    if (admittedRoom !== room)
-      return {
-        remoteVideoTracks: videos,
-        remoteAudioTracks: audios,
-        remoteChatTracks: chats,
-        remoteReactionTracks: reactions,
-      };
-    for (const participant of participants) {
-      const id = participant.id();
-      if (id === participantId) continue;
-      const reference = pinnedRoom.participant(id);
-      for (const track of participant.tracks()) {
-        if (track.kind.tag === "Video")
-          videos.push(reference.video(track.trackId));
-        if (track.kind.tag === "Audio")
-          audios.push(reference.audio(track.trackId));
-        if (track.kind.tag !== "Data") continue;
-        if (
-          track.trackId === "chat" &&
-          track.kind.inner.delivery === CatalogDelivery.Ordered
-        )
-          chats.push(reference.data("chat"));
-        if (
-          track.trackId === "reactions" &&
-          track.kind.inner.delivery === CatalogDelivery.Lossy
-        )
-          reactions.push(reference.data("reactions"));
-      }
-    }
-    return {
-      remoteVideoTracks: videos,
-      remoteAudioTracks: audios,
-      remoteChatTracks: chats,
-      remoteReactionTracks: reactions,
-    };
-  }, [room, admittedRoom, participantId, participants, pinnedRoom]);
+  const receiveRoom = admittedRoom === room ? pinnedRoom : null;
+  const videoSubscription = useSubscribe(receiveRoom?.video() ?? null);
+  const audioSubscription = useSubscribe(receiveRoom?.audio() ?? null);
+  const remoteVideoTracks = videoSubscription
+    ?.state()
+    .tracks.filter((entry) => entry.participantId !== participantId);
+  const remoteAudioTracks = audioSubscription
+    ?.state()
+    .tracks.filter((entry) => entry.participantId !== participantId);
   const { remoteTracks, spotlight, setPin } = useVideoLayout(remoteVideoTracks);
   const connect = useCallback(() => {
     try {
@@ -282,21 +202,15 @@ function ActiveRoom({
     sendReaction(emoji);
     setReactionAnchor(null);
   };
-  const video = (track: RemoteVideoTrack | null, fill: "contain" | "cover") => (
-    <RoomVideo
-      track={track}
-      local={cameraOn ? capture.video : null}
-      preferences={
-        track
-          ? {
-              visible: true,
-              height: 0,
-              minHeight: 0,
-              minFps: 15,
-              priority: track === spotlight ? 200 : 10,
-            }
-          : undefined
-      }
+  const video = (
+    entry: VideoCollectionEntry | null,
+    fill: "contain" | "cover",
+  ) => (
+    <Video
+      key={entry?.publicationId ?? "local"}
+      source={entry ? entry.track : cameraOn ? capture.video : null}
+      autoPlay
+      mirror={!entry}
       className={
         fill === "cover"
           ? "h-full w-full object-cover"
@@ -305,24 +219,20 @@ function ActiveRoom({
       onPlaybackError={playbackError}
     />
   );
-  const tile = (track: RemoteVideoTrack | null) => (
+  const tile = (entry: VideoCollectionEntry | null) => (
     <Box
       component="button"
-      key={
-        track
-          ? `${track.selector().participantId}:${track.selector().trackId}`
-          : "local"
-      }
-      aria-label={`Spotlight ${track?.selector().participantId ?? "your camera"}`}
-      onClick={() => setPin(track ?? "local")}
+      key={entry?.publicationId ?? "local"}
+      aria-label={`Spotlight ${entry?.participantId ?? "your camera"}`}
+      onClick={() => setPin(entry?.publicationId ?? "local")}
       className="relative aspect-video w-36 shrink-0 cursor-pointer overflow-hidden rounded-lg border-2 border-transparent bg-slate-900 p-0 hover:border-blue-500 focus-visible:border-blue-500 lg:w-full"
     >
-      {video(track, "cover")}
+      {video(entry, "cover")}
       <Typography
         variant="caption"
         className="absolute bottom-1 left-1.5 max-w-[90%] truncate rounded bg-slate-950/80 px-1.5 text-white!"
       >
-        {track?.selector().participantId ?? "You"}
+        {entry?.participantId ?? "You"}
       </Typography>
     </Box>
   );
@@ -332,29 +242,27 @@ function ActiveRoom({
       onClickCapture={recoverPlayback}
       onKeyDownCapture={recoverPlayback}
     >
-      {remoteAudioTracks.map((track) => (
-        <RoomAudio
-          key={`${room}:${track.selector().participantId}:${track.selector().trackId}`}
-          track={track}
+      {remoteAudioTracks?.map((entry) => (
+        <Audio
+          key={entry.publicationId}
+          source={entry.track}
+          autoPlay
           onPlaybackError={playbackError}
         />
       ))}
-      {remoteChatTracks.map((track) => (
-        <Data
-          key={`${track.selector().room}:${track.selector().participantId}:${track.selector().trackId}`}
-          track={track}
-          onEvent={receiveChat}
-          onError={onChatError}
-        />
-      ))}
-      {remoteReactionTracks.map((track) => (
-        <Data
-          key={`${track.selector().room}:${track.selector().participantId}:${track.selector().trackId}`}
-          track={track}
-          options={{ delivery: DataDelivery.Unreliable }}
-          onEvent={receiveReaction}
-        />
-      ))}
+      {receiveRoom && (
+        <>
+          <Data
+            track={receiveRoom.data({ trackId: "chat" })}
+            onEvent={receiveChat}
+            onError={onChatError}
+          />
+          <Data
+            track={receiveRoom.data({ trackId: "reactions" })}
+            onEvent={receiveReaction}
+          />
+        </>
+      )}
       <Paper
         component="header"
         square
@@ -466,7 +374,7 @@ function ActiveRoom({
             {spotlight && (
               <Chip
                 size="small"
-                label={spotlight.selector().participantId}
+                label={spotlight.participantId}
                 className="absolute! top-3 left-3 max-w-[80%]"
                 sx={{ bgcolor: "#15233a", color: "white" }}
               />
@@ -599,7 +507,9 @@ function ActiveRoom({
             ))}
             {spotlight && tile(null)}
             {remoteTracks
-              .filter((track) => track !== spotlight)
+              .filter(
+                (entry) => entry.publicationId !== spotlight?.publicationId,
+              )
               .map((track) => tile(track))}
           </Stack>
         </Stack>

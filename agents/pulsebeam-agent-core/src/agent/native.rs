@@ -676,6 +676,7 @@ fn reconcile_logical_media(
     slot: &MediaSlot,
     resource: &Resource,
     desired: &state::ResourceSpec,
+    ids: &mut IdGenerator,
 ) -> Result<(), SignalingError> {
     let Some((offer, logical)) = session.state.logical_offer(resource) else {
         return Ok(());
@@ -690,6 +691,40 @@ fn reconcile_logical_media(
     let Some(source) = &logical.source else {
         return Ok(());
     };
+    if session.state.binding_profile() == state::validation::BindingProfile::Quic {
+        use state::logical_receiver_report::Outcome;
+        if logical.execution.is_some() || session.state.logical_receiver_reported(offer) {
+            return Ok(());
+        }
+        let (video, format) = match source.kind.as_ref() {
+            Some(state::track::Kind::Audio(audio)) => (false, audio.format.as_ref()),
+            Some(state::track::Kind::Video(video)) => (true, video.format.as_ref()),
+            _ => return Ok(()),
+        };
+        let format = format
+            .filter(|format| {
+                session.capabilities.rtp.codecs.iter().any(|codec| {
+                    codec.format.as_ref().is_some_and(|supported| {
+                        state::validation::formats_equivalent(supported, format)
+                    })
+                })
+            })
+            .cloned();
+        let binding = format
+            .and_then(|format| build_quic_rtp_binding(session, format, video, true, None, ids));
+        let outcome = binding.map_or_else(
+            || {
+                Outcome::Failure(state::Failure {
+                    code: state::FailureCode::Incompatible as i32,
+                    diagnostic: "QUIC RTP receiver cannot bind the selected format".into(),
+                })
+            },
+            Outcome::Prepared,
+        );
+        return session
+            .state
+            .report_logical_receiver(resource, offer, outcome);
+    }
     let Some(mut want) = media_want(
         session,
         resource.clone(),
@@ -1041,11 +1076,31 @@ fn quic_rtp_binding(
             })?,
         },
     };
+    build_quic_rtp_binding(
+        session,
+        format.clone(),
+        video,
+        source.is_some(),
+        profile,
+        ids,
+    )
+}
+
+fn build_quic_rtp_binding(
+    session: &mut Session,
+    format: state::CodecFormat,
+    video: bool,
+    receiving: bool,
+    profile: Option<super::quic::PublicationProfile>,
+    ids: &mut IdGenerator,
+) -> Option<state::TrackBinding> {
+    use super::quic::PublicationProfile;
+    use state::track_binding::Transport;
     let video_dd = match format.mime_type.as_str() {
         "audio/opus" | "video/h264" => None,
         "video/vp8" | "video/vp9" | "video/av1" if session.quic_directional_video_dd => {
-            state::VideoMode::for_format(format, "L1T1").ok()?;
-            let direction = if source.is_some() {
+            state::VideoMode::for_format(&format, "L1T1").ok()?;
+            let direction = if receiving {
                 state::QuicVideoDd::Accept
             } else if matches!(
                 profile,
@@ -1060,7 +1115,6 @@ fn quic_rtp_binding(
         _ => return None,
     };
     let publishes_h264_dd = video && matches!(profile, Some(PublicationProfile::LegacyH264Dd));
-    let format = format.clone();
     let id = u16::try_from(session.next_stream).ok()?;
     session.next_stream = session.next_stream.checked_add(1)?;
     Some(state::TrackBinding {
@@ -1147,7 +1201,7 @@ pub(super) fn reconcile(
         if let Some(selector) = &video.selector {
             let spec = logical_subscription(selector, state::TrackKind::Video, receive, None);
             let resource = Resource::LogicalReception(slot.clone());
-            reconcile_logical_media(session, &mut media, &slot, &resource, &spec)?;
+            reconcile_logical_media(session, &mut media, &slot, &resource, &spec, ids)?;
             wanted.insert(resource, spec);
             continue;
         }
@@ -1322,7 +1376,7 @@ pub(super) fn reconcile(
         let slot = MediaSlot::RemoteAudio(index);
         let resource = Resource::LogicalReception(slot.clone());
         let spec = logical_subscription(selector, state::TrackKind::Audio, audio_options(), None);
-        reconcile_logical_media(session, &mut media, &slot, &resource, &spec)?;
+        reconcile_logical_media(session, &mut media, &slot, &resource, &spec, ids)?;
         wanted.insert(resource, spec);
     }
     let mut data = BTreeMap::new();

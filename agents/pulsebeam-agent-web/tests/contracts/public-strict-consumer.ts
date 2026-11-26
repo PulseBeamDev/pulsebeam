@@ -4,8 +4,6 @@ import {
   Catalog,
   DataDelivery,
   DataEvent,
-  SelectorStatus,
-  SelectorTrackKind,
   VideoSource,
   WatchStatus,
   type AgentConfig,
@@ -64,25 +62,6 @@ const videoOptions: VideoObservation = {
 const reception = remote.video("camera").subscribe(videoOptions);
 const output = await reception.playbackOutput();
 const received: MediaStreamTrack | undefined = output.track();
-const selector = agent.subscribeSelector({ kind: SelectorTrackKind.Video });
-const selected = selector.state();
-if (selected?.status === SelectorStatus.Complete) {
-  for (const match of selected.matches) {
-    const playback = await selector.playbackOutput(match);
-    const track: MediaStreamTrack | undefined = playback.track();
-    void track;
-    await playback.close();
-  }
-}
-selector.close();
-const dataSelector = agent.subscribeSelector({ kind: SelectorTrackKind.Data });
-for (const match of dataSelector.state()?.matches ?? []) {
-  const selectedData = dataSelector.receiveData(match);
-  const selectedEvent: DataEvent | undefined = await selectedData.next();
-  void selectedEvent;
-  await selectedData.close();
-}
-dataSelector.close();
 const dataSet = room.data({ trackId: "data" }).subscribe();
 const setEvent = await dataSet.next();
 if (setEvent && DataEvent.SourceFailed.instanceOf(setEvent)) {

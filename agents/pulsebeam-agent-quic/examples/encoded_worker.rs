@@ -1,4 +1,4 @@
-//! Pinned encoded media worker. No audio or video codecs are loaded.
+//! Read a logical source as encoded media without loading a decoder.
 
 use std::{
     env, fs,
@@ -10,15 +10,14 @@ use std::{
 };
 
 use pulsebeam_agent_core::{
-    AgentCommand, AgentConfig, AudioSubscription, ConnectionState, DesiredState, MediaKind,
-    RtpSource, VideoSubscription,
+    AgentCommand, AgentConfig, ConnectionState, MediaKind, SelectorStatus, TrackFilter, TrackOwner,
 };
 use pulsebeam_agent_quic::{
     executor::{
         host::Agent,
         recorder::{Limits, Recorder},
         rtp::Binding,
-        timed::{Policy, Reader, Receive},
+        timed::{Policy, Receive},
     },
     media::units::{Codec, Event, Unit},
 };
@@ -28,8 +27,8 @@ use rustls::{
 };
 use tokio::sync::{mpsc, oneshot};
 
-const USAGE: &str = "encoded_worker ENDPOINT ROOM opus|h264|vp8|vp9|av1 PUBLICATION_ID QUIC_CA_PEM fresh\n\
-encoded_worker ENDPOINT ROOM opus|h264|vp8|vp9|av1 PUBLICATION_ID QUIC_CA_PEM record NEW_DIRECTORY\n\
+const USAGE: &str = "encoded_worker ENDPOINT ROOM PARTICIPANT TRACK opus|h264|vp8|vp9|av1 QUIC_CA_PEM fresh\n\
+encoded_worker ENDPOINT ROOM PARTICIPANT TRACK opus|h264|vp8|vp9|av1 QUIC_CA_PEM record NEW_DIRECTORY\n\
 Set PULSEBEAM_TOKEN and PULSEBEAM_LOCAL_IP. Optional: PULSEBEAM_PLACEMENT_CA_DER.";
 const DRAIN_GRACE: Duration = Duration::from_secs(3);
 const RECORD_LIMITS: Limits = Limits {
@@ -43,7 +42,8 @@ type Work = (Binding, Receive);
 struct Settings {
     endpoint: String,
     room: String,
-    publication: String,
+    participant: String,
+    track: String,
     codec: Codec,
     ca: PathBuf,
     record: Option<PathBuf>,
@@ -51,7 +51,17 @@ struct Settings {
 
 impl Settings {
     fn parse(arguments: &[String]) -> Result<Self> {
-        let [endpoint, room, codec, publication, ca, mode, output @ ..] = arguments else {
+        let [
+            endpoint,
+            room,
+            participant,
+            track,
+            codec,
+            ca,
+            mode,
+            output @ ..,
+        ] = arguments
+        else {
             return Err(USAGE.into());
         };
         let codec = match codec.as_str() {
@@ -70,7 +80,8 @@ impl Settings {
         Ok(Self {
             endpoint: endpoint.clone(),
             room: room.clone(),
-            publication: publication.clone(),
+            participant: participant.clone(),
+            track: track.clone(),
             codec,
             ca: ca.into(),
             record,
@@ -94,6 +105,7 @@ fn roots(path: &Path) -> Result<RootCertStore> {
 }
 
 struct Storage {
+    publication: String,
     input: mpsc::Sender<Work>,
     done: oneshot::Receiver<Result<()>>,
 }
@@ -101,12 +113,14 @@ struct Storage {
 fn record_storage(directory: PathBuf, publication: String, codec: Codec) -> Result<Storage> {
     let (input, mut queue) = mpsc::channel::<Work>(4);
     let (finished, done) = oneshot::channel();
+    let recorded_publication = publication.clone();
     std::thread::Builder::new()
         .name("encoded-storage".into())
         .spawn(move || {
             let result = (|| {
-                let mut recorder = Recorder::create(&directory, publication, codec, RECORD_LIMITS)
-                    .map_err(|error| format!("open recording: {error:?}"))?;
+                let mut recorder =
+                    Recorder::create(&directory, recorded_publication, codec, RECORD_LIMITS)
+                        .map_err(|error| format!("open recording: {error:?}"))?;
                 while let Some((binding, event)) = queue.blocking_recv() {
                     recorder
                         .record(binding, &event)
@@ -117,31 +131,82 @@ fn record_storage(directory: PathBuf, publication: String, codec: Codec) -> Resu
             let _ = finished.send(result);
         })
         .map_err(|error| format!("start storage: {error}"))?;
-    Ok(Storage { input, done })
+    Ok(Storage {
+        publication,
+        input,
+        done,
+    })
 }
 
 #[derive(Default)]
 struct Processed {
+    binding: Option<Binding>,
     units: u64,
     bytes: u64,
     discontinuities: u64,
 }
 
 impl Processed {
-    // Replace this bounded callback with work on complete encoded bytes.
-    // Offload slow processing just as the recording mode offloads writes.
     fn process(&mut self, unit: &Unit<Binding>) {
         self.units = self.units.saturating_add(1);
         self.bytes = self.bytes.saturating_add(unit.data.len() as u64);
     }
 }
 
-async fn drive(
-    agent: &mut Agent,
-    mut reader: Reader,
+struct Worker {
+    owner: TrackOwner,
     codec: Codec,
-    storage: Option<&mpsc::Sender<Work>>,
-) -> Result<Processed> {
+    policy: Policy,
+    directory: Option<PathBuf>,
+    storage: Option<Storage>,
+    binding: Option<Binding>,
+}
+
+impl Worker {
+    fn sync(&mut self, agent: &mut Agent) -> Result<Option<Binding>> {
+        let state = agent
+            .media_selector_state(self.owner)
+            .ok_or("selector closed")?;
+        match state.status {
+            SelectorStatus::Rejected => {
+                return Err(format!("selector rejected: {:?}", state.error));
+            }
+            SelectorStatus::Overflow => return Err("selector exceeded membership capacity".into()),
+            SelectorStatus::Pending | SelectorStatus::Complete => {}
+        }
+        let selected = match state.matches.as_slice() {
+            [] => None,
+            [matched] => agent
+                .selected_rtp(self.owner, matched)
+                .map_err(|error| format!("receive selected track: {error:?}"))?,
+            _ => return Err("selector returned more than one logical source".into()),
+        };
+        if selected.map(|selected| selected.binding) == self.binding {
+            return Ok(self.binding);
+        }
+        let selected = selected.map(|live| (live.binding, live.publication_id.to_owned()));
+        if let Some(previous) = self.binding.take() {
+            agent.detach_encoded(previous);
+        }
+        let Some((binding, publication)) = selected else {
+            return Ok(None);
+        };
+        if let Some(storage) = &self.storage {
+            if storage.publication != publication {
+                return Err("publication replaced; use a new recording directory".into());
+            }
+        } else if let Some(directory) = self.directory.take() {
+            self.storage = Some(record_storage(directory, publication, self.codec)?);
+        }
+        agent
+            .attach_encoded(binding, self.policy)
+            .map_err(|error| format!("attach reader: {error:?}"))?;
+        self.binding = Some(binding);
+        Ok(self.binding)
+    }
+}
+
+async fn drive(agent: &mut Agent, worker: &mut Worker) -> Result<Processed> {
     let stop = tokio::signal::ctrl_c();
     tokio::pin!(stop);
     let mut processed = Processed::default();
@@ -149,11 +214,19 @@ async fn drive(
         if let Some(failure) = &agent.snapshot().terminal_failure {
             return Err(format!("connection failed: {:?}", failure.class));
         }
-        reader
-            .sync(agent)
-            .map_err(|error| format!("attach reader: {error:?}"))?;
+        let binding = worker.sync(agent)?;
+        if binding.is_some() && binding != processed.binding {
+            processed = Processed {
+                binding,
+                ..Default::default()
+            };
+        }
+        let storage = worker.storage.as_ref().map(|storage| &storage.input);
+        if storage.is_some_and(mpsc::Sender::is_closed) {
+            return Err("storage stopped".into());
+        }
         let mut blocked = false;
-        for _ in 0..34 {
+        for binding in binding.into_iter().cycle().take(34) {
             if let Some(storage) = storage {
                 let permit = match storage.try_reserve() {
                     Ok(permit) => permit,
@@ -165,25 +238,19 @@ async fn drive(
                         return Err("storage stopped".into());
                     }
                 };
-                let Some(work) = reader
-                    .next(agent)
-                    .map_err(|error| format!("attach reader: {error:?}"))?
-                else {
+                let Some(event) = agent.next_encoded(binding) else {
                     break;
                 };
-                permit.send(work);
+                permit.send((binding, event));
             } else {
-                let Some((_, event)) = reader
-                    .next(agent)
-                    .map_err(|error| format!("attach reader: {error:?}"))?
-                else {
+                let Some(event) = agent.next_encoded(binding) else {
                     break;
                 };
                 match event {
                     Receive::Media(Event::Unit(unit)) => {
-                        if unit.codec != codec {
+                        if unit.source != binding || unit.codec != worker.codec {
                             return Err(format!(
-                                "expected {codec:?} publication, received {:?}",
+                                "unexpected source or codec on {binding:?}: {:?}",
                                 unit.codec
                             ));
                         }
@@ -260,80 +327,49 @@ async fn run(settings: Settings) -> Result<()> {
             .with_placement_root(&der)
             .map_err(|error| format!("install placement CA: {error:?}"))?;
     }
-    let mime = match settings.codec {
-        Codec::Opus => "audio/opus",
-        Codec::H264 => "video/h264",
-        Codec::Vp8 => "video/vp8",
-        Codec::Vp9 => "video/vp9",
-        Codec::Av1 => "video/av1",
-    };
-    let source =
-        RtpSource::native_quic_baseline(settings.publication.clone(), settings.room.clone(), mime)
-            .ok_or("unknown source format")?;
-    let mut desired = DesiredState {
-        revision: 1,
-        rtp_sources: vec![source],
-        ..Default::default()
-    };
     let kind = match settings.codec {
-        Codec::Opus => {
-            desired.audio = AudioSubscription {
-                pinned: vec![settings.publication.clone()],
-                ..Default::default()
-            };
-            MediaKind::Audio
-        }
-        Codec::H264 | Codec::Vp8 | Codec::Vp9 | Codec::Av1 => {
-            desired.video = vec![VideoSubscription {
-                decode_target: None,
-                slot: 0,
-                publication_id: settings.publication.clone(),
-                selector: None,
-                height: 720,
-                min_height: 0,
-                min_fps: 0,
-                priority: 0,
-            }];
-            MediaKind::Video
-        }
+        Codec::Opus => MediaKind::Audio,
+        Codec::H264 | Codec::Vp8 | Codec::Vp9 | Codec::Av1 => MediaKind::Video,
     };
-    let (policy, storage) = if let Some(directory) = settings.record {
-        (
-            Policy::Recording {
-                reorder: Duration::from_millis(120),
-            },
-            Some(record_storage(
-                directory,
-                settings.publication.clone(),
-                settings.codec,
-            )?),
-        )
+    let policy = if settings.record.is_some() {
+        Policy::Recording {
+            reorder: Duration::from_millis(120),
+        }
     } else {
-        (
-            Policy::Freshness {
-                reorder: Duration::from_millis(35),
-                max_age: Duration::from_millis(150),
-            },
-            None,
-        )
+        Policy::Freshness {
+            reorder: Duration::from_millis(35),
+            max_age: Duration::from_millis(150),
+        }
     };
-    agent
-        .command(AgentCommand::ReplaceDesired(desired))
-        .map_err(|error| format!("pin publication: {error:?}"))?;
+    let owner = agent
+        .open_media_selector(
+            settings.room.clone(),
+            kind,
+            TrackFilter {
+                participant_id: Some(settings.participant),
+                track_id: Some(settings.track),
+            },
+        )
+        .map_err(|error| format!("open selector: {error:?}"))?;
     agent
         .command(AgentCommand::Join(settings.room))
         .map_err(|error| format!("join: {error:?}"))?;
-    let reader = Reader::new(kind, settings.publication, policy);
-    let recording = storage.is_some();
-    let drive = drive(
-        &mut agent,
-        reader,
-        settings.codec,
-        storage.as_ref().map(|storage| &storage.input),
-    )
-    .await;
+    let mut worker = Worker {
+        owner,
+        codec: settings.codec,
+        policy,
+        directory: settings.record,
+        storage: None,
+        binding: None,
+    };
+    let drive = drive(&mut agent, &mut worker).await;
+    if let Some(binding) = worker.binding {
+        agent.detach_encoded(binding);
+    }
+    agent.close_media_selector(owner);
+    let recording = worker.storage.is_some();
     let output = async {
-        if let Some(Storage { input, done }) = storage {
+        if let Some(Storage { input, done, .. }) = worker.storage {
             drop(input);
             tokio::time::timeout(DRAIN_GRACE, done)
                 .await
@@ -352,8 +388,8 @@ async fn run(settings: Settings) -> Result<()> {
     } else {
         let _ = writeln!(
             stderr,
-            "encoded units processed={} bytes={} discontinuities={}",
-            processed.units, processed.bytes, processed.discontinuities
+            "binding {:?}: encoded units={} bytes={} discontinuities={}",
+            processed.binding, processed.units, processed.bytes, processed.discontinuities
         );
     }
     Ok(())

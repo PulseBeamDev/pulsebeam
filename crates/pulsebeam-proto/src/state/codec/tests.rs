@@ -413,11 +413,14 @@ fn installed_data_v1_publication_requires_the_authenticated_source_incarnation()
         panic!("publication fixture");
     };
     spec.settings.as_mut().unwrap().enabled = Some(true);
-    let source = lookup_state(true, true);
+    let source = data_source();
     let mut live = LiveResource {
         spec: Some(spec.as_ref().clone()),
-        participant: source.participant,
-        track: source.track,
+        participant: Some(Participant {
+            participant_id: source.participant_id.clone(),
+            room_id: source.room_id.clone(),
+        }),
+        track: Some(source),
         execution: ExecutionStatus::Installed as i32,
         ..Default::default()
     };
@@ -457,58 +460,39 @@ fn desired(batch: &mut ClientStateBatch) -> &mut DesiredState {
     batch.records[0].desired.as_mut().unwrap()
 }
 
-fn lookup_spec(enabled: bool) -> ResourceSpec {
-    ResourceSpec {
-        settings: Some(ResourceSettings {
-            enabled: Some(enabled),
-            receive: None,
-        }),
-        declaration: Some(resource_spec::Declaration::SourceLookup(SourceLookupSpec {
-            source: Some(LogicalSourceAddress {
-                room: String::from("room"),
-                participant_id: String::from("alice"),
-                kind: TrackKind::Data as i32,
-                track_id: String::from("cursor"),
-            }),
+fn data_source() -> Track {
+    Track {
+        publication_id: String::from("replacement-track"),
+        participant_id: String::from("alice"),
+        room_id: String::from("room"),
+        track_id: String::from("cursor"),
+        kind: Some(track::Kind::Data(DataTrack {
+            capture_clock: None,
+            delivery: DataDelivery::Lossy as i32,
+            record_dd: false,
         })),
-    }
-}
-
-fn lookup_state(enabled: bool, paired: bool) -> SourceLookupState {
-    SourceLookupState {
-        spec: Some(lookup_spec(enabled)),
-        participant: paired.then(|| Participant {
-            participant_id: String::from("alice"),
-            room_id: String::from("room"),
-        }),
-        track: paired.then(|| Track {
-            publication_id: String::from("replacement-track"),
-            participant_id: String::from("alice"),
-            room_id: String::from("room"),
-            track_id: String::from("cursor"),
-            kind: Some(track::Kind::Data(DataTrack {
-                capture_clock: None,
-                delivery: DataDelivery::Lossy as i32,
-                record_dd: false,
-            })),
-        }),
     }
 }
 
 #[test]
 fn logical_subscription_accepts_only_an_enabled_exact_source_offer() {
-    let lookup = lookup_state(true, true);
-    let mut spec = lookup.spec.unwrap();
-    let Some(resource_spec::Declaration::SourceLookup(lookup_spec)) = spec.declaration.take()
-    else {
-        panic!("lookup spec");
+    let spec = ResourceSpec {
+        settings: Some(ResourceSettings {
+            enabled: Some(true),
+            receive: None,
+        }),
+        declaration: Some(resource_spec::Declaration::LogicalSubscription(
+            LogicalSubscriptionSpec {
+                source: Some(LogicalSourceAddress {
+                    room: String::from("room"),
+                    participant_id: String::from("alice"),
+                    kind: TrackKind::Data as i32,
+                    track_id: String::from("cursor"),
+                }),
+                data_version: None,
+            },
+        )),
     };
-    spec.declaration = Some(resource_spec::Declaration::LogicalSubscription(
-        LogicalSubscriptionSpec {
-            data_version: None,
-            source: lookup_spec.source,
-        },
-    ));
     let mut subscription = LogicalSubscriptionState {
         data_v1: None,
         spec: Some(spec),
@@ -521,7 +505,7 @@ fn logical_subscription_accepts_only_an_enabled_exact_source_offer() {
         Ok(())
     );
 
-    subscription.source = lookup.track;
+    subscription.source = Some(data_source());
     assert_eq!(
         validation::validate_logical_subscription(&subscription),
         Err(ValidationError::Confirmed)
@@ -682,205 +666,6 @@ fn raw_protobuf_preserves_exact_revision_and_explicit_false() {
         assert_eq!(validation::validate_spec(spec), Ok(()));
         assert_eq!(spec.settings.as_ref().unwrap().enabled, Some(false));
     }
-}
-
-#[test]
-fn source_lookup_is_a_bounded_owned_nonforwarding_observation() {
-    let client = ClientStateBatch {
-        records: vec![ClientStateRecord {
-            owned: 1,
-            desired: Some(DesiredState {
-                revision: 1,
-                value: Some(desired_state::Value::Present(lookup_spec(false).into())),
-            }),
-            execution: None,
-        }],
-        ..Default::default()
-    };
-    assert_eq!(decode_client(&encode_client(&client).unwrap()), Ok(client));
-
-    for lookup in [
-        lookup_state(false, false),
-        lookup_state(true, false),
-        lookup_state(true, true),
-    ] {
-        let confirmed = ConfirmedState {
-            evaluated_revision: 1,
-            value: Some(confirmed_state::Value::SourceLookup(lookup.into())),
-            ..Default::default()
-        };
-        let server = ServerStateBatch {
-            records: vec![ServerStateRecord {
-                key: Some(ResourceKey {
-                    key: Some(resource_key::Key::Owned(1)),
-                }),
-                confirmed: Some(confirmed),
-            }],
-            initial_complete: false,
-            ..Default::default()
-        };
-        assert_eq!(decode_server(&encode_server(&server).unwrap()), Ok(server));
-    }
-
-    let mut disabled_with_descriptor = lookup_state(false, true);
-    assert_eq!(
-        validation::validate_source_lookup(&disabled_with_descriptor),
-        Err(ValidationError::Confirmed)
-    );
-    disabled_with_descriptor.track = None;
-    disabled_with_descriptor.participant = None;
-    assert_eq!(
-        validation::validate_source_lookup(&disabled_with_descriptor),
-        Ok(())
-    );
-    assert_eq!(
-        validation::validate_live(&LiveResource {
-            spec: Some(lookup_spec(false)),
-            ..Default::default()
-        }),
-        Err(ValidationError::Confirmed)
-    );
-
-    let valid = lookup_state(true, true);
-    let record = |key: resource_key::Key, evaluated_revision: u64, lookup: SourceLookupState| {
-        ServerStateBatch {
-            records: vec![ServerStateRecord {
-                key: Some(ResourceKey { key: Some(key) }),
-                confirmed: Some(ConfirmedState {
-                    evaluated_revision,
-                    value: Some(confirmed_state::Value::SourceLookup(lookup.into())),
-                    ..Default::default()
-                }),
-            }],
-            initial_complete: false,
-            ..Default::default()
-        }
-    };
-    assert_eq!(
-        validation::validate_server_batch(&record(resource_key::Key::Owned(1), 1, valid.clone())),
-        Ok(())
-    );
-    assert_eq!(
-        validation::validate_server_batch(&record(resource_key::Key::Owned(1), 0, valid.clone())),
-        Err(ValidationError::Confirmed)
-    );
-    assert_eq!(
-        validation::validate_server_batch(&record(
-            resource_key::Key::Publication(String::from("replacement-track")),
-            0,
-            valid.clone()
-        )),
-        Err(ValidationError::Confirmed)
-    );
-    let mut wrong_spec = valid.clone();
-    wrong_spec.spec.as_mut().unwrap().declaration = lookup_spec(true).declaration;
-    if let Some(resource_spec::Declaration::SourceLookup(source)) =
-        wrong_spec.spec.as_mut().unwrap().declaration.as_mut()
-    {
-        source.source.as_mut().unwrap().kind = TrackKind::Audio as i32;
-    }
-    assert_eq!(
-        validation::validate_server_batch(&record(resource_key::Key::Owned(1), 1, wrong_spec)),
-        Err(ValidationError::Identity)
-    );
-    let mut wrong_declaration = valid.clone();
-    wrong_declaration.spec = Some(ResourceSpec {
-        settings: Some(ResourceSettings {
-            enabled: Some(true),
-            receive: None,
-        }),
-        declaration: Some(resource_spec::Declaration::Publication(PublicationSpec {
-            track_id: String::from("cursor"),
-            kind: Some(publication_spec::Kind::Data(DataPublication {
-                capture_clock: None,
-                delivery: DataDelivery::Lossy as i32,
-                binding: Some(TrackBinding {
-                    transport: Some(track_binding::Transport::Sctp(SctpParameters {
-                        stream_id: Some(1),
-                    })),
-                }),
-            })),
-        })),
-    });
-    assert_eq!(
-        validation::validate_source_lookup(&wrong_declaration),
-        Err(ValidationError::Confirmed)
-    );
-    let mut invalid = valid.clone();
-    invalid.track = None;
-    assert_eq!(
-        validation::validate_source_lookup(&invalid),
-        Err(ValidationError::Confirmed)
-    );
-    let mut invalid = valid.clone();
-    invalid.participant.as_mut().unwrap().participant_id = String::from("other-owner");
-    assert_eq!(
-        validation::validate_source_lookup(&invalid),
-        Err(ValidationError::Identity)
-    );
-    let mut invalid = valid.clone();
-    invalid.participant.as_mut().unwrap().room_id = String::from("OtherRoom");
-    invalid.track.as_mut().unwrap().room_id = String::from("OtherRoom");
-    assert_eq!(
-        validation::validate_source_lookup(&invalid),
-        Err(ValidationError::Identity)
-    );
-    let mut invalid = valid.clone();
-    invalid.track.as_mut().unwrap().track_id = String::from("other-label");
-    assert_eq!(
-        validation::validate_source_lookup(&invalid),
-        Err(ValidationError::Identity)
-    );
-    let mut invalid = valid;
-    invalid.track.as_mut().unwrap().kind = Some(track::Kind::Audio(AudioTrack { format: None }));
-    assert_eq!(
-        validation::validate_source_lookup(&invalid),
-        Err(ValidationError::Format)
-    );
-
-    let mut bad_spec = lookup_spec(true);
-    bad_spec.settings.as_mut().unwrap().receive = Some(resource_settings::Receive::Audio(
-        AudioReceiveOptions::default(),
-    ));
-    assert_eq!(
-        validation::validate_spec(&bad_spec),
-        Err(ValidationError::Settings)
-    );
-    let mut bad_spec = lookup_spec(true);
-    if let Some(resource_spec::Declaration::SourceLookup(source)) = bad_spec.declaration.as_mut() {
-        source.source.as_mut().unwrap().participant_id = String::from("bad\nendpoint");
-    }
-    assert_eq!(
-        validation::validate_spec(&bad_spec),
-        Err(ValidationError::Identity)
-    );
-    let invalid_desired = ClientStateBatch {
-        records: vec![ClientStateRecord {
-            owned: 1,
-            desired: Some(DesiredState {
-                revision: 1,
-                value: Some(desired_state::Value::Present(bad_spec.into())),
-            }),
-            execution: None,
-        }],
-        ..Default::default()
-    };
-    assert!(encode_client(&invalid_desired).is_ok());
-
-    let mut changed = lookup_spec(true);
-    changed.settings.as_mut().unwrap().enabled = Some(false);
-    assert!(validation::declarations_equivalent(
-        &lookup_spec(true),
-        &changed
-    ));
-    changed.declaration = lookup_spec(true).declaration;
-    if let Some(resource_spec::Declaration::SourceLookup(source)) = changed.declaration.as_mut() {
-        source.source.as_mut().unwrap().room = String::from("other-room");
-    }
-    assert!(!validation::declarations_equivalent(
-        &lookup_spec(true),
-        &changed
-    ));
 }
 
 #[test]

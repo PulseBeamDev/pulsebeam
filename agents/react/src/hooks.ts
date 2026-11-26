@@ -5,6 +5,7 @@ import {
   AudioSource,
   AudioSubscription,
   DataDelivery,
+  DataSetRef,
   LocalAudioTrack,
   LocalDataTrack,
   LocalVideoTrack,
@@ -21,7 +22,6 @@ import {
   type VideoCollection,
   type DataPublication,
   type DataPublishOptions,
-  type DataSubscribeOptions,
   type DataSubscription,
   type Pipe,
   type PublicationConfig,
@@ -58,7 +58,8 @@ type Remote =
   | RemoteAudioTrack
   | RemoteDataTrack
   | VideoCollectionRef
-  | AudioCollectionRef;
+  | AudioCollectionRef
+  | DataSetRef;
 type Subscription =
   | VideoSubscription
   | AudioSubscription
@@ -67,9 +68,17 @@ type Subscription =
   | AudioCollection;
 
 function sameSelection(previous: Remote | null, current: Remote | null) {
-  if (previous instanceof VideoCollectionRef && current instanceof VideoCollectionRef)
+  if (
+    previous instanceof VideoCollectionRef &&
+    current instanceof VideoCollectionRef
+  )
     return previous.sameSelection(current);
-  if (previous instanceof AudioCollectionRef && current instanceof AudioCollectionRef)
+  if (
+    previous instanceof AudioCollectionRef &&
+    current instanceof AudioCollectionRef
+  )
+    return previous.sameSelection(current);
+  if (previous instanceof DataSetRef && current instanceof DataSetRef)
     return previous.sameSelection(current);
   return false;
 }
@@ -206,8 +215,12 @@ export function usePublish(
   return usePublication(track, source, options).value;
 }
 
-export function useSubscribe(track: VideoCollectionRef | null): VideoCollection | null;
-export function useSubscribe(track: AudioCollectionRef | null): AudioCollection | null;
+export function useSubscribe(
+  track: VideoCollectionRef | null,
+): VideoCollection | null;
+export function useSubscribe(
+  track: AudioCollectionRef | null,
+): AudioCollection | null;
 export function useSubscribe(
   track: RemoteVideoTrack | null,
   options?: VideoObservation,
@@ -216,33 +229,21 @@ export function useSubscribe(
   track: RemoteAudioTrack | null,
 ): AudioSubscription | null;
 export function useSubscribe(
-  track: RemoteDataTrack | null,
-  options?: DataSubscribeOptions,
+  track: RemoteDataTrack | DataSetRef | null,
 ): DataSubscription | null;
 export function useSubscribe(
   selection: Remote | null,
-  options?: VideoObservation | DataSubscribeOptions,
+  options?: VideoObservation,
 ): Subscription | null {
   const track = useStableTarget(selection, sameSelection);
-  const mode =
-    track instanceof RemoteDataTrack
-      ? (options as DataSubscribeOptions | undefined)?.delivery
-      : undefined;
-  const target = useMemo(() => track && { track, mode }, [track, mode]);
   const committed = useCommittedRef(options);
   const applied = useRef(new WeakMap<Subscription, string>());
   const key = JSON.stringify(options ?? null);
-  const subscription = useResource<Subscription>(target, () => {
+  const subscription = useResource<Subscription>(track, () => {
     const owner =
-      track instanceof RemoteDataTrack
-        ? track.subscribe(options as DataSubscribeOptions | undefined)
-        : track instanceof RemoteVideoTrack
-          ? track.subscribe(options as VideoObservation | undefined)
-          : track instanceof RemoteAudioTrack ||
-              track instanceof AudioCollectionRef ||
-              track instanceof VideoCollectionRef
-            ? track.subscribe()
-            : undefined;
+      track instanceof RemoteVideoTrack
+        ? track.subscribe(options)
+        : track?.subscribe();
     if (!owner) throw new TypeError("Expected an SDK remote track");
     applied.current.set(owner, key);
     return owner;
@@ -252,7 +253,7 @@ export function useSubscribe(
     if (!owner || applied.current.get(owner) === key) return;
     try {
       if (owner instanceof VideoSubscription)
-        owner.configure(committed.current as VideoObservation | undefined);
+        owner.configure(committed.current);
       applied.current.set(owner, key);
     } catch (error) {
       subscription.fail(error);

@@ -166,12 +166,6 @@ impl DataPublishOptions {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, uniffi::Record)]
-pub struct DataSubscribeOptions {
-    #[uniffi(default = None)]
-    pub delivery: Option<DataDelivery>,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, uniffi::Record)]
 pub struct DataSendOptions {
     #[uniffi(default = None)]
     pub captured_at: Option<CaptureTimestamp>,

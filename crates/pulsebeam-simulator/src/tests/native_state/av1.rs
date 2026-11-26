@@ -684,14 +684,11 @@ pub(in crate::tests) async fn prove_warm_wan_av1(
             connect(host, egress, "av1-viewer", false, dd).await?;
         let remote = receiver.receiver().track().context("remote AV1 track")?;
         let sink = remote.attach_sink()?;
-        viewer
-            .wait_for_video_publication(ROOM, "av1-source", "camera", &track.publication_id)
-            .await?;
-        let observed = install(&mut viewer, 2, subscription(&track, parameters)).await?;
-        anyhow::ensure!(
-            observed.publication_id == track.publication_id,
-            "wrong remote AV1 publication"
-        );
+        viewer.subscribe_video(ROOM, "av1-source", "camera");
+        let binding = wire::TrackBinding {
+            transport: Some(wire::track_binding::Transport::Rtp(parameters)),
+        };
+        bind_logical_video(&mut viewer, &track.publication_id, &binding, 2, 0).await?;
         let mut previous = None;
         for _ in 0..3 {
             let picture = loop {

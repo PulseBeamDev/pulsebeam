@@ -1045,9 +1045,7 @@ async fn prove_payload(
         .room(ROOM.into())?
         .participant(PUBLISHER.into())?
         .data(TRACK.into())?
-        .subscribe(Some(core_ffi::DataSubscribeOptions {
-            delivery: Some(delivery),
-        }))?;
+        .subscribe()?;
     let changes = feed.updates()?;
     if local {
         // Reserve the first room partition so the publisher installs on the other shard.
@@ -1571,9 +1569,7 @@ fn subscribe_reliable(
         .room(room.into())?
         .participant(publisher.into())?
         .data(track.into())?
-        .subscribe(Some(core_ffi::DataSubscribeOptions {
-            delivery: Some(core_ffi::DataDelivery::Reliable),
-        }))?)
+        .subscribe()?)
 }
 
 async fn prove_reliable_subscription_denied(
@@ -1868,9 +1864,7 @@ async fn prove_local_ordered_cutoff(
         .room(room.into())?
         .participant(publisher.into())?
         .data(track.into())?
-        .subscribe(Some(core_ffi::DataSubscribeOptions {
-            delivery: Some(core_ffi::DataDelivery::Reliable),
-        }))?;
+        .subscribe()?;
     let updates = replacement.updates()?;
     tokio::time::timeout(Duration::from_secs(2), async {
         while let Some(state) = updates.next().await? {
@@ -1976,9 +1970,7 @@ async fn prove_local_ordered_late_join(
         .room(room.into())?
         .participant(publisher.into())?
         .data(track.into())?
-        .subscribe(Some(core_ffi::DataSubscribeOptions {
-            delivery: Some(core_ffi::DataDelivery::Reliable),
-        }))?;
+        .subscribe()?;
     late.join(room.into())?;
     wait_connected_when(late, None, |_| true).await?;
     tokio::time::timeout(Duration::from_secs(2), async {
