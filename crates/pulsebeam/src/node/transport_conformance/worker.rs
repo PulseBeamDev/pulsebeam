@@ -23,7 +23,7 @@ use pulsebeam_agent_quic::{
         host::Agent,
         recorder::{Limits, RecordError, Recorder},
         rtp::{Binding, Publication, SendPacketError},
-        timed::{Policy, Reader, Receive},
+        timed::{Policy, Receive},
     },
     media::{
         Opus, Packet, PacketBudget,
@@ -239,16 +239,22 @@ async fn ready_source(publisher: &mut Agent, kind: MediaKind, track: &str) -> Re
 async fn ready_reader(
     publisher: &mut Agent,
     subscriber: &mut Agent,
-    reader: &mut Reader,
+    kind: MediaKind,
+    publication: &str,
     label: &str,
 ) -> Result<Binding> {
     let result = pulsebeam_runtime::time::timeout(Duration::from_secs(5), async {
         loop {
             check(subscriber)?;
-            if let Some(binding) = reader
-                .sync(subscriber)
-                .map_err(|error| anyhow!("worker attach: {error:?}"))?
-            {
+            if let Some(binding) = subscriber.rtp_subscription(kind, publication) {
+                subscriber
+                    .attach_encoded(
+                        binding,
+                        Policy::Recording {
+                            reorder: Duration::from_millis(25),
+                        },
+                    )
+                    .map_err(|error| anyhow!("worker attach: {error:?}"))?;
                 return Ok(binding);
             }
             drive_pair(publisher, subscriber).await?;
@@ -267,7 +273,7 @@ async fn send_read(
     publisher: &mut Agent,
     subscriber: &mut Agent,
     source: &Publication,
-    reader: &mut Reader,
+    binding: Binding,
     sequence: u32,
     mut observe: impl FnMut(Binding, &Receive) -> Result<()>,
 ) -> Result<()> {
@@ -284,7 +290,7 @@ async fn send_read(
         publisher,
         subscriber,
         source,
-        reader,
+        binding,
         &[packet],
         |binding, event| {
             observe(binding, event)?;
@@ -302,7 +308,7 @@ async fn send_encoded(
     publisher: &mut Agent,
     subscriber: &mut Agent,
     source: &Publication,
-    reader: &mut Reader,
+    binding: Binding,
     packets: &[Packet<impl AsRef<[u8]>>],
     mut observe: impl FnMut(Binding, &Receive) -> Result<()>,
 ) -> Result<()> {
@@ -331,10 +337,7 @@ async fn send_encoded(
     };
     let receive = async {
         loop {
-            while let Some((binding, event)) = reader
-                .next(subscriber)
-                .map_err(|error| anyhow!("real encoded reader: {error:?}"))?
-            {
+            while let Some(event) = subscriber.next_encoded(binding) {
                 observe(binding, &event)?;
                 if matches!(event, Receive::Media(Event::Unit(_))) {
                     return Ok(());
@@ -445,15 +448,15 @@ pub(super) async fn witness(
             .collect(),
         ..Default::default()
     }))?;
-    let mut reader = Reader::new(
-        MediaKind::Audio,
-        publication.clone(),
-        Policy::Recording {
-            reorder: Duration::from_millis(25),
-        },
-    );
     subscriber.command(AgentCommand::Join(ROOM.into()))?;
-    let first = ready_reader(&mut publisher, &mut subscriber, &mut reader, "Opus").await?;
+    let first = ready_reader(
+        &mut publisher,
+        &mut subscriber,
+        MediaKind::Audio,
+        &publication,
+        "Opus",
+    )
+    .await?;
     let peer = Some(Family::V4.address(port));
     ensure!(
         publisher.quic_peer() == peer && subscriber.quic_peer() == peer,
@@ -468,7 +471,7 @@ pub(super) async fn witness(
             .join("encoded-worker");
     let mut recorder = Recorder::create(
         &directory,
-        publication,
+        publication.clone(),
         Codec::Opus,
         Limits {
             units: 8,
@@ -486,7 +489,7 @@ pub(super) async fn witness(
             &mut publisher,
             &mut subscriber,
             &source,
-            &mut reader,
+            first,
             0,
             &mut store
         ),
@@ -494,16 +497,16 @@ pub(super) async fn witness(
     )?;
     for (video, source) in VIDEO.iter().zip(&sources) {
         let exercise = async {
-            let mut reader = Reader::new(
+            let binding = ready_reader(
+                &mut publisher,
+                &mut subscriber,
                 MediaKind::Video,
-                source.publication_id().to_owned(),
-                Policy::Recording {
-                    reorder: Duration::from_millis(25),
-                },
-            );
-            ready_reader(&mut publisher, &mut subscriber, &mut reader, video.name).await?;
+                source.publication_id(),
+                video.name,
+            )
+            .await?;
             let packets = video.keyframe()?;
-            send_encoded(&mut publisher, &mut subscriber, source, &mut reader, &packets, |_, event| {
+            send_encoded(&mut publisher, &mut subscriber, source, binding, &packets, |_, event| {
                 if let Receive::Media(Event::Unit(unit)) = event {
                     ensure!(unit.codec == video.codec && unit.access == Access::IndependentVideo
                         && unit.rtp_time.is_some() && unit.data.len() > 1200
@@ -524,7 +527,7 @@ pub(super) async fn witness(
             &mut publisher,
             &mut subscriber,
             &source,
-            &mut reader,
+            first,
             2,
             &mut store
         ),
@@ -534,16 +537,17 @@ pub(super) async fn witness(
 
     close(&mut subscriber).await?;
     ensure!(
-        reader
-            .sync(&mut subscriber)
-            .map_err(|error| anyhow!("retire worker reader: {error:?}"))?
+        subscriber
+            .rtp_subscription(MediaKind::Audio, &publication)
             .is_none()
     );
+    ensure!(subscriber.next_encoded(first).is_none());
     subscriber.command(AgentCommand::Join(ROOM.into()))?;
     let next = ready_reader(
         &mut publisher,
         &mut subscriber,
-        &mut reader,
+        MediaKind::Audio,
+        &publication,
         "replacement Opus",
     )
     .await?;
@@ -552,7 +556,7 @@ pub(super) async fn witness(
         &mut publisher,
         &mut subscriber,
         &source,
-        &mut reader,
+        next,
         3,
         &mut store,
     )
@@ -581,7 +585,7 @@ pub(super) async fn witness(
         &mut publisher,
         &mut subscriber,
         &source,
-        &mut reader,
+        next,
         4,
         |binding, event| {
             ensure!(matches!(
@@ -596,7 +600,7 @@ pub(super) async fn witness(
         &mut publisher,
         &mut subscriber,
         &source,
-        &mut reader,
+        next,
         5,
         |binding, event| {
             ensure!(matches!(

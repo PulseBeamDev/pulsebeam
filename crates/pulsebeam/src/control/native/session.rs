@@ -301,7 +301,7 @@ impl NativeSession {
     }
 
     fn put(&mut self, key: Key, value: wire::ConfirmedState) -> Result<(), OutputError> {
-        let (record, _) = Self::state_record(&key, &value, u64::MAX, 0);
+        let (record, _) = Self::state_record(&key, &value, u64::MAX, 0)?;
         self.encode_batch(&wire::ServerStateBatch {
             records: vec![record],
             initial_complete: false,
@@ -376,15 +376,15 @@ impl NativeSession {
         value: &wire::ConfirmedState,
         version: u64,
         offset: usize,
-    ) -> (wire::ServerStateRecord, Option<usize>) {
-        let (confirmed, next) = selectors::slice(value, version, offset);
-        (
+    ) -> Result<(wire::ServerStateRecord, Option<usize>), OutputError> {
+        let (confirmed, next) = selectors::slice(value, version, offset)?;
+        Ok((
             wire::ServerStateRecord {
                 key: Some(key.wire()),
                 confirmed: Some(confirmed),
             },
             next,
-        )
+        ))
     }
 
     pub(crate) fn set_cid(&mut self, cid: ChannelId, at: pulsebeam_runtime::time::Instant) {
@@ -2383,7 +2383,7 @@ impl NativeSession {
                 continue;
             }
             let (record, next_offset) =
-                Self::state_record(&key, &row.value, row.version, row.selector_offset);
+                Self::state_record(&key, &row.value, row.version, row.selector_offset)?;
             let candidate_len = batch
                 .encoded_len()
                 .saturating_add(record.encoded_len())

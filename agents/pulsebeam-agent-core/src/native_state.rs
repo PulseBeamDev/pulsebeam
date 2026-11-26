@@ -170,7 +170,7 @@ impl Owned {
             .map_or(0, |span| span.total as usize);
         state
             .encoded_len()
-            .saturating_add(capacity * size_of::<wire::LogicalSourceAddress>())
+            .saturating_add(capacity.saturating_mul(size_of::<wire::LogicalSourceAddress>()))
     }
 
     fn awaiting_evaluation(&self) -> bool {
@@ -428,7 +428,7 @@ impl NativeState {
             if let Some(owned) = self.owned.get_mut(&reference) {
                 owned.retiring = true;
             }
-            self.clear_selector_assembly(reference);
+            self.take_selector_assembly(reference)?;
             self.retiring.insert(reference);
             self.retiring_resources.insert(resource.clone(), reference);
         }
@@ -978,14 +978,18 @@ impl NativeState {
         Ok(changes)
     }
 
-    fn clear_selector_assembly(&mut self, reference: u64) {
-        if let Some(assembly) = self
+    fn take_selector_assembly(
+        &mut self,
+        reference: u64,
+    ) -> Result<Option<wire::ConfirmedState>, SignalingError> {
+        let assembly = self
             .owned
             .get_mut(&reference)
-            .and_then(|owned| owned.selector_assembly.take())
-        {
-            self.retained_bytes -= Owned::assembly_bytes(&assembly);
+            .and_then(|owned| owned.selector_assembly.take());
+        if let Some(assembly) = &assembly {
+            self.account(Owned::assembly_bytes(assembly), 0)?;
         }
+        Ok(assembly)
     }
 
     fn stage_selector_slice(
@@ -995,11 +999,11 @@ impl NativeState {
     ) -> Result<Option<wire::ConfirmedState>, SignalingError> {
         let Some(wire::confirmed_state::Value::SubscriptionSelector(slice)) = state.value.as_ref()
         else {
-            self.clear_selector_assembly(reference);
+            self.take_selector_assembly(reference)?;
             return Ok(Some(state));
         };
         let Some(span) = slice.membership.as_ref() else {
-            self.clear_selector_assembly(reference);
+            self.take_selector_assembly(reference)?;
             return Ok(Some(state));
         };
         let owned = self
@@ -1041,24 +1045,20 @@ impl NativeState {
         }
         let mut assembly =
             if offset == 0 {
-                self.clear_selector_assembly(reference);
-                self.owned.get_mut(&reference).unwrap().selector_revision = span.revision;
+                self.take_selector_assembly(reference)?;
+                self.owned
+                    .get_mut(&reference)
+                    .ok_or(SignalingError::Invalid("unknown selector reference"))?
+                    .selector_revision = span.revision;
                 state
             } else {
                 if span.revision != owned.selector_revision {
-                    self.clear_selector_assembly(reference);
+                    self.take_selector_assembly(reference)?;
                     return Ok(None);
                 }
-                let Some(mut assembly) = self
-                    .owned
-                    .get_mut(&reference)
-                    .unwrap()
-                    .selector_assembly
-                    .take()
-                else {
+                let Some(mut assembly) = self.take_selector_assembly(reference)? else {
                     return Ok(None);
                 };
-                self.retained_bytes -= Owned::assembly_bytes(&assembly);
                 let Some(wire::confirmed_state::Value::SubscriptionSelector(base)) =
                     &mut assembly.value
                 else {
@@ -1078,23 +1078,27 @@ impl NativeState {
                 }
                 let Some(wire::confirmed_state::Value::SubscriptionSelector(slice)) = state.value
                 else {
-                    unreachable!();
+                    return Err(SignalingError::Invalid("selector continuation value"));
                 };
                 base.matches.extend(slice.matches);
                 assembly
             };
         let Some(wire::confirmed_state::Value::SubscriptionSelector(base)) = &mut assembly.value
         else {
-            unreachable!();
+            return Err(SignalingError::Invalid("selector assembly value"));
         };
         if base.matches.len() == total {
             // Framing geometry is not exposed to projection or evaluated as a new value.
             base.membership = None;
             return Ok(Some(assembly));
         }
-        base.matches.reserve_exact(total - base.matches.len());
+        base.matches
+            .reserve_exact(total.saturating_sub(base.matches.len()));
         self.account(0, Owned::assembly_bytes(&assembly))?;
-        self.owned.get_mut(&reference).unwrap().selector_assembly = Some(assembly);
+        self.owned
+            .get_mut(&reference)
+            .ok_or(SignalingError::Invalid("unknown selector reference"))?
+            .selector_assembly = Some(assembly);
         Ok(None)
     }
 

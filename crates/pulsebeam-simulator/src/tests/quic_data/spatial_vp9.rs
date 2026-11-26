@@ -126,7 +126,7 @@ pub(in crate::tests) async fn replay(
                 }
             }
             let rtp = descriptor_rtp(record.bytes).context("VP9 capture RTP/DD")?;
-            let sequence = next.unwrap_or(u32::from(rtp.sequence));
+            let sequence = next.unwrap_or_else(|| u32::from(rtp.sequence));
             ensure!(
                 captured_next.is_none_or(|expected| expected == rtp.sequence),
                 "capture sequence discontinuity"
@@ -200,12 +200,12 @@ fn shift_picture_id(payload: &mut [u8], shift: u16) -> Result<()> {
         *first = high | 0x80;
         *second = low;
     } else {
-        *first = first.wrapping_add(shift as u8) & 0x7f;
+        *first = first.wrapping_add(shift.to_le_bytes()[0]) & 0x7f;
     }
     if *flags & 0x10 == 0 && *flags & 0x20 != 0 {
         let index = if *first & 0x80 != 0 { 2 } else { 1 };
         let tl0 = rest.get_mut(index).context("short VP9 TL0 index")?;
-        *tl0 = tl0.wrapping_add(shift as u8);
+        *tl0 = tl0.wrapping_add(shift.to_le_bytes()[0]);
     }
     Ok(())
 }

@@ -444,6 +444,14 @@ fn subscriber_bindings_follow_declared_room_topic_and_mode() {
         .insert(registration.clone(), wrong_id);
     assert!(check(&model, &client).is_err());
     let mut unbound = bound.clone();
+    unbound.delivery = None;
+    client
+        .data_subscribers
+        .insert(registration.clone(), unbound.clone());
+    assert!(
+        check(&model, &client).is_err(),
+        "installed binding cannot omit delivery"
+    );
     unbound.source_track_id = None;
     unbound.execution = PublicationExecution::Unavailable;
     client

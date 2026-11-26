@@ -362,7 +362,7 @@ impl MediaCapacity {
             return None;
         }
         let next = self.waiting.pop_front()?;
-        self.released -= 1;
+        self.released = self.released.saturating_sub(1);
         Some(next)
     }
 

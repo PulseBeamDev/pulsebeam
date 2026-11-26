@@ -1622,29 +1622,21 @@ fn selector_slices_bound_geometry_and_validate_membership() {
     let complete = SelectorMatchStatus::Complete;
     let total = validation::MAX_SELECTOR_MATCHES;
     let slice = validation::MAX_SELECTOR_SLICE_MATCHES;
+    let wire_total = u32::try_from(total).unwrap();
     for (index, addresses) in addresses(total).chunks(slice).enumerate() {
         let chunk = batch(
             &spec,
             complete,
-            (index * slice) as u32,
-            total as u32,
+            u32::try_from(index * slice).unwrap(),
+            wire_total,
             addresses.to_vec(),
         );
         let frame = encode_server(&chunk).unwrap();
         assert!(frame.len() <= MAX_FRAME_SIZE);
         assert_eq!(decode_server(&frame), Ok(chunk));
     }
-    assert!(encode_server(&batch(&spec, complete, 0, (total + 1) as u32, addresses(1))).is_err());
-    assert!(
-        encode_server(&batch(
-            &spec,
-            complete,
-            0,
-            total as u32,
-            addresses(slice + 1)
-        ))
-        .is_err()
-    );
+    assert!(encode_server(&batch(&spec, complete, 0, wire_total + 1, addresses(1))).is_err());
+    assert!(encode_server(&batch(&spec, complete, 0, wire_total, addresses(slice + 1))).is_err());
     assert!(encode_server(&batch(&spec, complete, 3, 3, addresses(1))).is_err());
     assert!(encode_server(&batch(&spec, complete, 0, 1, addresses(0))).is_err());
     let mut duplicate = addresses(1);

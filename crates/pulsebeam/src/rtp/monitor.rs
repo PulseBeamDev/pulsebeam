@@ -563,13 +563,24 @@ impl StreamMonitor {
         }
         let mut heights = [0; MAX_LADDER_TARGETS];
         let mut payload_bps = [0; MAX_LADDER_TARGETS];
-        for target in 0..count {
+        for (target, ((height, cost), (measured_height, measured_cost))) in heights
+            .iter_mut()
+            .zip(&mut payload_bps)
+            .zip(
+                stats
+                    .decode_target_heights
+                    .into_iter()
+                    .zip(stats.measured_decode_target_bps),
+            )
+            .take(count)
+            .enumerate()
+        {
             if context.active_targets & (1 << target) == 0 {
                 continue;
             }
-            heights[target] = stats.decode_target_heights[target];
-            payload_bps[target] = stats.measured_decode_target_bps[target];
-            if heights[target] == 0 || payload_bps[target] == 0 {
+            *height = measured_height;
+            *cost = measured_cost;
+            if *height == 0 || *cost == 0 {
                 return None;
             }
         }

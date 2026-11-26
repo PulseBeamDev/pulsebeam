@@ -58,24 +58,24 @@ impl DataSetQueue {
         let lane = self.lanes.entry(key.clone()).or_default();
         let was_ready = !lane.messages.is_empty();
         if mode == TopicMode::Latest {
-            self.messages -= lane.messages.len();
-            self.bytes -= lane.bytes;
+            self.messages = self.messages.saturating_sub(lane.messages.len());
+            self.bytes = self.bytes.saturating_sub(lane.bytes);
             lane.messages.clear();
             lane.bytes = 0;
         }
-        let full = |lane: &Lane, messages, queued_bytes| {
+        let full = |lane: &Lane, messages, queued_bytes: usize| {
             lane.messages.len() == Self::LANE_MESSAGES
-                || lane.bytes + bytes > Self::LANE_BYTES
+                || lane.bytes.saturating_add(bytes) > Self::LANE_BYTES
                 || messages == DATA_RECEIVE_CAPACITY
-                || queued_bytes + bytes > DataReadQueue::BYTE_LIMIT
+                || queued_bytes.saturating_add(bytes) > DataReadQueue::BYTE_LIMIT
         };
         while full(lane, self.messages, self.bytes) {
             if mode == TopicMode::Lossy
                 && let Some((removed, _)) = lane.messages.pop_front()
             {
-                lane.bytes -= removed;
-                self.bytes -= removed;
-                self.messages -= 1;
+                lane.bytes = lane.bytes.saturating_sub(removed);
+                self.bytes = self.bytes.saturating_sub(removed);
+                self.messages = self.messages.saturating_sub(1);
                 continue;
             }
             if lane.messages.is_empty() {
@@ -94,9 +94,9 @@ impl DataSetQueue {
             };
         }
         lane.messages.push_back((bytes, event));
-        lane.bytes += bytes;
-        self.messages += 1;
-        self.bytes += bytes;
+        lane.bytes = lane.bytes.saturating_add(bytes);
+        self.messages = self.messages.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(bytes);
         if !was_ready {
             self.ready.push_back(key);
         }
@@ -170,11 +170,11 @@ impl DataSetQueue {
 
     pub(super) fn pop(&mut self) -> Option<DataEvent> {
         let key = self.ready.pop_front()?;
-        let lane = self.lanes.get_mut(&key).expect("queued data lane");
+        let lane = self.lanes.get_mut(&key)?;
         let event = if let Some((bytes, event)) = lane.messages.pop_front() {
-            lane.bytes -= bytes;
-            self.bytes -= bytes;
-            self.messages -= 1;
+            lane.bytes = lane.bytes.saturating_sub(bytes);
+            self.bytes = self.bytes.saturating_sub(bytes);
+            self.messages = self.messages.saturating_sub(1);
             Some(event)
         } else {
             lane.failure.take()

@@ -1,3 +1,4 @@
+mod application_profile;
 mod provisioned;
 
 use std::cell::Cell;

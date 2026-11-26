@@ -299,8 +299,16 @@ impl ApplicationStateOracle {
                     selector.room == subscriber.room
                         && selector.participant_id == subscriber.participant_id
                         && selector.track_id == subscriber.topic
-                }) && state.delivery == Some(subscriber.mode.into()),
+                }),
                 "wrong DATA subscription selector for {subscriber:?}: {state:?}"
+            );
+            ensure!(
+                state
+                    .delivery
+                    .is_none_or(|delivery| delivery == subscriber.mode.into())
+                    && (state.execution != PublicationExecution::Installed
+                        || state.delivery.is_some()),
+                "wrong DATA delivery for {subscriber:?}: {state:?}"
             );
             let registration = pulsebeam_agent_native::agent_core::TopicPublisher {
                 topic: subscriber.topic.clone(),

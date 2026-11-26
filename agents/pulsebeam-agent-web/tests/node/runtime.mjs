@@ -162,7 +162,11 @@ assert.throws(
   () => publication.configure({ enabled: false, codec: VideoCodec.Av1 }),
   rejectedWith(ErrorCode.Unsupported),
 );
-assert.equal(publication.state(), published, "rejected codec change preserves accepted settings");
+assert.equal(
+  publication.state(),
+  published,
+  "rejected codec change preserves accepted settings",
+);
 assert.ok(Object.isFrozen(published.configuration));
 assert.deepEqual(await publicationUpdates.next(), published);
 const changing = publicationUpdates.next();

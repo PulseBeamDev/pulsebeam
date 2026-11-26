@@ -207,27 +207,40 @@ impl DataEvent {
                 ..
             } => {
                 let descriptors = fragment_descriptors.as_ref().map_or(0, |items| {
-                    items.len() * core::mem::size_of::<crate::data_v1::DataFragmentDescriptor>()
-                        + items.iter().map(|item| item.bytes.len()).sum::<usize>()
+                    items
+                        .len()
+                        .saturating_mul(
+                            core::mem::size_of::<crate::data_v1::DataFragmentDescriptor>(),
+                        )
+                        .saturating_add(
+                            items
+                                .iter()
+                                .map(|item| item.bytes.len())
+                                .fold(0_usize, usize::saturating_add),
+                        )
                 });
-                participant_id.len()
-                    + track_id.len()
-                    + publication_id.len()
-                    + data.len()
-                    + captured_at.as_ref().map_or(0, |stamp| stamp.clock.id.len())
-                    + descriptors
+                participant_id
+                    .len()
+                    .saturating_add(track_id.len())
+                    .saturating_add(publication_id.len())
+                    .saturating_add(data.len())
+                    .saturating_add(captured_at.as_ref().map_or(0, |stamp| stamp.clock.id.len()))
+                    .saturating_add(descriptors)
             }
             Self::SourceFailed { .. } => 0,
             Self::Discontinuity {
                 participant_id,
                 previous_publication_id,
                 publication_id,
-            } => participant_id.len() + previous_publication_id.len() + publication_id.len(),
+            } => participant_id
+                .len()
+                .saturating_add(previous_publication_id.len())
+                .saturating_add(publication_id.len()),
             Self::Gap {
                 participant_id,
                 publication_id,
                 ..
-            } => participant_id.len() + publication_id.len(),
+            } => participant_id.len().saturating_add(publication_id.len()),
         }
     }
 }
@@ -409,20 +422,22 @@ impl DataReadQueue {
         if mode == TopicMode::Latest {
             self.clear();
         }
-        while self.events.len() == DATA_RECEIVE_CAPACITY || self.bytes + bytes > Self::BYTE_LIMIT {
+        while self.events.len() == DATA_RECEIVE_CAPACITY
+            || self.bytes.saturating_add(bytes) > Self::BYTE_LIMIT
+        {
             if mode != TopicMode::Lossy {
                 return false;
             }
             let _ = self.pop();
         }
-        self.bytes += bytes;
+        self.bytes = self.bytes.saturating_add(bytes);
         self.events.push_back((bytes, event));
         true
     }
 
     fn pop(&mut self) -> Option<DataEvent> {
         let (bytes, event) = self.events.pop_front()?;
-        self.bytes -= bytes;
+        self.bytes = self.bytes.saturating_sub(bytes);
         Some(event)
     }
 

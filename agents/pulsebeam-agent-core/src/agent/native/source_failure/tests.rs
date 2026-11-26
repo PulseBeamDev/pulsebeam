@@ -232,7 +232,7 @@ fn data_set_dispatch_checks_each_owner_and_stops_at_withdrawn_membership() {
                 membership: Some(state::SelectorMembershipSpan {
                     revision,
                     offset: 0,
-                    total: matches.len() as u32,
+                    total: u32::try_from(matches.len()).unwrap(),
                 }),
                 matches,
             }),

@@ -143,6 +143,16 @@ py_binary(
 )
 
 py_binary(
+    name = "application_subscription_profile",
+    testonly = True,
+    srcs = ["scripts/application_subscription_profile.py"],
+    main = "scripts/application_subscription_profile.py",
+    args = ["--sim-binary", "$(rootpath :sim_binary)"] + CANDIDATE_ARGS,
+    data = [":sim_binary", ":candidate"],
+    tags = ["manual"],
+)
+
+py_binary(
     name = "quic_profile",
     testonly = True,
     srcs = ["scripts/quic_profile.py"],

@@ -112,7 +112,7 @@ impl PublicationFact {
             Some(wire::codec_format::Codec::Vp9(wire::Vp9Parameters {
                 profile_id: None | Some(0)
             }))
-        ) && self.layers[0].1.is_none()
+        ) && self.layers.first().is_some_and(|layer| layer.1.is_none())
         {
             Profile::Vp9
         } else {

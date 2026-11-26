@@ -902,7 +902,9 @@ impl FabricVideoMonitor {
     pub(crate) fn observe(&mut self, now: Instant, report: &crate::route::fabric::local::Offers) {
         if let Some((seq, len)) = report.admitted_endpoint {
             self.monitor.observe_primary(now, seq, len);
-            self.due.get_or_insert(now + Self::POLL_INTERVAL);
+            if self.due.is_none() {
+                self.due = now.checked_add(Self::POLL_INTERVAL);
+            }
         }
         if let Some(facts) = report.dd_structure {
             self.monitor.apply_stream_facts(facts);
@@ -927,7 +929,9 @@ impl FabricVideoMonitor {
         }
         self.monitor.poll(now, false);
         self.publish();
-        self.due = (!self.published.inactive).then_some(now + Self::POLL_INTERVAL);
+        self.due = now
+            .checked_add(Self::POLL_INTERVAL)
+            .filter(|_| !self.published.inactive);
     }
 
     pub(crate) fn reset(&mut self) {

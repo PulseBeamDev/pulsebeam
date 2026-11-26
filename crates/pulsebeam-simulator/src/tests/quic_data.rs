@@ -533,6 +533,11 @@ fn quic_spatial_vp9_native_receiver_adapts_to_bandwidth_across_shards() {
     use super::native_state::spatial_vp9::{Check, receive};
     use tokio::sync::oneshot;
 
+    let seed = super::common::sim_seed();
+    let _clocks = crate::sim_clock::SimClocksGuard::init();
+    crate::sim_rand::set_thread_rng(seed);
+    fastrand::seed(seed);
+    pulsebeam_runtime::net::shaper::seed_impairments(seed);
     let server = pulsebeam_runtime::testing::test_host_ip("192.168.250.103");
     let viewer = pulsebeam_runtime::testing::test_host_ip("192.168.250.104");
     let (publish, publication) = oneshot::channel();
@@ -540,14 +545,17 @@ fn quic_spatial_vp9_native_receiver_adapts_to_bandwidth_across_shards() {
     let (finish, finished) = oneshot::channel();
     let mut sim = turmoil::Builder::new()
         .simulation_duration(Duration::from_secs(42))
+        .rng_seed(seed)
         .build();
     sim.client(server, async move {
-        witness(Scenario::SpatialVp9Bandwidth {
-            server,
-            publish,
-            begun,
-            finished,
-        })
+        witness(Scenario::SpatialVp9Bandwidth(Box::new(
+            SpatialVp9Bandwidth {
+                server,
+                publish,
+                begun,
+                finished,
+            },
+        )))
         .await?;
         Ok(())
     });
@@ -2191,8 +2199,7 @@ async fn mixed_opus_exchange(
     use super::common::{client::create_http_client, native::NativeHost};
     use pulsebeam_agent_core::{
         AgentCommand, AgentConfig, AudioSubscription, DataEvent, DesiredState, MediaKind,
-        PublicationIntent, ResourceCommand, TopicMode, TrackSpec,
-        ffi::{DataDelivery, PublicationExecution},
+        PublicationIntent, ResourceCommand, TopicMode, TrackSpec, ffi::PublicationExecution,
     };
     use pulsebeam_agent_native::{
         Agent as RuntimeAgent, AudioInput, Config, Host, InputFrame, MediaStreamUpdate,
@@ -3350,12 +3357,7 @@ enum Scenario {
     SpatialVp9Rtc {
         host: std::net::IpAddr,
     },
-    SpatialVp9Bandwidth {
-        server: std::net::IpAddr,
-        publish: tokio::sync::oneshot::Sender<(SocketAddr, String)>,
-        begun: tokio::sync::oneshot::Receiver<()>,
-        finished: tokio::sync::oneshot::Receiver<()>,
-    },
+    SpatialVp9Bandwidth(Box<SpatialVp9Bandwidth>),
     Opus,
     Mobility,
     FailedPath,
@@ -3367,6 +3369,13 @@ enum Scenario {
         host: std::net::IpAddr,
         cross_shard: bool,
     },
+}
+
+struct SpatialVp9Bandwidth {
+    server: std::net::IpAddr,
+    publish: tokio::sync::oneshot::Sender<(SocketAddr, String)>,
+    begun: tokio::sync::oneshot::Receiver<()>,
+    finished: tokio::sync::oneshot::Receiver<()>,
 }
 
 #[allow(
@@ -3392,7 +3401,9 @@ async fn witness(scenario: Scenario) -> Result<()> {
     let host = std::net::Ipv4Addr::LOCALHOST.into();
     let edge = SocketAddr::new(host, 8443);
     let rtc_address = match scenario {
-        Scenario::SpatialVp9Bandwidth { server, .. } => Some(SocketAddr::new(server, edge.port())),
+        Scenario::SpatialVp9Bandwidth(ref replay) => {
+            Some(SocketAddr::new(replay.server, edge.port()))
+        }
         _ => None,
     };
     let http = TcpListener::bind(
@@ -3465,7 +3476,7 @@ async fn witness(scenario: Scenario) -> Result<()> {
             ..
         } | Scenario::DataRecordDd
             | Scenario::MixedOpus { .. }
-            | Scenario::SpatialVp9Bandwidth { .. }
+            | Scenario::SpatialVp9Bandwidth(_)
             | Scenario::MixedH264 {
                 cross_shard: true,
                 ..
@@ -3486,7 +3497,8 @@ async fn witness(scenario: Scenario) -> Result<()> {
         result = &mut node => anyhow::bail!("node stopped before startup: {result:?}"),
     }
     let result = async {
-        if let Scenario::SpatialVp9Bandwidth { server, publish, begun, finished } = scenario {
+        if let Scenario::SpatialVp9Bandwidth(replay) = scenario {
+            let SpatialVp9Bandwidth { server, publish, begun, finished } = *replay;
             let (mut publisher, source) = spatial_vp9::connect_publisher(address, edge.ip(), edge, roots, &credential).await?;
             publish.send((SocketAddr::new(server, address.port()), source.publication_id().to_owned()))
                 .map_err(|_| anyhow::anyhow!("VP9 viewer stopped before connecting"))?;

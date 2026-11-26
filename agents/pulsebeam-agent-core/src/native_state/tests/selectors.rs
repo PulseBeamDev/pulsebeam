@@ -43,7 +43,7 @@ fn snapshot(
                     wire::SelectorMembershipSpan {
                         revision: membership_revision,
                         offset: 0,
-                        total: matches.len() as u32,
+                        total: u32::try_from(matches.len()).unwrap(),
                     },
                 ),
                 matches,
@@ -179,7 +179,7 @@ fn selector_replacement_commits_a_hundred_matches_at_one_cut_and_restarts_after_
             version,
         );
         let Some(Value::SubscriptionSelector(selector)) = state.value.as_mut() else {
-            unreachable!()
+            panic!("selector fixture must produce a selector state")
         };
         selector.matches = (offset..offset + count)
             .map(|index| wire::LogicalSourceAddress {
@@ -191,7 +191,7 @@ fn selector_replacement_commits_a_hundred_matches_at_one_cut_and_restarts_after_
             .collect();
         selector.membership = Some(wire::SelectorMembershipSpan {
             revision: version,
-            offset: offset as u32,
+            offset: u32::try_from(offset).unwrap(),
             total,
         });
         frame(alloc::vec![record(reference, state)], false)

@@ -521,7 +521,7 @@ impl WirePeer {
                 )),
                 settings: Some(wire::ResourceSettings {
                     enabled: Some(true),
-                    receive: None,
+                    receive: Some(wire::resource_settings::Receive::Video(Default::default())),
                 }),
             }),
         );

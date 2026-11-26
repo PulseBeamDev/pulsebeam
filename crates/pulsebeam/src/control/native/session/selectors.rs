@@ -22,16 +22,22 @@ pub(super) fn slice(
     value: &wire::ConfirmedState,
     version: u64,
     offset: usize,
-) -> (wire::ConfirmedState, Option<usize>) {
+) -> Result<(wire::ConfirmedState, Option<usize>), OutputError> {
     let Some(wire::confirmed_state::Value::SubscriptionSelector(state)) = &value.value else {
-        return (value.clone(), None);
+        return Ok((value.clone(), None));
     };
     if state.status() == wire::SelectorMatchStatus::Pending {
-        return (value.clone(), None);
+        return Ok((value.clone(), None));
     }
     let total = state.matches.len();
-    let end = (offset + validation::MAX_SELECTOR_SLICE_MATCHES).min(total);
-    (
+    let end = offset
+        .saturating_add(validation::MAX_SELECTOR_SLICE_MATCHES)
+        .min(total);
+    let matches = state
+        .matches
+        .get(offset..end)
+        .ok_or(OutputError::InvalidObservation)?;
+    Ok((
         wire::ConfirmedState {
             evaluated_revision: value.evaluated_revision,
             rejection: value.rejection.clone(),
@@ -39,17 +45,18 @@ pub(super) fn slice(
                 Box::new(wire::SubscriptionSelectorState {
                     spec: state.spec.clone(),
                     status: state.status,
-                    matches: state.matches[offset..end].to_vec(),
+                    matches: matches.to_vec(),
                     membership: Some(wire::SelectorMembershipSpan {
                         revision: version,
-                        offset: offset as u32,
-                        total: total as u32,
+                        offset: u32::try_from(offset)
+                            .map_err(|_| OutputError::InvalidObservation)?,
+                        total: u32::try_from(total).map_err(|_| OutputError::InvalidObservation)?,
                     }),
                 }),
             )),
         },
         (end < total).then_some(end),
-    )
+    ))
 }
 
 impl Selectors {
@@ -239,7 +246,7 @@ impl NativeSession {
             .ok_or(OutputError::InvalidObservation)?;
         let build = work.as_mut().ok_or(OutputError::InvalidObservation)?;
         use wire::SelectorMatchStatus::{Complete, Overflow, Pending};
-        let remaining = validation::MAX_SELECTOR_MATCHES - build.matches.len();
+        let remaining = validation::MAX_SELECTOR_MATCHES.saturating_sub(build.matches.len());
         let limited = page.sources.len() > remaining;
         build
             .matches

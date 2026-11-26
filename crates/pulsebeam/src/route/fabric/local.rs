@@ -2083,7 +2083,8 @@ impl SourceFanout {
                     .evidence
                     .as_ref()
                     .and_then(|evidence| evidence.context.structure_for(qualified));
-                vp9_filtered_marker(qualified, structure, target).unwrap_or(packet.header().marker)
+                vp9_filtered_marker(qualified, structure, target)
+                    .unwrap_or_else(|| packet.header().marker)
             }
             _ => packet.header().marker,
         };

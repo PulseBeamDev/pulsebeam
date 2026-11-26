@@ -19,7 +19,9 @@ export async function publishWithSwap(
     pipe: Pipe,
   ) => Promise<void>,
 ) {
-  const publication = agent.video("camera").publish({ enabled: true, codec: VideoCodec.H264 });
+  const publication = agent
+    .video("camera")
+    .publish({ enabled: true, codec: VideoCodec.H264 });
   try {
     const first = VideoSource.fromTrack(firstTrack);
     try {
