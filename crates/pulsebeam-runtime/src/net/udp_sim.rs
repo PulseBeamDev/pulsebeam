@@ -181,9 +181,16 @@ impl Io for DirectedIo {
     }
 }
 
-fn offer(socket: &UdpSocket, shaper: &mut shaper::Shaper, destination: SocketAddr, payload: &[u8]) {
-    if let shaper::Shaped::PassThrough =
-        shaper.offer(tokio::time::Instant::now(), destination, payload)
+fn offer(
+    socket: &UdpSocket,
+    shaper: &mut shaper::Shaper,
+    source: SocketAddr,
+    destination: SocketAddr,
+    payload: &[u8],
+) {
+    let now = tokio::time::Instant::now();
+    if let shaper::Shaped::PassThrough = shaper.offer_directed(now, source, destination, payload)
+        && let shaper::Shaped::PassThrough = shaper.offer(now, destination, payload)
     {
         deliver(socket, shaper, destination, payload);
     }
@@ -204,6 +211,19 @@ fn deliver(
         let _ = socket.try_send_to(payload, destination);
     }
     let _ = socket.try_send_to(payload, destination);
+}
+
+impl HostIo {
+    fn source_for(&self, destination: std::net::IpAddr) -> SocketAddr {
+        let ip = if destination.is_loopback() {
+            destination
+        } else if self.local_addr.ip().is_unspecified() {
+            turmoil::current_ip()
+        } else {
+            self.local_addr.ip()
+        };
+        SocketAddr::new(ip, self.local_addr.port())
+    }
 }
 
 impl Io for HostIo {
@@ -293,15 +313,7 @@ impl Io for HostIo {
     ) -> io::Result<()> {
         // Turmoil chooses loopback for loopback destinations and otherwise
         // uses the host interface for wildcard binds. It cannot override that.
-        let destination = entry.destination.ip();
-        let selected = if destination.is_loopback() {
-            destination
-        } else if self.local_addr.ip().is_unspecified() {
-            turmoil::current_ip()
-        } else {
-            self.local_addr.ip()
-        };
-        if selected != source {
+        if self.source_for(entry.destination.ip()).ip() != source {
             return Err(io::ErrorKind::Unsupported.into());
         }
         self.submit(entry)
@@ -325,13 +337,21 @@ impl Io for HostIo {
         // Admission is synchronous, as in Turmoil. An extra task queue would
         // introduce local loss and scheduling delay ahead of the modeled link.
         let mut shaper = self.network.shaper.clone();
+        let source = self.source_for(entry.destination.ip());
         if entry.payload.is_empty() {
-            offer(&self.network.socket, &mut shaper, entry.destination, &[]);
+            offer(
+                &self.network.socket,
+                &mut shaper,
+                source,
+                entry.destination,
+                &[],
+            );
         }
         for payload in entry.payload.chunks(stride) {
             offer(
                 &self.network.socket,
                 &mut shaper,
+                source,
                 entry.destination,
                 payload,
             );
@@ -483,7 +503,7 @@ mod tests {
                 assert_eq!(packet.source, expected);
                 assert_eq!(packet.payload, b"1234567890");
             }
-            shaper::remove_directed_capacity(source, destination);
+            shaper::remove_directed_link(source, destination);
             Ok(())
         });
         sim.run().unwrap();

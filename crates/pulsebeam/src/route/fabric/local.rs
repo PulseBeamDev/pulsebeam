@@ -112,6 +112,7 @@ pub struct Emission {
     profile: Profile,
     mask: u16,
     minimum_revision: u8,
+    required_av1_dd: bool,
 }
 
 impl Emission {
@@ -119,6 +120,7 @@ impl Emission {
         profile: Profile::Data,
         mask: 0,
         minimum_revision: 0,
+        required_av1_dd: false,
     };
 
     pub(crate) const fn data(record_dd: bool) -> Self {
@@ -128,6 +130,7 @@ impl Emission {
                 profile: Profile::Data,
                 mask: kind.bit(),
                 minimum_revision: kind.minimum_revision(),
+                required_av1_dd: false,
             }
         } else {
             Self::DATA
@@ -148,6 +151,7 @@ impl Emission {
             profile,
             mask,
             minimum_revision,
+            required_av1_dd: false,
         })
     }
 
@@ -163,16 +167,35 @@ impl Emission {
         self.profile.is_video() && self.includes(ExtensionKind::DependencyDescriptor)
     }
 
+    pub(crate) fn with_required_av1_dd(mut self) -> Option<Self> {
+        if self.profile != Profile::Av1 || !self.carries_video_dd() {
+            return None;
+        }
+        self.required_av1_dd = true;
+        Some(self)
+    }
+
     pub(crate) fn selects_dd_encoding(self) -> bool {
-        matches!(self.profile, Profile::H264 | Profile::Vp9) && self.carries_video_dd()
+        match self.profile {
+            Profile::Av1 => self.required_av1_dd,
+            Profile::H264 | Profile::Vp8 | Profile::Vp9 => self.carries_video_dd(),
+            Profile::Data | Profile::Opus => false,
+        }
     }
 
     pub(crate) fn supports_wan_rtp(self) -> bool {
         match self.profile {
-            Profile::Opus | Profile::H264 | Profile::Av1 => true,
+            Profile::Opus | Profile::H264 => true,
+            // WAN source metadata carries the extension set, not the AV1 DD guarantee.
+            Profile::Av1 => !self.required_av1_dd,
+            Profile::Vp8 => !self.carries_video_dd(),
             Profile::Vp9 => self.carries_video_dd(),
-            Profile::Vp8 | Profile::Data => false,
+            Profile::Data => false,
         }
+    }
+
+    pub(crate) fn supports_wan_video_projection(self) -> bool {
+        matches!(self.profile, Profile::H264 | Profile::Vp9) && self.carries_video_dd()
     }
 
     pub(crate) const fn wire_profile(self) -> (u8, u16) {
@@ -196,6 +219,7 @@ impl Emission {
             profile,
             mask,
             minimum_revision,
+            required_av1_dd: false,
         };
         emission.fits_registry(major, revision).then_some(emission)
     }
@@ -211,7 +235,7 @@ impl Emission {
                 .all(|ext| self.mask & bit(ext.kind) != 0)
     }
 
-    fn fits(self, receiver: Self) -> bool {
+    pub(crate) fn fits(self, receiver: Self) -> bool {
         self.profile == receiver.profile && self.mask & !receiver.mask == 0
     }
 }
@@ -308,7 +332,7 @@ impl DecodeTargetSample {
                 && qualified.descriptor.is_in_decode_target(target)
             {
                 *total = total.saturating_add(payload_bytes);
-                if vp9_filtered_marker(qualified, structure, target as u8) == Some(true) {
+                if spatial_filtered_marker(qualified, structure, target as u8) == Some(true) {
                     pictures[target] = pictures[target].saturating_add(1);
                 }
             }
@@ -395,7 +419,7 @@ impl SourceEvidence {
 
 // In LxT1 each picture has one frame at each retained spatial layer. The
 // source marker can be on an omitted frame, so terminate at the selected top.
-fn vp9_filtered_marker(
+fn spatial_filtered_marker(
     qualified: &Qualified,
     structure: Option<&pulsebeam_core::dd::TemplateDependencyStructure>,
     target: u8,
@@ -453,7 +477,8 @@ fn dd_structure(
         || !matches!(frame, FrameStatus::Resolved(_))
         || !descriptor.start_of_frame
         || !descriptor.frame_dependencies.frame_diffs.is_empty()
-        || (emission.profile() == Profile::H264 && structure.spatial_layer_count() != 1)
+        || (matches!(emission.profile(), Profile::H264 | Profile::Vp8)
+            && structure.spatial_layer_count() != 1)
     {
         return None;
     }
@@ -2193,7 +2218,7 @@ impl SourceFanout {
         if branch.destination != destination {
             return Ok(None);
         }
-        branch.discard_stale(now, &self.fates, permits);
+        branch.discard_stale(now, &self.fates, &permits);
         let Some(queued) = branch
             .queue
             .front()
@@ -2207,15 +2232,14 @@ impl SourceFanout {
         let Some(packet) = frozen.packet.arrival_view(queued.hops) else {
             return Ok(None);
         };
-        let dd = queued.frame.and_then(|frame| {
+        let qualify = |queued: &Queued, packet: &PacketView<'_>| {
+            let frame = queued.frame?;
+            let evidence = self.evidence.as_ref()?;
             if branch
                 .dd_reset
                 .is_some_and(|fence| queued.sequence <= fence)
+                || !evidence.frames.is_consistent(frame.number)
             {
-                return None;
-            }
-            let evidence = self.evidence.as_ref()?;
-            if !evidence.frames.is_consistent(frame.number) {
                 return None;
             }
             let raw = packet
@@ -2228,25 +2252,62 @@ impl SourceFanout {
                 .ok()??;
             (qualified.structure_sequence == frame.structure_sequence)
                 .then_some((frame.number, qualified))
-        });
+        };
+        let marker_for = |target, qualified: &Qualified| {
+            let structure = self.evidence.as_ref()?.context.structure_for(qualified);
+            spatial_filtered_marker(qualified, structure, target)
+        };
+        let dd = qualify(queued, &packet);
+        let header = packet.header();
+        let mut marker = header.marker;
+        if let (
+            Profile::Vp9 | Profile::Av1,
+            pulsebeam_core::dd::output::Mode::Filtered(target),
+            Some((_, qualified)),
+        ) = (header.profile, queued.selection, dd.as_ref())
+            && let Some(selected_marker) = marker_for(target, qualified)
+        {
+            marker = selected_marker;
+            // A base start can enter several targets, but must not replace the
+            // committed branch until this picture reaches the selected layer.
+            if !marker && queued.entry && queued.ingress.is_some() {
+                let mut complete = false;
+                for next in branch.queue.iter().skip(1) {
+                    let bound_marker = (|| {
+                        let frozen = self.fates.get(&next.sequence)?;
+                        let packet = frozen.packet.arrival_view(next.hops)?;
+                        if !permits(next.ingress)
+                            || !frozen.live(now)
+                            || next.repair_only.is_some()
+                            || next.selection != queued.selection
+                            || packet.header().timestamp != header.timestamp
+                        {
+                            return None;
+                        }
+                        let (_, qualified) = qualify(next, &packet)?;
+                        marker_for(target, &qualified)
+                    })();
+                    match bound_marker {
+                        Some(true) => {
+                            complete = true;
+                            break;
+                        }
+                        Some(false) => continue,
+                        None => {
+                            let fence = branch.queue.back().map(|packet| packet.sequence);
+                            branch.reset_dd_output(fence);
+                            return Ok(None);
+                        }
+                    }
+                }
+                if !complete {
+                    return Ok(None);
+                }
+            }
+        }
         let capture = frozen
             .capture
             .filter(|_| frozen.live_ingress == queued.ingress);
-        let marker = match (packet.header().profile, queued.selection, dd.as_ref()) {
-            (
-                Profile::Vp9,
-                pulsebeam_core::dd::output::Mode::Filtered(target),
-                Some((_, qualified)),
-            ) => {
-                let structure = self
-                    .evidence
-                    .as_ref()
-                    .and_then(|evidence| evidence.context.structure_for(qualified));
-                vp9_filtered_marker(qualified, structure, target)
-                    .unwrap_or_else(|| packet.header().marker)
-            }
-            _ => packet.header().marker,
-        };
         let projected = OutputEvidence {
             mode: queued.selection,
             marker,

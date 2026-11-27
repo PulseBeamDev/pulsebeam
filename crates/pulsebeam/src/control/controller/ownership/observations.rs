@@ -43,8 +43,10 @@ impl PublicationFact {
             layers,
         }
         .media_track(endpoint, publisher.connection)?;
-        if publisher.emission.profile() == pulsebeam_core::fabric::Profile::Vp9 {
-            track.as_video_mut()?.guarantees_video_dd = publisher.emission.carries_video_dd();
+        if publisher.emission.profile() == pulsebeam_core::fabric::Profile::Vp9
+            && publisher.emission.carries_video_dd()
+        {
+            track.as_video_mut()?.guarantees_video_dd = true;
         }
         Some(track)
     }
@@ -107,14 +109,14 @@ impl PublicationFact {
             Profile::H264
         } else if format.mime_type.eq_ignore_ascii_case("video/av1") {
             Profile::Av1
-        } else if matches!(
-            format.known_codec(),
-            Some(wire::codec_format::Codec::Vp9(wire::Vp9Parameters {
-                profile_id: None | Some(0)
-            }))
-        ) && self.layers.first().is_some_and(|layer| layer.1.is_none())
-        {
-            Profile::Vp9
+        } else if self.layers[0].1.is_none() {
+            match format.known_codec() {
+                Some(wire::codec_format::Codec::Vp8(_)) => Profile::Vp8,
+                Some(wire::codec_format::Codec::Vp9(wire::Vp9Parameters {
+                    profile_id: None | Some(0),
+                })) => Profile::Vp9,
+                _ => return None,
+            }
         } else {
             return None;
         };
@@ -164,6 +166,7 @@ impl PublicationFact {
                 };
                 track.format = Some(video.format.clone()?);
                 track.av1_whole_source = video.av1_whole_source;
+                track.guarantees_video_dd = video.guarantees_video_dd;
                 MediaTrack::Video(track)
             }
             track::Kind::Data(data) => {

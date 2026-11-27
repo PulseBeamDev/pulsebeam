@@ -99,7 +99,8 @@ separate link classes even when the forwarding implementation is shared.
 Use a provisioned region tree for discovery and a diamond with two distinct
 relay failure domains for protection. Inter-node RTP requires an authenticated
 Fabric association and an acknowledged route accepting the full source emission
-set; unlayered VP8 and DD-free VP9 are not currently eligible on that RTP path.
+set. Single-stream VP8 without a dependency descriptor is qualified between
+Linux QUIC endpoints over direct WAN. DD-free VP9 is not eligible on that path.
 DATA uses separate record delivery and repair semantics, and Opus tests do not
 imply video target selection.
 

@@ -1,3 +1,5 @@
+use std::net::SocketAddr;
+
 use super::*;
 use pulsebeam_agent_core::client_sdp as client;
 use pulsebeam_rtc_simulation::{
@@ -22,6 +24,17 @@ async fn connect(
     publish: bool,
     dd: bool,
 ) -> anyhow::Result<(WirePeer, RtpTransceiver, Source, wire::RtpParameters)> {
+    connect_in_room(host, (server, 7070).into(), subject, ROOM, publish, dd).await
+}
+
+async fn connect_in_room(
+    host: NativeHost,
+    address: SocketAddr,
+    subject: &str,
+    room: &str,
+    publish: bool,
+    dd: bool,
+) -> anyhow::Result<(WirePeer, RtpTransceiver, Source, wire::RtpParameters)> {
     let input = (!dd)
         .then(|| EncodedVideoInput::new_for_format(VideoCodecFormat::new("AV1")))
         .transpose()?;
@@ -40,9 +53,9 @@ async fn connect(
     };
     let (mut wire, _) = WirePeer::connect_with_peer(
         host,
-        (server, 7070).into(),
+        address,
         subject,
-        ROOM,
+        room,
         true,
         Some(bootstrap),
         |factory, peer| {
@@ -392,6 +405,45 @@ fn push_stock(source: &VideoSource, frame: u32) -> anyhow::Result<()> {
         frame.wrapping_mul(3000),
     )?)?;
     Ok(())
+}
+
+pub(in crate::tests) async fn prove_stock_av1_dd_to_quic(
+    host: NativeHost,
+    address: SocketAddr,
+    receiver: &mut pulsebeam_agent_quic::executor::host::Agent,
+) -> anyhow::Result<()> {
+    use crate::tests::quic_data::dd_video::{Cadence, prove_dd_cadence};
+
+    let (mut publisher, transceiver, source, mut parameters) =
+        connect_in_room(host, address, "av1-source", "stage", true, true).await?;
+    let Source::Stock(source) = source else {
+        anyhow::bail!("AV1 DD must come from the stock encoder");
+    };
+    let sender = transceiver.sender();
+    let [encoding] = parameters.encodings.as_mut_slice() else {
+        anyhow::bail!("AV1 DD requires one adopted encoding");
+    };
+    encoding.scalability_mode = Some("L1T1".into());
+    let track = install(&mut publisher, 1, publication(parameters)).await?;
+    let send = async {
+        let mut at = tokio::time::Instant::now();
+        for frame in 0.. {
+            tokio::time::sleep_until(at).await;
+            if frame % 32 == 0 {
+                sender.generate_keyframe(&[])?;
+            }
+            push_stock(&source, frame)?;
+            at += Duration::from_millis(34);
+        }
+        Ok(())
+    };
+    let receive = prove_dd_cadence(
+        receiver,
+        &track.publication_id,
+        Cadence::Av1StockWhole,
+        None,
+    );
+    pulsebeam_runtime::select! { result = send => result, result = receive => result }
 }
 
 async fn session(

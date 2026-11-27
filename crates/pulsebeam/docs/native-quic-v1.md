@@ -54,10 +54,12 @@ Native media carries payload, timestamp, sequence and marker in Fabric, not an R
 | Path | Codec or mode | Dependency descriptors |
 | --- | --- | --- |
 | Audio | Opus | No video DD field. |
-| Raw native QUIC video | H.264 Constrained Baseline (packetization mode 1), VP8, VP9 profile 0, stock AV1 profile 0 | DD-free publishers declare `Absent`. H.264 also supports `Emit` through the descriptor-aware send API. |
-| Independent video projection | H.264 and VP8 L1T1 through L1T3; VP9 and AV1 temporal, spatial, and key-picture modes in the qualified inventory | Filtered forwarding consumes negotiated DD and rewrites its frame lineage. Packetization alone does not establish mode support. |
+| Raw native QUIC video | H.264 Constrained Baseline (packetization mode 1), VP8, VP9 profile 0, stock AV1 profile 0 | DD-free publishers declare `Absent`. For descriptor-guaranteed H.264, VP8, VP9, and AV1, enable DD before connecting and supply encoder-generated descriptors on every media packet via `send_rtp`. |
+| Independent video projection | H.264 and VP8 temporal modes; VP9 and AV1 temporal, spatial, and key-picture modes | Filtered forwarding requires a source that guarantees DD and rewrites its frame lineage. See the [endpoint qualification matrix](../../pulsebeam-simulator/qualification.tsv) for observed combinations and remaining gaps. |
 
-The [qualified inventory](../../pulsebeam-testdata/fixtures/codec-inventory-v1.tsv) contains 66 video codec/mode pairs. This is not a browser capability list or an offer to publish all modes over raw native QUIC. The Chromium native SDK path negotiates video separately from the native worker. Inspect the selected codec and mode on the actual peer instead of relying on its advertised encoder list.
+To receive stock WebRTC AV1 over QUIC, leave the decode target unset. The WebRTC source can carry DD without guaranteeing it; requesting even target 0 requires a guarantee. Use DD-free VP8 and AV1 for whole-stream WAN delivery. VP8 and AV1 projection with guaranteed DD has same-shard evidence, not WAN support. DD-free VP9 cannot transit WAN.
+
+The [codec fixture inventory](../../pulsebeam-testdata/fixtures/codec-inventory-v1.tsv) records codec/mode corpus evidence, not endpoint admission or delivery. The Chromium native SDK negotiates video separately from the native worker. Inspect the selected codec and mode on the actual peer instead of relying on its advertised encoder list.
 
 These 12 pairs are not qualified. Do not offer them in the new single-stream publication path:
 

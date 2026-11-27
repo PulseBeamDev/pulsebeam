@@ -1505,6 +1505,7 @@ fn capability_identity_uses_typed_defaults_without_guessing_unsupported_formats(
         track_id: String::from("camera"),
         kind: Some(track::Kind::Video(VideoTrack {
             av1_whole_source: false,
+            guarantees_video_dd: false,
             format: Some(future_format.clone()),
         })),
     };
@@ -1521,6 +1522,7 @@ fn capability_identity_uses_typed_defaults_without_guessing_unsupported_formats(
     whole.kind = Some(track::Kind::Video(VideoTrack {
         format: CodecFormat::native_quic_baseline("video/av1"),
         av1_whole_source: true,
+        guarantees_video_dd: false,
     }));
     assert_eq!(validation::validate_track(&whole), Ok(()));
     caps.codecs.pop();

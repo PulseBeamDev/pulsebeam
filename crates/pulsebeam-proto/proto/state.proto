@@ -402,6 +402,9 @@ message VideoTrack {
   // The admitted AV1 source uses DD-free L1T1 framing: the RTP marker ends
   // the only spatial frame at each timestamp. False does not assert framing.
   bool av1_whole_source = 2;
+
+  // The admitted source must carry a dependency descriptor on every media packet.
+  bool guarantees_video_dd = 3;
 }
 
 message DataTrack {

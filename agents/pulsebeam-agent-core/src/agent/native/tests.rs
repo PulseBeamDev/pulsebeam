@@ -453,6 +453,7 @@ fn bootstrap_receiver_checks_the_effective_source_format_before_claiming() {
                         track_id: id.into(),
                         kind: Some(state::track::Kind::Video(state::VideoTrack {
                             av1_whole_source: false,
+                            guarantees_video_dd: false,
                             format: Some(format),
                         })),
                     }),
@@ -1893,6 +1894,7 @@ fn logical_offer_selects_exact_identity_without_discovery_and_gates_pending_disa
         track_id: selector.track_id.clone(),
         kind: Some(state::track::Kind::Video(state::VideoTrack {
             av1_whole_source: false,
+            guarantees_video_dd: false,
             format: Some(state::CodecFormat::from(state::codec_format::Codec::Vp8(
                 state::Vp8Parameters {},
             ))),

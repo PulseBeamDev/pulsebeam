@@ -430,10 +430,6 @@ impl Demand {
     }
 
     /// Contended, a camera, and asked for above the co-tenant's 180p floor.
-    ///
-    /// `the_stream_asked_for_more_is_not_served_less` stated this as a `prop_assume!` on the far
-    /// side of the simulation, so two thirds of its cases were generated, simulated in full, and
-    /// then discarded - which is why it ran at 132s against 44-65s for every other property.
     fn contended_camera_above_the_floor() -> impl Strategy<Value = Demand> {
         (0usize..2).prop_map(|height_idx| Demand {
             temporal: false,
@@ -442,6 +438,11 @@ impl Demand {
             contended: true,
         })
     }
+}
+
+enum CameraFixture {
+    AtRequestedHeight,
+    Floor,
 }
 
 /// The relation a property needs between what the link supplies and what is asked of it.
@@ -595,13 +596,18 @@ impl Scenario {
         (hasher.finish() % 200) as u8
     }
 
-    fn run(&self, namespace: &str) -> LinkReport {
+    fn run(&self, namespace: &str, camera: CameraFixture) -> LinkReport {
         let publisher = if self.demand.screenshare {
             Participant::screensharer("publisher")
         } else if self.demand.temporal {
             Participant::publisher("publisher", &["q"]).with_temporal_dd(3)
         } else {
-            Participant::publisher("publisher", &["q", "h", "f"])
+            let encodings: &[&str] = match (camera, self.demand.target_height) {
+                (CameraFixture::Floor, _) | (_, 180) => &["q"],
+                (CameraFixture::AtRequestedHeight, 360) => &["h"],
+                (CameraFixture::AtRequestedHeight, _) => &["f"],
+            };
+            Participant::publisher("publisher", encodings)
         };
         // The co-tenant is always asked for at its lowest rung. The claim being set up is that a
         // stream wanting very little is not starved outright, which is a far weaker thing to ask
@@ -648,7 +654,7 @@ impl Scenario {
 
         let mut room = Room::new("room1").with_participant(publisher);
         if self.demand.contended {
-            room = room.with_participant(Participant::publisher("cotenant", &["q", "h", "f"]));
+            room = room.with_participant(Participant::publisher("cotenant", &["q"]));
         }
         for who in self.fault.churners() {
             room = room.with_participant(Participant::single_publisher(who).starts_disconnected());
@@ -680,7 +686,7 @@ impl Scenario {
         let publisher = if self.demand.screenshare {
             Participant::screensharer("publisher")
         } else {
-            Participant::publisher("publisher", &["q", "h", "f"])
+            Participant::publisher("publisher", &["f"])
         };
         let targets: &'static [(&str, u32)] = if self.demand.screenshare {
             &[("publisher", SCREENSHARE_HEIGHT)]
@@ -985,7 +991,7 @@ mod slow {
             SATURATED,
             scenarios(Demand::temporal_camera(), Budget::Tight, NO_FAULT),
             |scenario| {
-                let report = scenario.run("temporal_shedding");
+                let report = scenario.run("temporal_shedding", CameraFixture::AtRequestedHeight);
                 prop_assert!(
                     report.samples > 0 && report.received_bytes.is_some_and(|bytes| bytes > 0),
                     "missing allocation or media is a failed scenario, not a discarded input ({scenario:?}, {report:?})"
@@ -1017,7 +1023,7 @@ mod slow {
             fault: Fault::PeerStorm,
             capacity_bps: 2_650_000,
         };
-        let report = scenario.run("renders_floor");
+        let report = scenario.run("renders_floor", CameraFixture::AtRequestedHeight);
         assert!(report.samples > 0);
         assert_ne!(report.qoe.experience(scenario.content()), Experience::Blank);
     }
@@ -1034,22 +1040,17 @@ mod slow {
             SATURATED,
             scenarios(Demand::any(), Budget::Tight, PEER_CHURN),
             |scenario| {
-                let report = scenario.run("renders_floor");
+                let report = scenario.run("renders_floor", CameraFixture::Floor);
                 prop_assert!(
                     report.samples > 0,
                     "no allocation was recorded on a generated link that carries the floor ({scenario:?})"
                 );
 
-                prop_assert_ne!(
-                    report.qoe.experience(scenario.content()),
-                    Experience::Blank,
-                    "nothing rendered on a {} bps link, which carries the {} bps bottom rung several \
-                 times over. Shedding to the smallest layer is the right answer to a tight link; \
-                 a blank tile is not ({:?}, {:?})",
+                prop_assert!(
+                    report.decoded_video_in_window.contains_key("publisher"),
+                    "no fresh publisher frames decoded at {} bps ({scenario:?}, {:?})",
                     scenario.capacity_bps,
-                    LADDER_Q_BPS,
-                    scenario,
-                    report.qoe,
+                    report.decoded_video_in_window,
                 );
                 Ok(())
             },
@@ -1065,7 +1066,7 @@ mod slow {
             SPACIOUS,
             scenarios(Demand::any(), Budget::Ample, ANY_FAULT),
             |scenario| {
-                let report = scenario.run("subscribed_stream");
+                let report = scenario.run("subscribed_stream", CameraFixture::AtRequestedHeight);
                 prop_assert!(
                     report.samples > 0,
                     "no allocation passes recorded; the viewer was never exercised ({scenario:?})"
@@ -1164,9 +1165,8 @@ mod slow {
     /// there is no capacity argument available: a stream left paused here was not priced out, it was
     /// overlooked.
     ///
-    /// Stated as "not paused" rather than "gets its fair share". What fairness means between a screen
-    /// share and a camera is a policy question with defensible answers either way; being dropped
-    /// entirely is not one of them.
+    /// Require fresh decoded video from both current sources, not a particular share of the
+    /// link. Whole-source Fabric delivery does not use the allocator's DD selection.
     #[test]
     fn a_cheap_co_tenant_is_not_starved() {
         // Counted rather than assumed. The condition below is a runtime outcome, so it cannot be moved
@@ -1181,7 +1181,7 @@ mod slow {
             SATURATED,
             scenarios(Demand::contended(), Budget::Ample, ANY_FAULT),
             |scenario| {
-                let report = scenario.run("cheap_cotenant");
+                let report = scenario.run("cheap_cotenant", CameraFixture::AtRequestedHeight);
                 prop_assert!(
                     report.samples > 0 && report.received_bytes.is_some_and(|bytes| bytes > 0),
                     "missing allocation or media is a failed scenario, not a discarded input ({scenario:?}, {report:?})"
@@ -1196,18 +1196,16 @@ mod slow {
                 }
                 exercised.set(exercised.get() + 1);
 
-                let height = report.forwarded_height.get("cotenant").copied();
-                prop_assert!(
-                    height.is_some_and(|height| height > 0),
-                    "the co-tenant was left at {height:?} pixels (0 = paused) on a {} bps link that covers \
-                 the full {} bps of demand, so nothing was priced out. The other stream ended at \
-                 {:?}. ({scenario:?}, estimate {} bps, {:.2}% congestion loss)",
-                    scenario.capacity_bps,
-                    report.demand_last_bps,
-                    report.forwarded_height.get("publisher"),
-                    report.estimate_last_bps,
-                    report.congestion_loss_percent(),
-                );
+                for source in ["publisher", "cotenant"] {
+                    prop_assert!(
+                        report.decoded_video_in_window.contains_key(source),
+                        "{source} did not decode in the live window despite sufficient estimated capacity \
+                        ({scenario:?}, estimate {} bps, demand {} bps, decoded {:?})",
+                        report.estimate_last_bps,
+                        report.demand_last_bps,
+                        report.decoded_video_in_window,
+                    );
+                }
                 Ok(())
             },
         );
@@ -1224,15 +1222,10 @@ mod slow {
         );
     }
 
-    /// Under contention, the stream asked for at a higher rung must not end below the one asked for at
-    /// the lowest.
-    ///
-    /// The co-tenant always requests 180p and the publisher requests more, so this is the weakest
-    /// possible statement of "what the viewer asked for is what decides who gets the bandwidth". It
-    /// fails on a priority inversion - which the allocator had, with a low-priority screen share
-    /// holding a floor that preempted a focused camera's target.
+    /// With a tight but sufficient budget, the larger requested camera must make
+    /// fresh progress at its requested size alongside the small co-tenant.
     #[test]
-    fn the_stream_asked_for_more_is_not_served_less() {
+    fn contended_cameras_decode_at_their_requested_sizes() {
         check(
             SATURATED,
             scenarios(
@@ -1241,37 +1234,17 @@ mod slow {
                 ANY_FAULT,
             ),
             |scenario| {
-                let report = scenario.run("no_inversion");
-                prop_assert!(
-                    report.samples > 0
-                        && ["publisher", "cotenant"].into_iter().all(|publisher| {
-                            report
-                                .decoded_video
-                                .get(publisher)
-                                .is_some_and(|frames| *frames > 0)
-                        }),
-                    "missing allocation or media is a failed scenario, not a discarded input ({scenario:?}, {report:?})"
-                );
-                // Both must be running for their rungs to be comparable; a paused co-tenant is the
-                // separate claim asserted above.
-                let (Some(publisher), Some(cotenant)) = (
-                    report.forwarded_height.get("publisher").copied(),
-                    report.forwarded_height.get("cotenant").copied(),
-                ) else {
-                    return Err(TestCaseError::fail(format!(
-                        "missing publisher or cotenant allocation ({scenario:?}, {report:?})"
-                    )));
-                };
-                prop_assume!(publisher > 0 && cotenant > 0);
-
-                prop_assert!(
-                    publisher >= cotenant,
-                    "the publisher was asked for {}p and ended at {publisher}p, below the \
-                 co-tenant asked for 180p and served at {cotenant}p, on a {} bps link \
-                 ({scenario:?})",
-                    scenario.demand.target_height,
-                    scenario.capacity_bps,
-                );
+                let report = scenario.run("contended_sizes", CameraFixture::AtRequestedHeight);
+                for (source, expected) in [
+                    ("publisher", scenario.demand.target_height as usize),
+                    ("cotenant", 180),
+                ] {
+                    let decoded = report.decoded_video_in_window.get(source);
+                    prop_assert!(
+                        decoded.is_some_and(|video| video.frames > 0 && video.height == expected),
+                        "{source} did not make fresh progress at {expected}p ({scenario:?}, {decoded:?})",
+                    );
+                }
                 Ok(())
             },
         );

@@ -1663,12 +1663,87 @@ fn vp9_picture_marker_follows_the_highest_retained_spatial_frame() {
             qualified.descriptor.end_of_frame = end_of_frame;
             for target in 0..3 {
                 assert_eq!(
-                    vp9_filtered_marker(&qualified, Some(&structure), target),
+                    spatial_filtered_marker(&qualified, Some(&structure), target),
                     Some(end_of_frame && target == ending_target),
                 );
             }
         }
     }
+}
+
+#[test]
+fn wan_vp9_entry_waits_for_the_selected_picture_end() {
+    use pulsebeam_core::dd::{
+        DecodeTargetIndication::{NotPresent, Switch},
+        DependencyDescriptor, FrameDependencyTemplate, TemplateDependencyStructure,
+    };
+    let emission = Emission::new(Profile::Vp9, &[ExtensionKind::DependencyDescriptor]).unwrap();
+    let mut fanout = SourceFanout::new(emission);
+    let destination = SlotMap::with_key().insert(());
+    let low = fanout
+        .install_filtered_branch(destination, emission, DecodeTarget::new(0).unwrap())
+        .unwrap();
+    let high = fanout
+        .install_filtered_branch(destination, emission, DecodeTarget::new(1).unwrap())
+        .unwrap();
+    let base = FrameDependencyTemplate {
+        dtis: [Switch, Switch].into_iter().collect(),
+        ..Default::default()
+    };
+    let upper = FrameDependencyTemplate {
+        spatial_id: 1,
+        dtis: [NotPresent, Switch].into_iter().collect(),
+        frame_diffs: [1].into_iter().collect(),
+        ..Default::default()
+    };
+    let structure = TemplateDependencyStructure {
+        decode_target_count: 2,
+        templates: [base.clone(), upper.clone()].into_iter().collect(),
+        ..Default::default()
+    };
+    let now = Instant::now();
+    let mut writer = DependencyDescriptorWriter::new();
+    let mut offer = |fanout: &mut SourceFanout, index, frame_dependencies| {
+        let position = 100 + u32::from(index);
+        let packet = write_dd_test_packet(
+            &mut writer,
+            Profile::Vp9,
+            position,
+            9000,
+            &DependencyDescriptor {
+                start_of_frame: true,
+                end_of_frame: true,
+                template_id: index,
+                frame_number: 10 + u16::from(index),
+                attached_structure: (index == 0).then(|| Box::new(structure.clone())),
+                frame_dependencies,
+                ..Default::default()
+            },
+        );
+        fanout
+            .offer_bound_network(now, now, u64::from(position), NonZeroU64::MIN, packet, None)
+            .unwrap();
+    };
+    let take = |fanout: &mut SourceFanout, branch| {
+        fanout
+            .admit_with_evidence(
+                now,
+                branch,
+                destination,
+                |_| true,
+                |sequence, _, evidence| {
+                    Ok::<_, std::convert::Infallible>((sequence, evidence.marker))
+                },
+            )
+            .unwrap()
+    };
+    offer(&mut fanout, 0, base);
+    assert_eq!(take(&mut fanout, low), Some((100, true)));
+    assert_eq!(take(&mut fanout, high), None);
+    offer(&mut fanout, 1, upper);
+    assert_eq!(take(&mut fanout, high), Some((100, false)));
+    assert_eq!(take(&mut fanout, high), Some((101, true)));
+    assert_eq!(take(&mut fanout, low), None);
 }
 
 #[test]
@@ -1956,7 +2031,7 @@ fn wan_rtp_admission_matrix_distinguishes_whole_stream_and_dd() {
     for (profile, bare, with_dd) in [
         (Profile::Opus, true, true),
         (Profile::H264, true, true),
-        (Profile::Vp8, false, false),
+        (Profile::Vp8, true, false),
         (Profile::Vp9, false, true),
         (Profile::Av1, true, true),
         (Profile::Data, false, false),
@@ -1974,6 +2049,22 @@ fn wan_rtp_admission_matrix_distinguishes_whole_stream_and_dd() {
             "{profile:?} with DD",
         );
     }
+}
+
+#[test]
+fn required_av1_dd_is_not_inferred_from_the_extension_mask() {
+    let optional = Emission::new(Profile::Av1, &[ExtensionKind::DependencyDescriptor]).unwrap();
+    let required = optional.with_required_av1_dd().unwrap();
+    assert!(optional.carries_video_dd());
+    assert!(!optional.selects_dd_encoding());
+    assert!(required.selects_dd_encoding());
+    assert!(optional.supports_wan_rtp());
+    assert!(!required.supports_wan_rtp());
+    let (profile, extensions) = required.wire_profile();
+    assert_eq!(
+        Emission::from_wire_profile(profile, extensions, MAJOR, REGISTRY_REVISION),
+        Some(optional)
+    );
 }
 
 #[test]

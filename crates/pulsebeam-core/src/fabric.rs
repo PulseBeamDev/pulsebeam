@@ -346,12 +346,18 @@ impl<P: AsRef<[u8]>, E: AsRef<[u8]>> FabricPacket<P, E> {
         self
     }
 
-    /// Project a media packet into a receiver-local sequence and clock domain.
+    /// Project a media packet into a receiver-local timeline and picture boundary.
     #[must_use]
-    pub fn with_receiver_media_position(mut self, sequence: u32, timestamp: u32) -> Self {
+    pub fn with_receiver_media_position(
+        mut self,
+        sequence: u32,
+        timestamp: u32,
+        marker: bool,
+    ) -> Self {
         debug_assert!(self.header.profile != Profile::Data);
         self.header.sequence = sequence;
         self.header.timestamp = timestamp;
+        self.header.marker = marker;
         self
     }
 

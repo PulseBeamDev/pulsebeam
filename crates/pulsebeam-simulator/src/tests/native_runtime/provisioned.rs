@@ -19,11 +19,14 @@ use pulsebeam_link::{NetworkClass, NetworkPeer, PeerRole, SecretCredential};
 use serde_json::{Value, json};
 use tracing_subscriber::{Layer, layer::SubscriberExt};
 
+use crate::tests::quic_data::{dd_video::Graph, whole_video::Capture};
+
 mod regional;
 
 enum RoutingFixture<'a> {
     Direct,
     DirectQuic(pulsebeam_agent_quic::transport::ServerConfig),
+    DirectQuicPair(pulsebeam_agent_quic::transport::ServerConfig),
     StaticTransit,
     Regional(
         &'a mut regional::Fixture,
@@ -74,6 +77,103 @@ fn provisioned_av1_warm_whole_without_dd_decodes_over_low_latency_wan_link() -> 
 #[test]
 fn provisioned_av1_warm_whole_with_dd_decodes_over_wan() -> anyhow::Result<()> {
     prove_provisioned_av1(true, Duration::from_millis(5))
+}
+
+#[test]
+fn provisioned_wan_h264_whole_preserves_encoded_units() -> anyhow::Result<()> {
+    prove_provisioned_quic_video(QuicVideoCase::Whole(Capture::H264))
+}
+
+#[test]
+fn provisioned_wan_vp8_whole_preserves_encoded_units() -> anyhow::Result<()> {
+    prove_provisioned_quic_video(QuicVideoCase::Whole(Capture::Vp8))
+}
+
+#[test]
+fn provisioned_wan_av1_whole_preserves_encoded_units() -> anyhow::Result<()> {
+    prove_provisioned_quic_video(QuicVideoCase::Whole(Capture::Av1))
+}
+
+#[test]
+fn provisioned_wan_h264_temporal_targets_change_native_decode_cadence() -> anyhow::Result<()> {
+    prove_provisioned_quic_video(QuicVideoCase::Projected(Graph::H264Temporal))
+}
+
+enum QuicVideoCase {
+    Whole(Capture),
+    Projected(Graph),
+}
+
+fn prove_provisioned_quic_video(case: QuicVideoCase) -> anyhow::Result<()> {
+    use crate::tests::quic_data::{
+        dd_video::prove_projected_video,
+        sim_quic_tls,
+        whole_video::{Endpoint, prove_whole_video},
+    };
+
+    let seed = std::env::var("PULSEBEAM_SIM_SEED")
+        .map(|value| value.parse::<u64>())
+        .unwrap_or(Ok(NATIVE_RUNTIME_SEED))?;
+    let _clocks = crate::sim_clock::SimClocksGuard::init();
+    crate::sim_rand::set_thread_rng(seed);
+    fastrand::seed(seed);
+    let root = tempfile::tempdir()?;
+    let (tls, roots) = sim_quic_tls()?;
+    let (mut sim, [publisher, viewer, client]) = provisioned_video_pair(
+        seed,
+        Duration::from_millis(5),
+        Duration::from_secs(20),
+        root.path(),
+        RoutingFixture::DirectQuicPair(tls),
+    )?;
+    let key = pulsebeam_server::insecure_dev_api_key()?;
+    let expires = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs()
+        + 60;
+    let token = |subject, allow: &[&str]| {
+        pulsebeam_server::sign_participant_token(
+            &key,
+            &serde_json::from_value(json!([{"rooms":["stage"],"allow": allow}]))?,
+            subject,
+            expires,
+        )
+    };
+    let publish = token("video-publisher", &["join", "publish", "discover"])?;
+    let receive = token("video-viewer", &["join", "subscribe", "discover"])?;
+    let endpoints = [publisher, viewer].map(|node| Endpoint {
+        placement: (node, 7070).into(),
+        edge: (node, 3478).into(),
+    });
+    sim.client(client, async move {
+        match case {
+            QuicVideoCase::Whole(capture) => {
+                Box::pin(prove_whole_video(
+                    capture,
+                    client,
+                    endpoints,
+                    roots,
+                    &publish.token,
+                    &receive.token,
+                ))
+                .await?;
+            }
+            QuicVideoCase::Projected(graph) => {
+                Box::pin(prove_projected_video(
+                    graph,
+                    client,
+                    endpoints,
+                    roots,
+                    &publish.token,
+                    &receive.token,
+                ))
+                .await?;
+            }
+        }
+        Ok(())
+    });
+    run_sim_or_timeout(&mut sim, Duration::from_secs(20))
+        .map_err(|error| anyhow::anyhow!("two-node QUIC video: {error:#}"))
 }
 
 fn provisioned_video_pair(
@@ -134,25 +234,48 @@ fn prove_provisioned_av1(dd: bool, latency: Duration) -> anyhow::Result<()> {
 
 #[test]
 fn provisioned_wan_vp9_remote_only_cold_start() -> anyhow::Result<()> {
-    prove_vp9_cold_start(false, false)
+    prove_vp9_cold_start(Vp9Path::Direct)
 }
 
 #[test]
 fn regional_wan_vp9_remote_only_cold_start() -> anyhow::Result<()> {
-    prove_vp9_cold_start(true, false)
+    prove_vp9_cold_start(Vp9Path::Regional)
 }
 
 #[test]
 fn provisioned_wan_shared_hop_keeps_opus_and_vp9_base_playing() -> anyhow::Result<()> {
-    prove_vp9_cold_start(false, true)
+    prove_vp9_cold_start(Vp9Path::SharedHop)
 }
 
-fn prove_vp9_cold_start(routed: bool, shared_hop: bool) -> anyhow::Result<()> {
+#[test]
+fn provisioned_wan_vp9_viewer_socket_isolation() -> anyhow::Result<()> {
+    prove_vp9_cold_start(Vp9Path::ViewerIsolation)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Vp9Path {
+    Direct,
+    Regional,
+    SharedHop,
+    ViewerIsolation,
+}
+
+fn prove_vp9_cold_start(path: Vp9Path) -> anyhow::Result<()> {
+    let routed = path == Vp9Path::Regional;
+    let shared_hop = path == Vp9Path::SharedHop;
+    let isolation = path == Vp9Path::ViewerIsolation;
+    let run_for = if isolation {
+        65
+    } else if shared_hop {
+        40
+    } else {
+        20
+    };
     use crate::tests::{
-        native_state::spatial_vp9::{Check, receive},
+        native_state::spatial_vp9::{Check, check_viewer_isolation, receive},
         quic_data::{
+            dd_video::{connect_publisher, replay, replay_on_feedback, replay_with_refresh},
             sim_quic_tls,
-            spatial_vp9::{connect_publisher, replay, replay_on_feedback},
         },
     };
 
@@ -171,16 +294,13 @@ fn prove_vp9_cold_start(routed: bool, shared_hop: bool) -> anyhow::Result<()> {
         let (sim, hosts) = provisioned_video_pair(
             seed,
             Duration::from_millis(5),
-            Duration::from_secs(if shared_hop { 40 } else { 20 }),
+            Duration::from_secs(run_for),
             root.path(),
             RoutingFixture::DirectQuic(tls),
         )?;
         (sim, hosts, None)
     };
-    sim.client(client, async move {
-        if let Some(fixture) = &mut regional {
-            fixture.connect();
-        }
+    let connect = move |client, roots| async move {
         let key = pulsebeam_server::insecure_dev_api_key()?;
         let expires = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
@@ -194,18 +314,57 @@ fn prove_vp9_cold_start(routed: bool, shared_hop: bool) -> anyhow::Result<()> {
             "vp9-source",
             expires,
         )?;
-        let (mut publisher, source) = connect_publisher(
+        connect_publisher(
             (ingress, 7070).into(),
             client,
             (ingress, 3478).into(),
             roots,
             &token.token,
         )
-        .await?;
+        .await
+    };
+    let wan = ((ingress, 7443).into(), (egress, 7443).into());
+    if isolation {
+        // Native RTC and simulated QUIC allocate ephemeral ports independently.
+        let source_client = subnet_ip(reserve_subnet(), 1);
+        let (publish, publication) = tokio::sync::oneshot::channel();
+        let (viewer_lifetime, viewer_done) = tokio::sync::oneshot::channel::<()>();
+        sim.client(source_client, async move {
+            let (mut publisher, source) = connect(source_client, roots).await?;
+            publish
+                .send(source.publication_id().to_owned())
+                .map_err(|_| anyhow::anyhow!("VP9 viewers left before source publication"))?;
+            pulsebeam_runtime::select! {
+                result = replay_with_refresh(&mut publisher, &source) => result?,
+                _ = viewer_done => {},
+            }
+            Ok(())
+        });
+        sim.client(client, async move {
+            let _viewer_lifetime = viewer_lifetime;
+            let publication = publication
+                .await
+                .context("VP9 source exited before publishing")?;
+            check_viewer_isolation(
+                (egress, 7070).into(),
+                NativeHost::bind(client)?,
+                &publication,
+                wan,
+            )
+            .await?;
+            Ok(())
+        });
+        return run_sim_or_timeout(&mut sim, Duration::from_secs(run_for + 5))
+            .map_err(|error| anyhow::anyhow!("VP9 viewer isolation: {error:#}"));
+    }
+    sim.client(client, async move {
+        if let Some(fixture) = &mut regional {
+            fixture.connect();
+        }
+        let (mut publisher, source) = connect(client, roots).await?;
         let publication = source.publication_id().to_owned();
         let counter = pulsebeam::sim_metrics::routing_counter;
         let before = counter("fabric_rtp_vp9_wan_enqueued");
-        let edge = shared_hop.then(|| ((ingress, 7443).into(), (egress, 7443).into()));
         let host = NativeHost::bind(client)?;
         let (audio_started, audio_ready) = tokio::sync::oneshot::channel();
         let audio_progress = AudioProgress::default();
@@ -223,7 +382,7 @@ fn prove_vp9_cold_start(routed: bool, shared_hop: bool) -> anyhow::Result<()> {
                     publisher: "vp9-source",
                     track: "spatial-camera",
                     prove_relay_projection: routed,
-                    shared_hop: edge,
+                    shared_hop: shared_hop.then_some(wan),
                 },
                 || Ok(()),
             )
@@ -260,11 +419,8 @@ fn prove_vp9_cold_start(routed: bool, shared_hop: bool) -> anyhow::Result<()> {
         }
         Ok(())
     });
-    run_sim_or_timeout(
-        &mut sim,
-        Duration::from_secs(if shared_hop { 45 } else { 25 }),
-    )
-    .map_err(|error| anyhow::anyhow!("VP9 WAN scenario: {error:#}"))
+    run_sim_or_timeout(&mut sim, Duration::from_secs(run_for + 5))
+        .map_err(|error| anyhow::anyhow!("VP9 WAN scenario: {error:#}"))
 }
 
 #[derive(Default)]
@@ -410,8 +566,8 @@ fn provisioned_wan_vp9_dd_decodes_and_recovers_after_loss() -> anyhow::Result<()
         common::native::NativeHost,
         native_state::spatial_vp9::{Check, receive},
         quic_data::{
+            dd_video::{connect_publisher, replay},
             sim_quic_tls,
-            spatial_vp9::{connect_publisher, replay},
         },
     };
 
@@ -1091,6 +1247,7 @@ fn install_nodes(
         };
         let standby = standby.cloned();
         let quic = match &routing {
+            RoutingFixture::DirectQuicPair(tls) => Some(tls.clone()),
             RoutingFixture::DirectQuic(tls) | RoutingFixture::Regional(_, Some(tls))
                 if index == 0 =>
             {

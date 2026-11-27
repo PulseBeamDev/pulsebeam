@@ -314,6 +314,11 @@ impl WanSourceWindow {
                         self.publisher.emission.supports_wan_rtp()
                             && fact.wan_rtp_publication()
                                 == Some((self.publisher.publication, profile))
+                            && (!matches!(
+                                &fact.descriptor.kind,
+                                Some(pulsebeam_proto::state::track::Kind::Video(video))
+                                    if video.guarantees_video_dd
+                            ) || self.publisher.emission.carries_video_dd())
                     }
                 })
     }

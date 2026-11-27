@@ -796,6 +796,7 @@ impl ControllerActor {
             {
                 self.publish_track_lifecycle(outcome);
                 self.notify_scoped_source_changed(&meta);
+                self.wake_exact_source_waits(&meta);
             }
         }
     }

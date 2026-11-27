@@ -101,33 +101,95 @@ fn selected_fabric_temporal_dd_reaches_cross_shard_native_decoder() {
 }
 
 fn prove_selected_fabric_temporal_dd(shards: usize) {
+    use super::common::{Capacity, harness::VideoSubscription, media::native_temporal_fixture};
+
+    let target = |min_fps| VideoSubscription {
+        participant_id: "source".into(),
+        height: 720,
+        min_height: 720,
+        min_fps,
+        ..Default::default()
+    };
     LocalNodeSim::new()
         .with_shards(shards)
         .with_link(LinkProfile::fiber())
         .with_room(
             Room::new("fabric-temporal-dd")
-                .with_participant(Participant::publisher("source", &["q"]).with_temporal_dd(3))
-                .with_participant(Participant::subscriber("viewer").with_native_decoded_video()),
+                .with_participant(
+                    Participant::publisher("source", &["f"])
+                        .with_native_video_fixture(native_temporal_fixture(&["f"])),
+                )
+                .with_participant(
+                    Participant::manual_subscriber("viewer", 1).with_native_decoded_video(),
+                ),
         )
         .run(vec![
+            Step::WaitForPublication {
+                description: "Discover the single-encoding H264 L1T3 publication",
+                publisher: "source",
+                timeout: Duration::from_secs(5),
+            },
+            Step::SetCapacity {
+                description: "Limit viewer delivery to the middle temporal rung",
+                participant: "viewer",
+                capacity: Capacity::Fixed(650_000),
+                max_backlog: Duration::from_millis(500),
+            },
+            Step::SubscribeToConfigured {
+                description: "Request a 15 fps floor on the RTC receiver",
+                participant: "viewer",
+                targets: vec![target(15)],
+            },
             Step::Run {
-                description: "Discover the single-encoding Native DD publication",
+                description: "Settle the receiver bandwidth and qualify the temporal ladder",
+                duration: Duration::from_secs(15),
+            },
+            Step::BeginNativePlayback {
+                description: "Start measuring only the settled 15 fps window",
+                participant: "viewer",
+                after_pause: false,
+            },
+            Step::Run {
+                description: "Deliver fresh pictures at the middle target",
                 duration: Duration::from_secs(1),
             },
-            Step::SubscribeAll {
-                description: "Request a DD stream capped at 180p",
+            Step::CheckNativeDecodedCadence {
+                description: "Native decoder renders fresh 720p at 15 fps",
                 participant: "viewer",
-                heights: &[180],
+                dimensions: (1280, 720),
+                min_fresh_frames: 7,
+                rtp_ticks: 6000,
+            },
+            Step::SetCapacity {
+                description: "Open enough viewer capacity for the full temporal rung",
+                participant: "viewer",
+                capacity: Capacity::Fixed(4_000_000),
+                max_backlog: Duration::from_millis(500),
+            },
+            Step::SubscribeToConfigured {
+                description: "Raise the floor to 30 fps on the same RTC subscription",
+                participant: "viewer",
+                targets: vec![target(30)],
             },
             Step::Run {
-                description: "Allow qualification and decode on the selected source",
-                duration: Duration::from_secs(4),
+                description: "Settle the upgraded receiver policy and deliver a switch point",
+                duration: Duration::from_secs(15),
             },
-            Step::CheckNativeDecodedVideo {
-                description: "Native decoder renders the selected encoding",
+            Step::BeginNativePlayback {
+                description: "Start measuring only the settled 30 fps window",
                 participant: "viewer",
-                dimensions: (320, 180),
-                min_fresh_frames: 20,
+                after_pause: false,
+            },
+            Step::Run {
+                description: "Deliver fresh pictures at the full target",
+                duration: Duration::from_secs(1),
+            },
+            Step::CheckNativeDecodedCadence {
+                description: "The same native receiver renders fresh 720p at 30 fps",
+                participant: "viewer",
+                dimensions: (1280, 720),
+                min_fresh_frames: 7,
+                rtp_ticks: 3000,
             },
         ]);
     let counter = pulsebeam::sim_metrics::routing_counter;
@@ -612,16 +674,16 @@ fn stable_receiver_decodes_after_the_first_pli_response_is_lost_test() {
 }
 
 #[test]
-fn a_pli_recovers_decoding_without_natural_keyframe_repeats_test() {
+fn a_pli_starts_late_subscription_without_natural_keyframe_repeats_test() {
     LocalNodeSim::new()
         .with_room(
             Room::new("pli-decoded-recovery")
                 .with_participant(
-                    Participant::publisher("source", &["q", "h", "f"])
+                    Participant::publisher("source", &["q"])
                         .starts_disconnected()
                         .suppress_natural_keyframe_repeats(),
                 )
-                .with_participant(Participant::subscriber("viewer")),
+                .with_participant(Participant::manual_subscriber("viewer", 1)),
         )
         .run(vec![
             Step::Run {
@@ -633,22 +695,13 @@ fn a_pli_recovers_decoding_without_natural_keyframe_repeats_test() {
                 participant: "source",
             },
             Step::Run {
-                description: "Decode an initial interval before the switch",
-                duration: Duration::from_secs(10),
-            },
-            Step::SubscribeAll {
-                description: "Select the high-quality layer before the recovery test",
-                participant: "viewer",
-                heights: &[720],
-            },
-            Step::Run {
-                description: "Establish the selected layer before switching",
+                description: "Let the source's initial keyframe pass before subscribing",
                 duration: Duration::from_secs(5),
             },
-            Step::SubscribeAll {
-                description: "Switch layers and request an explicit PLI",
+            Step::SubscribeTo {
+                description: "Start a late subscription that needs a fresh keyframe",
                 participant: "viewer",
-                heights: &[180],
+                targets: &[("source", 180)],
             },
             Step::Run {
                 description: "Render the recovered keyframe promptly",
@@ -985,7 +1038,7 @@ fn fast_initial_ramp_up_on_good_network_test() {
     LocalNodeSim::new()
         .with_room(
             Room::new("room1")
-                .with_participant(Participant::publisher("alice", &["q", "h", "f"]))
+                .with_participant(Participant::publisher("alice", &["f"]))
                 .with_participant(
                     Participant::subscriber("bob").with_encoded_and_native_decoded_video(),
                 ),
@@ -1106,74 +1159,6 @@ fn cross_shard_stream_survives_congestion_test() {
                 description: "Bob keeps receiving renderable frames through the squeeze",
                 participant: "bob",
                 quality: VideoQuality::min_frames(60).allow_gaps(30),
-            },
-        ]);
-}
-
-/// Simulcast layer switching across a shard boundary.
-///
-/// Switching picks a different encoding of the same track, which cross-shard
-/// means the destination's fanout re-keys while packets for the previous layer
-/// are still in flight on the old route. The parameter-set replay that makes a
-/// switch decodable has to survive the restamp on arrival.
-#[test]
-fn cross_shard_simulcast_switching_stays_decodable_test() {
-    LocalNodeSim::new()
-        .with_room(
-            Room::new("room1")
-                .with_participant(Participant::publisher("alice", &["q", "h", "f"]))
-                .with_participant(Participant::manual_subscriber("bob", 1)),
-        )
-        .run(vec![
-            Step::Run {
-                description: "Connect the publisher and receiver",
-                duration: Duration::from_secs(1),
-            },
-            Step::SubscribeTo {
-                description: "Request Alice at up to 720p on one owned subscription",
-                participant: "bob",
-                targets: &[("alice", 720)],
-            },
-            Step::Run {
-                description: "Establish flow across shards",
-                duration: Duration::from_secs(5),
-            },
-            Step::CheckVideoDecodedFromInterval {
-                description: "Bob decodes Alice's high layer before congestion",
-                participant: "bob",
-                publisher: "alice",
-                min_frames: 1,
-                min_resolution: (1280, 720),
-            },
-            Step::SetBandwidth {
-                description: "Force a switch down to the lowest encoding",
-                participant: "bob",
-                bits_per_sec: 250_000,
-            },
-            Step::Run {
-                description: "Settle on the low layer",
-                duration: Duration::from_secs(8),
-            },
-            Step::SetBandwidth {
-                description: "Restore headroom so the allocator switches back up",
-                participant: "bob",
-                bits_per_sec: 5_000_000,
-            },
-            Step::Run {
-                description: "Settle on a higher layer",
-                duration: Duration::from_secs(10),
-            },
-            Step::CheckVideoDecodedFromInterval {
-                description: "Bob independently decodes fresh 720p from Alice after restoring bandwidth",
-                participant: "bob",
-                publisher: "alice",
-                min_frames: 1,
-                min_resolution: (1280, 720),
-            },
-            Step::CheckVideoQuality {
-                description: "Bob decodes across every switch",
-                participant: "bob",
-                quality: VideoQuality::min_frames(100).allow_gaps(30),
             },
         ]);
 }

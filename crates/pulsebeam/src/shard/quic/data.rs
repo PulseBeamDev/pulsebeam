@@ -479,7 +479,13 @@ impl Installed {
                 video_dd.map(|dd| dd == wire::QuicVideoDd::Emit),
             )
             .map_err(|_| ExecutionFailureKind::Unsupported)?;
-        Ok((wire, Self::publisher_emission(wire)?))
+        let mut emission = Self::publisher_emission(wire)?;
+        if profile == Profile::Av1 && video_dd == Some(wire::QuicVideoDd::Emit) {
+            emission = emission
+                .with_required_av1_dd()
+                .ok_or(ExecutionFailureKind::Invalid)?;
+        }
+        Ok((wire, emission))
     }
 
     fn publisher_emission(wire: FabricBinding) -> Result<Emission, ExecutionFailure> {

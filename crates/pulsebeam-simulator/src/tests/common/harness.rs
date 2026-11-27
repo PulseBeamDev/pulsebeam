@@ -794,6 +794,13 @@ pub enum Step {
         dimensions: (u32, u32),
         min_fresh_frames: u64,
     },
+    CheckNativeDecodedCadence {
+        description: &'static str,
+        participant: &'static str,
+        dimensions: (u32, u32),
+        min_fresh_frames: u64,
+        rtp_ticks: u32,
+    },
     /// Admission-specific actual native I420 progress, separate from the
     /// encoded observer and its independent H264 decoder.
     CheckNativeVideoDecodedFromInterval {
@@ -1387,7 +1394,7 @@ struct ParticipantHandle {
     native_playback_started: bool,
     native_origin_interval: Instant,
     native_video_stats_timestamp: Option<i64>,
-    native_video_decoder_frames: Option<(u64, String, u64)>,
+    native_video_decoder_frames: Option<(pulsebeam_agent_native::NativeReceiverInfo, u64)>,
     /// Ground truth, from the plan rather than from anything the SFU said.
     ///
     /// The room invariant is checked against these: what this participant actually publishes, and
@@ -1881,6 +1888,7 @@ fn step_name(step: &Step) -> &'static str {
         Step::MeasureJoinToDecode { .. } => "MeasureJoinToDecode",
         Step::CheckNativePlayback { .. } => "CheckNativePlayback",
         Step::CheckNativeDecodedVideo { .. } => "CheckNativeDecodedVideo",
+        Step::CheckNativeDecodedCadence { .. } => "CheckNativeDecodedCadence",
         Step::CheckNativeVideoDecodedFromInterval { .. } => "CheckNativeVideoDecodedFromInterval",
         Step::CheckNativeSourceProgress { .. } => "CheckNativeSourceProgress",
         Step::CheckSourceInputLoad { .. } => "CheckSourceInputLoad",
@@ -3178,6 +3186,13 @@ async fn execute_plan(
                 participant,
                 dimensions,
                 min_fresh_frames,
+            }
+            | Step::CheckNativeDecodedCadence {
+                description,
+                participant,
+                dimensions,
+                min_fresh_frames,
+                ..
             } => {
                 tracing::info!("[step {n}/{total}: {kind}] \"{description}\" ({participant})");
                 let handle = get_handle(handles, participant, description)?;
@@ -3201,6 +3216,21 @@ async fn execute_plan(
                         Instant::now(),
                     )
                     .with_context(|| format!("{description}: {:?}", log.native_decoded))?;
+                if let Step::CheckNativeDecodedCadence { rtp_ticks, .. } = step {
+                    anyhow::ensure!(
+                        *min_fresh_frames >= 2,
+                        "cadence requires at least one decoded interval"
+                    );
+                    if let Some((previous, _)) = &handle.native_video_decoder_frames {
+                        anyhow::ensure!(
+                            previous == &track,
+                            "cadence switch replaced the native receiver"
+                        );
+                    }
+                    log.native_decoded
+                        .require_cadence(&track, *rtp_ticks, *min_fresh_frames - 1)
+                        .with_context(|| format!("{description}: native decoded cadence"))?;
+                }
                 let statistics = handle.shared.statistics.lock().unwrap();
                 let stats = statistics
                     .as_ref()
@@ -3227,10 +3257,9 @@ async fn execute_plan(
                     min_fresh_frames,
                     "fresh native decoded rung verified; native decoder-error counter is unavailable"
                 );
-                if let Some((previous_generation, previous_mid, previous_frames)) =
-                    &handle.native_video_decoder_frames
-                    && *previous_generation == generation
-                    && previous_mid == &track.mid
+                if let Some((previous, previous_frames)) = &handle.native_video_decoder_frames
+                    && previous.generation == generation
+                    && previous.mid == track.mid
                 {
                     let fresh = decoded
                         .checked_sub(*previous_frames)
@@ -3239,7 +3268,7 @@ async fn execute_plan(
                     // Require actual SDK progress, not an identical interval count.
                     anyhow::ensure!(fresh > 0, "native SDK decoder count did not advance");
                 }
-                handle.native_video_decoder_frames = Some((generation, track.mid.clone(), decoded));
+                handle.native_video_decoder_frames = Some((track, decoded));
                 handle.native_video_stats_timestamp = Some(stats.timestamp_us);
                 handle.native_video_baseline = log.native_decoded.checkpoint();
             }
@@ -3698,7 +3727,7 @@ async fn execute_plan(
                 );
                 anyhow::ensure!(
                     competing_bps > *capacity_bps as f64,
-                    "{description}: competing {competing_tier:?} coded slices alone {competing_bps} do not exceed {capacity_bps}"
+                    "{description}: competing {competing_tier:?} coded slices alone {competing_bps} do not exceed {capacity_bps}; protected load {minimum_bps}, minimum backlog {required_backlog:?}"
                 );
                 anyhow::ensure!(
                     burst as f64 * 8.0 / (*capacity_bps as f64) < max_backlog.as_secs_f64(),
@@ -4969,6 +4998,20 @@ async fn execute_plan(
                 (frames > 0).then_some((*name, frames))
             })
             .collect();
+        report.decoded_video_in_window = handles
+            .iter()
+            .filter_map(|(name, publisher)| {
+                let id = publisher.participant_id()?;
+                let decoded = video.decoded_by_publisher.get(&id)?;
+                let baseline = handle
+                    .interval_decoded_video_baseline
+                    .get(&id)
+                    .copied()
+                    .unwrap_or(0);
+                let frames = decoded.frames.saturating_sub(baseline);
+                (frames > 0).then_some((*name, DecodedVideoWindow { frames, height: decoded.height }))
+            })
+            .collect();
         report.forwarded_height = height_by_publisher.clone();
         report.quality_changes = changes_by_publisher.clone();
         report.quality_reversals = reversals_by_publisher.clone();
@@ -5630,6 +5673,13 @@ pub struct LinkReport {
     /// bytes tells you nothing about whether one of its two streams was starved to pay for the
     /// other.
     pub forwarded_height: BTreeMap<&'static str, u32>,
+    pub decoded_video_in_window: BTreeMap<&'static str, DecodedVideoWindow>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecodedVideoWindow {
+    pub frames: u64,
+    pub height: usize,
 }
 
 impl LinkReport {
@@ -5747,6 +5797,7 @@ fn measure(handle: &ParticipantHandle, ip: IpAddr, window: Duration) -> LinkRepo
         congestion_drops: stats.dropped_overflow,
         link_loss_drops: stats.dropped_loss,
         forwarded_height: BTreeMap::new(),
+        decoded_video_in_window: BTreeMap::new(),
         quality_changes: BTreeMap::new(),
         quality_reversals: BTreeMap::new(),
     }

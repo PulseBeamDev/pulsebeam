@@ -886,9 +886,7 @@ impl ShardRuntime {
                     .any(|member| member.spec.window.is_some() != child.window.is_some())
                 || members.len() != plan.local.len()
                 || !plan.local.iter().all(|member| members.contains(member))
-                || (child.window.is_none()
-                    || child.emission.profile() != pulsebeam_core::fabric::Profile::Vp9
-                    || !child.emission.carries_video_dd())
+                || (child.window.is_none() || !child.emission.supports_wan_video_projection())
                     && !plan
                         .local
                         .iter()
@@ -991,6 +989,10 @@ impl ShardRuntime {
         let handle = FabricLocalBranch { source, branch };
         self.fabric_handoff_owner(handle, member)?;
         Some(handle)
+    }
+
+    pub(super) fn fabric_branch_track(&self, branch: FabricLocalBranch) -> Option<TrackHandle> {
+        Some(self.fabric_sources.get(branch.source)?.track)
     }
 
     pub(super) fn network_fabric_branch(

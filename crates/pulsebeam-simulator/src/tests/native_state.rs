@@ -25,7 +25,7 @@ pub(super) mod av1;
 mod sdp;
 pub(super) mod spatial_vp9;
 
-struct WirePeer {
+pub(in crate::tests) struct WirePeer {
     media: Option<pulsebeam_agent_core::client_sdp::Context>,
     peer: PeerConnection,
     control: DataChannel,
@@ -520,6 +520,22 @@ impl WirePeer {
                 }),
             }),
         );
+    }
+
+    pub(in crate::tests) async fn remove_owned(
+        &mut self,
+        reference: u64,
+        revision: u64,
+    ) -> anyhow::Result<()> {
+        self.desire(reference, revision, None);
+        let removed = self.confirmed(reference, revision).await?;
+        anyhow::ensure!(
+            removed.rejection.is_none()
+                && matches!(removed.value, Some(wire::confirmed_state::Value::Absent(absent))
+                    if absent.reason == wire::AbsenceReason::Removed as i32),
+            "resource removal was not confirmed"
+        );
+        Ok(())
     }
 
     fn desire(&self, reference: u64, revision: u64, spec: Option<wire::ResourceSpec>) {

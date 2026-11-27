@@ -41,7 +41,7 @@ rust_library(
     compile_data = [
         "src/tests/histories/admission-replacement.history",
         "src/tests/properties.regressions",
-        "//crates/pulsebeam-testdata:vp9_spatial_replay",
+        "//crates/pulsebeam-testdata:live_video_replay_inputs",
     ],
     edition = crate_edition(),
     crate_features = ["parking_lot"],

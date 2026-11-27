@@ -289,7 +289,11 @@ impl RtpOutput {
                 .ok()?;
             let [.., a, b, c, d] = projected.sequence.to_be_bytes();
             let wire_sequence = u32::from_be_bytes([a, b, c, d]);
-            let packet = packet.with_receiver_media_position(wire_sequence, projected.timestamp);
+            let packet = packet.with_receiver_media_position(
+                wire_sequence,
+                projected.timestamp,
+                evidence.marker,
+            );
             let kind = ExtensionKind::DependencyDescriptor;
             let (len, dd) =
                 if header.profile.is_video() && agreement.extension_mask() & kind.bit() != 0 {
@@ -699,6 +703,26 @@ impl Installed {
         for (&reference, subscriber) in &mut subscribers.owned {
             if !subscriber.execution.enabled {
                 continue;
+            }
+            if let SubscriberPayload::Rtp(output) = &mut subscriber.payload
+                && let Some(branch) = subscriber.branch
+                && !core.quic_rtp_branch_live(branch, receiver)
+            {
+                subscriber.branch = None;
+                subscriber.execution.ready = false;
+                output.wire.discard();
+                output.dd.lose_context();
+                output.pending_report = None;
+                if !self
+                    .handoff
+                    .fact(Fact::Resource(ResourceObservation::Receiver {
+                        binding: reference,
+                        execution: subscriber.execution,
+                    }))
+                {
+                    self.failed = true;
+                    return true;
+                }
             }
             if subscriber.branch.is_none() {
                 subscriber.branch = match (&subscriber.payload, subscriber.binding) {

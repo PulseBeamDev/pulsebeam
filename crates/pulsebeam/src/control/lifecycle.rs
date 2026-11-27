@@ -755,6 +755,14 @@ impl TrackLifecycle {
         self.topology.catalog_version()
     }
 
+    pub(super) fn enabled_exact_subscribers(
+        &self,
+        track: &Track,
+    ) -> impl Iterator<Item = ConnectionId> + '_ {
+        self.topology
+            .enabled_exact_subscribers(track.meta().room, track.id())
+    }
+
     pub(super) fn has_local_subscriber(&self, room: ProjectRoomKey) -> bool {
         self.topology.has_local_subscriber(room)
     }

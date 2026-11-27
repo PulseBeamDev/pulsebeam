@@ -317,6 +317,38 @@ impl ControllerActor {
             track_id: meta.track_id?,
         };
         let mut latest = None;
+        for connection in self.lifecycle.enabled_exact_subscribers(track) {
+            let Some(native) = self.native_connections.get(&connection) else {
+                continue;
+            };
+            let Some(meta) = self
+                .core
+                .registry
+                .get_incarnation(native.handler.participant, connection)
+            else {
+                continue;
+            };
+            if let Some(lease) = meta.authorization.as_ref()
+                && meta.profile == SignalingProtocol::State
+                && meta.materialized
+                && meta.scope.project == source.room.project
+                && !lease.is_expired_at(wall_now)
+                && lease.allows_current_room()
+                && lease.matches_scope(meta.scope, native.handler.participant)
+                && lease.permissions().allows_source_at_room(
+                    pulsebeam_core::auth::grants::Action::Subscribe,
+                    source.room.room.as_str(),
+                    Some(source.participant.as_str()),
+                    track,
+                )
+            {
+                let expiry = lease.expiry().unix_seconds().saturating_mul(1_000);
+                if expiry >= limit_ms {
+                    return Some(limit_ms);
+                }
+                latest = latest.max(Some(expiry));
+            }
+        }
         for key in source.interest_keys() {
             let Some(owners) = self.source_lookup_index.by_source.get(&key) else {
                 continue;
@@ -841,14 +873,16 @@ impl ControllerActor {
             return;
         }
         self.notify_scoped_source_changed(meta);
-        let room = meta.room;
-        if !appeared {
-            return;
+        if appeared {
+            self.wake_exact_source_waits(meta);
         }
+    }
+
+    pub(super) fn wake_exact_source_waits(&mut self, meta: &crate::track::TrackMeta) {
         let connections: Vec<_> = self
             .core
             .registry
-            .ordered_participants_in_room(&room, None)
+            .ordered_participants_in_room(&meta.room, None)
             .map(|(_, _, peer)| peer.connection_id)
             .collect();
         for connection in connections {

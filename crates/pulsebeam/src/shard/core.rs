@@ -990,14 +990,42 @@ impl ShardExecution {
         emission: Emission,
         target: Option<pulsebeam_core::dd::evidence::DecodeTarget>,
     ) -> Option<FabricLocalBranch> {
+        if !self
+            .fabric_unix_time()
+            .is_some_and(|now| self.registry.current_quic_owner_authorized(receiver, now))
+        {
+            return None;
+        }
         let track = self.runtime.track_handle(publication)?;
         let source = self.runtime.fabric_source_for_track(track)?;
+        if !self.plans.get(track)?.local.contains(&receiver) {
+            return None;
+        }
         if let Some(publisher) = self.runtime.source_origin(track) {
             if !self.fabric_publisher_authorized(publisher, source) {
                 return None;
             }
         } else if !self.runtime.is_shard_fabric_source(source) {
-            return None;
+            let source_emission = self.runtime.fabric_emission(source)?;
+            if !source_emission.fits(emission) {
+                return None;
+            }
+            if target.is_none()
+                && let Some(branch) = self.runtime.remote_fabric_branch(source, receiver)
+            {
+                return Some(branch);
+            }
+            if source_emission.profile() != pulsebeam_core::fabric::Profile::H264
+                || !source_emission.supports_wan_video_projection()
+                || !self.runtime.is_windowed_network_fabric_source(source)
+            {
+                return None;
+            }
+            if target.is_some() {
+                // The network route initially reserves a whole branch for
+                // each authorized receiver. QUIC uses one selected branch.
+                self.runtime.retire_unbound_network_video_branch(source, receiver);
+            }
         }
         self.runtime.install_fabric_branch(
             track,
@@ -1015,20 +1043,24 @@ impl ShardExecution {
         receiver: ParticipantHandle,
     ) -> bool {
         use crate::shard::router::FabricOwner;
-        let publication = match self.runtime.fabric_handoff_owner(branch, receiver) {
-            Some(FabricOwner::Local(publisher))
-                if self.fabric_publisher_authorized(publisher, branch.source()) =>
-            {
-                self.runtime
-                    .local_fabric_publication(branch.source(), publisher)
+        if !self
+            .fabric_unix_time()
+            .is_some_and(|now| self.registry.current_quic_owner_authorized(receiver, now))
+            || !self
+                .runtime
+                .fabric_branch_track(branch)
+                .and_then(|track| self.plans.get(track))
+                .is_some_and(|plan| plan.local.contains(&receiver))
+        {
+            return false;
+        }
+        match self.runtime.fabric_handoff_owner(branch, receiver) {
+            Some(FabricOwner::Local(publisher)) => {
+                self.fabric_publisher_authorized(publisher, branch.source())
             }
-            Some(FabricOwner::Shard(binding)) => Some(binding.publication),
-            _ => None,
-        };
-        publication
-            .and_then(|id| self.runtime.track_handle(id))
-            .and_then(|track| self.plans.get(track))
-            .is_some_and(|plan| plan.local.contains(&receiver))
+            Some(FabricOwner::Shard(_) | FabricOwner::Network) => true,
+            None => false,
+        }
     }
 
     fn admit_quic_rtp(
@@ -1045,7 +1077,13 @@ impl ShardExecution {
         if !self.quic_rtp_branch_live(branch, receiver) {
             return Ok(None);
         }
-        self.runtime.admit_fabric(branch, receiver, now, write)
+        let admitted = self.runtime.admit_fabric(branch, receiver, now, write);
+        #[cfg(feature = "sim")]
+        if matches!(admitted, Ok(Some(()))) && self.runtime.is_shard_fabric_source(branch.source())
+        {
+            crate::sim_metrics::record_routing_counter("fabric_quic_rtp_shard_enqueued");
+        }
+        admitted
     }
 
     fn ingest_quic_media_packet(
@@ -1267,10 +1305,15 @@ impl ShardExecution {
     ) -> Option<crate::route::fabric::LiveNetworkChild> {
         let track = self.runtime.track_handle(child.publication)?;
         let plan = self.plans.get(track)?;
-        if !plan.local.iter().all(|member| {
-            self.registry
-                .resolve_mut(*member)
-                .is_some_and(|receiver| receiver.fabric_io_authorized())
+        let unix_now = self.fabric_unix_time();
+        if !plan.local.iter().all(|&member| {
+            if self.registry.is_quic_owner(member) {
+                unix_now.is_some_and(|now| self.registry.current_quic_owner_authorized(member, now))
+            } else {
+                self.registry
+                    .resolve_mut(member)
+                    .is_some_and(|receiver| receiver.fabric_io_authorized())
+            }
         }) {
             return None;
         }

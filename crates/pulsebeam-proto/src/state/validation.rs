@@ -345,7 +345,7 @@ pub fn validate_track(track: &Track) -> Result {
             let format = video.format.as_ref().ok_or(ValidationError::Format)?;
             validate_discovery_format(Some(format), false)?;
             if video.av1_whole_source {
-                if format.mime_type != "video/av1" {
+                if format.mime_type != "video/av1" || video.guarantees_video_dd {
                     return Err(ValidationError::Format);
                 }
                 super::VideoMode::for_format(format, "L1T1")?;

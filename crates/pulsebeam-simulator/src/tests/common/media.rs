@@ -91,6 +91,46 @@ impl NativeVideoFixture {
     }
 }
 
+pub fn native_temporal_fixture(rids: &[&str]) -> Arc<NativeVideoFixture> {
+    use pulsebeam_rtc_simulation::NativeH264FixtureEncoding;
+    Arc::new(
+        NativeVideoFixture::stock_temporal(
+            &[
+                (
+                    "q",
+                    NativeH264FixtureEncoding {
+                        width: 320,
+                        height: 180,
+                        bitrate_kbps: 200,
+                    },
+                ),
+                (
+                    "h",
+                    NativeH264FixtureEncoding {
+                        width: 640,
+                        height: 360,
+                        bitrate_kbps: 500,
+                    },
+                ),
+                (
+                    "f",
+                    NativeH264FixtureEncoding {
+                        width: 1280,
+                        height: 720,
+                        bitrate_kbps: 1_000,
+                    },
+                ),
+            ]
+            .into_iter()
+            .filter(|(rid, _)| rids.contains(rid))
+            .collect::<Vec<_>>(),
+            3,
+            48,
+        )
+        .expect("genuine precomputed H.264 T3 input"),
+    )
+}
+
 #[derive(Debug, Default)]
 pub struct SolidVideoInput {
     light: AtomicBool,

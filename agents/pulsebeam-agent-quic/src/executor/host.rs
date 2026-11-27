@@ -553,13 +553,25 @@ impl Agent {
     /// Opt a local H.264 track into Dependency Descriptor emission before connecting.
     /// Publish using `send_rtp` with encoder-supplied DD on every media packet.
     pub fn enable_h264_dependency_descriptors(&mut self, track_id: &str) -> Result<(), AgentError> {
-        self.core.enable_quic_h264_dd(track_id)
+        self.core.configure_quic_video(track_id, "video/h264", true)
+    }
+
+    /// Publish one VP8 RTP encoding carrying encoder-supplied Dependency Descriptors.
+    /// Configure the track before connecting and publish packets with `send_rtp`.
+    pub fn enable_vp8_dependency_descriptors(&mut self, track_id: &str) -> Result<(), AgentError> {
+        self.core.configure_quic_video(track_id, "video/vp8", true)
     }
 
     /// Publish one VP9 RTP encoding carrying encoder-supplied Dependency Descriptors.
     /// Configure the track before connecting and publish packets with `send_rtp`.
     pub fn enable_vp9_dependency_descriptors(&mut self, track_id: &str) -> Result<(), AgentError> {
-        self.core.configure_quic_vp9_dd(track_id)
+        self.core.configure_quic_video(track_id, "video/vp9", true)
+    }
+
+    /// Publish one AV1 RTP encoding with encoder-supplied DD on every packet.
+    /// Configure the track before connecting and publish packets with `send_rtp`.
+    pub fn enable_av1_dependency_descriptors(&mut self, track_id: &str) -> Result<(), AgentError> {
+        self.core.configure_quic_video(track_id, "video/av1", true)
     }
 
     /// Select the codec for a raw, unlayered video publication before connecting.
@@ -577,7 +589,7 @@ impl Agent {
                 return Err(pulsebeam_agent_core::ValidationError::QuicPublicationProfile.into());
             }
         };
-        self.core.configure_quic_video(track_id, mime)
+        self.core.configure_quic_video(track_id, mime, false)
     }
 
     pub fn rtp_publication(&self, kind: MediaKind, track_id: &str) -> Option<Publication> {

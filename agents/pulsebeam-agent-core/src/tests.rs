@@ -3342,6 +3342,7 @@ fn native_state_received_before_activation_is_replayed_at_the_host_boundary() {
                             track_id: "camera".into(),
                             kind: Some(state::track::Kind::Video(state::VideoTrack {
                                 av1_whole_source: false,
+                                guarantees_video_dd: false,
                                 format: Some(state::CodecFormat::from(
                                     state::codec_format::Codec::Vp8(state::Vp8Parameters {}),
                                 )),
@@ -4034,6 +4035,7 @@ fn malformed_native_state_is_transactional_and_cancels_a_pending_renewal() {
                     track_id: "camera".into(),
                     kind: Some(state::track::Kind::Video(state::VideoTrack {
                         av1_whole_source: false,
+                        guarantees_video_dd: false,
                         format: Some(state::CodecFormat::from(state::codec_format::Codec::Vp8(
                             state::Vp8Parameters {},
                         ))),

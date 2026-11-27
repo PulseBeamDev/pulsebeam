@@ -115,6 +115,7 @@ fn lookup_record(
     let track_kind = match state::TrackKind::try_from(address.kind).unwrap() {
         state::TrackKind::Video => state::track::Kind::Video(state::VideoTrack {
             av1_whole_source: false,
+            guarantees_video_dd: false,
             format: Some(state::CodecFormat::from(state::codec_format::Codec::Vp8(
                 state::Vp8Parameters {},
             ))),

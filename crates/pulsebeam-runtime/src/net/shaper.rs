@@ -364,8 +364,22 @@ fn stats_map() -> &'static Mutex<HashMap<Bottleneck, Stats>> {
     STATS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn directed_limits() -> &'static Mutex<HashMap<Bottleneck, Limit>> {
-    static LIMITS: std::sync::OnceLock<Mutex<HashMap<Bottleneck, Limit>>> =
+#[derive(Clone, Copy, Debug)]
+pub struct DirectedLink {
+    pub capacity: Capacity,
+    pub max_backlog: Duration,
+    pub delay: Duration,
+    pub loss: Loss,
+    pub reorder: Reorder,
+}
+
+struct DirectedLimit {
+    link: DirectedLink,
+    since: Option<Instant>,
+}
+
+fn directed_limits() -> &'static Mutex<HashMap<Bottleneck, DirectedLimit>> {
+    static LIMITS: std::sync::OnceLock<Mutex<HashMap<Bottleneck, DirectedLimit>>> =
         std::sync::OnceLock::new();
     LIMITS.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -376,20 +390,30 @@ pub fn set_directed_capacity(
     capacity: Capacity,
     max_backlog: Duration,
 ) {
+    set_directed_link(
+        from,
+        to,
+        DirectedLink {
+            capacity,
+            max_backlog,
+            delay: Duration::ZERO,
+            loss: Loss::NONE,
+            reorder: Reorder::NONE,
+        },
+    );
+}
+
+pub fn set_directed_link(from: SocketAddr, to: SocketAddr, link: DirectedLink) {
     directed_limits()
         .lock()
         .expect("directed shaper limits poisoned")
         .insert(
             Bottleneck::Directed(from, to),
-            Limit {
-                capacity,
-                max_backlog,
-                since: None,
-            },
+            DirectedLimit { link, since: None },
         );
 }
 
-pub fn remove_directed_capacity(from: SocketAddr, to: SocketAddr) {
+pub fn remove_directed_link(from: SocketAddr, to: SocketAddr) {
     directed_limits()
         .lock()
         .expect("directed shaper limits poisoned")
@@ -575,8 +599,8 @@ struct ShaperState {
     next_free: HashMap<Bottleneck, Instant>,
     queue: VecDeque<Queued>,
     loss_counter: u64,
-    /// Gilbert-Elliott position per destination: true while in the bad state.
-    in_bad_state: HashMap<IpAddr, bool>,
+    /// Gilbert-Elliott position per bottleneck: true while in the bad state.
+    in_bad_state: HashMap<Bottleneck, bool>,
 }
 
 impl Default for ShaperState {
@@ -643,7 +667,7 @@ impl Shaper {
                 dst,
                 buf,
                 (bits_per_sec, max_backlog),
-                reorder,
+                (Duration::ZERO, reorder),
             )
         })
     }
@@ -656,21 +680,30 @@ impl Shaper {
         buf: &[u8],
     ) -> Shaped {
         let edge = Bottleneck::Directed(from, dst);
-        let rate = directed_limits()
+        let config = directed_limits()
             .lock()
             .expect("directed shaper limits poisoned")
             .get_mut(&edge)
             .map(|limit| {
                 let since = *limit.since.get_or_insert(now);
-                (
-                    limit
-                        .capacity
-                        .bits_per_sec_at(now.saturating_duration_since(since)),
-                    limit.max_backlog,
-                )
+                (limit.link, now.saturating_duration_since(since))
             });
-        rate.map_or(Shaped::PassThrough, |rate| {
-            self.with(|st| st.offer(now, edge, dst, buf, rate, Reorder::NONE))
+        let Some((link, elapsed)) = config else {
+            return Shaped::PassThrough;
+        };
+        self.with(|st| {
+            if st.sample_loss(edge, link.loss) {
+                record_link(edge, |s| s.dropped_loss += 1);
+                return Shaped::Absorbed;
+            }
+            st.offer(
+                now,
+                edge,
+                dst,
+                buf,
+                (link.capacity.bits_per_sec_at(elapsed), link.max_backlog),
+                (link.delay, link.reorder),
+            )
         })
     }
 
@@ -713,7 +746,7 @@ impl Shaper {
     /// Return whether the next datagram to `ip` should be dropped by the loss model.
     pub fn should_drop_packet(&mut self, ip: IpAddr) -> bool {
         let loss = loss_for(&ip);
-        let drop = self.with(|st| st.sample_loss(ip, loss));
+        let drop = self.with(|st| st.sample_loss(Bottleneck::Downlink(ip), loss));
         if drop {
             record(ip, |s| s.dropped_loss += 1);
         }
@@ -731,7 +764,7 @@ fn record_link(link: Bottleneck, f: impl FnOnce(&mut Stats)) {
 }
 
 impl ShaperState {
-    fn sample_loss(&mut self, ip: IpAddr, loss: Loss) -> bool {
+    fn sample_loss(&mut self, link: Bottleneck, loss: Loss) -> bool {
         match loss {
             Loss::Independent(rate) => {
                 if rate == 0.0 {
@@ -745,15 +778,14 @@ impl ShaperState {
                 loss_in_good,
                 loss_in_bad,
             } => {
-                let bad = *self.in_bad_state.entry(ip).or_insert(false);
+                let bad = self.in_bad_state.entry(link).or_default();
                 let transition = next_uniform(&mut self.loss_counter);
-                let bad = if bad {
+                *bad = if *bad {
                     transition >= to_good
                 } else {
                     transition < to_bad
                 };
-                self.in_bad_state.insert(ip, bad);
-                let rate = if bad { loss_in_bad } else { loss_in_good };
+                let rate = if *bad { loss_in_bad } else { loss_in_good };
                 next_uniform(&mut self.loss_counter) < rate
             }
         }
@@ -766,7 +798,7 @@ impl ShaperState {
         dst: SocketAddr,
         buf: &[u8],
         (bits_per_sec, max_backlog): (u64, Duration),
-        reorder: Reorder,
+        (delay, reorder): (Duration, Reorder),
     ) -> Shaped {
         // Serialisation delay: how long this packet occupies the link.
         let on_wire =
@@ -796,7 +828,7 @@ impl ShaperState {
         // Reordering is applied to the release time, not by shuffling the queue, so the packet
         // genuinely leaves after ones offered behind it. Delaying it in place would only add
         // jitter; the queue is re-sorted below so departure order actually changes.
-        let mut release_at = release_at;
+        let mut release_at = release_at + delay;
         if reorder.probability > 0.0 && next_uniform(&mut self.loss_counter) < reorder.probability {
             release_at += reorder.delay;
             record_link(link, |s| s.reordered += 1);
@@ -871,7 +903,9 @@ mod tests {
             loss_in_bad: 1.0,
         };
 
-        let drops: Vec<bool> = (0..5000).map(|_| st.sample_loss(ip, loss)).collect();
+        let drops: Vec<bool> = (0..5000)
+            .map(|_| st.sample_loss(Bottleneck::Downlink(ip), loss))
+            .collect();
         let total: usize = drops.iter().filter(|d| **d).count();
         assert!(total > 0, "expected some loss");
 

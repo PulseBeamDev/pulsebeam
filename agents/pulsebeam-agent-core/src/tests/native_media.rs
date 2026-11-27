@@ -88,6 +88,7 @@ impl Target {
             track_id: publication.track_id.clone(),
             kind: Some(state::track::Kind::Video(state::VideoTrack {
                 av1_whole_source: false,
+                guarantees_video_dd: false,
                 format: rtp.codec.as_ref().and_then(|codec| codec.format.clone()),
             })),
         };

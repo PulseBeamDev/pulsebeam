@@ -436,6 +436,7 @@ mod tests {
                         track_id: "camera".into(),
                         kind: Some(track::Kind::Video(VideoTrack {
                             av1_whole_source: false,
+                            guarantees_video_dd: false,
                             format: Some(CodecFormat {
                                 mime_type: "video/vp8".into(),
                                 clock_rate: 90_000,
@@ -546,6 +547,32 @@ mod tests {
             Box::new([(SourceEncoding::Ssrc(12.into()), None, LayerQuality::High)]);
         let image = encode(&endpoints, h264).unwrap();
         assert_eq!(decode_wan(&image).unwrap().wan.sources.as_ref(), &[h264]);
+        let mut h264_dd = h264;
+        h264_dd.publisher.emission = Emission::new(
+            Profile::H264,
+            &[pulsebeam_core::fabric::ExtensionKind::DependencyDescriptor],
+        )
+        .unwrap();
+        for guaranteed in [false, true] {
+            let Some(track::Kind::Video(video)) =
+                &mut endpoints[0].1.publications[0].descriptor.kind
+            else {
+                panic!("expected video");
+            };
+            video.guarantees_video_dd = guaranteed;
+            let decoded = decode_wan(&encode(&endpoints, h264_dd).unwrap()).unwrap();
+            let (endpoint, observed) = &decoded.endpoints[0];
+            let track = observed.publications[0]
+                .media_track(*endpoint, observed.claim.connection())
+                .unwrap();
+            assert_eq!(track.as_video().unwrap().guarantees_video_dd, guaranteed);
+        }
+        assert!(matches!(encode(&endpoints, h264), Err(Error::Invalid)));
+        let Some(track::Kind::Video(video)) = &mut endpoints[0].1.publications[0].descriptor.kind
+        else {
+            panic!("expected video");
+        };
+        video.guarantees_video_dd = false;
         assert!(matches!(
             encode(&endpoints, source(Profile::Av1, publication)),
             Err(Error::Invalid)
@@ -618,6 +645,32 @@ mod tests {
         )
         .unwrap();
         assert!(routed.as_video().unwrap().guarantees_video_dd);
+
+        let bare_vp8 = source(Profile::Vp8, publication);
+        assert!(matches!(encode(&endpoints, bare_vp8), Err(Error::Invalid)));
+        let fact = &mut endpoints[0].1.publications[0];
+        let Some(track::Kind::Video(video)) = fact.descriptor.kind.as_mut() else {
+            panic!("expected video");
+        };
+        video.format = CodecFormat::native_quic_baseline("video/vp8");
+        let image = encode(&endpoints, bare_vp8).unwrap();
+        assert_eq!(
+            decode_wan(&image).unwrap().wan.sources.as_ref(),
+            &[bare_vp8]
+        );
+
+        let mut vp8_dd = bare_vp8;
+        vp8_dd.publisher.emission = Emission::new(
+            Profile::Vp8,
+            &[pulsebeam_core::fabric::ExtensionKind::DependencyDescriptor],
+        )
+        .unwrap();
+        assert!(matches!(encode(&endpoints, vp8_dd), Err(Error::Invalid)));
+        endpoints[0].1.publications[0].layers = Box::new([
+            (SourceEncoding::Ssrc(12.into()), None, LayerQuality::High),
+            (SourceEncoding::Ssrc(13.into()), None, LayerQuality::Low),
+        ]);
+        assert!(matches!(encode(&endpoints, bare_vp8), Err(Error::Invalid)));
     }
 
     #[test]

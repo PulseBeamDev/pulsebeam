@@ -517,20 +517,167 @@ fn quic_single_encoding_vp9_spatial_targets_reach_live_receivers() {
 #[test]
 #[allow(clippy::expect_used, reason = "simulated VP9 receiver must complete")]
 fn quic_spatial_vp9_native_receiver_switches_height_on_one_subscription() {
+    prove_target_switches(dd_video::Graph::InterLayer);
+}
+
+#[test]
+fn quic_independent_vp9_targets_decode_and_switch_on_one_subscription() {
+    prove_target_switches(dd_video::Graph::Independent);
+}
+
+#[test]
+fn quic_temporal_vp9_targets_change_native_decode_cadence() {
+    prove_target_switches(dd_video::Graph::Temporal);
+}
+
+#[test]
+fn quic_vp9_replaces_dependency_structure_on_one_binding() {
+    prove_target_switches(dd_video::Graph::TemporalReplacement);
+}
+
+#[test]
+fn quic_temporal_h264_targets_change_native_decode_cadence() {
+    prove_target_switches(dd_video::Graph::H264Temporal);
+}
+
+#[test]
+fn quic_temporal_vp8_targets_change_native_decode_cadence() {
+    prove_target_switches(dd_video::Graph::Vp8Temporal);
+}
+
+#[test]
+fn quic_temporal_av1_targets_change_native_decode_cadence() {
+    prove_target_switches(dd_video::Graph::Av1Temporal);
+}
+
+#[test]
+fn quic_spatial_av1_targets_decode_complete_pictures() {
+    prove_target_switches(dd_video::Graph::Av1Spatial);
+}
+
+#[test]
+fn quic_spatial_av1_targets_decode_complete_pictures_across_shards() {
+    prove_cross_shard_target_switches(dd_video::Graph::Av1Spatial);
+}
+
+#[test]
+fn quic_temporal_targets_change_native_decode_cadence_across_shards() {
+    use dd_video::Graph;
+    for graph in [
+        Graph::H264Temporal,
+        Graph::Vp8Temporal,
+        Graph::Temporal,
+        Graph::Av1Temporal,
+    ] {
+        prove_cross_shard_target_switches(graph);
+    }
+}
+
+fn prove_cross_shard_target_switches(graph: dd_video::Graph) {
+    let delivered = || pulsebeam::sim_metrics::routing_counter("fabric_quic_rtp_shard_enqueued");
+    let before = delivered();
+    run_video_witness(|host| Scenario::DdVideoTargets {
+        host,
+        graph,
+        cross_shard: true,
+    });
+    assert!(
+        delivered() > before,
+        "{:?} RTP did not cross a shard boundary",
+        graph.codec(),
+    );
+}
+
+#[test]
+fn quic_key_picture_av1_targets_decode_complete_pictures() {
+    prove_target_switches(dd_video::Graph::Av1KeyPicture);
+}
+
+#[test]
+fn quic_key_picture_vp9_targets_decode_complete_pictures() {
+    prove_target_switches(dd_video::Graph::Vp9KeyPicture);
+}
+
+#[test]
+fn quic_whole_vp9_preserves_encoded_units() {
+    run_video_witness(|_| Scenario::WholeVp9);
+}
+
+#[test]
+fn quic_whole_stock_av1_with_dd_decodes() {
+    run_video_witness(|host| Scenario::StockAv1Whole { host });
+}
+
+fn prove_target_switches(graph: dd_video::Graph) {
+    run_video_witness(|host| Scenario::DdVideoTargets {
+        host,
+        graph,
+        cross_shard: false,
+    });
+}
+
+fn run_video_witness(scenario: impl FnOnce(std::net::IpAddr) -> Scenario) {
     let host = pulsebeam_runtime::testing::test_host_ip("192.168.250.103");
-    let mut sim = turmoil::Builder::new().build();
+    let mut sim = turmoil::Builder::new()
+        .simulation_duration(Duration::from_secs(100))
+        .build();
+    let scenario = scenario(host);
     sim.client(host, async move {
-        witness(Scenario::SpatialVp9Rtc { host }).await?;
+        witness(scenario).await?;
         Ok(())
     });
     super::common::run_sim_or_timeout(&mut sim, Duration::from_secs(15))
-        .expect("VP9 RTC height policy changes");
+        .expect("descriptor-aware video delivery");
 }
 
 #[test]
 #[allow(clippy::expect_used, reason = "simulated VP9 receiver must adapt")]
 fn quic_spatial_vp9_native_receiver_adapts_to_bandwidth_across_shards() {
-    use super::native_state::spatial_vp9::{Check, receive};
+    run_spatial_vp9_downlink(42, |receiver_ip| {
+        super::native_state::spatial_vp9::Check::Bandwidth { receiver_ip }
+    });
+}
+
+pub(super) fn run_spatial_vp9_downlink(
+    budget_secs: u64,
+    check: impl FnOnce(std::net::IpAddr) -> super::native_state::spatial_vp9::Check + 'static,
+) {
+    run_spatial_vp9_receivers(budget_secs, SpatialCompanion::None, |ip, _| check(ip));
+}
+
+#[test]
+fn quic_spatial_vp9_native_receiver_protects_both_floors() {
+    run_spatial_vp9_receivers(75, SpatialCompanion::Layered, |receiver_ip, other| {
+        super::native_state::spatial_vp9::Check::Contention {
+            receiver_ip,
+            other: other.expect("second VP9 publication"),
+        }
+    });
+}
+
+#[test]
+fn resizing_vp9_camera_preserves_full_size_h264_screen() {
+    run_spatial_vp9_receivers(35, SpatialCompanion::Screen, |_, screen| {
+        super::native_state::spatial_vp9::Check::ResizeWithScreen {
+            screen: screen.expect("screen publication"),
+        }
+    });
+}
+
+#[derive(Clone, Copy)]
+enum SpatialCompanion {
+    None,
+    Layered,
+    Screen,
+}
+
+fn run_spatial_vp9_receivers(
+    budget_secs: u64,
+    companion: SpatialCompanion,
+    check: impl FnOnce(std::net::IpAddr, Option<String>) -> super::native_state::spatial_vp9::Check
+    + 'static,
+) {
+    use super::native_state::spatial_vp9::receive;
     use tokio::sync::oneshot;
 
     let seed = super::common::sim_seed();
@@ -543,14 +690,16 @@ fn quic_spatial_vp9_native_receiver_adapts_to_bandwidth_across_shards() {
     let (publish, publication) = oneshot::channel();
     let (begin, begun) = oneshot::channel();
     let (finish, finished) = oneshot::channel();
+    let budget = Duration::from_secs(budget_secs);
     let mut sim = turmoil::Builder::new()
-        .simulation_duration(Duration::from_secs(42))
+        .simulation_duration(budget)
         .rng_seed(seed)
         .build();
     sim.client(server, async move {
         witness(Scenario::SpatialVp9Bandwidth(Box::new(
             SpatialVp9Bandwidth {
                 server,
+                companion,
                 publish,
                 begun,
                 finished,
@@ -561,20 +710,12 @@ fn quic_spatial_vp9_native_receiver_adapts_to_bandwidth_across_shards() {
     });
     sim.client(viewer, async move {
         let host = super::common::native::NativeHost::bind(viewer)?;
-        let (address, id) = publication.await.context("VP9 publisher stopped")?;
-        receive(
-            address,
-            host,
-            &id,
-            Check::Bandwidth {
-                receiver_ip: viewer,
-            },
-            || {
-                begin
-                    .send(())
-                    .map_err(|()| anyhow::anyhow!("VP9 replay stopped"))
-            },
-        )
+        let (address, id, other) = publication.await.context("VP9 publisher stopped")?;
+        receive(address, host, &id, check(viewer, other), || {
+            begin
+                .send(())
+                .map_err(|()| anyhow::anyhow!("VP9 replay stopped"))
+        })
         .await?;
         finish
             .send(())
@@ -584,8 +725,7 @@ fn quic_spatial_vp9_native_receiver_adapts_to_bandwidth_across_shards() {
     let cross_shard_packets =
         || pulsebeam::sim_metrics::routing_counter("fabric_rtp_shard_enqueued");
     let before = cross_shard_packets();
-    super::common::run_sim_or_timeout(&mut sim, Duration::from_secs(42))
-        .expect("VP9 RTC bandwidth adaptation");
+    super::common::run_sim_or_timeout(&mut sim, budget).expect("VP9 RTC bandwidth adaptation");
     assert!(
         cross_shard_packets() > before,
         "VP9 RTP did not cross a shard boundary"
@@ -593,8 +733,10 @@ fn quic_spatial_vp9_native_receiver_adapts_to_bandwidth_across_shards() {
 }
 
 fn replay_scenario(host: std::net::IpAddr, scenario: Scenario) {
+    // Keep the largest scenario's future out of the simulator's task wrappers.
+    let replay = Box::pin(witness(scenario));
     pulsebeam_runtime::testing::run_local(host, async move {
-        pulsebeam_runtime::time::timeout(Duration::from_secs(10), witness(scenario))
+        pulsebeam_runtime::time::timeout(Duration::from_secs(10), replay)
             .await
             .unwrap()
             .unwrap();
@@ -2999,7 +3141,103 @@ async fn mixed_h264_exchange(
     Ok(())
 }
 
-pub(super) mod spatial_vp9;
+pub(super) mod dd_video;
+pub(super) mod whole_video;
+
+const SCREEN_TRACK: &str = "screen";
+
+async fn connect_screen(
+    address: SocketAddr,
+    edge: SocketAddr,
+    roots: RootCertStore,
+    token: &str,
+) -> Result<(pulsebeam_agent_quic::executor::host::Agent, String)> {
+    use pulsebeam_agent_core::{AgentCommand, DesiredState, MediaKind, PublicationIntent};
+    let mut agent = sim_quic_agent(address, edge, roots, token)?;
+    agent.command(AgentCommand::ReplaceDesired(DesiredState {
+        revision: 1,
+        publications: vec![PublicationIntent {
+            slot: SCREEN_TRACK.into(),
+            track_id: SCREEN_TRACK.into(),
+            kind: MediaKind::Video,
+            active: true,
+        }],
+        ..Default::default()
+    }))?;
+    agent.command(AgentCommand::Join("stage".into()))?;
+    let id = pulsebeam_runtime::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(id) = agent.h264_publication_id(SCREEN_TRACK) {
+                return anyhow::Ok(id.to_owned());
+            }
+            agent
+                .turn()
+                .await
+                .map_err(|err| anyhow::anyhow!("screen setup: {err:?}"))?;
+        }
+    })
+    .await
+    .context("screen publication setup timed out")??;
+    Ok((agent, id))
+}
+
+async fn replay_screen(
+    agent: &mut pulsebeam_agent_quic::executor::host::Agent,
+    start: pulsebeam_runtime::time::Instant,
+) -> Result<()> {
+    use pulsebeam_agent_quic::executor::host::H264SendError;
+    use pulsebeam_runtime::time::{Instant, sleep_until};
+    use pulsebeam_testdata::{
+        RAW_H264_SCREEN_FULL_TIMING, RAW_H264_SCREEN_FULL_VBR, frame_timestamps_micros,
+    };
+
+    let frames = super::common::media::video_frames(RAW_H264_SCREEN_FULL_VBR);
+    let times = frame_timestamps_micros(RAW_H264_SCREEN_FULL_TIMING);
+    ensure!(
+        !frames.is_empty() && frames.len() == times.len(),
+        "screen fixture timing mismatch"
+    );
+    let mut index = 0;
+    let mut epoch = start;
+    let mut previous_timestamp = 8999;
+    loop {
+        if agent.take_h264_keyframe_request(SCREEN_TRACK) && index != 0 {
+            // Replay the IDR and its own dependent pictures as a new epoch.
+            index = 0;
+            epoch = Instant::now();
+        }
+        let Some(frame) = frames.get(index) else {
+            agent
+                .turn()
+                .await
+                .map_err(|err| anyhow::anyhow!("screen flush: {err:?}"))?;
+            continue;
+        };
+        let at = epoch + Duration::from_micros(times[index] - times[0]);
+        if Instant::now() < at {
+            pulsebeam_runtime::select! {
+                () = sleep_until(at) => {},
+                result = agent.turn() => result.map_err(|err| anyhow::anyhow!("screen drive: {err:?}"))?,
+            }
+            continue;
+        }
+        let ticks = at.saturating_duration_since(start).as_micros() * 90 / 1000;
+        let timestamp = (9000 + u32::try_from(ticks)?).max(previous_timestamp + 1);
+        match agent.send_h264(SCREEN_TRACK, timestamp, frame.to_vec()) {
+            Ok(()) => {
+                previous_timestamp = timestamp;
+                index += 1;
+            }
+            Err(H264SendError::Busy) => {
+                agent
+                    .turn()
+                    .await
+                    .map_err(|err| anyhow::anyhow!("screen send progress: {err:?}"))?;
+            }
+            Err(err) => anyhow::bail!("screen replay: {err:?}"),
+        }
+    }
+}
 
 async fn descriptor_h264_exchange(
     publisher: &mut pulsebeam_agent_quic::executor::host::Agent,
@@ -3345,6 +3583,14 @@ fn qualification_sample(sample: serde_json::Value) {
     }
 }
 
+struct SpatialVp9Bandwidth {
+    server: std::net::IpAddr,
+    companion: SpatialCompanion,
+    publish: tokio::sync::oneshot::Sender<(SocketAddr, String, Option<String>)>,
+    begun: tokio::sync::oneshot::Receiver<()>,
+    finished: tokio::sync::oneshot::Receiver<()>,
+}
+
 enum Scenario {
     Data {
         delivery: DataV1Delivery,
@@ -3354,9 +3600,15 @@ enum Scenario {
     SpatialVp9 {
         target: u32,
     },
-    SpatialVp9Rtc {
+    DdVideoTargets {
+        host: std::net::IpAddr,
+        graph: dd_video::Graph,
+        cross_shard: bool,
+    },
+    StockAv1Whole {
         host: std::net::IpAddr,
     },
+    WholeVp9,
     SpatialVp9Bandwidth(Box<SpatialVp9Bandwidth>),
     Opus,
     Mobility,
@@ -3369,13 +3621,6 @@ enum Scenario {
         host: std::net::IpAddr,
         cross_shard: bool,
     },
-}
-
-struct SpatialVp9Bandwidth {
-    server: std::net::IpAddr,
-    publish: tokio::sync::oneshot::Sender<(SocketAddr, String)>,
-    begun: tokio::sync::oneshot::Receiver<()>,
-    finished: tokio::sync::oneshot::Receiver<()>,
 }
 
 #[allow(
@@ -3400,9 +3645,9 @@ pub(super) fn sim_quic_tls() -> Result<(transport::ServerConfig, RootCertStore)>
 async fn witness(scenario: Scenario) -> Result<()> {
     let host = std::net::Ipv4Addr::LOCALHOST.into();
     let edge = SocketAddr::new(host, 8443);
-    let rtc_address = match scenario {
-        Scenario::SpatialVp9Bandwidth(ref replay) => {
-            Some(SocketAddr::new(replay.server, edge.port()))
+    let rtc_address = match &scenario {
+        Scenario::SpatialVp9Bandwidth(witness) => {
+            Some(SocketAddr::new(witness.server, edge.port()))
         }
         _ => None,
     };
@@ -3477,6 +3722,10 @@ async fn witness(scenario: Scenario) -> Result<()> {
         } | Scenario::DataRecordDd
             | Scenario::MixedOpus { .. }
             | Scenario::SpatialVp9Bandwidth(_)
+            | Scenario::DdVideoTargets {
+                cross_shard: true,
+                ..
+            }
             | Scenario::MixedH264 {
                 cross_shard: true,
                 ..
@@ -3497,32 +3746,73 @@ async fn witness(scenario: Scenario) -> Result<()> {
         result = &mut node => anyhow::bail!("node stopped before startup: {result:?}"),
     }
     let result = async {
-        if let Scenario::SpatialVp9Bandwidth(replay) = scenario {
-            let SpatialVp9Bandwidth { server, publish, begun, finished } = *replay;
-            let (mut publisher, source) = spatial_vp9::connect_publisher(address, edge.ip(), edge, roots, &credential).await?;
-            publish.send((SocketAddr::new(server, address.port()), source.publication_id().to_owned()))
+        if let Scenario::SpatialVp9Bandwidth(witness) = scenario {
+            let SpatialVp9Bandwidth { server, companion, publish, begun, finished } = *witness;
+            let other = if matches!(companion, SpatialCompanion::Layered) {
+                Some(dd_video::connect_publisher(address, edge.ip(), edge, roots.clone(), &subscriber_token).await?)
+            } else {
+                None
+            };
+            let screen = if matches!(companion, SpatialCompanion::Screen) {
+                Some(connect_screen(address, edge, roots.clone(), &subscriber_token).await?)
+            } else {
+                None
+            };
+            let (mut publisher, source) = dd_video::connect_publisher(address, edge.ip(), edge, roots, &credential).await?;
+            let other_id = other.as_ref().map(|(_, source)| source.publication_id().to_owned())
+                .or_else(|| screen.as_ref().map(|(_, id)| id.clone()));
+            publish.send((SocketAddr::new(server, address.port()), source.publication_id().to_owned(), other_id))
                 .map_err(|_| anyhow::anyhow!("VP9 viewer stopped before connecting"))?;
             begun.await.context("VP9 viewer stopped before subscribing")?;
+            let start = pulsebeam_runtime::time::Instant::now();
+            let compete = async move {
+                if let Some((mut publisher, source)) = other {
+                    dd_video::replay(&mut publisher, &source, start + Duration::from_millis(13), true).await
+                } else if let Some((mut publisher, _)) = screen {
+                    Box::pin(replay_screen(&mut publisher, start)).await
+                } else {
+                    std::future::pending().await
+                }
+            };
             return pulsebeam_runtime::select! {
                 result = finished => result.context("VP9 viewer stopped before completing"),
-                result = spatial_vp9::replay(&mut publisher, &source, pulsebeam_runtime::time::Instant::now(), true) => result,
+                result = dd_video::replay(&mut publisher, &source, start, true) => result,
+                result = compete => result,
             };
         }
-        if let Scenario::SpatialVp9Rtc { host } = scenario {
+        if let Scenario::WholeVp9 = scenario {
+            let endpoint = whole_video::Endpoint { placement: address, edge };
+            return whole_video::prove_whole_video(
+                whole_video::Capture::Vp9, edge.ip(), [endpoint; 2], roots, &credential, &subscriber_token,
+            ).await;
+        }
+        if let Scenario::StockAv1Whole { host } = scenario {
+            let host = super::common::native::NativeHost::bind(host)?;
+            let mut receiver = sim_quic_agent(address, edge, roots, &subscriber_token)?;
+            return super::native_state::av1::prove_stock_av1_dd_to_quic(host, address, &mut receiver).await;
+        }
+        if let Scenario::DdVideoTargets { host, graph, .. } = scenario {
             use super::native_state::spatial_vp9::Check;
-            let (mut publisher, source) = spatial_vp9::connect_publisher(address, edge.ip(), edge, roots, &credential).await?;
+            if !matches!(graph, dd_video::Graph::InterLayer | dd_video::Graph::Independent) {
+                let endpoint = whole_video::Endpoint { placement: address, edge };
+                return dd_video::prove_projected_video(
+                    graph, edge.ip(), [endpoint; 2], roots, &credential, &subscriber_token,
+                ).await;
+            }
+            let (mut publisher, source) = dd_video::connect_dd_publisher(address, edge.ip(), edge, roots, &credential, graph.codec()).await?;
             let host = super::common::native::NativeHost::bind(host)?;
             let (begin, begun) = tokio::sync::oneshot::channel();
             let send = async {
                 begun.await.context("VP9 receiver stopped before replay")?;
-                spatial_vp9::replay(&mut publisher, &source, pulsebeam_runtime::time::Instant::now(), true).await
+                dd_video::replay_graph(&mut publisher, &source, graph).await
             };
-            let receive = super::native_state::spatial_vp9::receive(address, host, source.publication_id(), Check::HeightChanges,
+            let check = Check::HeightChanges { sustained: matches!(graph, dd_video::Graph::InterLayer) };
+            let receive = super::native_state::spatial_vp9::receive(address, host, source.publication_id(), check,
                 || begin.send(()).map_err(|()| anyhow::anyhow!("VP9 replay stopped")));
             return pulsebeam_runtime::select! { result = receive => result, result = send => result };
         }
         if let Scenario::SpatialVp9 { target } = scenario {
-            return spatial_vp9::exchange(
+            return dd_video::exchange(
                 address,
                 edge,
                 roots,
@@ -3617,7 +3907,8 @@ async fn witness(scenario: Scenario) -> Result<()> {
                     .format
                     .as_ref()
                     .map(|format| format.mime_type.as_str()))
-                .eq(["audio/opus", "video/h264"])
+                .eq(["audio/opus"]),
+            "a legacy offer without directional DD must not advertise video: {caps:?}"
         );
         ensure!(
             caps.codecs

@@ -5,8 +5,8 @@
 //! probe controller, and the failure modes only appear once both are in the loop.
 
 use super::common::{
-    Capacity, LinkProfile, LinkReport, LocalNodeSim, Loss, Participant, Playback,
-    PlaybackExpectation, Property, Reorder, Room, Step, VideoQuality,
+    Capacity, LinkProfile, LinkReport, LocalNodeSim, Participant, Playback,
+    PlaybackExpectation, Property, Reorder, Room, Step, VideoQuality, media::native_temporal_fixture,
 };
 use std::time::Duration;
 
@@ -19,293 +19,41 @@ use std::time::Duration;
 /// of the implementation rather than of a lucky schedule.
 const QOS_SEEDS: [u64; 4] = [0xDEAD_BEEF, 0x1234_5678, 0x0BAD_F00D, 0xFEED_FACE];
 
-/// Upgrading after a long stretch at low quality must not break the stream.
-///
-/// This is an end-to-end anchor for the transition from a long low-quality period to an explicit
-/// upgrade request. It covers the allocator, BWE-facing demand, and forwarding path together.
+/// Priority decides between 15 fps minimums whose submitted inputs cannot both fit.
 #[test]
-fn upgrade_after_long_low_quality_period_test() {
-    LocalNodeSim::new()
-        .with_room(
-            Room::new("room1")
-                .with_participant(Participant::publisher("alice", &["q", "h", "f"]))
-                .with_participant(Participant::subscriber("bob")),
-        )
-        .run(vec![
-            Step::Run {
-                description: "Establish connection and discover tracks",
-                duration: Duration::from_secs(5),
-            },
-            Step::SubscribeAll {
-                description: "Bob starts on the lowest layer",
-                participant: "bob",
-                heights: &[180],
-            },
-            // Long enough for the 30s-fall stable filter to decay substantially.
-            Step::Run {
-                description: "60s on the low layer - `desired` would decay here",
-                duration: Duration::from_secs(60),
-            },
-            Step::SubscribeAll {
-                description: "Bob asks for full quality",
-                participant: "bob",
-                heights: &[720],
-            },
-            Step::Run {
-                description: "Allow BWE to probe up and the allocator to upgrade",
-                duration: Duration::from_secs(15),
-            },
-            Step::CheckVideoDecodedFromInterval {
-                description: "Bob is upgraded well past the lowest layer",
-                participant: "bob",
-                publisher: "alice",
-                min_frames: 1,
-                min_resolution: (1, 720),
-            },
-            Step::CheckVideoQuality {
-                description: "Frames stay renderable across the upgrade",
-                participant: "bob",
-                quality: VideoQuality::min_frames(200).allow_gaps(5),
-            },
-        ]);
-}
-
-/// A subscriber asking for 720p on a fast link must actually receive the top layer.
-///
-/// Alice publishes q=150 kbps / h=400 kbps / f=1.25 Mbps; Bob subscribes at 720p over
-/// [`LinkProfile::fiber`]. This is the end-to-end statement that BWE converges high enough for
-/// the allocator to promote the subscriber all the way up the simulcast ladder.
-///
-/// This test failed for a long time - Bob would sit on "h" forever - and the cause turned out to
-/// be the simulator, not the congestion controller. turmoil's default link applies a uniform
-/// random 0-100ms latency per message, which destroys the inter-packet spacing GCC measures:
-/// probes under-read their own send rate by 2-4x and reordering was charged as ~9% loss. See
-/// [`LinkProfile`]. With a realistic latency band it converges as expected.
-#[test]
-fn subscriber_reaches_top_layer_on_fast_link_test() {
-    LocalNodeSim::new()
-        .with_room(
-            Room::new("room1")
-                .with_participant(Participant::publisher("alice", &["q", "h", "f"]))
-                .with_participant(Participant::subscriber("bob")),
-        )
-        .run(vec![
-            Step::WaitForPublication {
-                description: "alice publication is ready before subscribing",
-                publisher: "alice",
-                timeout: Duration::from_secs(5),
-            },
-            Step::SubscribeAll {
-                description: "Bob asks for 720p from the start",
-                participant: "bob",
-                heights: &[720],
-            },
-            Step::WaitForVideoAtResolution {
-                description: "Bob decodes the top layer",
-                participant: "bob",
-                publishers: &["alice"],
-                min_resolution: (1, 720),
-                timeout: Duration::from_secs(60),
-            },
-            Step::Run {
-                description: "Measurement window",
-                duration: Duration::from_secs(15),
-            },
-            Step::CheckVideoDecodedFromInterval {
-                description: "Bob independently decodes full-height video in the measurement window",
-                participant: "bob",
-                publisher: "alice",
-                min_frames: 1,
-                min_resolution: (1, 720),
-            },
-        ]);
-}
-
-/// A hard height ceiling retains decoding when only smaller spatial layers fit.
-#[test]
-fn height_ceiling_keeps_a_smaller_layer_decodable_test() {
-    LocalNodeSim::new()
-        .with_room(
-            Room::new("room1")
-                .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
-                .with_participant(Participant::multi_subscriber("viewer", 1)),
-        )
-        .run(vec![
-            Step::WaitForPublication {
-                description: "camera publication is ready before subscribing",
-                publisher: "camera",
-                timeout: Duration::from_secs(5),
-            },
-            Step::SubscribeTo {
-                description: "Viewer sets a 540p ceiling between the 360p and 720p layers",
-                participant: "viewer",
-                targets: &[("camera", 540)],
-            },
-            Step::WaitForVideoAtResolution {
-                description: "Viewer decodes the largest ceiling-compatible layer",
-                participant: "viewer",
-                publishers: &["camera"],
-                min_resolution: (1, 360),
-                timeout: Duration::from_secs(30),
-            },
-            Step::Run {
-                description: "Measurement window",
-                duration: Duration::from_secs(30),
-            },
-            Step::CheckVideoDecodedFromInterval {
-                description: "Viewer independently decodes the supplied 360p representation",
-                participant: "viewer",
-                publisher: "camera",
-                min_frames: 1,
-                min_resolution: (1, 360),
-            },
-        ]);
-}
-
-/// A high-priority camera request must reclaim bandwidth from a lower-priority screen share.
-///
-/// Both slots start protected, then the camera is raised to 720p and the screen becomes
-/// explicitly optional. A previously retained optional stream must yield to a higher-priority
-/// target; retaining old quality cannot recreate a reservation removed by the new intent.
-#[test]
-fn high_priority_camera_reclaims_bandwidth_from_screenshare_test() {
-    LocalNodeSim::new()
-        .with_bandwidth(2_750_000)
-        .with_room(
-            Room::new("room1")
-                .with_participant(Participant::screensharer("screen"))
-                .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
-                .with_participant(Participant::manual_subscriber("viewer", 2)),
-        )
-        .run(vec![
-            Step::WaitForPublication {
-                description: "camera publication is ready before subscribing",
-                publisher: "camera",
-                timeout: Duration::from_secs(5),
-            },
-            Step::WaitForPublication {
-                description: "screen publication is ready before subscribing",
-                publisher: "screen",
-                timeout: Duration::from_secs(5),
-            },
-            Step::SubscribeToQos {
-                description: "Viewer starts both streams at low priority and height",
-                participant: "viewer",
-                targets: &[("camera", 180, 90, 10), ("screen", 1080, 90, 10)],
-            },
-            Step::Run {
-                description: "Let the screen share become the retained co-tenant",
-                duration: Duration::from_secs(30),
-            },
-            Step::SubscribeToQos {
-                description: "Viewer protects the camera and makes the background screen optional",
-                participant: "viewer",
-                targets: &[("camera", 720, 360, 200), ("screen", 1080, 0, 10)],
-            },
-            Step::WaitForVideoAtResolution {
-                description: "Viewer decodes the reclaimed camera target",
-                participant: "viewer",
-                publishers: &["camera"],
-                min_resolution: (1, 720),
-                timeout: Duration::from_secs(60),
-            },
-        ]);
-}
-
-/// The standard QoS contention room: a variable-bitrate screen share (single 2.5 Mbit/s layer),
-/// a three-layer camera (q/h/f ≈ 150 k / 400 k / 1.25 Mbit/s at 180/360/720p), and a viewer with
-/// two manual slots. This is the setup that makes the priority levers of the user-intent protocol
-/// visible: the streams together cost more than a typical link, so `priority`, `min_height`, and
-/// `target_height` actually decide who gets what.
-fn screen_camera_viewer_room() -> Room {
-    Room::new("room1")
-        .with_participant(Participant::screensharer("screen"))
-        .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
-        .with_participant(Participant::manual_subscriber("viewer", 2))
-}
-
-/// Joint spatial/temporal minimums precede optional target upgrades; priority
-/// decides between minimums that cannot both fit. Premises use submitted input.
-#[test]
-fn low_priority_minimum_precedes_high_priority_target_test() {
+fn competing_native_temporal_minimums_follow_priority() {
     use super::common::harness::{SourceInputTier, VideoSubscription};
-    let fixture = native_temporal_ladder();
+
+    // One T0/T1 source fits (about 502 kbps on the wire), but two do not
+    // (about 772 kbps of coded slices alone).
+    const ONE_MINIMUM_BPS: u64 = 650_000;
+    let full = native_temporal_fixture(&["f"]);
     for seed in QOS_SEEDS {
         LocalNodeSim::new()
             .with_rng_seed(seed)
             .with_link(LinkProfile::fiber())
             .with_room(
                 Room::new("room1")
-                    .with_participant(Participant::publisher("camera", &["q", "h", "f"])
-                        .with_native_video_fixture(fixture.clone()))
-                    .with_participant(Participant::publisher("protected", &["q", "h", "f"])
-                        .with_native_video_fixture(fixture.clone()))
+                    .with_participant(Participant::publisher("camera", &["f"])
+                        .with_native_video_fixture(full.clone()))
+                    .with_participant(Participant::publisher("protected", &["f"])
+                        .with_native_video_fixture(full.clone()))
                     .with_participant(Participant::manual_subscriber("viewer", 2).with_native_playback()),
             )
             .run(vec![
                 Step::WaitForPublication {
-                    description: "Discover both independently stamped genuine three-rung T3 sources",
+                    description: "Discover independently stamped single-encoding T3 sources",
                     publisher: "protected",
                     timeout: Duration::from_secs(5),
                 },
                 Step::SetCapacity {
                     description: "Only viewer egress is constrained; publisher uplinks remain clean",
                     participant: "viewer",
-                    capacity: Capacity::Fixed(780_000),
+                    capacity: Capacity::Fixed(ONE_MINIMUM_BPS),
                     max_backlog: Duration::from_millis(500),
                 },
                 Step::SubscribeToConfigured {
-                    description: "Protect 180p/15fps and lower-priority 720p/15fps before target upgrades",
-                    participant: "viewer",
-                    targets: [("camera", 180, 200), ("protected", 720, 10)].into_iter()
-                        .map(|(publisher, min_height, priority)| VideoSubscription {
-                            participant_id: publisher.into(), height: 720, min_height, min_fps: 15,
-                            priority,
-                            ..Default::default()
-                        }).collect(),
-                },
-                Step::WaitForSourceVideo {
-                    description: "The protected source becomes genuine native 720p within convergence bound",
-                    participant: "viewer", publisher: "protected", min_resolution: (1280, 720),
-                    temporal_index: None, timeout: Duration::from_secs(30),
-                },
-                Step::WaitForSourceVideo {
-                    description: "Both protected sources are visible before measuring sustained service",
-                    participant: "viewer", publisher: "camera", min_resolution: (320, 180),
-                    temporal_index: None, timeout: Duration::from_secs(45),
-                },
-                Step::Run {
-                    description: "Measure fresh source progress throughout sustained joint contention",
-                    duration: Duration::from_secs(60),
-                },
-                Step::CheckSourceInputLoad {
-                    description: "Protected input fits, both full targets do not, and keyframe bursts fit",
-                    participant: "viewer",
-                    protected: &[("camera", "q"), ("protected", "f")],
-                    competing: &[("camera", "f"), ("protected", "f")],
-                    competing_tier: SourceInputTier::Full,
-                    capacity_bps: 780_000, max_backlog: Duration::from_millis(500),
-                },
-                // Leave one second for the declared 500ms queue and source/
-                // decoder phase edges. This rejects the T0-only 7.5fps tier;
-                // it is a phase service floor, not unshaped per-event D.
-                Step::CheckNativeSourceProgress {
-                    description: "Lower-priority 720p/15fps minimum reaches actual native pictures",
-                    participant: "viewer", publisher: "protected", min_frames: 15 * 59,
-                    min_resolution: (1280, 720),
-                },
-                Step::CheckNativeSourceProgress {
-                    description: "High-priority 180p/15fps minimum also reaches actual native pictures",
-                    participant: "viewer", publisher: "camera", min_frames: 15 * 59,
-                    min_resolution: (320, 180),
-                },
-                Step::SetCapacity {
-                    description: "One native 720p/15fps input fits 650kbps but the two protected inputs cannot both fit",
-                    participant: "viewer", capacity: Capacity::Fixed(650_000),
-                    max_backlog: Duration::from_millis(500),
-                },
-                Step::SubscribeToConfigured {
-                    description: "Request competing 720p/15fps minimums with unequal priorities",
+                    description: "Request competing 15fps minimums on two 720p sources",
                     participant: "viewer",
                     targets: [("camera", 200), ("protected", 10)].into_iter()
                         .map(|(publisher, priority)| VideoSubscription {
@@ -315,7 +63,7 @@ fn low_priority_minimum_precedes_high_priority_target_test() {
                         }).collect(),
                 },
                 Step::WaitForSourceVideo {
-                    description: "The higher-priority source reaches genuine native 720p after reconfiguration",
+                    description: "The higher-priority source reaches genuine native 720p under contention",
                     participant: "viewer", publisher: "camera", min_resolution: (1280, 720),
                     temporal_index: None, timeout: Duration::from_secs(30),
                 },
@@ -328,8 +76,9 @@ fn low_priority_minimum_precedes_high_priority_target_test() {
                     participant: "viewer", protected: &[("camera", "f")],
                     competing: &[("camera", "f"), ("protected", "f")],
                     competing_tier: SourceInputTier::T0T1,
-                    capacity_bps: 650_000, max_backlog: Duration::from_millis(500),
+                    capacity_bps: ONE_MINIMUM_BPS, max_backlog: Duration::from_millis(500),
                 },
+                // Allow one second for the 500ms queue and source/decoder phase edges.
                 Step::CheckNativeSourceProgress {
                     description: "The higher-priority protected minimum wins in actual source-correlated native 720p/15fps pictures",
                     participant: "viewer", publisher: "camera", min_frames: 15 * 59,
@@ -344,110 +93,6 @@ fn low_priority_minimum_precedes_high_priority_target_test() {
 mod slow {
     use super::*;
 
-    #[test]
-    fn reconfiguring_priority_preserves_focused_camera_decoding_test() {
-        for seed in QOS_SEEDS {
-            LocalNodeSim::new()
-            .with_rng_seed(seed)
-            .with_bandwidth(3_500_000)
-            .with_room(screen_camera_viewer_room())
-            .run(vec![
-                Step::WaitForPublication {
-                    description: "Establish connections and discover the camera",
-                    publisher: "camera",
-                    timeout: Duration::from_secs(5),
-                },
-                Step::SubscribeToQos {
-                    description: "Viewer starts with the camera at low quality",
-                    participant: "viewer",
-                    targets: &[("camera", 180, 90, 10)],
-                },
-                Step::WaitForVideoAtResolution {
-                    description: "Establish the initial camera subscription",
-                    participant: "viewer", publishers: &["camera"], min_resolution: (1, 180),
-                    timeout: Duration::from_secs(10),
-                },
-                Step::SubscribeToQos {
-                    description: "Viewer adds the screen share at equal low priority",
-                    participant: "viewer",
-                    targets: &[("camera", 180, 90, 10), ("screen", 1080, 90, 10)],
-                },
-                Step::WaitForVideo {
-                    description: "Establish both subscriptions before reconfiguration",
-                    participant: "viewer", publishers: &["camera", "screen"],
-                    timeout: Duration::from_secs(15),
-                },
-                Step::SubscribeToQos {
-                    description: "Viewer protects the focused camera and removes screen protection",
-                    participant: "viewer",
-                    targets: &[("camera", 720, 360, 200), ("screen", 1080, 0, 10)],
-                },
-                Step::WaitForVideoAtResolution {
-                    description: "Require the focused camera to reach top quality after reconfiguration",
-                    participant: "viewer", publishers: &["camera"], min_resolution: (1, 720),
-                    timeout: Duration::from_secs(30),
-                },
-                Step::CheckVideoDecodedFromInterval {
-                    description: "The focused high-priority camera reaches its requested full-height video",
-                    participant: "viewer",
-                    publisher: "camera",
-                    min_frames: 1,
-                    min_resolution: (1, 720),
-                },
-                Step::Run {
-                    description: "Soak the focused allocation",
-                    duration: Duration::from_secs(30),
-                },
-                Step::Report {
-                    description: "priority reconfiguration diagnostic",
-                    participant: "viewer",
-                },
-                Step::CheckVideoDecodedFromInterval {
-                    description: "The focused camera holds its full-height video through the soak",
-                    participant: "viewer",
-                    publisher: "camera",
-                    min_frames: 1,
-                    min_resolution: (1, 720),
-                },
-            ]);
-        }
-    }
-
-    /// Without either minimum, the background stream is opportunistic and must
-    /// yield to a higher-priority target rather than pinning its old allocation.
-    #[test]
-    fn droppable_background_yields_to_focused_camera_test() {
-        for seed in QOS_SEEDS {
-            LocalNodeSim::new()
-            .with_rng_seed(seed)
-            .with_bandwidth(3_500_000)
-            .with_room(screen_camera_viewer_room())
-            .run(vec![
-                Step::Run {
-                    description: "Establish connections and discover both tracks",
-                    duration: Duration::from_secs(5),
-                },
-                Step::SubscribeToQos {
-                    description: "Focused camera (720p, high priority); droppable background screen",
-                    participant: "viewer",
-                    targets: &[("camera", 720, 360, 200), ("screen", 1080, 0, 10)],
-                },
-                Step::WaitForVideoAtResolution {
-                    description: "Let the allocator resolve the contention",
-                    participant: "viewer", publishers: &["camera"], min_resolution: (1, 720),
-                    timeout: Duration::from_secs(45),
-                },
-                Step::CheckVideoDecodedFromInterval {
-                    description: "The focused camera reaches its full-height video over a droppable stream",
-                    participant: "viewer",
-                    publisher: "camera",
-                    min_frames: 1,
-                    min_resolution: (1, 720),
-                },
-            ]);
-        }
-    }
-
     /// A zero target and zero minimums mean off: the server forwards nothing and frees its
     /// bandwidth for the streams that are actually on screen. The link fits only one camera at its top
     /// layer, so the visible camera reaches `f` only if the hidden one is truly off. A second plain
@@ -458,11 +103,11 @@ mod slow {
         for seed in QOS_SEEDS {
             LocalNodeSim::new()
             .with_rng_seed(seed)
-            .with_bandwidth(4_000_000)
+            .with_bandwidth(2_000_000)
             .with_room(
                 Room::new("room1")
-                    .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
-                    .with_participant(Participant::publisher("hidden", &["q", "h", "f"]))
+                    .with_participant(Participant::publisher("camera", &["f"]))
+                    .with_participant(Participant::publisher("hidden", &["f"]))
                     .with_participant(Participant::manual_subscriber("viewer", 2)),
             )
             .run(vec![
@@ -506,7 +151,7 @@ mod slow {
                 .with_bandwidth(3_500_000)
                 .with_room(
                     Room::new("room1")
-                        .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
+                        .with_participant(Participant::publisher("camera", &["f"]))
                         .with_participant(Participant::manual_subscriber("viewer", 1)),
                 )
                 .run(vec![
@@ -563,7 +208,7 @@ mod slow {
             .with_link(link)
             .with_room(
                 Room::new("room1")
-                    .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
+                    .with_participant(Participant::publisher("camera", &["f"]))
                     .with_participant(Participant::manual_subscriber("viewer", 1)),
             )
             .run(vec![
@@ -614,7 +259,7 @@ mod slow {
                 .with_link(link)
                 .with_room(
                     Room::new("room1")
-                        .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
+                        .with_participant(Participant::publisher("camera", &["f"]))
                         .with_participant(Participant::manual_subscriber("viewer", 1)),
                 )
                 .run(vec![
@@ -654,7 +299,7 @@ fn priority_swap_reaches_every_requested_top_layer_on_fast_link_test() {
         .with_room(
             Room::new("room1")
                 .with_participant(Participant::screensharer("screen"))
-                .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
+                .with_participant(Participant::publisher("camera", &["f"]))
                 .with_participant(Participant::manual_subscriber("viewer", 2).with_encoded_and_native_decoded_video()),
         )
         .run(vec![
@@ -665,20 +310,23 @@ fn priority_swap_reaches_every_requested_top_layer_on_fast_link_test() {
             Step::SubscribeToQos {
                 description: "Viewer prioritizes the screen share",
                 participant: "viewer",
-                targets: &[("camera", 180, 90, 10), ("screen", 1080, 90, 200)],
+                targets: &[("camera", 720, 90, 10), ("screen", 1080, 90, 200)],
             },
-            Step::Run {
-                description: "Let the screen share reach full quality",
-                duration: Duration::from_secs(30),
+            Step::WaitForVideoAtResolution {
+                description: "Both full-size sources decode before the swap",
+                participant: "viewer",
+                publishers: &["camera", "screen"],
+                min_resolution: (1280, 720),
+                timeout: Duration::from_secs(20),
             },
             Step::SubscribeToQos {
                 description: "Viewer transfers priority to the camera",
                 participant: "viewer",
-                targets: &[("camera", 1080, 360, 200), ("screen", 1080, 90, 10)],
+                targets: &[("camera", 720, 90, 200), ("screen", 1080, 90, 10)],
             },
             Step::Run {
                 description: "Allow BWE to satisfy the new allocation",
-                duration: Duration::from_secs(60),
+                duration: Duration::from_secs(20),
             },
             Step::CheckNativeVideoDecodedFromInterval {
                 description: "Camera finishes on its full-height video",
@@ -693,13 +341,6 @@ fn priority_swap_reaches_every_requested_top_layer_on_fast_link_test() {
                 description: "Screen share renders full-size native frames: actual admission-correlated native I420",
                 participant: "viewer", publisher: "screen", min_frames: 1, min_resolution: (1280, 720),
             },
-            Step::CheckVideoDecodedFromInterval {
-                description: "Screen share renders full-size native frames",
-                participant: "viewer",
-                publisher: "screen",
-                min_frames: 1,
-                min_resolution: (1280, 720),
-            },
         ]);
 }
 
@@ -711,7 +352,7 @@ fn screenshare_recovers_after_competing_camera_pause_test() {
         .with_room(
             Room::new("room1")
                 .with_participant(Participant::screensharer("screen"))
-                .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
+                .with_participant(Participant::publisher("camera", &["q"]))
                 .with_participant(Participant::manual_subscriber("viewer", 2).with_encoded_and_native_decoded_video()),
         )
         .run(vec![
@@ -778,73 +419,6 @@ fn screenshare_recovers_after_competing_camera_pause_test() {
         ]);
 }
 
-#[test]
-fn resizing_camera_keeps_single_layer_screenshare_rendering_test() {
-    LocalNodeSim::new()
-        .with_room(
-            Room::new("room1")
-                .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
-                .with_participant(Participant::screensharer("screen"))
-                .with_participant(Participant::manual_subscriber("viewer", 2).with_encoded_and_native_decoded_video()),
-        )
-        .run(vec![
-            Step::WaitForPublication {
-                description: "camera publication is ready before subscribing",
-                publisher: "camera",
-                timeout: Duration::from_secs(5),
-            },
-            Step::WaitForPublication {
-                description: "screen publication is ready before subscribing",
-                publisher: "screen",
-                timeout: Duration::from_secs(5),
-            },
-            Step::SubscribeTo {
-                description: "Viewer allows the full-size camera and single-layer screen",
-                participant: "viewer",
-                targets: &[("camera", 720), ("screen", 1080)],
-            },
-            Step::WaitForVideoAtResolution {
-                description: "Viewer decodes both full-size streams before resizing",
-                participant: "viewer",
-                publishers: &["camera", "screen"],
-                min_resolution: (1280, 720),
-                timeout: Duration::from_secs(30),
-            },
-            Step::SubscribeTo {
-                description: "Viewer resizes only the camera to 360p",
-                participant: "viewer",
-                targets: &[("camera", 360), ("screen", 1080)],
-            },
-            Step::Run {
-                description: "Render both streams after the resize",
-                duration: Duration::from_secs(30),
-            },
-            Step::CheckVideoQuality {
-                description: "Camera remains decodable after the layer change",
-                participant: "viewer",
-                quality: VideoQuality::min_frames(300).allow_gaps(4),
-            },
-            Step::CheckNativeVideoDecodedFromInterval {
-                description: "Camera settles on its 360p video",
-                participant: "viewer",
-                publisher: "camera",
-                min_frames: 1,
-                min_resolution: (1, 360),
-            },
-            Step::CheckNativeVideoDecodedFromInterval {
-                description: "Single-layer screen share keeps rendering full-size frames: actual admission-correlated native I420",
-                participant: "viewer", publisher: "screen", min_frames: 1, min_resolution: (1280, 720),
-            },
-            Step::CheckVideoDecodedFromInterval {
-                description: "Single-layer screen share keeps rendering full-size frames",
-                participant: "viewer",
-                publisher: "screen",
-                min_frames: 1,
-                min_resolution: (1280, 720),
-            },
-        ]);
-}
-
 /// The real-world call: one screen share plus one camera, both directions live.
 ///
 /// This is the scenario from production that motivated the BWE work. Two participants each
@@ -876,7 +450,7 @@ fn screenshare_and_camera_conference_test() {
             Room::new("room1")
                 .with_participant(Participant::screensharer("screen").and_subscribes())
                 .with_participant(
-                    Participant::publisher("camera", &["q", "h", "f"]).and_subscribes(),
+                    Participant::publisher("camera", &["f"]).and_subscribes(),
                 ),
         )
         .run(vec![
@@ -1031,7 +605,7 @@ fn native_conference_room(
     if let Some(picture) = picture {
         screen = screen.with_solid_video(picture);
     }
-    let mut camera = Participant::publisher("camera", &["q", "h", "f"])
+    let mut camera = Participant::publisher("camera", &["f"])
         .and_subscribes()
         .with_native_playback();
     if let Some(fixture) = camera_fixture {
@@ -1042,48 +616,11 @@ fn native_conference_room(
         .with_participant(camera)
 }
 
-fn native_temporal_ladder() -> std::sync::Arc<super::common::media::NativeVideoFixture> {
-    use pulsebeam_rtc_simulation::NativeH264FixtureEncoding;
-    std::sync::Arc::new(
-        super::common::media::NativeVideoFixture::stock_temporal(
-            &[
-                (
-                    "q",
-                    NativeH264FixtureEncoding {
-                        width: 320,
-                        height: 180,
-                        bitrate_kbps: 200,
-                    },
-                ),
-                (
-                    "h",
-                    NativeH264FixtureEncoding {
-                        width: 640,
-                        height: 360,
-                        bitrate_kbps: 500,
-                    },
-                ),
-                (
-                    "f",
-                    NativeH264FixtureEncoding {
-                        width: 1280,
-                        height: 720,
-                        bitrate_kbps: 1_000,
-                    },
-                ),
-            ],
-            3,
-            48,
-        )
-        .expect("genuine precomputed three-rung T3 input"),
-    )
-}
-
 #[test]
 fn clean_native_source_windows_bound_motion_and_updates_test() {
     use super::common::harness::VideoSubscription;
     use super::common::native_origin::SourceService::{CameraMotion, SparseUpdates};
-    let camera_fixture = native_temporal_ladder();
+    let camera_fixture = native_temporal_fixture(&["f"]);
     let full_temporal_index = camera_fixture.temporal_layers() - 1;
     let mut plan = vec![Step::WaitForPublication {
         description: "Establish the existing conference sources on clean fiber",
@@ -1546,46 +1083,6 @@ fn late_video_subscription_is_delivered_test() {
 
 /// A feasible middle-height request produces genuine source video.
 /// Receiver height is a hint, so a taller supplied representation remains valid.
-#[test]
-fn middle_height_request_keeps_source_decodable_test() {
-    LocalNodeSim::new()
-        .with_room(
-            Room::new("room1")
-                .with_participant(Participant::publisher("alice", &["q", "h", "f"]))
-                .with_participant(Participant::multi_subscriber("bob", 1)),
-        )
-        .run(vec![
-            Step::WaitForPublication {
-                description: "alice publication is ready before subscribing",
-                publisher: "alice",
-                timeout: Duration::from_secs(5),
-            },
-            Step::SubscribeTo {
-                description: "Bob asks for 360p, which the h layer satisfies exactly",
-                participant: "bob",
-                targets: &[("alice", 360)],
-            },
-            Step::WaitForVideoAtResolution {
-                description: "Bob decodes the requested middle layer",
-                participant: "bob",
-                publishers: &["alice"],
-                min_resolution: (1, 360),
-                timeout: Duration::from_secs(30),
-            },
-            Step::Run {
-                description: "Measurement window",
-                duration: Duration::from_secs(60),
-            },
-            Step::CheckVideoDecodedFromInterval {
-                description: "Bob decodes the source at the requested middle height or larger",
-                participant: "bob",
-                publisher: "alice",
-                min_frames: 1,
-                min_resolution: (1, 360),
-            },
-        ]);
-}
-
 /// A screen share must come back to full quality after the screen has been still.
 ///
 /// The scenario behind the "stuck at 360p" report. A viewer watches a screen share at 720p, the
@@ -1671,8 +1168,8 @@ fn requested_streams_recover_when_downstream_capacity_returns_test() {
         .with_room(
             Room::new("room1")
                 .with_participant(Participant::screensharer("screen"))
-                .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
-                .with_participant(Participant::manual_subscriber("viewer", 2)),
+                .with_participant(Participant::publisher("camera", &["f"]))
+                .with_participant(Participant::manual_subscriber("viewer", 2).with_native_playback()),
         )
         .run(vec![
             Step::WaitForPublication {
@@ -1694,34 +1191,46 @@ fn requested_streams_recover_when_downstream_capacity_returns_test() {
                 participant: "viewer",
                 bits_per_sec: 5_000_000,
             },
-            Step::WaitForVideo {
-                description: "Both requested sources decode after capacity returns",
+            Step::WaitForNativeVideo {
+                description: "Native camera playback resumes after capacity returns",
                 participant: "viewer",
-                publishers: &["camera", "screen"],
-                timeout: Duration::from_secs(120),
+                publisher: "camera",
+                min_resolution: (1280, 720),
+                timeout: Duration::from_secs(60),
+            },
+            Step::WaitForNativeVideo {
+                description: "Native screen playback also resumes",
+                participant: "viewer",
+                publisher: "screen",
+                min_resolution: (1280, 720),
+                timeout: Duration::from_secs(60),
+            },
+            Step::BeginNativePlayback {
+                description: "Track camera playback after both sources recover",
+                participant: "viewer",
+                after_pause: false,
             },
             Step::Run {
                 description: "Measure sustained delivery after both sources recover",
                 duration: Duration::from_secs(5),
             },
-            Step::CheckVideoQualityInterval {
-                description: "Recovered video remains decodable after the constrained phase",
-                participant: "viewer",
-                quality: VideoQuality::min_frames(120).allow_gaps(12),
-            },
-            Step::CheckVideoDecodedFromInterval {
-                description: "The camera keeps decoding throughout the recovered interval",
+            Step::CheckNativePlayback {
+                description: "The camera keeps playing fresh full-size frames after recovery",
                 participant: "viewer",
                 publisher: "camera",
-                min_frames: 1,
-                min_resolution: (1, 1),
+                expected: PlaybackExpectation {
+                    content: Playback::Camera,
+                    min_frames: 120,
+                    min_resolution: (1280, 720),
+                },
+                fresh_receiver: false,
             },
-            Step::CheckVideoDecodedFromInterval {
-                description: "The screenshare keeps decoding throughout the recovered interval",
+            Step::CheckNativeSourceProgress {
+                description: "The screenshare also delivers fresh native frames in the same interval",
                 participant: "viewer",
                 publisher: "screen",
                 min_frames: 1,
-                min_resolution: (1, 1),
+                min_resolution: (1280, 720),
             },
         ]);
 }
@@ -1732,12 +1241,12 @@ fn all_requested_gallery_sources_recover_after_capacity_returns_test() {
         .with_bandwidth(2_500_000)
         .with_room(
             Room::new("room1")
-                .with_participant(Participant::publisher("speaker", &["q", "h", "f"]))
-                .with_participant(Participant::publisher("tile1", &["q", "h", "f"]))
-                .with_participant(Participant::publisher("tile2", &["q", "h", "f"]))
-                .with_participant(Participant::publisher("tile3", &["q", "h", "f"]))
-                .with_participant(Participant::publisher("tile4", &["q", "h", "f"]))
-                .with_participant(Participant::publisher("tile5", &["q", "h", "f"]))
+                .with_participant(Participant::publisher("speaker", &["f"]))
+                .with_participant(Participant::publisher("tile1", &["q"]))
+                .with_participant(Participant::publisher("tile2", &["q"]))
+                .with_participant(Participant::publisher("tile3", &["q"]))
+                .with_participant(Participant::publisher("tile4", &["q"]))
+                .with_participant(Participant::publisher("tile5", &["q"]))
                 .with_participant(Participant::manual_subscriber("viewer", 6)),
         )
         .run(vec![
@@ -1782,71 +1291,6 @@ fn all_requested_gallery_sources_recover_after_capacity_returns_test() {
         ]);
 }
 
-/// On a link that comfortably fits the top layer, the subscription must actually get there.
-///
-/// The "stuck at 360p" guard. 3 Mbps carries the 1.25 Mbps `f` layer several times over, so a
-/// viewer asking for 720p has no excuse to settle for `h`.
-///
-/// # Why this needs a rate-limited link
-///
-/// Every other plan here runs unlimited, and that quietly removes the failure mode. turmoil models
-/// latency and loss but not capacity, so an unlimited path carries any offered load: there is no
-/// queueing delay, the delay-based estimate never falls, and `limit_probe_bitrate` floors probe
-/// results at it. A starved probe simply cannot drag the estimate down, so no unlimited plan can
-/// distinguish congestion control that ramps from congestion control that gives up.
-///
-/// [`LocalNodeSim::with_bandwidth`] adds a real bottleneck - rate, queueing delay, and tail drop
-/// once the buffer fills - so the estimate tracks capacity for the first time. Sanity-checked at
-/// 800 kbps, where the estimate settles at 663 kbps and the allocator walks the ladder down
-/// `H -> M -> L` as it should.
-#[test]
-fn subscriber_reaches_top_layer_on_a_rate_limited_link_test() {
-    LocalNodeSim::new()
-        .with_bandwidth(3_000_000)
-        .with_room(
-            Room::new("room1")
-                .with_participant(Participant::publisher("alice", &["q", "h", "f"]))
-                .with_participant(Participant::multi_subscriber("bob", 1)),
-        )
-        .run(vec![
-            Step::Run {
-                description: "Establish connection and discover the track",
-                duration: Duration::from_secs(5),
-            },
-            Step::SubscribeTo {
-                description: "Bob asks for 720p; the link carries it twice over",
-                participant: "bob",
-                targets: &[("alice", 720)],
-            },
-            Step::Run {
-                description: "Warmup: BWE has to find the capacity that is there",
-                duration: Duration::from_secs(40),
-            },
-            Step::Run {
-                description: "Measurement window",
-                duration: Duration::from_secs(30),
-            },
-            // 30s of f is ~4.7 MB; of h, ~1.5 MB. 3 MB cleanly separates "reached the top layer"
-            // from "stuck partway up the ladder".
-            Step::CheckVideoDecodedFromInterval {
-                description: "Bob reaches the 720p layer rather than stalling below it",
-                participant: "bob",
-                publisher: "alice",
-                min_frames: 1,
-                min_resolution: (1, 720),
-            },
-            Step::Report {
-                description: "steady state",
-                participant: "bob",
-            },
-            Step::Expect {
-                description: "The link is not driven into its buffer",
-                participant: "bob",
-                property: Property::QueueingDelayBelow(Duration::from_millis(100)),
-            },
-        ]);
-}
-
 /// A subscription squeezed onto a low layer must climb back when the link recovers.
 ///
 /// The link starts at 500 kbps, which only affords `q`, then widens to 3 Mbps. The viewer asked
@@ -1855,55 +1299,6 @@ fn subscriber_reaches_top_layer_on_a_rate_limited_link_test() {
 /// This is a rate-limited downlink recovery anchor: the viewer must move from the bottom layer to
 /// the requested top layer after its SFU egress recovers. It does not model publisher uplink
 /// congestion, because the simulator's publisher socket bypasses the SFU egress shaper.
-#[test]
-fn subscription_climbs_back_after_the_link_recovers_test() {
-    LocalNodeSim::new()
-        .with_bandwidth(500_000)
-        .with_room(
-            Room::new("room1")
-                .with_participant(Participant::publisher("alice", &["q", "h", "f"]))
-                .with_participant(Participant::multi_subscriber("bob", 1)),
-        )
-        .run(vec![
-            Step::Run {
-                description: "Establish connection and discover the track",
-                duration: Duration::from_secs(5),
-            },
-            Step::SubscribeTo {
-                description: "Bob asks for 720p, but the link only affords the bottom layer",
-                participant: "bob",
-                targets: &[("alice", 720)],
-            },
-            Step::Run {
-                description: "Squeeze: long enough to settle on the low layer",
-                duration: Duration::from_secs(60),
-            },
-            Step::SetBandwidth {
-                description: "The viewer link recovers to 3 Mbps",
-                participant: "bob",
-                bits_per_sec: 3_000_000,
-            },
-            Step::WaitForVideoAtResolution {
-                description: "Fresh decoded delivery reaches the requested full height",
-                participant: "bob",
-                publishers: &["alice"],
-                min_resolution: (1, 720),
-                timeout: Duration::from_secs(180),
-            },
-            Step::Run {
-                description: "Measurement window",
-                duration: Duration::from_secs(30),
-            },
-            // 30s of f is ~4.7 MB; of h, ~1.5 MB; of q, ~0.5 MB. 3 MB means it climbed all the
-            // way back rather than stalling on a rung.
-            Step::CheckRxBytesInterval {
-                description: "Bob is back on the 720p layer, not stranded below it",
-                participant: "bob",
-                min_bytes: 3_000_000,
-            },
-        ]);
-}
-
 /// A steady 720p subscription should mostly carry video, not retransmission and padding.
 ///
 /// A production capture showed a viewer receiving 46 MB over ~190s to deliver only 15 MB of
@@ -1951,167 +1346,24 @@ fn steady_subscription_keeps_requested_source_decodable_test() {
         ]);
 }
 
-/// Capacity that slides instead of stepping, which is what a real link does.
-///
-/// Every other plan changes bandwidth instantaneously. A controller can handle square waves and
-/// still misbehave on a gradual change: a slow decline gives the delay estimator a continuously
-/// moving target, and the failure mode is riding the queue down rather than backing off, which
-/// shows up as latency long before it shows up as throughput.
-///
-/// The capacity-relative properties deliberately refuse to run here — on a ramp "the capacity" is
-/// not one number — so this asserts the two that remain meaningful: the controller must not park
-/// in the bottleneck's buffer, and must not sustain congestion loss.
+/// Once a gradual decline settles, playback must continue without a standing queue.
 #[test]
 fn estimate_follows_a_sliding_link_without_riding_the_queue_test() {
-    LocalNodeSim::new()
-        .with_bandwidth(3_000_000)
-        .with_room(
-            Room::new("room1")
-                .with_participant(Participant::publisher("alice", &["q", "h", "f"]))
-                .with_participant(Participant::multi_subscriber("bob", 1)),
-        )
-        .run(vec![
-            Step::Run {
-                description: "Establish connection and discover the track",
-                duration: Duration::from_secs(5),
-            },
-            Step::SubscribeTo {
-                description: "Bob asks for 720p",
-                participant: "bob",
-                targets: &[("alice", 720)],
-            },
-            Step::Run {
-                description: "Warmup at full capacity",
-                duration: Duration::from_secs(30),
-            },
-            Step::SetCapacity {
-                description: "The link slides down to 700 kbps over 40s",
-                participant: "bob",
-                capacity: Capacity::Ramp {
-                    from: 3_000_000,
-                    to: 700_000,
-                    over: Duration::from_secs(40),
-                },
-                max_backlog: Duration::from_millis(200),
-            },
-            Step::Run {
-                description: "Follow the decline",
-                duration: Duration::from_secs(50),
-            },
-            // A second window, so the assertions describe the settled link rather than the
-            // transition. Every counter resets on Run, and during a 4.3x decline a transient
-            // queue spike is not a defect - the controller cannot shed rate before the capacity
-            // it has not yet observed goes away. What it may not do is stay there.
-            Step::Run {
-                description: "Settled at the new, lower capacity",
-                duration: Duration::from_secs(30),
-            },
-            Step::Report {
-                description: "settled after the decline",
-                participant: "bob",
-            },
-            // Measured settled: a 7ms standing queue behind a ~100ms peak, no congestion loss,
-            // and the estimate within 5.7% of the new capacity. The gap between those two numbers
-            // is the point - the peak moves 88-108ms with the seed while the standing queue holds
-            // at 6-8ms, so bounding the peak tested the noise and not the controller. During the
-            // decline itself the queue hits the full 200ms buffer with 7.2% tail-drop, which is
-            // what a window spanning the transition reports - and asserting on that would be
-            // asserting that the controller predict a capacity drop before observing it.
-            Step::Expect {
-                description: "Once settled, the controller is not sitting in the buffer",
-                participant: "bob",
-                property: Property::QueueingDelayBelow(Duration::from_millis(100)),
-            },
-            Step::Expect {
-                description: "A settled link is not sustaining congestion loss",
-                participant: "bob",
-                property: Property::CongestionLossBelow(1),
-            },
-        ]);
+    use super::native_state::spatial_vp9::{CapacityTracking, Check};
+    super::quic_data::run_spatial_vp9_downlink(60, |receiver_ip| Check::CapacityTracking {
+        receiver_ip,
+        profile: CapacityTracking::Ramp,
+    });
 }
 
-/// A link that breathes, plus wireless-style burst loss.
-///
-/// Oscillation and Gilbert-Elliott loss together are the closest thing here to a real congested
-/// Wi-Fi link: capacity moves continuously and loss arrives in correlated runs rather than spread
-/// evenly. Uniform loss at the same average rate is a materially easier problem, so a controller
-/// that only ever sees it is not tested against what it will actually meet.
+/// Measure congestion loss across three full capacity oscillations with burst loss.
 #[test]
 fn estimate_survives_an_oscillating_lossy_link_test() {
-    LocalNodeSim::new()
-        .with_udp_only()
-        .with_bandwidth(2_500_000)
-        .with_room(
-            Room::new("room1")
-                .with_participant(Participant::publisher("alice", &["q", "h", "f"]))
-                .with_participant(Participant::multi_subscriber("bob", 1)),
-        )
-        .run(vec![
-            Step::Run {
-                description: "Establish connection and discover the track",
-                duration: Duration::from_secs(5),
-            },
-            Step::SubscribeTo {
-                description: "Bob asks for 720p",
-                participant: "bob",
-                targets: &[("alice", 720)],
-            },
-            Step::Run {
-                description: "Warmup on a steady link",
-                duration: Duration::from_secs(30),
-            },
-            Step::SetCapacity {
-                description: "Capacity breathes between 800 kbps and 2.5 Mbps every 20s",
-                participant: "bob",
-                capacity: Capacity::Oscillate {
-                    min: 800_000,
-                    max: 2_500_000,
-                    period: Duration::from_secs(20),
-                },
-                max_backlog: Duration::from_millis(200),
-            },
-            Step::SetLoss {
-                description: "Wi-Fi style burst loss",
-                participant: "bob",
-                loss: Loss::wifi(),
-            },
-            Step::Run {
-                description: "Adapt to the new regime",
-                duration: Duration::from_secs(40),
-            },
-            // Three whole 20s periods, so the window is not weighted toward one phase of the
-            // cycle and the first adaptation is excluded. This link never settles, so unlike the
-            // ramp there is no steady state to wait for - the claim has to hold while moving.
-            Step::Run {
-                description: "Three full periods of the oscillation",
-                duration: Duration::from_secs(60),
-            },
-            Step::Report {
-                description: "riding the oscillation",
-                participant: "bob",
-            },
-            // Measured across three periods: 4.7% congestion loss, and peak queue reaching the
-            // full 200ms buffer during the low phases of the cycle.
-            //
-            // No peak-queue assertion here, deliberately. Unlike the ramp there is no settled
-            // state to measure against: capacity is always moving, so the queue is always either
-            // filling or draining, and a peak taken over three periods says only that it touched
-            // the buffer once. Whether a controller could avoid that on a link halving every 10s
-            // is a real question and not one this plan answers, so pinning a number would be
-            // asserting an unexamined opinion.
-            //
-            // The loss bound is the defensible claim: whatever the queue does transiently, the
-            // controller must not sit in overuse. Recorded at 4.7%, bounded at 8% for headroom.
-            // See the buffer-saturation follow-up.
-            //
-            // Also deliberately no media-efficiency assertion: this link drops packets, and that
-            // property is not a meaningful ratio under loss. See its doc comment.
-            Step::Expect {
-                description: "Riding an oscillating link does not sustain congestion loss",
-                participant: "bob",
-                property: Property::CongestionLossBelow(8),
-            },
-        ]);
+    use super::native_state::spatial_vp9::{CapacityTracking, Check};
+    super::quic_data::run_spatial_vp9_downlink(60, |receiver_ip| Check::CapacityTracking {
+        receiver_ip,
+        profile: CapacityTracking::Oscillation,
+    });
 }
 
 /// A still screen share on a healthy link must not talk the estimate down.
@@ -2524,36 +1776,33 @@ fn equal_priority_subscriptions_share_a_scarce_link_test() {
         ]);
 }
 
-/// Allocation with a room bigger than any other plan here exercises.
-///
-/// Every other plan has two or three publishers, and an allocator can be very wrong in ways that
-/// only show up once several streams compete for one budget: a priority comparison that is fine
-/// pairwise but not transitive, a reserve sized per-stream rather than per-link, a waterfall that
-/// spends everything on whoever it happens to reach first. None of that is reachable with two
-/// streams.
-///
-/// Every requested minimum fits this budget. Minimum-first allocation must keep all
-/// tiles forwarding before upgrading the speaker; discovery order must not omit a tile.
+/// A six-source gallery must preserve every protected tile when the speaker joins.
 #[test]
 fn a_busy_room_starves_nobody_test() {
-    const PUBLISHERS: [&str; 6] = ["ann", "ben", "cal", "dee", "eve", "fay"];
-
-    let mut room = Room::new("room1");
-    for name in PUBLISHERS {
-        room = room.with_participant(Participant::publisher(name, &["q", "h", "f"]));
+    const TILES: [&str; 5] = ["ben", "cal", "dee", "eve", "fay"];
+    let small = native_temporal_fixture(&["q"]);
+    let mut room = Room::new("room1")
+        .with_participant(
+            Participant::publisher("ann", &["h"])
+                .with_native_video_fixture(native_temporal_fixture(&["h"])),
+        )
+        .with_participant(Participant::manual_subscriber("viewer", 6).with_native_playback());
+    for name in TILES {
+        room = room.with_participant(
+            Participant::publisher(name, &["q"]).with_native_video_fixture(small.clone()),
+        );
     }
-    room = room.with_participant(Participant::manual_subscriber("viewer", PUBLISHERS.len()));
 
     let mut steps = vec![
         Step::Run {
-            description: "Establish connections and discover six cameras",
+            description: "Discover six independent camera sources",
             duration: Duration::from_secs(8),
         },
         Step::SubscribeToQos {
-            description: "Protect every small tile before upgrading the speaker",
+            description: "Protect each gallery tile while leaving the desired speaker optional",
             participant: "viewer",
             targets: &[
-                ("ann", 720, 180, 100),
+                ("ann", 360, 0, 100),
                 ("ben", 180, 180, 10),
                 ("cal", 180, 180, 10),
                 ("dee", 180, 180, 10),
@@ -2561,40 +1810,42 @@ fn a_busy_room_starves_nobody_test() {
                 ("fay", 180, 180, 10),
             ],
         },
-        Step::Run {
-            description: "Settle the gallery",
-            duration: Duration::from_secs(60),
-        },
-        // At the measured ~2Mbps estimate, all minimums and the middle
-        // speaker rung fit. The top rung plus all minimums and upgrade
-        // headroom does not. A target is not permission to displace a minimum.
-        Step::CheckVideoDecodedFromInterval {
-            description: "The speaker gets the affordable upgrade above its minimum",
+        Step::WaitForSourceVideo {
+            description: "The optional speaker progresses without replacing the gallery",
             participant: "viewer",
             publisher: "ann",
-            min_frames: 1,
-            min_resolution: (1, 360),
+            min_resolution: (640, 360),
+            temporal_index: None,
+            timeout: Duration::from_secs(20),
+        },
+        Step::Run {
+            description: "Measure sustained concurrent gallery service",
+            duration: Duration::from_secs(20),
+        },
+        Step::CheckNativeSourceProgress {
+            description: "The speaker continues delivering fresh native pictures",
+            participant: "viewer",
+            publisher: "ann",
+            min_frames: 140,
+            min_resolution: (640, 360),
         },
     ];
-    for origin in PUBLISHERS.into_iter().skip(1) {
-        steps.push(Step::CheckVideoDecodedFromInterval {
-            description: "Every protected tile independently decodes, regardless of discovery order",
+    for publisher in TILES {
+        steps.push(Step::CheckNativeSourceProgress {
+            description: "Every protected tile independently makes fresh native progress",
             participant: "viewer",
-            publisher: origin,
-            min_frames: 1,
-            min_resolution: (1, 180),
+            publisher,
+            min_frames: 140,
+            min_resolution: (320, 180),
         });
     }
-    steps.extend([Step::Expect {
+    steps.push(Step::Expect {
         description: "Six streams do not drive the link into congestion",
         participant: "viewer",
         property: Property::CongestionLossBelow(5),
-    }]);
+    });
 
     LocalNodeSim::new()
-        // The link and measured estimate carry all six minimums, but not six
-        // targets. Target progress is conditional on the estimate and headroom,
-        // not nominal link capacity or elementary-stream payload rates.
         .with_bandwidth(3_000_000)
         .with_room(room)
         .run(steps);

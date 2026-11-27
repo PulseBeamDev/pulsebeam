@@ -47,7 +47,15 @@ struct Receiver {
     format_budget_exhausted: bool,
     regressions: u64,
     window_max_gap: Duration,
+    window_cadence: Option<RtpCadence>,
     window_fingerprints: BTreeMap<(u32, u32), BTreeSet<u64>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RtpCadence {
+    min_ticks: u32,
+    max_ticks: u32,
+    intervals: u64,
 }
 
 impl NativeDecodedVideoLog {
@@ -121,10 +129,19 @@ impl NativeDecodedVideoLog {
         }
         match frame.metadata.rtp_timestamp {
             Some(timestamp) => {
-                if receiver.last_rtp.is_some_and(|previous| {
-                    timestamp == previous || timestamp.wrapping_sub(previous) >= 0x8000_0000
-                }) {
-                    receiver.regressions += 1;
+                if let Some(previous) = receiver.last_rtp {
+                    let ticks = timestamp.wrapping_sub(previous);
+                    if ticks == 0 || ticks >= 0x8000_0000 {
+                        receiver.regressions += 1;
+                    }
+                    let cadence = receiver.window_cadence.get_or_insert(RtpCadence {
+                        min_ticks: ticks,
+                        max_ticks: ticks,
+                        intervals: 0,
+                    });
+                    cadence.min_ticks = cadence.min_ticks.min(ticks);
+                    cadence.max_ticks = cadence.max_ticks.max(ticks);
+                    cadence.intervals += 1;
                 }
                 receiver.last_rtp = Some(timestamp);
             }
@@ -398,6 +415,31 @@ impl NativeDecodedVideoLog {
         )
     }
 
+    pub fn require_cadence(
+        &self,
+        track: &NativeReceiverInfo,
+        ticks: u32,
+        min_intervals: u64,
+    ) -> Result<()> {
+        let receiver = self
+            .receivers
+            .get(&(track.generation, track.receiver))
+            .context("native cadence receiver unavailable")?;
+        // RTC quantizes capture times to milliseconds before converting to
+        // the 90 kHz RTP clock. One tick interval can straddle a rounding boundary.
+        const TICKS_PER_MS: u32 = 90;
+        ensure!(
+            receiver.window_cadence.is_some_and(|cadence| {
+                cadence.intervals >= min_intervals
+                    && cadence.min_ticks >= ticks.saturating_sub(TICKS_PER_MS)
+                    && cadence.max_ticks <= ticks.saturating_add(TICKS_PER_MS)
+            }),
+            "native decoder cadence {:?}; expected at least {min_intervals} intervals within {TICKS_PER_MS} RTP ticks of {ticks}",
+            receiver.window_cadence
+        );
+        Ok(())
+    }
+
     /// Recovery starts after an intentionally absent publication. Keep counts
     /// and cumulative validity, but measure cadence between resumed callbacks.
     /// Continuous rung switching must use `checkpoint` instead.
@@ -412,6 +454,7 @@ impl NativeDecodedVideoLog {
     pub fn checkpoint(&mut self) -> Self {
         for receiver in self.receivers.values_mut() {
             receiver.window_max_gap = Duration::ZERO;
+            receiver.window_cadence = None;
             receiver.window_fingerprints.clear();
         }
         self.clone()

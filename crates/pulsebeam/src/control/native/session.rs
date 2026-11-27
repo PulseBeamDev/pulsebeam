@@ -2764,6 +2764,7 @@ pub(crate) fn track_descriptor(track: &crate::track::Track) -> Option<wire::Trac
         Track::Video(video) => wire::track::Kind::Video(wire::VideoTrack {
             format: Some(video.format.clone()?),
             av1_whole_source: video.av1_whole_source,
+            guarantees_video_dd: video.guarantees_video_dd,
         }),
         Track::Data(data) => wire::track::Kind::Data(wire::DataTrack {
             capture_clock: data.capture_clock.clone(),

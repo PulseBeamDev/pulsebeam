@@ -188,9 +188,7 @@ pub(crate) fn receiver_target(
                 .binding
                 .as_ref()
                 .and_then(|binding| binding.transport.as_ref()),
-            Some(
-                wire::track_binding::Transport::Rtp(_) | wire::track_binding::Transport::QuicRtp(_)
-            )
+            Some(wire::track_binding::Transport::Rtp(_))
         ),
     })
 }

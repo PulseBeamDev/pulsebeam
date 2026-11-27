@@ -180,6 +180,7 @@ pub(in crate::tests) struct UdpRtpWindow {
     received_from: IpAddr,
     peaks: RefCell<UdpRtpPeaks>,
     repair: RefCell<Option<UdpRtpRepair>>,
+    receive_edges: RefCell<BTreeMap<u32, Option<(SocketAddr, SocketAddr)>>>,
 }
 
 #[derive(Debug)]
@@ -240,13 +241,21 @@ impl UdpRtpWindow {
         *self.peaks.borrow()
     }
 
-    fn observe(&self, remote: IpAddr, bytes: &[u8], outgoing: bool) -> bool {
+    pub(in crate::tests) fn watch_receive_edge(&self, ssrc: u32) {
+        self.receive_edges.borrow_mut().insert(ssrc, None);
+    }
+
+    pub(in crate::tests) fn receive_edge(&self, ssrc: u32) -> Option<(SocketAddr, SocketAddr)> {
+        self.receive_edges.borrow().get(&ssrc).copied().flatten()
+    }
+
+    fn observe(&self, remote: SocketAddr, local: SocketAddr, bytes: &[u8], outgoing: bool) -> bool {
         let endpoint = if outgoing {
             self.sent_to
         } else {
             self.received_from
         };
-        if remote == endpoint
+        if remote.ip() == endpoint
             && let [first, pt, ..] = bytes
             && first >> 6 == 2
             && first & 0x20 == 0
@@ -264,6 +273,14 @@ impl UdpRtpWindow {
             } else {
                 peaks.received = peaks.received.max(bytes.len());
                 peaks.received_count += 1;
+                if let Some(ssrc) = bytes.get(8..12).and_then(|value| value.try_into().ok())
+                    && let Some(edge) = self
+                        .receive_edges
+                        .borrow_mut()
+                        .get_mut(&u32::from_be_bytes(ssrc))
+                {
+                    *edge = Some((remote, local));
+                }
             }
             if let Some(repair) = self.repair.borrow_mut().as_mut()
                 && let Some(ssrc) = bytes.get(8..12).and_then(|value| value.try_into().ok())
@@ -361,6 +378,7 @@ impl NativeHost {
             received_from,
             peaks: RefCell::default(),
             repair: RefCell::default(),
+            receive_edges: RefCell::default(),
         });
         *active = Rc::downgrade(&window);
         window
@@ -612,7 +630,12 @@ impl Transport {
                                     break;
                                 }
                                 if udp_rtp.borrow().upgrade().is_some_and(|window| {
-                                    !window.observe(remote.ip(), &data[..len], false)
+                                    !window.observe(
+                                        remote,
+                                        socket_addr(source),
+                                        &data[..len],
+                                        false,
+                                    )
                                 }) {
                                     continue;
                                 }
@@ -650,7 +673,12 @@ impl Transport {
                         )
                     })?;
                 if let Some(window) = self.udp_rtp.borrow().upgrade() {
-                    window.observe(destination.ip(), &packet.packet().payload, true);
+                    window.observe(
+                        socket_addr(destination),
+                        socket_addr(source),
+                        &packet.packet().payload,
+                        true,
+                    );
                 }
             }
             OutboundKind::TcpConnect => {

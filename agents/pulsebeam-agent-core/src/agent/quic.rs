@@ -320,18 +320,12 @@ impl Agent {
     }
 
     #[doc(hidden)]
-    pub fn enable_quic_h264_dd(&mut self, track_id: &str) -> Result<(), AgentError> {
-        self.configure_quic_publication(
-            track_id,
-            PublicationProfile::Video {
-                mime: "video/h264",
-                emits_dd: true,
-            },
-        )
-    }
-
-    #[doc(hidden)]
-    pub fn configure_quic_video(&mut self, track_id: &str, mime: &str) -> Result<(), AgentError> {
+    pub fn configure_quic_video(
+        &mut self,
+        track_id: &str,
+        mime: &str,
+        emits_dd: bool,
+    ) -> Result<(), AgentError> {
         let mime = match mime {
             "video/h264" => "video/h264",
             "video/vp8" => "video/vp8",
@@ -339,24 +333,7 @@ impl Agent {
             "video/av1" => "video/av1",
             _ => return Err(crate::ValidationError::QuicPublicationProfile.into()),
         };
-        self.configure_quic_publication(
-            track_id,
-            PublicationProfile::Video {
-                mime,
-                emits_dd: false,
-            },
-        )
-    }
-
-    #[doc(hidden)]
-    pub fn configure_quic_vp9_dd(&mut self, track_id: &str) -> Result<(), AgentError> {
-        self.configure_quic_publication(
-            track_id,
-            PublicationProfile::Video {
-                mime: "video/vp9",
-                emits_dd: true,
-            },
-        )
+        self.configure_quic_publication(track_id, PublicationProfile::Video { mime, emits_dd })
     }
 
     fn configure_quic_publication(

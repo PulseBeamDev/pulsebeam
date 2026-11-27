@@ -433,6 +433,31 @@ impl TrackTopology {
             .flat_map(move |room| room.candidate_subscribers(identity.publication_id))
     }
 
+    pub(super) fn enabled_exact_subscribers(
+        &self,
+        room: ProjectRoomKey,
+        publication: PublicationKey,
+    ) -> impl Iterator<Item = ConnectionId> + '_ {
+        self.rooms.get(&room).into_iter().flat_map(move |room| {
+            room.by_track
+                .get(&publication)
+                .into_iter()
+                .flatten()
+                .filter_map(|&id| {
+                    let subscription = room.subscriptions.get(id)?;
+                    match subscription.subscriber {
+                        Subscriber::Connection(connection)
+                            if subscription.owned_ref.is_some()
+                                && subscription.selection == SelectionPolicy::All =>
+                        {
+                            Some(connection)
+                        }
+                        _ => None,
+                    }
+                })
+        })
+    }
+
     pub(crate) fn active_subscribers(
         &self,
         identity: TrackAncestry,
