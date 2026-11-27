@@ -97,12 +97,18 @@ fn media_keeps_both_extension_forms_and_minimum_padding() {
 }
 
 #[test]
-fn negotiated_vp9_omission_run_is_not_part_of_the_fabric_image() {
+fn selected_omission_run_is_not_part_of_the_fabric_image() {
+    for profile in [Profile::Vp9, Profile::H264] {
+        check_omission_run(profile);
+    }
+}
+
+fn check_omission_run(profile: Profile) {
     let ssrc = NonZeroU32::new(0x0506_0708).unwrap();
-    let window = Window::new(Profile::Vp9, 0x18000, 3, ssrc, 1 << 2).unwrap();
+    let window = Window::new(profile, 0x18000, 3, ssrc, 1 << 2).unwrap();
     let position = 0x18002;
     let header = Header {
-        profile: Profile::Vp9,
+        profile,
         marker: true,
         sequence: low32(position),
         timestamp: 0x0102_0304,
@@ -167,9 +173,9 @@ fn negotiated_vp9_omission_run_is_not_part_of_the_fabric_image() {
                 .2
                 .is_none()
         );
-        let h264 = Window::new(Profile::H264, 0x18000, 3, ssrc, 1 << 2).unwrap();
+        let vp8 = Window::new(Profile::Vp8, 0x18000, 3, ssrc, 1 << 2).unwrap();
         bytes[count] = 2;
-        assert!(h264.decode_projected(&bytes).is_err());
+        assert!(vp8.decode_projected(&bytes).is_err());
     }
 }
 

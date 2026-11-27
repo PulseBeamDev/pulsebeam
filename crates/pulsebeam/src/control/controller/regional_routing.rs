@@ -34,6 +34,7 @@ mod media_branch;
 mod media_client;
 mod media_ingress;
 mod media_permit;
+mod media_protection;
 mod media_read;
 
 use forwarding::{Arrival, Forwarding, Link, Links, Router};
@@ -80,6 +81,7 @@ impl Border {
 
 struct Connected<'a> {
     epoch: Instant,
+    now: Instant,
     mesh: Option<&'a Exchange>,
     peers: &'a [Peer],
     borders: &'a BTreeMap<Member, Border>,
@@ -113,7 +115,18 @@ impl Connected<'_> {
 
 impl Links for Connected<'_> {
     fn first_local_hop(&self, destination: Member) -> Option<Member> {
-        self.mesh?.path(destination)?.first().copied()
+        let mesh = self.mesh?;
+        let primary = *mesh.path(destination)?.first()?;
+        if self.lane(primary).is_some() {
+            return Some(primary);
+        }
+        // The installed media path can drain while its control lane is closed.
+        // Route new control requests over a live, independent first hop.
+        let (_, alternate) = mesh.protection_paths(destination, self.now)?;
+        alternate
+            .first()
+            .copied()
+            .filter(|hop| self.lane(*hop).is_some())
     }
 
     fn link(&self, member: Member) -> Option<Link> {
@@ -149,18 +162,147 @@ pub(super) struct Routing {
     media_branches: media_branch::Leases,
     media_sends: media_branch::OriginSends,
     media_receives: media_ingress::Receives,
+    protected_transit: media_protection::Transit,
+    protected_base_stream_bps: Option<NonZeroU64>,
+    protected_receivers: media_protection::Receivers,
 }
 
 impl Routing {
+    pub(super) fn protected_media(
+        &self,
+        actor: &ControllerActor,
+        room: crate::entity::ProjectRoomKey,
+        publication: crate::entity::PublicationKey,
+        now: Instant,
+    ) -> bool {
+        self.protection_plan(actor, room, publication, now)
+            .zip(actor.links.as_ref())
+            .is_some_and(|(plan, links)| self.protected_receivers.protected(links, &plan, now))
+    }
+
+    fn protection_plan(
+        &self,
+        actor: &ControllerActor,
+        room: crate::entity::ProjectRoomKey,
+        publication: crate::entity::PublicationKey,
+        now: Instant,
+    ) -> Option<media_protection::ReceiverPlan<'_>> {
+        let wire_bps = self.protected_base_stream_bps?;
+        let wall = SystemTime::now();
+        let mut demands = self.media_client.demands().filter(|demand| {
+            demand.source.room == room
+                && demand.source.publisher.publication == publication
+                && demand.authorized(actor, now, wall)
+        });
+        let demand = demands.next()?;
+        if demands.next().is_some() {
+            return None;
+        }
+        let router = Router {
+            local: self.local,
+            tree: &self.tree,
+            links: Connected {
+                epoch: self.epoch,
+                now,
+                mesh: actor.regional_mesh.as_ref(),
+                peers: &actor.provisioned_peers,
+                borders: &self.borders,
+            },
+        };
+        media_protection::ReceiverPlan::new(&router, demand, wire_bps, now)
+    }
+
+    pub(super) fn drain_media_relay(
+        &mut self,
+        actor: &mut ControllerActor,
+        room: crate::entity::ProjectRoomKey,
+        publication: crate::entity::PublicationKey,
+        relay: Member,
+        now: Instant,
+    ) -> bool {
+        let Some((plan, links)) = self
+            .protection_plan(actor, room, publication, now)
+            .zip(actor.links.as_ref())
+        else {
+            return false;
+        };
+        let Some(primary) = self
+            .protected_receivers
+            .drainable_primary(links, &plan, relay, now)
+        else {
+            return false;
+        };
+        let (endpoint, source) = (plan.demand.endpoint, plan.demand.source);
+        let Some(links) = actor.links.as_mut() else {
+            return false;
+        };
+        let Some(withdrawals) = self
+            .media_receives
+            .drain_primary(links, endpoint, source, primary, relay, now)
+        else {
+            return false;
+        };
+        let protected = self
+            .protected_receivers
+            .retire_relay(links, source, relay, now);
+        let router = Router {
+            local: self.local,
+            tree: &self.tree,
+            links: Connected {
+                epoch: self.epoch,
+                now,
+                mesh: actor.regional_mesh.as_ref(),
+                peers: &actor.provisioned_peers,
+                borders: &self.borders,
+            },
+        };
+        for withdrawal in withdrawals {
+            withdrawal.send(&router);
+        }
+        for withdrawal in protected {
+            withdrawal.send(&router);
+        }
+        true
+    }
+
+    pub(super) fn independent_media_repair(
+        &self,
+        actor: &ControllerActor,
+        interest: crate::route::fabric::network_repair::MediaInterest,
+        now: Instant,
+    ) -> Option<crate::route::fabric::network_repair::MediaInterest> {
+        let links = actor.links.as_ref()?;
+        let source = links.protected_wan_source(interest.parent, now)?;
+        let plan = self.protection_plan(actor, source.room, source.publisher.publication, now)?;
+        if !plan.demand.source.same_window(source) || plan.demand.source.origin != source.origin {
+            return None;
+        }
+        let parent = self.protected_receivers.alternate_repair_parent(
+            links,
+            &plan,
+            interest.parent,
+            interest.position,
+            now,
+        )?;
+        #[cfg(feature = "sim")]
+        crate::sim_metrics::wan_repair::selected_independent_repair(
+            interest.parent.ingress.association,
+            parent.ingress.association,
+            interest.position,
+        );
+        Some(crate::route::fabric::network_repair::MediaInterest { parent, ..interest })
+    }
+
     pub(super) fn media_repair_grants(
         &self,
         peer: NetworkId,
         demand: super::peer_ownership::media_repair::Demand,
         now: Instant,
-    ) -> [Option<super::peer_ownership::media_repair::Grant>; 2] {
+    ) -> [Option<super::peer_ownership::media_repair::Grant>; 3] {
         [
             self.media_sends.media_repair_grant(peer, demand, now),
             self.media_receives.media_repair_grant(peer, demand, now),
+            self.protected_transit.media_repair_grant(peer, demand, now),
         ]
     }
 
@@ -245,7 +387,7 @@ impl Routing {
         let refreshes = refreshes
             .into_iter()
             .filter_map(|(network, demand)| {
-                let [origin, relay] = self.media_repair_grants(network, demand, now);
+                let [origin, relay, _] = self.media_repair_grants(network, demand, now);
                 let ((Some(grant), None) | (None, Some(grant))) = (origin, relay) else {
                     return None;
                 };
@@ -289,6 +431,7 @@ impl Routing {
             tree: &self.tree,
             links: Connected {
                 epoch: self.epoch,
+                now,
                 mesh: actor.regional_mesh.as_ref(),
                 peers: &actor.provisioned_peers,
                 borders: &self.borders,
@@ -372,14 +515,44 @@ impl Routing {
             now,
             wall_now,
         );
+        let protected_plans = self
+            .media_branches
+            .protected()
+            .filter_map(|lease| media_protection::TransitPlan::new(&router, lease))
+            .collect();
+        let receiver_plans =
+            self.protected_base_stream_bps
+                .map_or_else(BTreeMap::new, |wire_bps| {
+                    media_protection::receiver_plans(
+                        &router,
+                        self.media_client.demands(),
+                        wire_bps,
+                        now,
+                    )
+                });
         let plans = media_ingress::plan(
             &router,
             self.media_client.demands(),
             self.media_branches.iter(),
             |target| self.media_client.attempt_for(target),
+            self.protected_base_stream_bps.is_some(),
         );
         self.media_owner.stage(actor, now, wall_now);
-        let updates = self.media_receives.step(actor, plans, now);
+        let updates = self
+            .media_receives
+            .step(actor, plans, &self.protected_receivers, now);
+        let protected_updates = actor
+            .links
+            .as_mut()
+            .map(|links| self.protected_transit.step(links, protected_plans, now))
+            .unwrap_or_default();
+        let receiver_updates = self.protected_receivers.step(
+            actor,
+            &self.media_receives,
+            self.local,
+            receiver_plans,
+            now,
+        );
         self.media_sends
             .step(actor, self.local, &self.media_branches, now, wall_now);
         let router = Router {
@@ -387,12 +560,16 @@ impl Routing {
             tree: &self.tree,
             links: Connected {
                 epoch: self.epoch,
+                now,
                 mesh: actor.regional_mesh.as_ref(),
                 peers: &actor.provisioned_peers,
                 borders: &self.borders,
             },
         };
         for update in updates {
+            update.send(&router);
+        }
+        for update in protected_updates.into_iter().chain(receiver_updates) {
             update.send(&router);
         }
     }
@@ -410,7 +587,13 @@ fn orders(actor: &ControllerActor, owner: Member) -> Vec<Order> {
 }
 
 impl ControllerActor {
-    pub(crate) fn set_region_tree(&mut self, local: Member, tree: RegionTree, epoch: Instant) {
+    pub(crate) fn set_region_tree(
+        &mut self,
+        local: Member,
+        tree: RegionTree,
+        epoch: Instant,
+        protected_base_stream_bps: Option<NonZeroU64>,
+    ) {
         let reads = tree
             .catalog_members()
             .filter(|&member| member != local)
@@ -419,7 +602,10 @@ impl ControllerActor {
         let media_targets = tree
             .catalog_members()
             .filter(|&member| {
-                tree.region(member) != tree.region(local) && tree.media_key(member).is_some()
+                member != local
+                    && tree.media_key(member).is_some()
+                    && (protected_base_stream_bps.is_some()
+                        || tree.region(member) != tree.region(local))
             })
             .collect();
         self.regional_routing = Some(Routing {
@@ -437,6 +623,9 @@ impl ControllerActor {
             media_branches: media_branch::Leases::default(),
             media_sends: media_branch::OriginSends::default(),
             media_receives: media_ingress::Receives::default(),
+            protected_transit: media_protection::Transit::default(),
+            protected_base_stream_bps,
+            protected_receivers: media_protection::Receivers::default(),
         });
     }
 

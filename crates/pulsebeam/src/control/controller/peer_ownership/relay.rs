@@ -177,6 +177,7 @@ pub(super) fn reconcile_wan_receives(
                 offer_cut: source.offer_cut,
                 regional: regional_peer.map(|member| (member, source)),
                 routed: false,
+                protected: false,
                 expires,
                 timing: source.window_timing(),
             },

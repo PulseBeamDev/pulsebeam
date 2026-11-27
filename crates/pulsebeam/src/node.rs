@@ -104,6 +104,7 @@ pub struct NodeBuilder {
     // Services
     cluster: Option<crate::cluster::Options>,
     region_tree: Option<crate::cluster::RegionTree>,
+    protected_base_stream_bps: Option<std::num::NonZeroU64>,
     operator_socket: bool,
     operator_listener: Option<std::os::unix::net::UnixListener>,
     provisioned_peers: Vec<ProvisionedPeer>,
@@ -171,6 +172,7 @@ impl NodeBuilder {
             },
             cluster: None,
             region_tree: None,
+            protected_base_stream_bps: None,
             operator_socket: false,
             operator_listener: None,
             provisioned_peers: Vec::new(),
@@ -407,6 +409,15 @@ impl NodeBuilder {
         ready: pulsebeam_runtime::sync::oneshot::Sender<crate::link::Control>,
     ) -> Self {
         self.link_listen = Some(address);
+        self.with_provisioned_link_control(ready)
+    }
+
+    /// Expose Link control to the trusted process owner without opening a legacy
+    /// listener. Provisioned peers keep their individually configured listeners.
+    pub fn with_provisioned_link_control(
+        mut self,
+        ready: pulsebeam_runtime::sync::oneshot::Sender<crate::link::Control>,
+    ) -> Self {
         self.link_control = Some(ready);
         self
     }
@@ -537,6 +548,7 @@ impl NodeBuilder {
         );
         self.provisioned_peers = options.ownership_peers.clone();
         self.region_tree = options.region_tree.clone();
+        self.protected_base_stream_bps = options.protected_base_stream_bps;
         if self.operator_socket {
             anyhow::ensure!(
                 !self.provisioned_peers.is_empty() && self.key_registry.is_some(),
@@ -979,7 +991,7 @@ impl NodeBuilder {
         let member = |(node, generation)| crate::cluster::mesh::Member { node, generation };
         if let Some(tree) = &self.region_tree {
             let local = self.provisioned_peers.first().context("region tree requires local identity")?;
-            controller.set_region_tree(member(local.local), tree.clone(), clock_origin);
+            controller.set_region_tree(member(local.local), tree.clone(), clock_origin, self.protected_base_stream_bps);
             controller.set_regional_media_key(&local.receipt_key)?;
         }
         #[cfg(feature = "sim")]
@@ -1020,8 +1032,9 @@ impl NodeBuilder {
                 }
                 port
             };
-            let (host, provisioner) = crate::link::wan_host::Service::bind(peer.listen, clock_origin)
-                .await.context("binding nonfragmenting Fabric WAN UDP")?;
+            let (host, provisioner) = crate::link::wan_host::Service::bind(
+                peer.listen, clock_origin, peer.protected_egress_bps,
+            ).await.context("binding nonfragmenting Fabric WAN UDP")?;
             hosts.push(SocketHost::Wan(host));
             if scope.is_some_and(|scope| scope.is_border()) {
                 let remote = member(peer.remote);

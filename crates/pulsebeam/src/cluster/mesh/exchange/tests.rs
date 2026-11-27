@@ -17,6 +17,53 @@ async fn send(exchange: &Exchange, peer: &mut Outbound, now: Instant) -> Box<[u8
     stream.directions().0.recv().await.unwrap().0
 }
 
+#[test]
+fn protection_does_not_use_an_expired_standby_between_reconciliations() {
+    let (publisher, relay, edge) = (member(), member(), member());
+    let now = Instant::now();
+    let cost = default_link_cost();
+    let links = BTreeMap::from([(relay, cost), (edge, cost)]);
+    let mut exchange = Exchange::new(publisher, Role::Router, now);
+    for (origin, role, fresh_ms, links) in [
+        (
+            relay,
+            Role::Router,
+            50,
+            vec![(publisher, cost), (edge, cost)],
+        ),
+        (
+            edge,
+            Role::Edge,
+            100,
+            vec![(publisher, cost), (relay, cost)],
+        ),
+    ] {
+        let mut frame = TAG.to_vec();
+        serde_json::to_writer(
+            &mut frame,
+            &[Report {
+                origin,
+                role,
+                revision: NonZeroU64::MIN,
+                fresh_ms,
+                links,
+            }],
+        )
+        .unwrap();
+        assert!(exchange.receive(&Outbound::new(origin, role), &frame, now));
+    }
+    exchange.reconcile(links, now);
+    assert_eq!(
+        exchange.protection_paths(edge, now),
+        Some(([edge].as_slice(), vec![relay, edge]))
+    );
+    assert_eq!(
+        exchange.protection_paths(edge, now + Duration::from_millis(50)),
+        None
+    );
+    assert_eq!(exchange.path(edge), Some([edge].as_slice()));
+}
+
 #[pulsebeam_runtime::test(start_paused = true, crate = "pulsebeam_runtime::__harness")]
 async fn router_relays_fresh_bilateral_links_but_a_replay_cannot_extend_them() {
     let (p, r, a) = (member(), member(), member());
@@ -43,6 +90,7 @@ async fn router_relays_fresh_bilateral_links_but_a_replay_cannot_extend_them() {
     assert!(publisher.receive(&publisher_from_router, &frame, now));
     publisher.reconcile(BTreeMap::from([(r, cost)]), now);
     assert_eq!(publisher.path(a), Some([r, a].as_slice()));
+    assert_eq!(publisher.protection_paths(a, now), None);
 
     let nearly_expired = now + FRESH - RECHECK;
     assert!(publisher.receive(&publisher_from_router, &frame, nearly_expired));

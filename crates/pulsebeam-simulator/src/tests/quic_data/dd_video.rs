@@ -24,7 +24,7 @@ use super::{
     sim_quic_agent_with_placement, stage_rtp_source,
 };
 
-const TRACK: &str = "spatial-camera";
+pub(in crate::tests) const TRACK: &str = "spatial-camera";
 const CAPTURE_PICTURES: u32 = 36;
 const WIRE: &[u8] = include_bytes!("../../../../pulsebeam-testdata/fixtures/vp9-v1/L3T1/wire.bin");
 const INDEX: &str = include_str!("../../../../pulsebeam-testdata/fixtures/vp9-v1/L3T1/wire.tsv");
@@ -447,7 +447,7 @@ pub(in crate::tests) async fn connect_publisher(
     connect_dd_publisher(address, local, edge, roots, publisher_token, Codec::Vp9).await
 }
 
-pub(super) async fn connect_dd_publisher(
+pub(in crate::tests) async fn connect_dd_publisher(
     address: SocketAddr,
     local: std::net::IpAddr,
     edge: SocketAddr,
@@ -508,7 +508,7 @@ pub(in crate::tests) async fn replay(
     .await
 }
 
-pub(super) async fn replay_graph(
+pub(in crate::tests) async fn replay_graph(
     publisher: &mut Agent,
     source: &Publication,
     graph: Graph,

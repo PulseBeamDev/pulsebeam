@@ -2,8 +2,8 @@ mod receives;
 mod sends;
 
 pub(super) use receives::RepairReceives;
-pub(in crate::control::controller) use sends::Grant;
-pub(super) use sends::RepairRequests;
+pub(in crate::control::controller) use sends::{Grant, Source};
+pub(super) use sends::{Packet, Receipt, RepairRequests};
 
 use std::num::{NonZeroU32, NonZeroU64};
 
@@ -22,8 +22,8 @@ const READY_BYTES: usize = DEMAND_BYTES + WINDOW_TUPLE_BYTES;
 /// Decoding establishes wire identity only. The owner must authorize the demand.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::control::controller) struct Demand {
-    pub(super) live: NonZeroU32,
-    pub(super) source: NonZeroU64,
+    pub(in crate::control::controller) live: NonZeroU32,
+    pub(in crate::control::controller) source: NonZeroU64,
     pub(super) branch: NonZeroU64,
     pub(super) request: NonZeroU64,
     pub(super) position: u64,
@@ -118,7 +118,7 @@ impl Demand {
         (bytes.len() == DEMAND_BYTES && bytes.starts_with(&REFRESH)).then(|| Self::prefix(bytes))?
     }
 
-    pub(super) fn matches_parent(self, parent: Window) -> bool {
+    pub(in crate::control::controller) fn matches_parent(self, parent: Window) -> bool {
         parent.profile() != Profile::Data
             && parent.ssrc() == self.live
             && parent.contains(self.position)

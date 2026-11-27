@@ -36,6 +36,7 @@ pub(in crate::control) struct WanLiveReceiveSpec {
     pub offer_cut: Option<NonZeroU64>,
     pub regional: Option<(Member, WanSourceWindow)>,
     pub routed: bool,
+    pub protected: bool,
     pub expires: Instant,
     pub timing: Option<crate::route::fabric::WindowTiming>,
 }
@@ -96,6 +97,7 @@ struct LiveAdvertisement {
     children: Vec<LiveNetworkChild>,
     regional: Option<RegionalReceive>,
     routed: bool,
+    protected: bool,
     evidence: Option<RelayEvidence>,
     projection: target_demand::ProjectionTx,
 }
@@ -228,6 +230,103 @@ impl Links {
         Ok(())
     }
 
+    pub(in crate::control) fn stage_protected_wan_receive(
+        &mut self,
+        upstream: NetworkId,
+        source: WanSourceWindow,
+        expires: Instant,
+    ) -> Result<(WanLiveRouteAck, wan_host::WarmReceive), BindError> {
+        let peer = self.wan.get_mut(&upstream).ok_or(BindError::Closed)?;
+        let ssrc = peer.allocate_label()?;
+        let window = Window::new(
+            source.publisher.emission.profile(),
+            source.window_start,
+            source.forms(),
+            ssrc,
+            source.publisher.emission.wire_profile().1,
+        )
+        .map_err(|_| BindError::UnsupportedProfile)?;
+        let warming =
+            peer.commands
+                .stage_warm_receive(window, source.publisher.incarnation, expires)?;
+        Ok((
+            WanLiveRouteAck {
+                room: source.room,
+                publication: source.publisher.publication,
+                incarnation: source.publisher.incarnation,
+                sequence_anchor: source.sequence_anchor,
+                offer_cut: source.offer_cut,
+                window,
+            },
+            warming,
+        ))
+    }
+
+    pub(in crate::control) fn lookup_protected_wan_packet(
+        &self,
+        fence: wan_host::WarmFence,
+        position: u64,
+    ) -> Option<oneshot::Receiver<Option<wan_host::WarmRepairPacket>>> {
+        self.wan
+            .get(&fence.peer())?
+            .commands
+            .lookup_warm(fence, position)
+    }
+
+    pub(in crate::control) fn stage_protected_wan_transit(
+        &mut self,
+        downstream: NetworkId,
+        input: &wan_host::WarmReceive,
+        ack: WanLiveRouteAck,
+        wire_bps: NonZeroU64,
+        expires: Instant,
+        now: Instant,
+    ) -> Result<(BindingCutoff, wan_host::PendingTx), BindError> {
+        let window = input
+            .installed(now)
+            .filter(|_| input.peer() != downstream)
+            .ok_or(BindError::Closed)?;
+        let expected = Window::new(
+            window.profile(),
+            window.start(),
+            window.forms(),
+            ack.window.ssrc(),
+            window.emission(),
+        )
+        .map_err(|_| BindError::UnsupportedProfile)?;
+        if expected != ack.window || now >= expires {
+            return Err(BindError::Closed);
+        }
+        let spec = pulsebeam_link::wan::WindowSpec {
+            authority: ack.incarnation,
+            direction: pulsebeam_link::wan::Direction::Send,
+            start: window.start(),
+            ssrc: expected.ssrc(),
+            purpose: pulsebeam_link::wan::Purpose::Live,
+            expires: expires.into_std(),
+        };
+        self.stage_wan_send(
+            downstream,
+            expected,
+            ack.window,
+            spec,
+            wan_host::SendPolicy::Protected { wire_bps },
+            Some(wan_host::SendParent::Warm(input.fence())),
+        )
+    }
+
+    pub(in crate::control) fn forward_protected_wan_receive(
+        &self,
+        input: &wan_host::WarmReceive,
+        output: wan_host::WanTx,
+    ) -> Result<(), BindError> {
+        self.wan
+            .get(&input.peer())
+            .ok_or(BindError::Closed)?
+            .commands
+            .forward_warm(input, output)
+    }
+
     pub(in crate::control) fn stage_wan_publisher_transport(
         &mut self,
         peer: NetworkId,
@@ -235,6 +334,7 @@ impl Links {
         ack: WanLiveRouteAck,
         expires: Instant,
         now: Instant,
+        protected_wire_bps: Option<NonZeroU64>,
     ) -> Result<(BindingCutoff, wan_host::PendingTx), BindError> {
         if now >= expires || !source.matches_ack(ack) {
             return Err(BindError::Closed);
@@ -256,7 +356,10 @@ impl Links {
             purpose: pulsebeam_link::wan::Purpose::Live,
             expires: expires.into_std(),
         };
-        self.stage_wan_send(peer, expected, ack.window, spec, true, None)
+        let policy = protected_wire_bps.map_or(wan_host::SendPolicy::Renewable, |wire_bps| {
+            wan_host::SendPolicy::Protected { wire_bps }
+        });
+        self.stage_wan_send(peer, expected, ack.window, spec, policy, None)
     }
 
     pub(in crate::control) fn is_wan_peer(&self, peer: NetworkId) -> bool {
@@ -278,6 +381,7 @@ impl Links {
             .find_map(|receive| {
                 let live = receive.live.as_ref()?;
                 if live.routed != routed
+                    || live.protected
                     || receive.pending.is_some()
                     || now >= receive.expires()
                     || !source.matches_ack(live.ack)
@@ -364,7 +468,11 @@ impl Links {
             expected,
             ack.window,
             spec,
-            renewable,
+            if renewable {
+                wan_host::SendPolicy::Renewable
+            } else {
+                wan_host::SendPolicy::Fixed
+            },
             Some(wan_host::SendParent::Transit {
                 cutoff: parent,
                 window,
@@ -409,7 +517,7 @@ impl Links {
             expected,
             permit.window,
             spec,
-            false,
+            wan_host::SendPolicy::Fixed,
             Some(wan_host::SendParent::Repair(parent)),
         )
     }
@@ -420,19 +528,12 @@ impl Links {
         expected: Window,
         acknowledged: Window,
         spec: pulsebeam_link::wan::WindowSpec,
-        renewable: bool,
+        policy: wan_host::SendPolicy,
         parent: Option<wan_host::SendParent>,
     ) -> Result<(BindingCutoff, wan_host::PendingTx), BindError> {
         let commands = &self.wan.get(&peer).ok_or(BindError::Closed)?.commands;
         let cutoff = self.control.reserve_wan_send(peer)?;
-        match commands.install_send(
-            cutoff.clone(),
-            expected,
-            acknowledged,
-            spec,
-            renewable,
-            parent,
-        ) {
+        match commands.install_send(cutoff.clone(), expected, acknowledged, spec, policy, parent) {
             Ok(pending) => Ok((cutoff, pending)),
             Err(error) => {
                 self.control.unbind(cutoff.id());
@@ -487,6 +588,7 @@ impl Links {
             || live.addresses.is_empty()
             || live.addresses.len() > crate::route::fabric::local::MAX_BRANCHES
             || !self.is_wan_peer(spec.canonical_ingress)
+            || (spec.protected && !(spec.routed && spec.regional.is_some()))
         {
             return Err(BindError::Closed);
         }
@@ -500,9 +602,9 @@ impl Links {
         }) {
             return Err(BindError::Closed);
         }
-        let alternatives = spec
-            .regional
-            .map_or(0, |(_, source)| self.regional_receive_count(source));
+        let alternatives = spec.regional.map_or(0, |(_, source)| {
+            self.regional_receive_count(source, spec.protected)
+        });
         let warming = alternatives != 0;
         let peer = self.wan.get_mut(&live.peer).ok_or(BindError::Closed)?;
         if alternatives >= 2 || peer.receives.len() >= RECEIVE_LIMIT {
@@ -517,6 +619,7 @@ impl Links {
                     && existing.ack.publication == live.publication
                     && existing.ack.incarnation == live.incarnation
                     && existing.ack.window.start() == spec.start
+                    && existing.protected == spec.protected
             })
         {
             return Err(BindError::Closed);
@@ -575,7 +678,7 @@ impl Links {
         let regional = spec.regional.map(|(member, source)| RegionalReceive {
             peer: member,
             source,
-            activity: wan_host::ReceiveActivity::default(),
+            activity: wan_host::ReceiveActivity::new(spec.protected),
             warming,
         });
         let deadline = Some(pulsebeam_link::wan::LiveDeadline::new(
@@ -614,6 +717,7 @@ impl Links {
                     children: live_children,
                     regional,
                     routed: spec.routed,
+                    protected: spec.protected,
                     projection: target_demand::ProjectionTx::default(),
                     evidence: self.node.map(|local| RelayEvidence {
                         local,
@@ -673,7 +777,8 @@ impl Links {
                     let live = receive.live.as_ref()?;
                     let regional = live.regional.as_ref()?;
                     let observed = regional.activity.observed();
-                    (receive.pending.is_none()
+                    (!live.protected
+                        && receive.pending.is_none()
                         && now < receive.expires()
                         && live.canonical_ingress == canonical
                         && receive.bindings.len() == live.children.len()
@@ -697,7 +802,7 @@ impl Links {
             .map(|(network, _, _)| network)
     }
 
-    fn regional_receive_count(&self, source: WanSourceWindow) -> usize {
+    fn regional_receive_count(&self, source: WanSourceWindow, protected: bool) -> usize {
         self.wan
             .values()
             .flat_map(|wan| wan.receives.values())
@@ -705,6 +810,7 @@ impl Links {
                 receive
                     .live
                     .as_ref()
+                    .filter(|live| live.protected == protected)
                     .and_then(|live| live.regional.as_ref())
                     .is_some_and(|regional| {
                         let offered = regional.source;
@@ -832,6 +938,59 @@ impl Links {
                 )
             }))
         .then_some(live.ack)
+    }
+
+    pub(in crate::control) fn protected_wan_source(
+        &self,
+        parent: LiveNetworkChild,
+        now: Instant,
+    ) -> Option<WanSourceWindow> {
+        self.wan_repair_parent_deadline(parent, now)?;
+        let receive = self
+            .wan
+            .get(&parent.ingress.association)?
+            .receives
+            .get(&parent.window?.ssrc())?;
+        let live = receive.live.as_ref()?;
+        live.protected.then_some(live.regional.as_ref()?.source)
+    }
+
+    pub(in crate::control) fn protected_wan_child(
+        &self,
+        peer: NetworkId,
+        ack: WanLiveRouteAck,
+        destination: NodeRouteAddress,
+        now: Instant,
+    ) -> Option<LiveNetworkChild> {
+        if self.routed_wan_ack(peer, ack.window, now)? != ack {
+            return None;
+        }
+        let live = self
+            .wan
+            .get(&peer)?
+            .receives
+            .get(&ack.window.ssrc())?
+            .live
+            .as_ref()?;
+        if !live.protected {
+            return None;
+        }
+        live.children
+            .iter()
+            .copied()
+            .find(|child| child.destination == destination)
+    }
+
+    pub(in crate::control) fn protected_wan_last_media(
+        &self,
+        peer: NetworkId,
+        window: Window,
+        now: Instant,
+    ) -> Option<Instant> {
+        self.routed_wan_ack(peer, window, now)?;
+        let receive = self.wan.get(&peer)?.receives.get(&window.ssrc())?;
+        let live = receive.live.as_ref().filter(|live| live.protected)?;
+        live.regional.as_ref()?.activity.last_observed()
     }
 
     pub(in crate::control) fn retire_routed_wan_receive(

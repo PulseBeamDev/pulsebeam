@@ -87,7 +87,7 @@ impl Sends {
         incarnation: std::num::NonZeroU64,
         now: Instant,
     ) -> Option<super::super::media_repair::Grant> {
-        use super::super::media_repair::Grant;
+        use super::super::media_repair::{Grant, Source};
         use crate::{link::wan_host::ParentSend, route::fabric::relay::MediaRepairParent};
         let entry = self.entries.get(&label)?;
         let Phase::Active(route) = &entry.phase else {
@@ -104,7 +104,7 @@ impl Sends {
             return None;
         }
         Some(Grant {
-            path: MediaRepairParent::Relay(route.clone()),
+            path: Source::Shard(MediaRepairParent::Relay(route.clone())),
             parent: ParentSend {
                 cutoff: entry.cutoff.clone(),
                 window,

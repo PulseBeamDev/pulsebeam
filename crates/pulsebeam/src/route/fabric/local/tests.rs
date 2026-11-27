@@ -1426,6 +1426,24 @@ fn write_dd_test_packet(
 }
 
 #[test]
+fn protection_requires_qualified_h264_base_packets() {
+    let emission = Emission::new(Profile::H264, &[ExtensionKind::DependencyDescriptor]).unwrap();
+    let mut fanout = SourceFanout::new(emission);
+    let now = Instant::now();
+    let mut writer = DependencyDescriptorWriter::new();
+    let base = dd_test_packet(&mut writer, 100, 10, true, false);
+    let enhanced = dd_test_packet(&mut writer, 101, 11, false, true);
+    for (position, image, qualifies) in [
+        (100, base, BasePacket::Base),
+        (101, enhanced, BasePacket::Enhancement),
+        (102, packet(102, b"no DD"), BasePacket::Unknown),
+    ] {
+        fanout.offer(now, now, position, image).unwrap();
+        assert_eq!(fanout.transit(position, 1).unwrap().h264_base, qualifies);
+    }
+}
+
+#[test]
 fn filtered_gap_suspends_without_holding_opaque_whole_source() {
     let emission = Emission::new(Profile::H264, &[ExtensionKind::DependencyDescriptor]).unwrap();
     let mut fanout = SourceFanout::new(emission);
@@ -1814,6 +1832,7 @@ fn wan_projection_flushes_unproved_or_oversized_runs() {
             work,
             packet: packet.arrival_view(packet.remaining_hops()).unwrap(),
             projection: excluded.then_some(proof),
+            h264_base: BasePacket::Unknown,
             ready_at: None,
             sender_ntp: None,
         };
@@ -1967,6 +1986,94 @@ fn wan_omission_carrier_bridges_only_the_proven_gap() {
         assert!(!fanout.has_media_position(101));
         assert!(!fanout.has_media_position(102));
     }
+}
+
+#[test]
+fn protected_h264_whole_branch_compacts_only_uncommitted_proven_positions() {
+    let emission = Emission::new(Profile::H264, &[ExtensionKind::DependencyDescriptor]).unwrap();
+    let mut fanout = SourceFanout::new(emission);
+    let mut destinations = SlotMap::with_key();
+    let destination = destinations.insert(());
+    let branch = fanout.install_branch(destination, emission).unwrap();
+    let mut writer = DependencyDescriptorWriter::new();
+    let now = Instant::now();
+    let primary = NonZeroU64::MIN;
+    let standby = primary.saturating_add(1);
+    let take = |fanout: &mut SourceFanout, at| {
+        fanout
+            .admit_with_evidence(
+                at,
+                branch,
+                destination,
+                |_| true,
+                |source, _, output| Ok::<_, ()>((source, output.output_position)),
+            )
+            .unwrap()
+    };
+    let first = dd_switch_packet(&mut writer, 100, 10, true);
+    fanout
+        .offer_bound_network(now, now, 100, primary, first, None)
+        .unwrap();
+    assert_eq!(take(&mut fanout, now), Some((100, 100)));
+    let enhancement = dd_test_packet(&mut writer, 101, 11, false, true);
+    fanout
+        .offer_bound_network(now, now, 101, primary, enhancement, None)
+        .unwrap();
+    assert_eq!(take(&mut fanout, now), Some((101, 101)));
+
+    let carrier = dd_switch_packet(&mut writer, 103, 13, false);
+    fanout
+        .offer_bound_network(now, now, 103, standby, carrier.clone(), OmissionRun::new(2))
+        .unwrap();
+    assert_eq!(take(&mut fanout, now), Some((103, 102)));
+    fanout
+        .offer_bound_network(now, now, 103, primary, carrier, None)
+        .unwrap();
+    assert_eq!(take(&mut fanout, now), None);
+
+    // Keep the real loss at position 104, even though 105 was omitted.
+    let partial = dd_switch_packet(&mut writer, 106, 16, true);
+    fanout
+        .offer_bound_network(now, now, 106, primary, partial.clone(), None)
+        .unwrap();
+    assert_eq!(take(&mut fanout, now), None);
+    fanout
+        .offer_bound_network(now, now, 106, standby, partial.clone(), OmissionRun::new(1))
+        .unwrap();
+    assert_eq!(take(&mut fanout, now), None);
+    let after_wait = now + DD_REORDER_WAIT;
+    fanout
+        .offer_bound_network(after_wait, after_wait, 106, primary, partial, None)
+        .unwrap();
+    assert_eq!(take(&mut fanout, after_wait), Some((106, 104)));
+    let next = dd_switch_packet(&mut writer, 108, 18, false);
+    fanout
+        .offer_bound_network(
+            after_wait,
+            after_wait,
+            108,
+            standby,
+            next,
+            OmissionRun::new(1),
+        )
+        .unwrap();
+    assert_eq!(take(&mut fanout, after_wait), Some((108, 105)));
+
+    // A late independent repair fills the reserved RTP slot without applying
+    // a later compaction to it or reopening an authenticated omission.
+    let repair = dd_switch_packet(&mut writer, 104, 14, false);
+    fanout
+        .offer_bound_network(after_wait, after_wait, 104, standby, repair.clone(), None)
+        .unwrap();
+    assert_eq!(take(&mut fanout, after_wait), Some((104, 103)));
+    fanout
+        .offer_bound_network(after_wait, after_wait, 104, primary, repair, None)
+        .unwrap();
+    let omitted = dd_test_packet(&mut writer, 105, 15, false, true);
+    fanout
+        .offer_bound_network(after_wait, after_wait, 105, primary, omitted, None)
+        .unwrap();
+    assert_eq!(take(&mut fanout, after_wait), None);
 }
 
 #[test]

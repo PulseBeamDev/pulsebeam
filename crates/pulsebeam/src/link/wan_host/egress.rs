@@ -1,18 +1,20 @@
-use std::{fmt, task::Poll};
+use std::{fmt, num::NonZeroU64, task::Poll};
 
 use pulsebeam_link::{BindError, BindingCutoff, BindingId};
 use pulsebeam_runtime::sync::oneshot;
 
 use super::*;
 
+mod protection;
 mod schedule;
+use protection::Envelope;
 use schedule::{Class, Schedule};
 
 const BUDGET: usize = 32;
 
-pub(super) type MediaSenders = [pulsebeam_queue::Sender<Media>; 3];
+pub(super) type MediaSenders = [pulsebeam_queue::Sender<Media>; Class::ALL.len()];
 pub(super) struct MediaInbox {
-    lanes: [pulsebeam_queue::Receiver<Media>; 3],
+    lanes: [pulsebeam_queue::Receiver<Media>; Class::ALL.len()],
     budget: pulsebeam_runtime::sync::watch::Sender<Option<VideoBudget>>,
 }
 
@@ -25,24 +27,30 @@ pub(super) struct VideoBudget {
 pub(super) type BudgetReader = pulsebeam_runtime::sync::watch::Receiver<Option<VideoBudget>>;
 
 pub(super) fn media_channels() -> (MediaSenders, MediaInbox, BudgetReader) {
-    let [(audio, audio_rx), (live, live_rx), (repair, repair_rx)] = Class::ALL.map(|class| {
+    let [
+        (audio, audio_rx),
+        (protected, protected_rx),
+        (live, live_rx),
+        (repair, repair_rx),
+    ] = Class::ALL.map(|class| {
         pulsebeam_queue::bounded(NonZeroUsize::new(class.capacity()).expect("bounded WAN class"))
     });
     let (budget, watch) = pulsebeam_runtime::sync::watch::channel(None);
     (
-        [audio, live, repair],
+        [audio, protected, live, repair],
         MediaInbox {
-            lanes: [audio_rx, live_rx, repair_rx],
+            lanes: [audio_rx, protected_rx, live_rx, repair_rx],
             budget,
         },
         watch,
     )
 }
 
-fn media_class(window: Window, purpose: Purpose) -> Class {
+fn media_class(window: Window, purpose: Purpose, protected: bool) -> Class {
     match purpose {
         Purpose::Repair { .. } => Class::Repair,
         Purpose::Live if window.profile() == pulsebeam_core::fabric::Profile::Opus => Class::Audio,
+        Purpose::Live if protected => Class::Protected,
         Purpose::Live => Class::Live,
     }
 }
@@ -50,9 +58,10 @@ fn media_class(window: Window, purpose: Purpose) -> Class {
 #[derive(Default)]
 pub(super) struct Egress {
     pub(super) inbox: Option<MediaInbox>,
+    pub(super) protected_egress_bps: Option<NonZeroU64>,
     routes: BTreeMap<NonZeroU32, Active>,
     queued: Schedule<Media>,
-    blocked: [Option<Blocked>; 3],
+    blocked: [Option<Blocked>; Class::ALL.len()],
     departures: Departures,
     budget_at: Option<Instant>,
 }
@@ -104,20 +113,31 @@ impl Drop for Departures {
 
 struct Active {
     route: Staged<Window>,
+    protection: Option<Envelope>,
     deadline: Option<wan::LiveDeadline>,
     cutoff: BindingCutoff,
-    parent: Option<BindingCutoff>,
+    parent: Option<ParentGate>,
 }
 
 impl Active {
+    fn class(&self) -> Class {
+        media_class(
+            self.route.descriptor(),
+            self.route.spec().purpose,
+            self.protection.is_some(),
+        )
+    }
+
     fn expires(&self) -> std::time::Instant {
-        self.deadline
+        let own = self
+            .deadline
             .as_ref()
-            .map_or_else(|| self.route.spec().expires, wan::LiveDeadline::expires)
+            .map_or_else(|| self.route.spec().expires, wan::LiveDeadline::expires);
+        self.parent.as_ref().map_or(own, |parent| parent.limit(own))
     }
 
     fn is_live(&self) -> bool {
-        self.cutoff.is_live() && self.parent.as_ref().is_none_or(BindingCutoff::is_live)
+        self.cutoff.is_live() && self.parent.as_ref().is_none_or(ParentGate::is_live)
     }
 }
 
@@ -167,18 +187,49 @@ pub(crate) enum SendParent {
         window: Window,
     },
     Repair(ParentSend),
+    Warm(super::warm::Fence),
 }
 
-impl SendParent {
-    fn cutoff(&self) -> &BindingCutoff {
+#[derive(Clone)]
+enum ParentGate {
+    Local(BindingCutoff),
+    Warm(super::warm::Fence),
+}
+
+impl ParentGate {
+    fn is_live(&self) -> bool {
         match self {
-            Self::Transit { cutoff, .. } => cutoff,
-            Self::Repair(parent) => &parent.cutoff,
+            Self::Local(cutoff) => cutoff.is_live(),
+            Self::Warm(fence) => fence.is_live(),
+        }
+    }
+
+    fn limit(&self, expires: std::time::Instant) -> std::time::Instant {
+        match self {
+            Self::Local(_) => expires,
+            Self::Warm(fence) => expires.min(fence.expires()),
         }
     }
 }
 
+impl SendParent {
+    fn gate(&self) -> ParentGate {
+        match self {
+            Self::Transit { cutoff, .. } => ParentGate::Local(cutoff.clone()),
+            Self::Repair(parent) => ParentGate::Local(parent.cutoff.clone()),
+            Self::Warm(fence) => ParentGate::Warm(fence.clone()),
+        }
+    }
+}
+
+pub(crate) enum SendPolicy {
+    Fixed,
+    Renewable,
+    Protected { wire_bps: NonZeroU64 },
+}
+
 pub(crate) struct Install {
+    protected_wire_bps: Option<NonZeroU64>,
     cutoff: BindingCutoff,
     parent: Option<SendParent>,
     window: Window,
@@ -191,11 +242,12 @@ pub(crate) struct Install {
 #[derive(Clone)]
 pub(crate) struct WanTx {
     cutoff: BindingCutoff,
-    parent: Option<BindingCutoff>,
+    parent: Option<ParentGate>,
     window: Window,
     purpose: Purpose,
     expires: Instant,
     deadline: Option<wan::LiveDeadline>,
+    class: Class,
     sender: pulsebeam_queue::Sender<Media>,
 }
 
@@ -243,6 +295,7 @@ impl SendFixture {
             purpose: Purpose::Live,
             expires,
             deadline: None,
+            class: media_class(window, Purpose::Live, false),
             sender,
         };
         (
@@ -263,13 +316,17 @@ impl SendFixture {
 
 impl WanTx {
     pub(crate) fn expires(&self) -> Instant {
-        self.deadline.as_ref().map_or(self.expires, |deadline| {
+        let own = self.deadline.as_ref().map_or(self.expires, |deadline| {
             Instant::from_std(deadline.expires())
+        });
+        self.parent.as_ref().map_or(own, |parent| {
+            Instant::from_std(parent.limit(own.into_std()))
         })
     }
 
     pub(crate) fn renew(&self, now: Instant, expires: Instant) -> bool {
         self.is_live()
+            && now < self.expires()
             && self
                 .deadline
                 .as_ref()
@@ -277,7 +334,17 @@ impl WanTx {
     }
 
     pub(crate) fn is_live(&self) -> bool {
-        self.cutoff.is_live() && self.parent.as_ref().is_none_or(BindingCutoff::is_live)
+        self.cutoff.is_live() && self.parent.as_ref().is_none_or(ParentGate::is_live)
+    }
+
+    pub(super) fn has_warm_parent(&self, exact: &super::warm::Fence) -> bool {
+        self.is_protected_base()
+            && self.is_live()
+            && matches!(&self.parent, Some(ParentGate::Warm(fence)) if fence.matches(exact))
+    }
+
+    pub(crate) fn is_protected_base(&self) -> bool {
+        self.class == Class::Protected
     }
 
     pub(crate) fn cutoff(&self) -> BindingCutoff {
@@ -291,10 +358,10 @@ impl WanTx {
         }
     }
 
-    pub(crate) fn accommodates_omission(
+    pub(crate) fn accommodates_omission<P: AsRef<[u8]>, E: AsRef<[u8]>>(
         &self,
         position: u64,
-        packet: &crate::route::fabric::local::PacketView<'_>,
+        packet: &pulsebeam_core::fabric::FabricPacket<P, E>,
         run: OmissionRun,
     ) -> bool {
         self.purpose == Purpose::Live && self.window.accommodates_omission(position, packet, run)
@@ -340,7 +407,7 @@ impl WanTx {
                 omitted,
             })
             .is_ok();
-        if media_class(self.window, self.purpose) == Class::Audio {
+        if self.class == Class::Audio {
             opus_egress_event(if queued {
                 "fabric_wan_opus_intake"
             } else {
@@ -403,25 +470,33 @@ impl Commands {
         window: Window,
         acknowledged: Window,
         spec: WindowSpec,
-        renewable: bool,
+        policy: SendPolicy,
         parent: Option<SendParent>,
     ) -> Result<PendingTx, BindError> {
         let (report, receipt) = oneshot::channel();
-        let deadline = renewable.then(|| wan::LiveDeadline::new(spec.expires));
+        let deadline =
+            (!matches!(policy, SendPolicy::Fixed)).then(|| wan::LiveDeadline::new(spec.expires));
+        let protected_wire_bps = match policy {
+            SendPolicy::Protected { wire_bps } => Some(wire_bps),
+            _ => None,
+        };
+        let class = media_class(window, spec.purpose, protected_wire_bps.is_some());
         let tx = WanTx {
             cutoff: cutoff.clone(),
-            parent: parent.as_ref().map(|parent| parent.cutoff().clone()),
+            parent: parent.as_ref().map(SendParent::gate),
             window,
             purpose: spec.purpose,
             expires: Instant::from_std(spec.expires),
             deadline: deadline.clone(),
-            sender: self.media[media_class(window, spec.purpose) as usize].clone(),
+            class,
+            sender: self.media[class as usize].clone(),
         };
         let pending = PendingTx {
             tx: Some(tx),
             receipt,
         };
         self.try_send(Command::Send(Box::new(Install {
+            protected_wire_bps,
             cutoff,
             parent,
             window,
@@ -435,17 +510,35 @@ impl Commands {
 }
 
 impl Egress {
-    fn audio_blocked(&self) -> bool {
-        self.blocked[Class::Audio as usize].is_some()
+    fn admits_protected(&self, now: Instant, wire_bps: NonZeroU64) -> bool {
+        let Some(limit) = self.protected_egress_bps else {
+            return false;
+        };
+        // Active windows are already bounded by the association. Charge the
+        // same set that can actually depart, including both warm legs when
+        // they carry distinct streams through this shared hop.
+        self.routes
+            .values()
+            .filter(|active| active.is_live() && now.into_std() < active.expires())
+            .filter_map(|active| active.protection.as_ref())
+            .try_fold(limit.get(), |left, envelope| {
+                left.checked_sub(envelope.rate())
+            })
+            .is_some_and(|available| available >= wire_bps.get())
+    }
+
+    fn priority_allows(&self, class: Class) -> bool {
+        Class::PRIORITY
+            .into_iter()
+            .all(|priority| !priority.precedes(class) || self.blocked[priority as usize].is_none())
     }
 
     pub(super) async fn readable(&mut self) {
-        let audio_blocked = self.audio_blocked();
-        if !audio_blocked
-            && Class::ALL.into_iter().any(|class| {
-                self.blocked[class as usize].is_none() && self.queued.has_packets(class)
-            })
-        {
+        if Class::ALL.into_iter().any(|class| {
+            self.priority_allows(class)
+                && self.blocked[class as usize].is_none()
+                && self.queued.has_packets(class)
+        }) {
             return;
         }
         async fn ready(inbox: &mut pulsebeam_queue::Receiver<Media>) {
@@ -454,12 +547,13 @@ impl Egress {
             }
         }
         if let Some(MediaInbox {
-            lanes: [audio, live, repair],
+            lanes: [audio, protected, live, repair],
             ..
         }) = &mut self.inbox
         {
             pulsebeam_runtime::select! {
                 _ = ready(audio) => {},
+                _ = ready(protected) => {},
                 _ = ready(live) => {},
                 _ = ready(repair) => {},
             }
@@ -513,7 +607,9 @@ impl Egress {
                     }
                     continue;
                 };
-                let class = media_class(media.scope.window, route.spec().purpose);
+                if route.class() != class {
+                    continue;
+                }
                 let window = media.scope.window;
                 let Ok(cost) = Window::protected_len(&media.packet, media.omitted) else {
                     continue;
@@ -528,10 +624,12 @@ impl Egress {
     }
 
     pub(super) fn socket_write_blocked(&self) -> bool {
-        self.blocked
-            .iter()
-            .flatten()
-            .any(|blocked| matches!(blocked.wait, Wait::Writable))
+        Class::ALL.into_iter().any(|class| {
+            self.priority_allows(class)
+                && self.blocked[class as usize]
+                    .as_ref()
+                    .is_some_and(|blocked| matches!(blocked.wait, Wait::Writable))
+        })
     }
 
     pub(super) fn next_deadline(&self) -> Option<std::time::Instant> {
@@ -543,11 +641,7 @@ impl Egress {
                     .iter()
                     .flat_map(move |blocked| {
                         let retry = match blocked.wait {
-                            Wait::Congestion(deadline)
-                                if class == Class::Audio || !self.audio_blocked() =>
-                            {
-                                deadline
-                            }
+                            Wait::Congestion(deadline) if self.priority_allows(class) => deadline,
                             _ => None,
                         };
                         [Some(blocked.scope.deadline.into_std()), retry]
@@ -558,14 +652,22 @@ impl Egress {
             .min()
     }
 
-    fn route(&self, now: Instant, scope: Scope) -> Option<Staged<Window>> {
+    fn route(&self, now: Instant, scope: Scope) -> Option<&Active> {
         let active = self.routes.get(&scope.window.ssrc())?;
         (now < scope.deadline
             && active.is_live()
             && now.into_std() < active.expires()
             && active.cutoff.id() == scope.binding
             && active.route.descriptor() == scope.window)
-            .then_some(active.route)
+            .then_some(active)
+    }
+
+    // Only used after the exact route and scope have been checked by drain_media.
+    fn protection(&mut self, scope: Scope) -> Option<&mut Envelope> {
+        self.routes
+            .get_mut(&scope.window.ssrc())?
+            .protection
+            .as_mut()
     }
 
     pub(super) fn fence_stale(
@@ -605,6 +707,7 @@ impl Egress {
 impl WanHost {
     pub(super) fn install_send(&mut self, now: Instant, install: Install) {
         let Install {
+            protected_wire_bps,
             cutoff,
             parent,
             window,
@@ -642,23 +745,35 @@ impl WanHost {
                     .ok()
                         == Some(window)
             }
+            (Purpose::Live, Some(SendParent::Warm(fence))) => {
+                protected_wire_bps.is_some()
+                    && fence.is_live()
+                    && now.into_std() < fence.expires()
+                    && spec.expires <= fence.expires()
+                    && spec.authority == fence.authority
+                    && Window::new(
+                        fence.window.profile(),
+                        fence.window.start(),
+                        fence.window.forms(),
+                        window.ssrc(),
+                        fence.window.emission(),
+                    )
+                    .ok()
+                        == Some(window)
+            }
             (Purpose::Repair { position }, Some(SendParent::Repair(parent))) => {
                 let scope = Scope {
                     binding: parent.cutoff.id(),
                     window: parent.window,
                     deadline: Instant::from_std(spec.expires),
                 };
-                self.egress
-                    .route(now, scope)
-                    .and_then(|route| self.egress.routes.get(&route.descriptor().ssrc()))
-                    .is_some_and(|route| {
-                        let live = route.route.spec();
-                        live.purpose == Purpose::Live
-                            && live.authority == spec.authority
-                            && spec.expires <= route.expires()
-                            && parent.window.repair_window(position, window.ssrc()).ok()
-                                == Some(window)
-                    })
+                self.egress.route(now, scope).is_some_and(|route| {
+                    let live = route.route.spec();
+                    live.purpose == Purpose::Live
+                        && live.authority == spec.authority
+                        && spec.expires <= route.expires()
+                        && parent.window.repair_window(position, window.ssrc()).ok() == Some(window)
+                })
             }
             _ => false,
         };
@@ -671,6 +786,18 @@ impl WanHost {
             cutoff.fence();
             let _ = report.send(Err(Error::Binding));
             return;
+        }
+        if let Some(wire_bps) = protected_wire_bps {
+            if spec.purpose != Purpose::Live || !window.profile().is_video() {
+                cutoff.fence();
+                let _ = report.send(Err(Error::Binding));
+                return;
+            }
+            if !self.egress.admits_protected(now, wire_bps) {
+                cutoff.fence();
+                let _ = report.send(Err(Error::Capacity));
+                return;
+            }
         }
         let route = match self.stage_send_with_deadline(now, window, spec, deadline.clone()) {
             Ok(route) => route,
@@ -687,9 +814,10 @@ impl WanHost {
                 window.ssrc(),
                 Active {
                     route,
+                    protection: protected_wire_bps.map(|rate| Envelope::new(rate, now)),
                     deadline,
                     cutoff,
-                    parent: parent.map(|parent| parent.cutoff().clone()),
+                    parent: parent.as_ref().map(SendParent::gate),
                 },
             );
         } else {
@@ -705,20 +833,28 @@ impl WanHost {
             .departures
             .report(now, || self.driver.send_budget(now.into_std()));
         self.egress.stage_media(now);
-        let reserve_for_audio = self.egress.routes.values().any(|active| {
-            active.is_live()
-                && now.into_std() < active.expires()
-                && media_class(active.route.descriptor(), active.route.spec().purpose)
-                    == Class::Audio
-        });
-        let mut deferred = [false; 3];
+        let priority_live =
+            self.egress
+                .routes
+                .values()
+                .fold([false; Class::ALL.len()], |mut live, active| {
+                    let class = active.class();
+                    if Class::PRIORITY.contains(&class)
+                        && active.is_live()
+                        && now.into_std() < active.expires()
+                    {
+                        live[class as usize] = true;
+                    }
+                    live
+                });
+        let mut deferred = [false; Class::ALL.len()];
         for _ in 0..BUDGET {
-            // If protected audio is waiting on the shared pacer or window, give
-            // it first use of the next credit rather than refilling with video.
-            let audio_blocked = self.egress.audio_blocked();
+            // Waiting priority traffic gets the next pacer/window credit
+            // instead of letting an ordinary send refill the window.
+            let allowed = Class::ALL.map(|class| self.egress.priority_allows(class));
             let Some(class) = self.egress.queued.pick(|class, queued| {
                 let i = class as usize;
-                (class == Class::Audio || !audio_blocked) && !deferred[i] && self.egress.blocked[i].as_ref().map_or(queued, |blocked| {
+                allowed[i] && !deferred[i] && self.egress.blocked[i].as_ref().map_or(queued, |blocked| {
                     !matches!(blocked.wait, Wait::Congestion(Some(deadline)) if now.into_std() < deadline)
                         || now >= blocked.scope.deadline
                 })
@@ -740,7 +876,7 @@ impl WanHost {
                 };
                 let Ok(prepared) = self.prepare_projected(
                     now,
-                    route,
+                    route.route,
                     media.position,
                     &media.packet,
                     media.omitted,
@@ -757,7 +893,20 @@ impl WanHost {
             if self.egress.route(now, scope).is_none() {
                 continue;
             }
-            let reserve = if reserve_for_audio && class != Class::Audio {
+            let wire_len = prepared.wire_len();
+            if class == Class::Protected
+                && !self
+                    .egress
+                    .protection(scope)
+                    .is_some_and(|rate| rate.allows(now, wire_len))
+            {
+                metrics::counter!("fabric_wan_protected_envelope_dropped").increment(1);
+                continue;
+            }
+            let reserve = if Class::PRIORITY
+                .into_iter()
+                .any(|priority| priority_live[priority as usize] && priority.precedes(class))
+            {
                 wan::MAX_DATAGRAM_BYTES
             } else {
                 0
@@ -771,13 +920,24 @@ impl WanHost {
                     (prepared, Wait::Congestion(deadline))
                 }
                 Submission::Accepted { bytes } => {
+                    if class == Class::Protected
+                        && let Some(rate) = self.egress.protection(scope)
+                    {
+                        rate.sent(bytes);
+                    }
                     if class == Class::Audio {
                         opus_egress_event("fabric_wan_opus_sent");
                     }
                     self.egress.departures.accepted(now, queued_at, bytes);
                     continue;
                 }
-                Submission::Dropped(_) => {
+                Submission::Dropped(outcome) => {
+                    if class == Class::Protected
+                        && outcome == wan::Dropped::Uncertain
+                        && let Some(rate) = self.egress.protection(scope)
+                    {
+                        rate.sent(wire_len);
+                    }
                     if class == Class::Audio {
                         opus_egress_event("fabric_wan_opus_transport_dropped");
                     }

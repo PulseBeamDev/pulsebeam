@@ -1266,12 +1266,11 @@ async fn check_shared_hop_squeeze(
 pub(in crate::tests) async fn open_logical_h264(
     server: SocketAddr,
     host: NativeHost,
-    subject: &str,
     publisher: &str,
     track: &str,
     publication: &str,
 ) -> anyhow::Result<(WirePeer, VideoSink)> {
-    let (mut viewer, mut outputs) = connect_viewer(server, host, subject, &["h264"]).await?;
+    let (mut viewer, mut outputs) = connect_viewer(server, host, "video-viewer", &["h264"]).await?;
     let (binding, sink) = outputs.pop().context("missing H264 receive slot")?;
     viewer.desire(
         1,

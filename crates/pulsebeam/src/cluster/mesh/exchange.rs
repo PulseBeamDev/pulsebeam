@@ -153,6 +153,23 @@ impl Exchange {
         self.routes.path(destination)
     }
 
+    /// Return geometry for the installed primary and a fresh, relay-disjoint
+    /// alternate. Reachability alone grants no protected capacity.
+    pub(crate) fn protection_paths(
+        &self,
+        destination: Member,
+        now: Instant,
+    ) -> Option<(&[Member], Vec<Member>)> {
+        let active = self.path(destination)?;
+        let live = self
+            .records
+            .values()
+            .filter(|rec| now < rec.fresh_until)
+            .map(|rec| &rec.advertisement);
+        let standby = Graph::from_reports(live)?.standby_for(self.local, active)?;
+        Some((active, standby))
+    }
+
     pub(crate) fn receive(&mut self, from: &Outbound, frame: &[u8], now: Instant) -> bool {
         let Some(body) = frame.strip_prefix(TAG) else {
             return false;

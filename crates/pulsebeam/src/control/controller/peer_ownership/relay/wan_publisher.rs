@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    num::NonZeroU32,
+    num::{NonZeroU32, NonZeroU64},
     task::Poll,
 };
 
@@ -34,11 +34,15 @@ struct Permit {
     source: WanSourceWindow,
     ack: WanLiveRouteAck,
     shard: ShardId,
+    protected_wire_bps: Option<NonZeroU64>,
 }
 
 impl Permit {
     fn same_route(self, other: Self) -> bool {
-        self.shard == other.shard && self.ack == other.ack && self.source.same_window(other.source)
+        self.shard == other.shard
+            && self.ack == other.ack
+            && self.protected_wire_bps == other.protected_wire_bps
+            && self.source.same_window(other.source)
     }
 }
 
@@ -80,14 +84,15 @@ impl PublisherSends {
         incarnation: std::num::NonZeroU64,
         now: Instant,
     ) -> Option<super::super::media_repair::Grant> {
-        use super::super::media_repair::Grant;
+        use super::super::media_repair::{Grant, Source};
         use crate::route::fabric::relay::MediaRepairParent;
         let entry = self.entries.get(&label)?;
         let Phase::Installed(route) = &entry.phase else {
             return None;
         };
         let window = entry.permit.ack.window;
-        if route.next.peer != peer
+        if entry.permit.protected_wire_bps.is_some()
+            || route.next.peer != peer
             || route.publisher.incarnation != incarnation
             || window.profile() == pulsebeam_core::fabric::Profile::Data
             || now >= entry.expires
@@ -97,7 +102,7 @@ impl PublisherSends {
             return None;
         }
         Some(Grant {
-            path: MediaRepairParent::Publisher(route.clone()),
+            path: Source::Shard(MediaRepairParent::Publisher(route.clone())),
             parent: ParentSend {
                 cutoff: entry.cutoff.clone(),
                 window,
@@ -210,7 +215,7 @@ impl PublisherSends {
             peer,
             acknowledged.iter().filter_map(|&ack| {
                 let &source = sources.iter().find(|source| source.matches_ack(ack))?;
-                Some((source, ack, expires))
+                Some((source, ack, expires, None))
             }),
             now,
         );
@@ -224,11 +229,18 @@ impl PublisherSends {
         &mut self,
         actor: &mut ControllerActor,
         peer: NetworkId,
-        permits: impl IntoIterator<Item = (WanSourceWindow, WanLiveRouteAck, Instant)>,
+        permits: impl IntoIterator<
+            Item = (
+                WanSourceWindow,
+                WanLiveRouteAck,
+                Instant,
+                Option<NonZeroU64>,
+            ),
+        >,
         now: Instant,
     ) {
         let mut desired = BTreeMap::new();
-        for (source, ack, expires) in permits {
+        for (source, ack, expires, protected_wire_bps) in permits {
             if now >= expires || !source.matches_ack(ack) {
                 continue;
             }
@@ -240,7 +252,18 @@ impl PublisherSends {
                 continue;
             };
             if publisher == source.publisher {
-                desired.insert(ack.window.ssrc(), (Permit { source, ack, shard }, expires));
+                desired.insert(
+                    ack.window.ssrc(),
+                    (
+                        Permit {
+                            source,
+                            ack,
+                            shard,
+                            protected_wire_bps,
+                        },
+                        expires,
+                    ),
+                );
             }
         }
         self.entries.retain(|ssrc, entry| {
@@ -266,9 +289,14 @@ impl PublisherSends {
             if self.used.contains(&ssrc) {
                 continue;
             }
-            if let Ok((cutoff, pending)) =
-                links.stage_wan_publisher_transport(peer, permit.source, permit.ack, expires, now)
-            {
+            if let Ok((cutoff, pending)) = links.stage_wan_publisher_transport(
+                peer,
+                permit.source,
+                permit.ack,
+                expires,
+                now,
+                permit.protected_wire_bps,
+            ) {
                 self.used.insert(ssrc);
                 self.entries.insert(
                     ssrc,

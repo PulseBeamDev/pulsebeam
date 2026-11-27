@@ -6,7 +6,8 @@
 //! extensions. The header has V=2, P=0, CC=0, optional X, M, PT=96+H, low
 //! sequence bits, timestamp and SSRC. Fields are big-endian. An RFC 8285 block
 //! uses ascending IDs 2–9 and minimum zero padding. An explicitly selected
-//! VP9 forward projection may append a hop-only omission run at ID 10. It
+//! VP9 forward projection or protected H264 base leg may append a hop-only
+//! omission run at ID 10. It
 //! does not become part of the Fabric image. The full RTP plaintext is
 //! limited to 1,216 bytes before the 16-byte SRTP tag. No format sniffing.
 //!
@@ -49,7 +50,8 @@ impl OmissionRun {
     }
 
     fn fits(self, window: Window, carrier: u64) -> bool {
-        window.profile == Profile::Vp9
+        matches!(window.profile, Profile::Vp9 | Profile::H264)
+            && window.emission & ExtensionKind::DependencyDescriptor.bit() != 0
             && window.contains(carrier)
             && self
                 .positions(carrier)

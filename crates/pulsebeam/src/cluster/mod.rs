@@ -272,6 +272,7 @@ mod tests {
                 data_dir: dir.path().to_owned(),
                 ownership_peers: Vec::new(),
                 region_tree: None,
+                protected_base_stream_bps: None,
             };
             let socket = ProbeSocket {
                 inner: socket,

@@ -101,7 +101,7 @@ struct FrameReservation {
 
 pub(crate) const MAX_BRANCHES: usize = 64;
 const QUEUE_PACKETS: usize = 32;
-const MAX_AGE: Duration = Duration::from_millis(120);
+pub(crate) const MAX_AGE: Duration = Duration::from_millis(120);
 const DD_REORDER_WAIT: Duration = Duration::from_millis(40);
 const DD_REORDER_POSITIONS: u64 = 16;
 
@@ -386,6 +386,7 @@ struct SourceEvidence {
     context: SourceContext,
     frames: Frames,
     ordered_through: Option<u64>,
+    protected_omissions: bool,
 }
 
 impl SourceEvidence {
@@ -462,6 +463,64 @@ fn vp9_projection(
     ProjectionEvidence::new(dd, *frame)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BasePacket {
+    Unknown,
+    Base,
+    Enhancement,
+}
+
+fn qualify_h264_base(
+    emission: Emission,
+    source: Option<&SourceEvidence>,
+    evidence: Option<&(Qualified, FrameStatus)>,
+) -> BasePacket {
+    if emission.profile() != Profile::H264 {
+        return BasePacket::Unknown;
+    }
+    let Some(qualified) = evidence.and_then(measurement_evidence) else {
+        return BasePacket::Unknown;
+    };
+    let descriptor = &qualified.descriptor;
+    if descriptor.spatial_id() != 0 {
+        return BasePacket::Unknown;
+    }
+    if descriptor.temporal_id() == 0 {
+        return BasePacket::Base;
+    }
+    if descriptor.attached_structure.is_some() || descriptor.active_decode_targets.is_some() {
+        return BasePacket::Unknown;
+    }
+    let Some(structure) = source.and_then(|source| source.context.structure_for(qualified)) else {
+        return BasePacket::Unknown;
+    };
+    if structure.spatial_layer_count() != 1 {
+        return BasePacket::Unknown;
+    }
+
+    use pulsebeam_core::dd::DecodeTargetIndication::NotPresent;
+    // Use template membership, not the numeric target index, to identify a base target.
+    let excludes_base = (0..usize::from(structure.decode_target_count)).any(|target| {
+        qualified.active_targets & (1 << target) != 0
+            && descriptor.frame_dependencies.dtis.get(target) == Some(&NotPresent)
+            && structure.templates.iter().any(|template| {
+                template.temporal_id == 0
+                    && template
+                        .dtis
+                        .get(target)
+                        .is_some_and(|dti| *dti != NotPresent)
+            })
+            && structure.templates.iter().all(|template| {
+                template.temporal_id == 0 || template.dtis.get(target) == Some(&NotPresent)
+            })
+    });
+    if excludes_base {
+        BasePacket::Enhancement
+    } else {
+        BasePacket::Unknown
+    }
+}
+
 fn measurement_evidence((dd, frame): &(Qualified, FrameStatus)) -> Option<&Qualified> {
     matches!(frame, FrameStatus::Resolved(_)).then_some(dd)
 }
@@ -524,6 +583,7 @@ struct Frozen {
     live_ingress: Option<NonZeroU64>,
     omitted: Option<OmissionRun>,
     projection: Option<ProjectionEvidence>,
+    h264_base: BasePacket,
     endpoint_original: bool,
 }
 
@@ -587,6 +647,7 @@ pub(crate) struct Transit<'a> {
     pub work: LiveWork,
     pub packet: PacketView<'a>,
     pub(crate) projection: Option<ProjectionEvidence>,
+    pub(crate) h264_base: BasePacket,
     pub ready_at: Option<std::time::Instant>,
 }
 
@@ -601,6 +662,13 @@ struct Branch {
     dd_structure: Option<(u64, u64)>,
     omitted: u64,
     last_omitted: Option<u64>,
+    missing: VecDeque<MissingPosition>,
+}
+
+struct MissingPosition {
+    source: u64,
+    output: u64,
+    expires: Instant,
 }
 
 struct Queued {
@@ -704,6 +772,7 @@ impl SourceFanout {
             dd_structure: None,
             omitted: 0,
             last_omitted: None,
+            missing: VecDeque::new(),
         }))
     }
 
@@ -941,6 +1010,18 @@ impl SourceFanout {
                 .fates
                 .get(&sequence)
                 .is_some_and(|frozen| frozen.live_arrival.is_some())
+    }
+
+    pub(crate) fn cached_peer_base(
+        &self,
+        sequence: u64,
+        ingress: Option<NonZeroU64>,
+        now: Instant,
+    ) -> Option<(&OwnedPacket, Instant)> {
+        if self.fates.get(&sequence)?.h264_base != BasePacket::Base {
+            return None;
+        }
+        self.cached_peer_media(sequence, ingress, now)
     }
 
     pub(crate) fn cached_peer_media(
@@ -1343,6 +1424,7 @@ impl SourceFanout {
                     live_ingress: None,
                     omitted: None,
                     projection: None,
+                    h264_base: BasePacket::Unknown,
                     endpoint_original: false,
                 },
             );
@@ -1795,6 +1877,7 @@ impl SourceFanout {
                 live_ingress: None,
                 omitted: None,
                 projection: None,
+                h264_base: BasePacket::Unknown,
                 endpoint_original: true,
             },
         );
@@ -1902,12 +1985,19 @@ impl SourceFanout {
             .and_then(|frozen| frozen.live_arrival)
             .unwrap_or(arrival);
         let work = LiveWork::new(high, sequence, arrival, hops).ok_or(Rejection::Stale)?;
-        // Stock AV1 decoders use the descriptor to resolve delta frames even
-        // on whole-stream branches. Reorder before qualifying their metadata.
-        let ordered = self.evidence.is_some()
-            && (self.emission.profile() == Profile::Av1
+        // Stock AV1 needs ordered DD even on whole-stream branches. A protected
+        // H264 branch also needs ordered output to compact authenticated gaps
+        // without changing any RTP positions it has already committed.
+        let protected_omissions = self.emission.profile() == Profile::H264 && omitted.is_some();
+        if protected_omissions && let Some(evidence) = &mut self.evidence {
+            evidence.protected_omissions = true;
+        }
+        let ordered = self.evidence.as_ref().is_some_and(|evidence| {
+            evidence.protected_omissions
+                || self.emission.profile() == Profile::Av1
                 || (self.emission.selects_dd_encoding() || !self.branches.is_empty())
-                    && self.branches.values().all(Branch::requires_dd));
+                    && self.branches.values().all(Branch::requires_dd)
+        });
         let qualified = if ordered {
             None
         } else if let Some(evidence) = &mut self.evidence {
@@ -1937,6 +2027,8 @@ impl SourceFanout {
         }
         if new_live {
             let projection = vp9_projection(self.emission, qualified.as_ref());
+            let h264_base =
+                qualify_h264_base(self.emission, self.evidence.as_deref(), qualified.as_ref());
             self.retire_before(oldest);
             if let Some(frozen) = self.fates.get_mut(&sequence) {
                 frozen.live_arrival = Some(arrival);
@@ -1944,6 +2036,7 @@ impl SourceFanout {
                 frozen.live_ingress = ingress;
                 frozen.omitted = omitted;
                 frozen.projection = projection;
+                frozen.h264_base = h264_base;
                 if !frozen.endpoint_original
                     && let Some(packet) = packet
                 {
@@ -1961,9 +2054,27 @@ impl SourceFanout {
                         live_ingress: ingress,
                         omitted,
                         projection,
+                        h264_base,
                         endpoint_original: false,
                     },
                 );
+            }
+        } else if protected_omissions
+            && self.evidence.as_ref().is_some_and(|evidence| {
+                evidence
+                    .ordered_through
+                    .is_none_or(|through| through < sequence)
+            })
+            && let Some(frozen) = self.fates.get_mut(&sequence)
+        {
+            // The full path may have queued this same carrier first. Only
+            // enrich an uncommitted match, after checking its immutable body.
+            let start = |run: Option<OmissionRun>| {
+                run.and_then(|run| run.positions(sequence))
+                    .map_or(sequence, |range| range.start)
+            };
+            if start(omitted) < start(frozen.omitted) {
+                frozen.omitted = omitted;
             }
         }
         self.high = Some(high);
@@ -1975,7 +2086,20 @@ impl SourceFanout {
             );
         }
         if ordered {
-            return Ok(self.offer_ordered_dd(now, high));
+            let late_h264 = new_live
+                && ingress.is_some()
+                && self.evidence.as_ref().is_some_and(|dd| {
+                    dd.protected_omissions
+                        && dd.ordered_through.is_some_and(|through| sequence < through)
+                });
+            let mut report = self.offer_ordered_dd(now, high);
+            if late_h264 {
+                for branch in self.branches.values_mut() {
+                    branch.discard_stale(now, &self.fates, |_| true);
+                    branch.offer_missing(now, work, ingress, &mut report);
+                }
+            }
+            return Ok(report);
         }
         if let Some(evidence) = &mut self.evidence {
             evidence.ordered_through = Some(high);
@@ -2022,7 +2146,11 @@ impl SourceFanout {
             let Some(arrival) = frozen.live_arrival else {
                 break;
             };
-            let omitted = position > next && covers_omission(frozen.omitted, next..position);
+            let skipped = frozen
+                .omitted
+                .and_then(|run| run.positions(position))
+                .map_or(0, |proof| position - proof.start.max(next));
+            let omitted = position > next && skipped == position - next;
             let padding_only = position > next
                 && self
                     .media_identity
@@ -2072,8 +2200,11 @@ impl SourceFanout {
             };
             for branch in self.branches.values_mut() {
                 branch.discard_stale(now, &self.fates, |_| true);
-                if omitted {
-                    branch.omitted = branch.omitted.saturating_add(position - next);
+                if evidence.protected_omissions && !padding_only {
+                    branch.reserve_missing(now, next..position - skipped);
+                }
+                if skipped != 0 && (omitted || evidence.protected_omissions) {
+                    branch.omitted = branch.omitted.saturating_add(skipped);
                     branch.last_omitted = position.checked_sub(1);
                 }
                 branch.offer(
@@ -2087,6 +2218,8 @@ impl SourceFanout {
             }
             if let Some(frozen) = self.fates.get_mut(&position) {
                 frozen.projection = vp9_projection(self.emission, qualified.as_ref());
+                frozen.h264_base =
+                    qualify_h264_base(self.emission, Some(evidence), qualified.as_ref());
             }
         }
         report
@@ -2181,6 +2314,7 @@ impl SourceFanout {
             work: LiveWork::new(self.high?, sequence, frozen.live_arrival?, hops)?,
             packet: frozen.packet.arrival_view(hops)?,
             projection: frozen.projection,
+            h264_base: frozen.h264_base,
             ready_at: frozen.ready_at,
         })
     }
@@ -2365,6 +2499,51 @@ impl SourceFanout {
 }
 
 impl Branch {
+    fn reserve_missing(&mut self, now: Instant, range: std::ops::Range<u64>) {
+        if self.requires_dd() || range.is_empty() || range.end - range.start > DD_REORDER_POSITIONS
+        {
+            return;
+        }
+        let Some(expires) = now.checked_add(super::network_repair::MAX_REPAIR_LIFETIME) else {
+            return;
+        };
+        self.missing.retain(|gap| now < gap.expires);
+        for source in range {
+            if let Some(output) = source.checked_sub(self.omitted) {
+                if self.missing.len() >= DD_REORDER_POSITIONS as usize {
+                    self.missing.pop_front();
+                }
+                self.missing.push_back(MissingPosition {
+                    source,
+                    output,
+                    expires,
+                });
+            }
+        }
+    }
+
+    fn offer_missing(
+        &mut self,
+        now: Instant,
+        work: LiveWork,
+        ingress: Option<NonZeroU64>,
+        report: &mut Offers,
+    ) {
+        if self.requires_dd() {
+            return;
+        }
+        let Some(index) = self
+            .missing
+            .iter()
+            .position(|gap| gap.source == work.sequence && now < gap.expires)
+        else {
+            return;
+        };
+        if let Some(gap) = self.missing.remove(index) {
+            self.offer_at(now, work, ingress, None, false, gap.output, report);
+        }
+    }
+
     fn offer(
         &mut self,
         now: Instant,
@@ -2374,7 +2553,7 @@ impl Branch {
         in_order: bool,
         report: &mut Offers,
     ) {
-        let LiveWork { sequence, hops, .. } = work;
+        let sequence = work.sequence;
         if self.last_omitted.is_some_and(|fence| sequence <= fence)
             || self.requires_dd() && self.dd_reset.is_some_and(|fence| sequence <= fence)
         {
@@ -2383,6 +2562,32 @@ impl Branch {
         let Some(output_position) = sequence.checked_sub(self.omitted) else {
             return;
         };
+        self.offer_at(
+            now,
+            work,
+            ingress,
+            evidence,
+            in_order,
+            output_position,
+            report,
+        );
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Offer at an immutable projected sequence"
+    )]
+    fn offer_at(
+        &mut self,
+        now: Instant,
+        work: LiveWork,
+        ingress: Option<NonZeroU64>,
+        evidence: Option<&(Qualified, FrameStatus)>,
+        in_order: bool,
+        output_position: u64,
+        report: &mut Offers,
+    ) {
+        let LiveWork { sequence, hops, .. } = work;
         let queue = &mut self.queue;
         let mut filtered = None;
         let frame = evidence.and_then(|(q, status)| match status {

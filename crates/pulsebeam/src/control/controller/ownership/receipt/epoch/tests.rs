@@ -128,6 +128,62 @@ fn retirement_cannot_be_forgotten_on_expiry_or_epoch_mismatch() {
 }
 
 #[test]
+fn reprovisioned_peer_pin_accepts_replacement_receipts_but_not_old_signatures() {
+    let (mut old, mut verifier) = pair();
+    let endpoint = endpoint();
+    let candidate = ConnectionId::new();
+    let rank = ClaimRank::root(ConnectionId::new());
+    let now = Instant::now();
+    let deadline = now + LEASE;
+    let successor = rank.successor(candidate).ok_or(Error::Invalid);
+    old.apply(rev(1), verifier.checkpoint(), now, deadline)
+        .unwrap();
+    let old_proof = issue_accepted(&mut old, endpoint, rank, 1000).unwrap();
+    verifier
+        .apply(rev(1), old.checkpoint(), now, deadline)
+        .unwrap();
+    assert_eq!(
+        validate_successor(&verifier, &old_proof.proof, endpoint, candidate, 1001),
+        successor
+    );
+
+    let new_key = ApiSigningKey::from_seed([34; 32]);
+    let mut reprovisioned = Trust::new(
+        verifier.issuer(),
+        verifier.key.clone(),
+        old.issuer(),
+        new_key.public_key(),
+    )
+    .unwrap();
+    let mut replacement = Trust::new(
+        old.issuer(),
+        new_key,
+        verifier.issuer(),
+        verifier.key.public_key(),
+    )
+    .unwrap();
+    replacement
+        .apply(rev(1), reprovisioned.checkpoint(), now, deadline)
+        .unwrap();
+    let new_proof = issue_accepted(&mut replacement, endpoint, rank, 1000).unwrap();
+    reprovisioned
+        .apply(rev(1), replacement.checkpoint(), now, deadline)
+        .unwrap();
+    assert_eq!(
+        validate_successor(&reprovisioned, &new_proof.proof, endpoint, candidate, 1001),
+        successor
+    );
+    assert_eq!(
+        validate_successor(&reprovisioned, &old_proof.proof, endpoint, candidate, 1001),
+        Err(Error::Invalid)
+    );
+    assert_eq!(
+        validate_successor(&verifier, &new_proof.proof, endpoint, candidate, 1001),
+        Err(Error::Invalid)
+    );
+}
+
+#[test]
 fn pinned_peers_have_independent_revisions_and_cannot_install_each_others_checkpoints() {
     let (mut a, mut b) = pair();
     let c_key = ApiSigningKey::from_seed([33; 32]);

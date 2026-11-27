@@ -4,6 +4,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
+    num::NonZeroU32,
     time::{Duration, SystemTime},
 };
 
@@ -33,6 +34,9 @@ use super::{
     media_read::Row,
 };
 
+mod protection;
+pub(super) use protection::ProtectionPath;
+
 const TTL: Duration = Duration::from_secs(1);
 const MAX_BYTES: usize = 32 * 1024;
 
@@ -42,19 +46,33 @@ struct Wire {
     row: Row,
     ack: WireWanLiveRouteAck,
     visited: Vec<Member>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    protection: Option<ProtectionPath>,
 }
 
-pub(super) fn encode(row: Row, ack: WanLiveRouteAck, visited: Vec<Member>) -> Option<Box<[u8]>> {
-    if !(1..=HOPS as usize).contains(&visited.len()) {
-        return None;
+impl Wire {
+    fn encode(&self) -> Option<Box<[u8]>> {
+        if !(1..=HOPS as usize).contains(&self.visited.len()) {
+            return None;
+        }
+        let bytes = serde_json::to_vec(self).ok()?;
+        (bytes.len() <= MAX_BYTES).then_some(bytes.into_boxed_slice())
     }
-    let bytes = serde_json::to_vec(&Wire {
+}
+
+pub(super) fn encode(
+    row: Row,
+    ack: WanLiveRouteAck,
+    visited: Vec<Member>,
+    protection: Option<ProtectionPath>,
+) -> Option<Box<[u8]>> {
+    Wire {
         row,
         ack: ack.into(),
         visited,
-    })
-    .ok()?;
-    (bytes.len() <= MAX_BYTES).then_some(bytes.into_boxed_slice())
+        protection,
+    }
+    .encode()
 }
 
 // Renewals are JSON objects; zero distinguishes a compact exact-ACK withdrawal.
@@ -66,7 +84,7 @@ pub(super) fn withdraw(ack: WanLiveRouteAck) -> Option<Box<[u8]>> {
     Some(bytes.into_boxed_slice())
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct Edge {
     pub(super) link: Link,
     pub(super) network: NetworkId,
@@ -80,12 +98,12 @@ pub(super) struct Lease {
     pub(super) downstream: Edge,
     pub(super) visited: Vec<Member>,
     pub(super) border: Option<(Member, Member)>,
-    pub(super) budget: u8,
     pub(super) attempt: u8,
     pub(super) expires: Instant,
     pub(super) issued_ms: u64,
     wall_expiry_ms: u64,
     pub(super) permit_deadline: Instant,
+    pub(super) protection: Option<ProtectionPath>,
 }
 
 impl Lease {
@@ -97,7 +115,12 @@ impl Lease {
         now: Instant,
         wall: SystemTime,
     ) -> Option<Self> {
-        let Wire { row, ack, visited } = serde_json::from_slice(request.payload).ok()?;
+        let Wire {
+            row,
+            ack,
+            visited,
+            protection,
+        } = serde_json::from_slice(request.payload).ok()?;
         if visited.last().copied() != Some(downstream.link.member)
             || visited.len().checked_add(request.budget.into())? != usize::from(HOPS) + 1
             || !valid_path(tree, local, request.target, &visited)
@@ -105,6 +128,11 @@ impl Lease {
             return None;
         }
         let ack = ack.decode()?;
+        if protection.as_ref().is_some_and(|path| {
+            request.border.is_some() || !path.matches_hop(tree, local, request.target, &visited)
+        }) {
+            return None;
+        }
         let descriptor = row.descriptor()?;
         let (endpoint, track) = media_permit::source_name(ack.room.project, &descriptor)?;
         let permit = media_permit::verify(
@@ -116,7 +144,9 @@ impl Lease {
             &row.permit,
             wall,
         )?;
-        if !permit.source.matches_ack(ack) {
+        if !permit.source.matches_ack(ack)
+            || (protection.is_some() && !supports_protection(permit.source, &descriptor))
+        {
             return None;
         }
         let ttl = Duration::from_millis(
@@ -133,14 +163,21 @@ impl Lease {
             downstream,
             visited,
             border: request.border,
-            budget: request.budget,
             attempt: request.attempt,
             expires: permit_deadline.min(now.checked_add(TTL)?),
             issued_ms: permit.issued_ms,
             wall_expiry_ms: permit.expires_ms,
             permit_deadline,
+            protection,
         })
     }
+}
+
+pub(super) fn supports_protection(source: WanSourceWindow, descriptor: &Track) -> bool {
+    let emission = source.publisher.emission;
+    emission.profile() == pulsebeam_core::fabric::Profile::H264
+        && emission.carries_video_dd()
+        && matches!(&descriptor.kind, Some(pulsebeam_proto::state::track::Kind::Video(video)) if video.guarantees_video_dd)
 }
 
 fn valid_path(tree: &RegionTree, local: Member, origin: Member, visited: &[Member]) -> bool {
@@ -163,11 +200,13 @@ fn valid_path(tree: &RegionTree, local: Member, origin: Member, visited: &[Membe
         })
 }
 
-/// Keys are the exact child edge and source window. Multiple children can
-/// contribute demand to one upstream receive, but each brings its own ACK.
+// Ordinary demand can aggregate to one receive; protected legs are keyed by
+// the additional exact downstream window and never feed ordinary aggregation.
+type BranchKey = (Member, Member, relay::Key, u64, Option<NonZeroU32>);
+
 #[derive(Default)]
 pub(super) struct Leases {
-    inner: BTreeMap<(Member, Member, relay::Key, u64), Lease>,
+    inner: BTreeMap<BranchKey, Lease>,
 }
 
 impl Leases {
@@ -188,18 +227,21 @@ impl Leases {
                 .ok()
                 .and_then(WireWanLiveRouteAck::decode)
             {
-                let key = (
-                    from.link.member,
-                    request.target,
-                    relay::Key::new(ack.room, ack.publication, false),
-                    ack.window.start(),
-                );
-                if self.inner.get(&key).is_some_and(|lease| {
-                    lease.downstream.link == from.link
-                        && lease.downstream.network == from.network
-                        && lease.ack == ack
-                }) {
-                    self.inner.remove(&key);
+                for leg in [None, Some(ack.window.ssrc())] {
+                    let key = (
+                        from.link.member,
+                        request.target,
+                        relay::Key::new(ack.room, ack.publication, false),
+                        ack.window.start(),
+                        leg,
+                    );
+                    if self.inner.get(&key).is_some_and(|lease| {
+                        lease.downstream.link == from.link
+                            && lease.downstream.network == from.network
+                            && lease.ack == ack
+                    }) {
+                        self.inner.remove(&key);
+                    }
                 }
             }
             return;
@@ -212,9 +254,24 @@ impl Leases {
             request.target,
             lease.source.scope(),
             lease.source.window_start,
+            lease.protection.as_ref().map(|_| lease.ack.window.ssrc()),
         );
+        if self.inner.iter().any(|(other, current)| {
+            &key != other
+                && (key.4.is_some() || other.4.is_some())
+                && current.downstream.network == from.network
+                && current.ack.window.ssrc() == lease.ack.window.ssrc()
+        }) {
+            return;
+        }
         if let Some(current) = self.inner.get_mut(&key) {
-            if lease.issued_ms < current.issued_ms {
+            if lease.issued_ms < current.issued_ms
+                || current.protection != lease.protection
+                || (lease.protection.is_some()
+                    && (current.ack != lease.ack
+                        || current.downstream.link != from.link
+                        || current.downstream.network != from.network))
+            {
                 return;
             }
             if lease.issued_ms == current.issued_ms
@@ -237,7 +294,15 @@ impl Leases {
     }
 
     pub(super) fn iter(&self) -> impl Iterator<Item = &Lease> {
-        self.inner.values()
+        self.inner
+            .values()
+            .filter(|lease| lease.protection.is_none())
+    }
+
+    pub(super) fn protected(&self) -> impl Iterator<Item = &Lease> {
+        self.inner
+            .values()
+            .filter(|lease| lease.protection.is_some())
     }
 }
 
@@ -281,6 +346,7 @@ impl OriginSends {
         let mut desired = HashMap::<_, Vec<_>>::new();
         for lease in leases
             .iter()
+            .chain(leases.protected())
             .filter(|lease| lease.source.origin == Some(local))
         {
             let Some((track, valid_until)) =
@@ -296,11 +362,18 @@ impl OriginSends {
             else {
                 continue;
             };
-            let expires = lease.permit_deadline.min(until);
+            let wire_bps = lease.protection.as_ref().map(ProtectionPath::wire_bps);
+            let expires = if wire_bps.is_some() {
+                lease.expires
+            } else {
+                lease.permit_deadline
+            }
+            .min(until);
             desired.entry(lease.downstream.network).or_default().push((
                 lease.source,
                 lease.ack,
                 expires,
+                wire_bps,
             ));
         }
         for (network, sends) in &mut self.peers {

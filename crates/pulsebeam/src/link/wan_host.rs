@@ -32,12 +32,14 @@ use super::{delivery_tag, fabric_codec::FabricWanCodec};
 mod egress;
 mod installation;
 mod service;
+mod warm;
 #[cfg(test)]
 pub(crate) use egress::SendFixture;
-pub(crate) use egress::{ParentSend, PendingTx, SendParent, WanTx};
+pub(crate) use egress::{ParentSend, PendingTx, SendParent, SendPolicy, WanTx};
 pub(crate) use installation::{ChildInstall, Commands, ReceiveCommand};
 use installation::{Command, Pending};
 pub(crate) use service::{MAX_EPOCH_WINDOWS, Provisioner, Service};
+pub(crate) use warm::{CachedPacket as WarmRepairPacket, Fence as WarmFence, WarmReceive};
 
 const RECEIVE_BUDGET: usize = 32;
 
@@ -72,35 +74,39 @@ struct Destination {
     pub tx: LinkTx<ShardFrame>,
 }
 
-pub(crate) use activity::ReceiveActivity;
+#[derive(Clone)]
+pub(crate) struct ReceiveActivity {
+    last: pulsebeam_runtime::sync::watch::Sender<Option<Instant>>,
+    protected: bool,
+}
 
-#[allow(
-    clippy::disallowed_types,
-    reason = "WAN socket publishes the first complete delivery once to its controller"
-)]
-mod activity {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    };
+impl Default for ReceiveActivity {
+    fn default() -> Self {
+        Self::new(false)
+    }
+}
 
-    #[derive(Clone, Default)]
-    pub(crate) struct ReceiveActivity(Arc<AtomicBool>);
-
-    impl ReceiveActivity {
-        pub(crate) fn observed(&self) -> bool {
-            self.0.load(Ordering::Acquire)
+impl ReceiveActivity {
+    pub(crate) fn new(protected: bool) -> Self {
+        Self {
+            last: pulsebeam_runtime::sync::watch::channel(None).0,
+            protected,
         }
+    }
 
-        pub(super) fn mark_observed(&self) {
-            self.0.store(true, Ordering::Release);
-        }
+    pub(crate) fn last_observed(&self) -> Option<Instant> {
+        *self.last.borrow()
+    }
+
+    pub(crate) fn observed(&self) -> bool {
+        self.last_observed().is_some()
     }
 }
 
 struct LiveReceive {
     window: Staged<Window>,
     projection_selected: bool,
+    protected: bool,
     deadline: Option<wan::LiveDeadline>,
     activity: Option<ReceiveActivity>,
     timing: Option<crate::route::fabric::WindowTiming>,
@@ -148,6 +154,7 @@ pub(crate) struct WanHost {
     socket: UdpSocket,
     driver: wan::Driver<FabricWanCodec, Window>,
     receives: BTreeMap<NonZeroU32, LiveReceive>,
+    warm: BTreeMap<NonZeroU32, warm::Active>,
     repairs: BTreeMap<NonZeroU32, RepairReceive>,
     pending: BTreeMap<NonZeroU32, Pending>,
     pending_capacity: usize,
@@ -209,6 +216,7 @@ impl WanHost {
             socket,
             driver,
             receives: BTreeMap::new(),
+            warm: BTreeMap::new(),
             repairs: BTreeMap::new(),
             pending: BTreeMap::new(),
             pending_capacity,
@@ -233,7 +241,11 @@ impl WanHost {
     ) -> Result<LiveReceive, Error> {
         let first = destinations.first().ok_or(Error::Binding)?.child;
         let window = first.window.ok_or(Error::Binding)?;
-        if window.profile() != first.emission.profile()
+        let protected = activity.as_ref().is_some_and(|activity| activity.protected);
+        if (protected
+            && (window.profile() != pulsebeam_core::fabric::Profile::H264
+                || !first.emission.carries_video_dd()))
+            || window.profile() != first.emission.profile()
             || window.emission() != first.emission.wire_profile().1
             || destinations.len() > MAX_BRANCHES
             || destinations.iter().enumerate().any(|(i, destination)| {
@@ -277,7 +289,8 @@ impl WanHost {
         )?;
         Ok(LiveReceive {
             window: staged,
-            projection_selected: false,
+            projection_selected: protected,
+            protected,
             deadline,
             activity,
             timing: timing.filter(|point| point.position == first.sequence_anchor),
@@ -534,6 +547,13 @@ impl WanHost {
             match receiver.try_recv() {
                 Ok(Command::Receive(command)) => self.install(now, command),
                 Ok(Command::Send(install)) => self.install_send(now, *install),
+                Ok(Command::Warm(install)) => {
+                    if let Err(error) = self.install_warm(now, install) {
+                        tracing::debug!(?error, "warm receive installation rejected");
+                    }
+                }
+                Ok(Command::ForwardWarm(forward)) => self.forward_warm(now, *forward),
+                Ok(Command::LookupWarm(lookup)) => self.lookup_warm(now, lookup),
                 Ok(Command::SelectProjection {
                     window,
                     incarnation,
@@ -615,6 +635,7 @@ impl WanHost {
     ) -> Result<(), Error> {
         let socket = &mut self.socket;
         let receives = &self.receives;
+        let warm = &self.warm;
         let received = self.driver.receive_with_decoder(
             now.into_std(),
             binding,
@@ -623,15 +644,18 @@ impl WanHost {
             &mut |destination, payload| send(socket, destination, payload),
             |codec, ticket, plaintext| {
                 let selected = ticket.spec().purpose == Purpose::Live
-                    && receives
+                    && (receives
                         .get(&ticket.spec().ssrc)
-                        .is_some_and(|route| route.window == ticket && route.projection_selected);
+                        .is_some_and(|route| route.window == ticket && route.projection_selected)
+                        || warm
+                            .get(&ticket.spec().ssrc)
+                            .is_some_and(|route| route.window == ticket));
                 codec.decode_live(ticket.descriptor(), plaintext, selected)
             },
         );
         self.sync_lease(now);
         match received {
-            Ok(Some(image)) => self.deliver(image, observed),
+            Ok(Some(image)) => self.deliver(image, observed, now),
             Err(error) if self.driver.is_closed() => return Err(error.into()),
             _ => {}
         }
@@ -651,7 +675,8 @@ impl WanHost {
 
         let edge = (peer.ip(), local.ip());
         let media_probe = wan_repair::active(peer, local);
-        if !media_probe && !sim_metrics::wan_data_loss_armed(edge) {
+        let protected_probe = wan_repair::protected_edge(peer, local);
+        if !media_probe && !protected_probe && !sim_metrics::wan_data_loss_armed(edge) {
             return Some(bytes);
         }
         let [0x80 | 0x90, pt, hi, lo, t0, t1, t2, t3, a, b, c, d, ..] = bytes.as_ref() else {
@@ -679,6 +704,12 @@ impl WanHost {
             Profile::Opus | Profile::Vp9 if media_probe => {
                 let timestamp = u32::from_be_bytes([*t0, *t1, *t2, *t3]);
                 wan_repair::filter(self.id, bytes, ecn, window, position, timestamp, repair)
+            }
+            Profile::H264
+                if protected_probe
+                    && wan_repair::protected_loss((peer, local), self.id, position, repair) =>
+            {
+                None
             }
             Profile::Data if !repair && sim_metrics::drop_wan_live_data(edge, position) => None,
             _ => Some(bytes),
@@ -713,6 +744,7 @@ impl WanHost {
             .chain(self.pending.values().map(Pending::expires))
             .chain(self.egress.next_deadline())
             .chain(self.receives.values().map(LiveReceive::expires))
+            .chain(self.warm.values().map(warm::Active::expires))
             .chain(
                 self.repairs
                     .values()
@@ -772,8 +804,17 @@ impl WanHost {
         &mut self,
         image: wan::Received<(OwnedPacket, Option<OmissionRun>), Window>,
         observed: ReceiveTime,
+        now: Instant,
     ) {
         let spec = image.route.spec();
+        if let Some(warm) = self
+            .warm
+            .get_mut(&spec.ssrc)
+            .filter(|warm| warm.window == image.route)
+        {
+            warm.deliver(now, image);
+            return;
+        }
         let (packet, omitted) = image.packet;
         let image = wan::Received {
             packet,
@@ -831,13 +872,21 @@ impl WanHost {
                 }
                 let mut frame: crate::route::fabric::NetworkPacket = image.into();
                 frame.omitted = omitted;
+                if route.protected {
+                    tracing::trace!(target: "pulsebeam_protection", position = frame.position, timestamp = frame.packet.header().timestamp, ?omitted, "protected viewer authenticated");
+                }
                 frame.capture = route.timing.and_then(|timing| timing.capture_for(&frame));
                 let mut complete = true;
                 for destination in &route.destinations {
                     complete &= handoff(&destination.tx, destination.child.ingress, frame.clone());
                 }
-                if complete && let Some(activity) = route.activity.take() {
-                    activity.mark_observed();
+                if complete {
+                    if let Some(activity) = &route.activity {
+                        activity.last.send_replace(Some(now));
+                    }
+                    if !route.protected {
+                        route.activity = None;
+                    }
                 }
             }
             Purpose::Repair { position } => {
@@ -877,6 +926,14 @@ impl WanHost {
             {
                 fence_receive(route);
                 self.driver.retire(route.window);
+                false
+            } else {
+                true
+            }
+        });
+        self.warm.retain(|_, warm| {
+            if changed || !warm.live(now) {
+                self.driver.retire(warm.window);
                 false
             } else {
                 true

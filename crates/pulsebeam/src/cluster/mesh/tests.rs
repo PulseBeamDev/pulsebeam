@@ -38,6 +38,10 @@ fn bilateral_max_and_hold_select_alternate_route_without_holding_a_dead_path() {
     );
     assert_eq!(routes.path(viewer), Some([viewer].as_slice()));
     let graph = Graph::from_reports([&p, &a, &fast]).unwrap();
+    assert_eq!(
+        graph.standby_for(publisher, &[viewer]),
+        Some(vec![relay, viewer])
+    );
     routes.reconcile(publisher, &graph, now);
     assert_eq!(routes.path(viewer), Some([viewer].as_slice()));
     routes.reconcile(publisher, &graph, now + HOLD);
@@ -67,6 +71,30 @@ fn diamond_ties_are_stable_and_edges_cannot_forward_between_routers() {
     assert_eq!(routes.path(edge), Some([edge].as_slice()));
     routes.reconcile(edge, &graph, Instant::now());
     assert_eq!(routes.path(a), Some([a].as_slice()));
+}
+
+#[test]
+fn protection_skips_cheaper_routes_through_the_same_relay() {
+    let (p, shared, detour, standby, a) = (member(), member(), member(), member(), member());
+    let reports = [
+        report(p, Role::Router, &[(shared, 5), (detour, 10), (standby, 40)]),
+        report(shared, Role::Router, &[(p, 5), (detour, 10), (a, 5)]),
+        report(detour, Role::Router, &[(p, 10), (shared, 10)]),
+        report(a, Role::Edge, &[(shared, 5), (standby, 40)]),
+        report(standby, Role::Router, &[(p, 40), (a, 40)]),
+    ];
+    let active = [shared, a];
+    let graph = Graph::from_reports(&reports).unwrap();
+    assert_eq!(
+        graph.shortest_paths(p).get(&a).map(Vec::as_slice),
+        Some(active.as_slice())
+    );
+    assert_eq!(graph.standby_for(p, &active), Some(vec![standby, a]));
+
+    let no_standby = Graph::from_reports(&reports[..4]).unwrap();
+    assert_eq!(no_standby.standby_for(p, &active), None);
+    let no_primary = Graph::from_reports(reports.iter().filter(|r| r.origin != shared)).unwrap();
+    assert_eq!(no_primary.standby_for(p, &active), None);
 }
 
 #[test]

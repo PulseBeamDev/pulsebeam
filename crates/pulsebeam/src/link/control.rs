@@ -1,3 +1,7 @@
+use std::num::NonZeroU64;
+
+use pulsebeam_core::identity::NodeId;
+
 use crate::control::controller::{ControllerCommand, ControllerSender};
 use crate::entity::{ProjectRoomKey, PublicationKey};
 use crate::id::ShardId;
@@ -38,6 +42,43 @@ impl Control {
         let (reply, result) = oneshot::channel();
         self.submit(ControllerCommand::InspectLinks(reply))?;
         result.await.map_err(|_| LinkError::Closed)?
+    }
+
+    /// Whether this exact publication currently qualifies for regional warm
+    /// base protection at this node. False means not admitted for protection.
+    /// This snapshot does not authorize a new subscription or switch paths.
+    pub async fn media_protection(
+        &self,
+        room: ProjectRoomKey,
+        publication: PublicationKey,
+    ) -> Result<bool, LinkError> {
+        let (reply, result) = oneshot::channel();
+        self.submit(ControllerCommand::InspectMediaProtection {
+            room,
+            publication,
+            reply,
+        })?;
+        result.await.map_err(|_| LinkError::Closed)
+    }
+
+    /// Retires this publication's primary receive through the exact relay
+    /// incarnation only if an independent protected base leg is already warm.
+    /// False leaves the receives unchanged. This is local to this receiver
+    /// and the current source window, not clearance to stop a cluster node.
+    pub async fn drain_media_relay(
+        &self,
+        room: ProjectRoomKey,
+        publication: PublicationKey,
+        relay: (NodeId, NonZeroU64),
+    ) -> Result<bool, LinkError> {
+        let (reply, result) = oneshot::channel();
+        self.submit(ControllerCommand::DrainMediaRelay {
+            room,
+            publication,
+            relay,
+            reply,
+        })?;
+        result.await.map_err(|_| LinkError::Closed)
     }
 
     /// Admits a pinned datagram peer. Security readiness is asynchronous.

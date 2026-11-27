@@ -3,23 +3,34 @@ use std::{
     num::NonZeroU32,
 };
 
-const PACKETS_PER_FLOW: usize = 32;
+pub(super) const PACKETS_PER_FLOW: usize = 32;
 const QUANTUM: usize = pulsebeam_link::wan::MAX_DATAGRAM_BYTES;
 const CYCLE: [Class; 3] = [Class::Live, Class::Live, Class::Repair];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Class {
     Audio,
+    Protected,
     Live,
     Repair,
 }
 
 impl Class {
-    pub(super) const ALL: [Self; 3] = [Self::Audio, Self::Live, Self::Repair];
+    pub(super) const ALL: [Self; 4] = [Self::Audio, Self::Protected, Self::Live, Self::Repair];
+    pub(super) const PRIORITY: [Self; 2] = [Self::Audio, Self::Protected];
+
+    pub(super) const fn precedes(self, other: Self) -> bool {
+        match self {
+            Self::Audio => !matches!(other, Self::Audio),
+            Self::Protected => matches!(other, Self::Live | Self::Repair),
+            _ => false,
+        }
+    }
 
     pub(super) const fn capacity(self) -> usize {
         match self {
             Self::Audio => 48,
+            Self::Protected => 128,
             Self::Live => 128,
             Self::Repair => 16,
         }
@@ -27,7 +38,7 @@ impl Class {
 }
 
 pub(super) struct Schedule<T> {
-    lanes: [Lane<T>; 3],
+    lanes: [Lane<T>; Class::ALL.len()],
     turn: usize,
 }
 
@@ -89,8 +100,10 @@ impl<T> Schedule<T> {
     }
 
     pub(super) fn pick(&mut self, mut ready: impl FnMut(Class, bool) -> bool) -> Option<Class> {
-        if ready(Class::Audio, self.has_packets(Class::Audio)) {
-            return Some(Class::Audio);
+        for class in Class::PRIORITY {
+            if ready(class, self.has_packets(class)) {
+                return Some(class);
+            }
         }
         for offset in 0..CYCLE.len() {
             let index = (self.turn + offset) % CYCLE.len();
@@ -174,7 +187,7 @@ mod tests {
     }
 
     #[test]
-    fn hot_live_flow_cannot_occupy_audio_or_repair_reserves() {
+    fn hot_live_flow_cannot_occupy_priority_or_repair_reserves() {
         let flow = |label| NonZeroU32::new(label).unwrap();
         let mut schedule = Schedule::default();
         for index in 0..PACKETS_PER_FLOW {
@@ -184,7 +197,9 @@ mod tests {
         assert!(schedule.push(Class::Live, flow(2), QUANTUM, 100));
         assert!(schedule.push(Class::Audio, flow(3), QUANTUM, 101));
         assert!(schedule.push(Class::Repair, flow(4), QUANTUM, 102));
+        assert!(schedule.push(Class::Protected, flow(5), QUANTUM, 103));
         assert_eq!(next(&mut schedule), Some(101));
+        assert_eq!(next(&mut schedule), Some(103));
         assert_eq!(next(&mut schedule), Some(0));
         assert_eq!(next(&mut schedule), Some(100));
         assert_eq!(next(&mut schedule), Some(102));

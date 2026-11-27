@@ -11,7 +11,7 @@ use pulsebeam_transport::{
 
 pub use pulsebeam_transport::dtls_srtp::wan::{
     Direction, Limits, MAX_DATAGRAM_BYTES,
-    handoff::{Prepared, SocketOutcome, Submission},
+    handoff::{Dropped, Prepared, SocketOutcome, Submission},
     path::{Binding, Lease},
     session::{
         Config, Ecn, Fingerprint, LiveDeadline, LocalIdentity, Purpose, Role, SendBudget,

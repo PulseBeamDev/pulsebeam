@@ -789,6 +789,8 @@ impl ShardCore {
         #[cfg(feature = "sim")]
         let wan_protected_bytes = image.packet.wan_received_bytes();
         let position = image.position;
+        #[cfg(feature = "sim")]
+        let timestamp = image.packet.header().timestamp;
         let omitted = image.omitted;
         let capture = image.capture;
         let result = self
@@ -836,6 +838,15 @@ impl ShardCore {
                         ingress.association,
                         position,
                         repair,
+                        report.enqueued,
+                    );
+                }
+                #[cfg(feature = "sim")]
+                if profile == pulsebeam_core::fabric::Profile::H264 && repair {
+                    crate::sim_metrics::wan_repair::admitted_protected_repair(
+                        ingress.association,
+                        position,
+                        timestamp,
                         report.enqueued,
                     );
                 }
@@ -1024,7 +1035,8 @@ impl ShardExecution {
             if target.is_some() {
                 // The network route initially reserves a whole branch for
                 // each authorized receiver. QUIC uses one selected branch.
-                self.runtime.retire_unbound_network_video_branch(source, receiver);
+                self.runtime
+                    .retire_unbound_network_video_branch(source, receiver);
             }
         }
         self.runtime.install_fabric_branch(

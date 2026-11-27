@@ -16,7 +16,7 @@ async fn provisioned_reverse_and_wan_sockets_cannot_activate_either_carrier() {
         let mut links = LinkControl::<ShardFrame>::new(|| LinkTime::from_nanos(0)).unwrap();
         let address = "127.0.0.1:0".parse().unwrap();
         let (mut legacy, control) = host::Host::bind(address, now).await.unwrap();
-        let (service, provisioner) = Service::bind(address, now).await.unwrap();
+        let (service, provisioner) = Service::bind(address, now, None).await.unwrap();
         let legacy_pin = SecretCredential::generate().unwrap();
         let wan_pin = SecretCredential::generate().unwrap();
         let old = NetworkPeer {
@@ -52,6 +52,7 @@ async fn provisioned_reverse_and_wan_sockets_cannot_activate_either_carrier() {
             socket,
             mut opens,
             origin,
+            protected_egress_bps,
         } = service;
         let Open {
             driver,
@@ -62,6 +63,7 @@ async fn provisioned_reverse_and_wan_sockets_cannot_activate_either_carrier() {
         let mut wan = WanHost::attach(socket, peer, origin, driver, LIMITS.active_windows);
         wan.commands = Some(commands);
         wan.egress.inbox = Some(media);
+        wan.egress.protected_egress_bps = protected_egress_bps;
 
         for _ in 0..64 {
             legacy.poll_at(now).unwrap();

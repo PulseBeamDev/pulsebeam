@@ -21,6 +21,7 @@ pub(crate) struct Service {
     socket: UdpSocket,
     opens: pulsebeam_queue::Receiver<Open>,
     origin: Instant,
+    protected_egress_bps: Option<NonZeroU64>,
 }
 
 pub(crate) struct Provisioner(pulsebeam_queue::Sender<Open>);
@@ -36,6 +37,7 @@ impl Service {
     pub(crate) async fn bind(
         address: SocketAddr,
         origin: Instant,
+        protected_egress_bps: Option<NonZeroU64>,
     ) -> io::Result<(Self, Provisioner)> {
         if address.ip().is_unspecified() {
             return Err(io::Error::new(
@@ -50,6 +52,7 @@ impl Service {
                 socket,
                 opens,
                 origin,
+                protected_egress_bps,
             },
             Provisioner(sender),
         ))
@@ -65,6 +68,7 @@ impl Service {
             mut socket,
             mut opens,
             origin,
+            protected_egress_bps,
         } = self;
         loop {
             let request = pulsebeam_runtime::select! {
@@ -83,6 +87,7 @@ impl Service {
             let mut host = WanHost::attach(socket, id, origin, driver, LIMITS.active_windows);
             host.commands = Some(commands);
             host.egress.inbox = Some(media);
+            host.egress.protected_egress_bps = protected_egress_bps;
             let endpoint = host.binding().peer;
             tracing::debug!(epoch = id.epoch(), %endpoint, "Fabric WAN association opened");
             let result = host.drive(&shutdown).await;

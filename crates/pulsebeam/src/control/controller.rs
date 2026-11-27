@@ -33,7 +33,7 @@ use crate::{
         negotiator::{Negotiator, NegotiatorError},
         ufrag::IceUfrag,
     },
-    entity::{ConnectionId, EndpointKey, ParticipantId, ProjectRoomKey, RoomId},
+    entity::{ConnectionId, EndpointKey, ParticipantId, ProjectRoomKey, PublicationKey, RoomId},
     id::ShardId,
     log::{self, ConnectionEnd},
     shard::{
@@ -52,6 +52,7 @@ use pulsebeam_rtc::LocalCandidate;
 use pulsebeam_runtime::rt::{Migration, MigrationHandle};
 use pulsebeam_runtime::sync::CancellationToken;
 use pulsebeam_runtime::sync::oneshot;
+use pulsebeam_runtime::time::Instant;
 
 #[derive(Debug, Clone)]
 pub struct ParticipantState {
@@ -241,6 +242,17 @@ struct AuthorizationExpiryWork {
 pub enum ControllerCommand {
     OpenLink(crate::link::OpenPeer),
     InspectLinks(oneshot::Sender<Result<crate::link::HostHealth, pulsebeam_link::LinkError>>),
+    InspectMediaProtection {
+        room: ProjectRoomKey,
+        publication: PublicationKey,
+        reply: oneshot::Sender<bool>,
+    },
+    DrainMediaRelay {
+        room: ProjectRoomKey,
+        publication: PublicationKey,
+        relay: (pulsebeam_core::identity::NodeId, std::num::NonZeroU64),
+        reply: oneshot::Sender<bool>,
+    },
     LinkDestinations(crate::link::Destinations),
     CloseLink(pulsebeam_link::NetworkId),
     BindLinkReceive(crate::link::BindReceive),
@@ -1163,6 +1175,37 @@ impl ControllerActor {
                 } else {
                     let _ = reply.send(Err(pulsebeam_link::LinkError::Closed));
                 }
+                None
+            }
+            ControllerCommand::InspectMediaProtection {
+                room,
+                publication,
+                reply,
+            } => {
+                let protected = self.regional_routing.as_ref().is_some_and(|routing| {
+                    routing.protected_media(self, room, publication, Instant::now())
+                });
+                let _ = reply.send(protected);
+                None
+            }
+            ControllerCommand::DrainMediaRelay {
+                room,
+                publication,
+                relay: (node, generation),
+                reply,
+            } => {
+                let drained = self.regional_routing.take().is_some_and(|mut routing| {
+                    let result = routing.drain_media_relay(
+                        self,
+                        room,
+                        publication,
+                        crate::cluster::mesh::Member { node, generation },
+                        Instant::now(),
+                    );
+                    self.regional_routing = Some(routing);
+                    result
+                });
+                let _ = reply.send(drained);
                 None
             }
             ControllerCommand::OpenLink(command) => {
@@ -2414,13 +2457,23 @@ impl ControllerActor {
                 }
             }
             ShardEvent::NetworkMediaRepair(interest) => {
-                if interest.parent.destination.shard() == shard
-                    && let Some(peer) = self
+                if interest.parent.destination.shard() != shard {
+                    return;
+                }
+                let now = Instant::now();
+                let alternate = self
+                    .regional_routing
+                    .as_ref()
+                    .and_then(|routing| routing.independent_media_repair(self, *interest, now));
+                for request in alternate.into_iter().chain([*interest]) {
+                    if let Some(peer) = self
                         .provisioned_peers
                         .iter_mut()
-                        .find(|peer| peer.matches_network(interest.parent.ingress.association))
-                {
-                    peer.request_media_repair(*interest, pulsebeam_runtime::time::Instant::now());
+                        .find(|peer| peer.matches_network(request.parent.ingress.association))
+                        && peer.request_media_repair(request, now)
+                    {
+                        break;
+                    }
                 }
             }
             ShardEvent::NetworkDataRepair(event) => {

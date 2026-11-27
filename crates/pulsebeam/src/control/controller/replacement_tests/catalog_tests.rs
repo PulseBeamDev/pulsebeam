@@ -852,7 +852,12 @@ async fn unavailable_configured_catalog_owner_is_not_covered_by_a_gateway() {
         "borders": [{"child": local, "parent": gateway}]
     }))
     .unwrap();
-    actor.set_region_tree(member(local), tree, pulsebeam_runtime::time::Instant::now());
+    actor.set_region_tree(
+        member(local),
+        tree,
+        pulsebeam_runtime::time::Instant::now(),
+        None,
+    );
     let (_sender, sessions) = pulsebeam_runtime::sync::mpsc::channel(1);
     actor
         .add_regional_border(
@@ -914,7 +919,7 @@ async fn sibling_catalog_requeries_through_parent_and_fails_over_gateways() {
     let epoch = Instant::now();
     let make = |node| {
         let (mut actor, receivers) = actor_with_receivers(1);
-        actor.set_region_tree(member(node), tree.clone(), epoch);
+        actor.set_region_tree(member(node), tree.clone(), epoch, None);
         (actor, receivers)
     };
     let (mut viewer, _viewer_rx) = make(west);

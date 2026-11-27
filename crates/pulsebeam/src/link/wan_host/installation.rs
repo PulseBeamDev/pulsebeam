@@ -78,6 +78,9 @@ pub(crate) struct ChildInstall<T> {
 pub(crate) enum Command {
     Receive(ReceiveCommand),
     Send(Box<super::egress::Install>),
+    Warm(super::warm::Install),
+    ForwardWarm(Box<super::warm::Forward>),
+    LookupWarm(super::warm::Lookup),
     SelectProjection {
         window: Window,
         incarnation: std::num::NonZeroU64,
@@ -293,6 +296,7 @@ impl WanHost {
         if self.pending.contains_key(&ssrc)
             || self.receives.contains_key(&ssrc)
             || self.repairs.contains_key(&ssrc)
+            || self.warm.contains_key(&ssrc)
         {
             reject(command.report(), Error::Binding);
             return;

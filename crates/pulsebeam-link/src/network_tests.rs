@@ -281,57 +281,59 @@ impl Pair {
         self.bd.start(now, instant).unwrap();
     }
 
-    fn poll_a(&mut self, now: LinkTime) {
-        self.ad
-            .poll(now, self.budget, |datagram| {
-                assert_eq!(datagram.destination, self.ba);
-                assert!(datagram.payload.len() <= wire::UDP_BUDGET);
-                if self.reject_a {
-                    return io::SendOutcome::Rejected;
+    fn poll_a(&mut self, now: LinkTime) -> Result<(), io::Error> {
+        self.ad.poll(now, self.budget, |datagram| {
+            assert_eq!(datagram.destination, self.ba);
+            assert!(datagram.payload.len() <= wire::UDP_BUDGET);
+            if self.reject_a {
+                return io::SendOutcome::Rejected;
+            }
+            if self.short_a {
+                return io::SendOutcome::Accepted {
+                    bytes: datagram.payload.len().saturating_sub(1),
+                };
+            }
+            // DTLS 1.3 unified headers expose the low epoch bits. Observation
+            // only: Link transport accounting must never use record identity.
+            if let Some(header) = datagram.payload.first()
+                && header & 0xe0 == 0x20
+            {
+                let epoch = usize::from(header & 3);
+                self.a_epochs[epoch] = true;
+                if datagram.payload.len() == 1180 {
+                    self.a_full_image_epochs[epoch] = true;
                 }
-                if self.short_a {
-                    return io::SendOutcome::Accepted {
-                        bytes: datagram.payload.len().saturating_sub(1),
-                    };
-                }
-                // DTLS 1.3 unified headers expose the low epoch bits. Observation
-                // only: Link transport accounting must never use record identity.
-                if let Some(header) = datagram.payload.first()
-                    && header & 0xe0 == 0x20
-                {
-                    let epoch = usize::from(header & 3);
-                    self.a_epochs[epoch] = true;
-                    if datagram.payload.len() == 1180 {
-                        self.a_full_image_epochs[epoch] = true;
-                    }
-                }
-                self.aout.push_back(datagram.payload.to_vec());
-                io::SendOutcome::Accepted {
-                    bytes: datagram.payload.len(),
-                }
-            })
-            .unwrap();
+            }
+            self.aout.push_back(datagram.payload.to_vec());
+            io::SendOutcome::Accepted {
+                bytes: datagram.payload.len(),
+            }
+        })?;
+        Ok(())
     }
 
-    fn poll_b(&mut self, now: LinkTime) {
-        self.bd
-            .poll(now, self.budget, |datagram| {
-                assert_eq!(datagram.destination, self.aa);
-                assert!(datagram.payload.len() <= wire::UDP_BUDGET);
-                if !self.drop_b {
-                    self.bout.push_back(datagram.payload.to_vec());
-                }
-                io::SendOutcome::Accepted {
-                    bytes: datagram.payload.len(),
-                }
-            })
-            .unwrap();
+    fn poll_b(&mut self, now: LinkTime) -> Result<(), io::Error> {
+        self.bd.poll(now, self.budget, |datagram| {
+            assert_eq!(datagram.destination, self.aa);
+            assert!(datagram.payload.len() <= wire::UDP_BUDGET);
+            if !self.drop_b {
+                self.bout.push_back(datagram.payload.to_vec());
+            }
+            io::SendOutcome::Accepted {
+                bytes: datagram.payload.len(),
+            }
+        })?;
+        Ok(())
     }
 
     fn step(&mut self) {
+        self.try_step().unwrap();
+    }
+
+    fn try_step(&mut self) -> Result<(), io::Error> {
         let now = LinkTime(self.ticks.fetch_add(1_000_000, Ordering::Relaxed) + 1_000_000);
-        self.poll_a(now);
-        self.poll_b(now);
+        self.poll_a(now)?;
+        self.poll_b(now)?;
         for _ in 0..256 {
             let mut progress = false;
             if let Some(bytes) = self.aout.pop_front() {
@@ -342,10 +344,10 @@ impl Pair {
                 match self.bd.receive(self.aa, &bytes, observed) {
                     Ok(()) => {
                         progress = true;
-                        self.poll_b(now);
+                        self.poll_b(now)?;
                     }
                     Err(io::Error::Busy) => self.aout.push_front(bytes),
-                    other => panic!("receive B: {other:?}"),
+                    Err(error) => return Err(error),
                 }
             }
             if let Some(bytes) = self.bout.pop_front() {
@@ -356,16 +358,17 @@ impl Pair {
                 match self.ad.receive(self.ba, &bytes, observed) {
                     Ok(()) => {
                         progress = true;
-                        self.poll_a(now);
+                        self.poll_a(now)?;
                     }
                     Err(io::Error::Busy) => self.bout.push_front(bytes),
-                    other => panic!("receive A: {other:?}"),
+                    Err(error) => return Err(error),
                 }
             }
             if !progress {
                 break;
             }
         }
+        Ok(())
     }
 
     fn connect(&mut self) {
@@ -979,6 +982,48 @@ fn association_replacement_reuses_pinned_identities_but_not_bindings_or_queued_p
 }
 
 #[test]
+fn replacement_wan_peer_pin_rejects_retired_quic_credential() {
+    let mut pair = Pair::with_backend(true);
+    pair.connect();
+
+    let replacement = QuicCredential::generate().unwrap();
+    let PeerConfig::Quic(responder) = &mut pair.b_peer else {
+        unreachable!();
+    };
+    responder.expected_peer = replacement.fingerprint();
+    pair.reset();
+    let failure = (0..5000).find_map(|_| {
+        let result = pair.try_step();
+        assert!(
+            !pair.bd.health().ready,
+            "retired credential passed the new pin"
+        );
+        result.err()
+    });
+    assert!(
+        matches!(failure, Some(io::Error::Security)),
+        "expected pin rejection, got {failure:?}"
+    );
+
+    let PeerConfig::Quic(initiator) = &mut pair.a_peer else {
+        unreachable!();
+    };
+    initiator.credential = replacement;
+    pair.reset();
+    pair.connect();
+    let (port, mut rx) = pair.b.create_port().unwrap();
+    let (_, tx) = pair.route(&[(port, DeliveryTag(1))]);
+    tx.try_send(Packet::Wire(Arc::from([1u8])), LinkTime(u64::MAX))
+        .unwrap();
+    for _ in 0..20 {
+        pair.step();
+    }
+    let mut batch = Vec::new();
+    assert_eq!(rx.try_recv_batch(&mut batch, 2), 1);
+    assert!(matches!(&batch[0].packet, Packet::Wire(bytes) if bytes.as_ref() == [1]));
+}
+
+#[test]
 fn fabric_restart_reuses_route_label_but_never_admits_old_association_work() {
     let path = FabricPath {
         udp_payload_limit: 1200,
@@ -1186,7 +1231,7 @@ fn attempt_wrap_with_reordered_ciphertext_keeps_extended_feedback_identity_case(
     }
     for _ in 0..30 {
         let now = LinkTime(pair.ticks.fetch_add(1_000_000, Ordering::Relaxed) + 1_000_000);
-        pair.poll_a(now);
+        pair.poll_a(now).unwrap();
     }
     assert_eq!(pair.ad.health().sent, 3);
     assert!(

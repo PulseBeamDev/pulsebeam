@@ -30,6 +30,8 @@ pub struct ProvisionedPeer {
     pub regional_control: Option<RegionalControlConfig>,
     /// Explicitly allow WAN sources from this pinned upstream on this outgoing edge.
     pub relay_from: Option<NodeId>,
+    /// Wire-rate budget provisioned for protected live sends on this directed hop.
+    pub protected_egress_bps: Option<NonZeroU64>,
     pub authority_epoch: [u8; 16],
     pub receipt_key: ApiSigningKey,
     pub peer_receipt_key: ApiPublicKey,
@@ -195,6 +197,7 @@ impl ServerConfig {
             data_dir,
             ownership_peers,
             region_tree: cluster.region_tree,
+            protected_base_stream_bps: cluster.protected_base_stream_bps,
         };
         options.validate_topology()?;
         Ok(Some(options))
@@ -215,6 +218,7 @@ pub struct ClusterConfig {
     #[serde(default)]
     adjacency: Vec<PeerConfig>,
     region_tree: Option<RegionTree>,
+    protected_base_stream_bps: Option<NonZeroU64>,
 }
 
 #[derive(Deserialize)]
@@ -232,6 +236,7 @@ struct PeerConfig {
     authority_epoch: String,
     receipt_key_file: PathBuf,
     peer_receipt_key: ApiPublicKey,
+    protected_egress_bps: Option<NonZeroU64>,
     regional_control: RegionalControlConfig,
 }
 
@@ -262,6 +267,7 @@ impl PeerConfig {
             peer_receipt_key: self.peer_receipt_key,
             regional_control: Some(self.regional_control),
             relay_from: None,
+            protected_egress_bps: self.protected_egress_bps,
             transport: NetworkPeer {
                 endpoint: self.peer_endpoint,
                 credential,
@@ -351,10 +357,17 @@ pub struct Options {
     pub data_dir: PathBuf,
     pub ownership_peers: Vec<ProvisionedPeer>,
     pub region_tree: Option<RegionTree>,
+    /// Opt in to staging two warm base legs for eligible regional receives.
+    /// The configured worst-case wire rate is reserved on each directed hop.
+    pub protected_base_stream_bps: Option<NonZeroU64>,
 }
 
 impl Options {
     pub(super) fn validate_topology(&self) -> Result<()> {
+        ensure!(
+            self.protected_base_stream_bps.is_none() || self.region_tree.is_some(),
+            "protected base streams require a region tree"
+        );
         if self.topology == Topology::SingleNode {
             ensure!(
                 self.seeds.is_empty(),

@@ -22,7 +22,7 @@ use crate::{
                 self, fabric::WanLiveRouteAck, wan_source::WanSourceWindow, wan_transit,
             },
         },
-        link::{LiveReceiveSpec, wan::WanLiveReceiveSpec},
+        link::{Links as MediaLinks, LiveReceiveSpec, wan::WanLiveReceiveSpec},
     },
     entity::{ConnectionId, EndpointKey, PublicationId, PublicationKey, TrackKind},
     route::fabric::LiveNetworkChild,
@@ -34,7 +34,7 @@ use super::{
     frames::{Frame, HOPS, Request},
     media_branch::{self, Edge, Lease},
     media_client::Demand,
-    media_permit,
+    media_permit, media_protection,
     media_read::Row,
 };
 
@@ -90,6 +90,7 @@ pub(super) struct Plan<'a> {
     local: Option<&'a Demand>,
     children: Vec<&'a Lease>,
     upstream: Edge,
+    pin_ingress: bool,
     journey: Journey,
 }
 
@@ -105,6 +106,7 @@ pub(super) fn plan<'a>(
     demands: impl Iterator<Item = &'a Demand>,
     leases: impl Iterator<Item = &'a Lease>,
     attempt_for: impl Fn(Member) -> u8,
+    protect: bool,
 ) -> Vec<Plan<'a>> {
     let mut groups = BTreeMap::new();
     for demand in demands {
@@ -188,6 +190,11 @@ pub(super) fn plan<'a>(
                     .map_or_else(|| attempt_for(target), |lease| lease.attempt),
                 payload: &[],
             };
+            let pin_ingress = protect
+                && local.is_some()
+                && children.is_empty()
+                && router.tree.region(router.local) == router.tree.region(target)
+                && media_branch::supports_protection(offer.source, offer.descriptor);
             let (upstream, border) = router.via(request, |member, request| {
                 if visited.contains(&member)
                     || children.iter().any(|lease| lease.visited.contains(&member))
@@ -209,6 +216,7 @@ pub(super) fn plan<'a>(
                 local,
                 children,
                 upstream,
+                pin_ingress,
                 journey,
             })
         })
@@ -220,7 +228,11 @@ struct Installed {
     source: WanSourceWindow,
     descriptor: Track,
     upstream: Edge,
+    canonical: NetworkId,
     window: Option<Window>,
+    viewer_only: bool,
+    base_only: bool,
+    drained: Option<Member>,
     next_renew: Instant,
     last_sent_permit: Option<u64>,
     announced: Option<Announcement>,
@@ -284,6 +296,61 @@ pub(super) struct Receives {
 }
 
 impl Receives {
+    pub(super) fn canonical_ingress(&self, demand: &Demand) -> Option<NetworkId> {
+        let installed = self.installed.get(&Key::new(
+            demand.endpoint,
+            demand.source.publisher.publication,
+        ))?;
+        (installed.source.same_window(demand.source)
+            && installed.source.origin == demand.source.origin)
+            .then_some(installed.canonical)
+    }
+
+    pub(super) fn drained_relay(&self, demand: &Demand) -> Option<Member> {
+        let installed = self.installed.get(&Key::new(
+            demand.endpoint,
+            demand.source.publisher.publication,
+        ))?;
+        installed
+            .source
+            .same_window(demand.source)
+            .then_some(installed.drained)
+            .flatten()
+    }
+
+    pub(super) fn drain_primary(
+        &mut self,
+        links: &mut MediaLinks,
+        endpoint: EndpointKey,
+        source: WanSourceWindow,
+        upstream: Edge,
+        relay: Member,
+        now: Instant,
+    ) -> Option<Vec<BranchUpdate>> {
+        let installed = self
+            .installed
+            .get_mut(&Key::new(endpoint, source.publisher.publication))?;
+        let window = installed.window?;
+        if !installed.viewer_only
+            || installed.upstream != upstream
+            || !installed.source.same_window(source)
+            || installed.source.origin != source.origin
+            || installed.drained.is_some()
+            || links
+                .routed_wan_ack(upstream.network, window, now)
+                .is_none()
+        {
+            return None;
+        }
+        installed.drained = Some(relay);
+        installed.base_only = true;
+        installed.window = None;
+        links.retire_routed_wan_receive(upstream.network, window);
+        let mut updates = Vec::new();
+        installed.withdraw(&mut updates, now);
+        Some(updates)
+    }
+
     pub(super) fn live_media_grant(
         &self,
         peer: NetworkId,
@@ -310,6 +377,7 @@ impl Receives {
         &mut self,
         actor: &mut ControllerActor,
         plans: Vec<Plan<'_>>,
+        protected: &media_protection::Receivers,
         now: Instant,
     ) -> Vec<BranchUpdate> {
         let mut next = BTreeMap::new();
@@ -324,6 +392,7 @@ impl Receives {
             local,
             children,
             upstream,
+            pin_ingress,
             journey,
         } in plans
         {
@@ -333,7 +402,7 @@ impl Receives {
             };
             let mut old = self.installed.remove(&key);
             if old.as_ref().is_some_and(|old| {
-                old.upstream.network != upstream.network
+                (!pin_ingress && old.canonical != upstream.network)
                     || old.source.publisher != source.publisher
                     || old.source.origin != source.origin
                     || &old.descriptor != offer.descriptor
@@ -355,9 +424,12 @@ impl Receives {
                 .flat_map(Demand::receivers)
                 .collect::<HashSet<ConnectionId>>();
             let transit = (!children.is_empty()).then_some(wan_transit::SHARD);
+            // The canonical peer scopes the shard route; it need not carry a
+            // packet. Keep that scope while the signed publisher is unchanged.
+            let canonical = old.as_ref().map_or(upstream.network, |old| old.canonical);
             if let Some(outcome) = actor.lifecycle.reconcile_routed_ingress(
                 track,
-                upstream.network,
+                canonical,
                 receivers,
                 transit,
                 &actor.core.registry,
@@ -370,7 +442,7 @@ impl Receives {
                 key.0,
                 source.publisher.publication,
                 source.publisher.connection,
-                upstream.network,
+                canonical,
             ) {
                 if let Some(old) = old {
                     retire(actor, key, old, &mut updates, now);
@@ -381,16 +453,33 @@ impl Receives {
                 source,
                 descriptor: offer.descriptor.clone(),
                 upstream,
+                canonical,
                 window: None,
+                viewer_only: pin_ingress,
+                base_only: false,
+                drained: None,
                 next_renew: now,
                 last_sent_permit: None,
                 announced: None,
             });
             if installed.upstream.link != upstream.link {
                 installed.next_renew = now;
-                installed.upstream = upstream;
             }
+            // A cold full receive can start mid-frame. Keep the warm base leg
+            // carrying playback instead of splicing an arbitrary suffix into it.
+            installed.viewer_only = pin_ingress;
+            if !installed.source.same_window(source) {
+                installed.drained = None;
+            }
+            installed.base_only = installed.drained.is_some()
+                || pin_ingress
+                    && (installed.base_only || installed.upstream != upstream)
+                    && actor
+                        .links
+                        .as_ref()
+                        .is_some_and(|links| protected.fresh_on(links, source, upstream, now));
             let window = receive(actor, &mut installed, source, upstream, offer.expires, now);
+            installed.upstream = upstream;
             if installed.announced.as_ref().is_some_and(|old| {
                 Some(old.ack.window) != window || old.upstream.link != upstream.link
             }) {
@@ -414,6 +503,7 @@ impl Receives {
                             Row::new(offer.descriptor, offer.permit.into()),
                             ack,
                             journey.visited.clone(),
+                            None,
                         )
                     {
                         let route = Announcement {
@@ -490,24 +580,26 @@ fn receive(
 ) -> Option<Window> {
     let links = actor.links.as_mut()?;
     let addresses = links
-        .relay_targets(upstream.network, relay::LIMIT)
+        .relay_targets(installed.canonical, relay::LIMIT)
         .and_then(|mut routes| routes.remove(&source.scope()))
         .unwrap_or_default();
     if let Some(window) = installed.window {
         let same_source = installed.source.same_window(source);
         if same_source
+            && !installed.base_only
+            && installed.upstream.network == upstream.network
             && links.retain_routed_wan_receive(upstream.network, window, &addresses, expires, now)
         {
             return Some(window);
         }
         tracing::debug!(?window, ?upstream.network, same_source, targets = addresses.len(), "regional media receive replaced");
-        links.retire_routed_wan_receive(upstream.network, window);
+        links.retire_routed_wan_receive(installed.upstream.network, window);
         installed.window = None;
     }
     installed.source = source;
     installed.upstream = upstream;
     installed.next_renew = now;
-    if addresses.is_empty() {
+    if installed.base_only || addresses.is_empty() {
         return None;
     }
     installed.window = actor.stage_peer_wan_live_receive(
@@ -524,12 +616,13 @@ fn receive(
                 emission: source.publisher.emission,
                 addresses,
             },
-            canonical_ingress: upstream.network,
+            canonical_ingress: installed.canonical,
             start: source.window_start,
             forms: source.forms(),
             offer_cut: None,
             regional: Some((upstream.link.member, source)),
             routed: true,
+            protected: false,
             expires,
             timing: source.window_timing(),
         },

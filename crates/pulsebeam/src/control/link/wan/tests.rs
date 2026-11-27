@@ -23,7 +23,7 @@ async fn border_media_network_cannot_back_an_ownership_session() {
     let origin = Instant::now();
     let control = LinkControl::new(|| LinkTime::from_nanos(0)).unwrap();
     let mut links = Links::new(control, Vec::new(), origin);
-    let (_host, provisioner) = wan_host::Service::bind("[::1]:0".parse().unwrap(), origin)
+    let (_host, provisioner) = wan_host::Service::bind("[::1]:0".parse().unwrap(), origin, None)
         .await
         .unwrap();
     let network = links.reserve_wan_peer().unwrap();
@@ -58,8 +58,12 @@ async fn wan_host_receives_only_controller_scoped_commits_and_fences_on_peer_clo
     let (port, mut mailbox) = control.create_port().unwrap();
     let mut links = Links::new(control, vec![port], origin);
     let address = "127.0.0.1:0".parse().unwrap();
-    let (sender_host, sender) = wan_host::Service::bind(address, origin).await.unwrap();
-    let (receiver_host, provisioner) = wan_host::Service::bind(address, origin).await.unwrap();
+    let (sender_host, sender) = wan_host::Service::bind(address, origin, None)
+        .await
+        .unwrap();
+    let (receiver_host, provisioner) = wan_host::Service::bind(address, origin, None)
+        .await
+        .unwrap();
     let left = SecretCredential::generate().unwrap();
     let right = SecretCredential::generate().unwrap();
     let outbound = NetworkPeer {
@@ -157,6 +161,7 @@ async fn wan_host_receives_only_controller_scoped_commits_and_fences_on_peer_clo
         offer_cut: None,
         regional: None,
         routed: false,
+        protected: false,
         expires: now + Duration::from_secs(2),
         timing: None,
     };
@@ -171,6 +176,23 @@ async fn wan_host_receives_only_controller_scoped_commits_and_fences_on_peer_clo
         links.stage_wan_live_receive(now, wrong_ingress, |_, _| panic!("wrong ingress")),
         Err(BindError::Closed)
     ));
+    for wrong_room in [
+        ProjectRoomKey {
+            project: ProjectId::from_bytes([2; 16]),
+            ..room
+        },
+        ProjectRoomKey {
+            room: RoomId::new("other-wan").unwrap(),
+            ..room
+        },
+    ] {
+        let mut wrong_scope = spec();
+        wrong_scope.live.room = wrong_room;
+        assert!(matches!(
+            links.stage_wan_live_receive(now, wrong_scope, |_, _| panic!("wrong room scope")),
+            Err(BindError::Closed)
+        ));
+    }
     let mut gate = None;
     let live_window = links
         .stage_wan_live_receive(now, spec(), |child, cutoff| {
@@ -279,16 +301,17 @@ async fn wan_host_receives_only_controller_scoped_commits_and_fences_on_peer_clo
                 ..ack
             },
             deadline,
-            now
+            now,
+            None,
         ),
         Err(BindError::Closed)
     ));
     assert!(matches!(
-        links.stage_wan_publisher_transport(sender_peer, source, ack, now, now),
+        links.stage_wan_publisher_transport(sender_peer, source, ack, now, now, None),
         Err(BindError::Closed)
     ));
     let (send_cutoff, mut pending) = links
-        .stage_wan_publisher_transport(sender_peer, source, ack, deadline, now)
+        .stage_wan_publisher_transport(sender_peer, source, ack, deadline, now, None)
         .unwrap();
     let tx = pulsebeam_runtime::time::timeout(timeout, async {
         loop {
@@ -300,7 +323,9 @@ async fn wan_host_receives_only_controller_scoped_commits_and_fences_on_peer_clo
     })
     .await
     .unwrap();
-    assert!(!tx.renew(now, deadline));
+    let extended = deadline + Duration::from_secs(1);
+    assert!(tx.renew(now, extended));
+    assert_eq!(tx.expires(), extended);
     let packet = FabricPacket::new(
         Header {
             profile: Profile::Data,
@@ -558,6 +583,7 @@ async fn wan_host_receives_only_controller_scoped_commits_and_fences_on_peer_clo
             replacement_ack,
             deadline,
             now,
+            None,
         )
         .unwrap();
     let replacement_tx = pulsebeam_runtime::time::timeout(timeout, async {
@@ -603,6 +629,7 @@ async fn wan_host_receives_only_controller_scoped_commits_and_fences_on_peer_clo
     assert!(!live_cutoff.is_live() && !repair_cutoff.is_live());
     links.close_peer(sender_peer);
     assert!(!send_cutoff.is_live() && !repair_send_cutoff.is_live());
+    assert!(!tx.renew(Instant::now(), extended + Duration::from_secs(1)));
     pulsebeam_runtime::time::timeout(timeout, async {
         while !sender_lane.is_closed() || !receiver_lane.is_closed() {
             pulsebeam_runtime::task::yield_now().await;

@@ -205,7 +205,7 @@ pub(crate) async fn live_send_fixture(
                 purpose: Purpose::Live,
                 expires: expires.into_std(),
             },
-            false,
+            SendPolicy::Fixed,
             None,
         )
         .map_err(|error| anyhow::anyhow!("install fixture WAN send: {error:?}"))?;
@@ -216,6 +216,210 @@ pub(crate) async fn live_send_fixture(
         anyhow::bail!("fixture requires an active WAN send");
     };
     Ok((sender, receiver, control, peer, tx))
+}
+
+#[pulsebeam_runtime::test(crate = "pulsebeam_runtime::__harness")]
+async fn protected_send_receipts_charge_only_live_windows_on_the_hop() {
+    let (mut host, _remote, mut control) = ready_pair_with_windows(8).await.unwrap();
+    let (commands, inbox, media) = command_channel(host.id);
+    host.commands = Some(inbox);
+    host.egress.inbox = Some(media);
+    let now = Instant::now();
+    let expires = now + Duration::from_millis(500);
+    let extension = expires + Duration::from_millis(500);
+    let mut install = |host: &mut WanHost, label: u32, rate, at: Instant, deadline: Instant| {
+        let ssrc = NonZeroU32::new(label).unwrap();
+        let start = (1 << 32) | 0x18000;
+        let window = Window::new(Profile::H264, start, 0, ssrc, 0).unwrap();
+        let cutoff = control.reserve_wan_send(host.id).unwrap();
+        let mut pending = commands
+            .install_send(
+                cutoff.clone(),
+                window,
+                window,
+                WindowSpec {
+                    authority: NonZeroU64::MIN,
+                    direction: Direction::Send,
+                    start,
+                    ssrc,
+                    purpose: Purpose::Live,
+                    expires: deadline.into_std(),
+                },
+                SendPolicy::Protected {
+                    wire_bps: NonZeroU64::new(rate).unwrap(),
+                },
+                None,
+            )
+            .unwrap();
+        host.poll(at).unwrap();
+        let std::task::Poll::Ready(result) = pending.poll() else {
+            panic!("host must resolve the install receipt");
+        };
+        assert_eq!(cutoff.is_live(), result.is_some());
+        result
+    };
+    assert!(install(&mut host, 100, 1, now, expires).is_none());
+    host.egress.protected_egress_bps = NonZeroU64::new(1_000_000);
+    let first = install(&mut host, 101, 550_000, now, expires).unwrap();
+    let second = install(&mut host, 102, 450_000, now, expires).unwrap();
+    assert!(install(&mut host, 103, 1, now, expires).is_none());
+    assert!(first.renew(now, extension));
+    second.cutoff().fence();
+    assert!(install(&mut host, 104, 450_001, now, expires).is_none());
+    assert!(install(&mut host, 105, 450_001, expires, extension).is_none());
+    assert!(install(&mut host, 106, 450_000, expires, extension).is_some());
+    assert!(
+        install(
+            &mut host,
+            107,
+            1_000_000,
+            extension,
+            extension + Duration::from_millis(500)
+        )
+        .is_some()
+    );
+    assert!(!first.is_live());
+    assert!(!first.renew(extension, extension + Duration::from_millis(500)));
+}
+
+#[pulsebeam_runtime::test(crate = "pulsebeam_runtime::__harness")]
+async fn warm_receive_relays_authenticated_media_without_installing_a_shard_route() {
+    use pulsebeam_core::fabric::{Extension, ExtensionKind};
+
+    let (mut left, mut right, _control) = ready_pair().await.unwrap();
+    let (mut onward, mut terminal, mut onward_control) = ready_pair().await.unwrap();
+    let (outbound, outbound_commands, outbound_media) = command_channel(onward.id);
+    onward.commands = Some(outbound_commands);
+    onward.egress.inbox = Some(outbound_media);
+    onward.egress.protected_egress_bps = NonZeroU64::new(1_000_000);
+    let (terminal_commands, inbox, _terminal_media) = command_channel(terminal.id);
+    terminal.commands = Some(inbox);
+    let (commands, inbox, _media) = command_channel(right.id);
+    right.commands = Some(inbox);
+    let mut now = Instant::now();
+    let expires = now + Duration::from_secs(2);
+    let ssrc = NonZeroU32::new(0x0506_0708).unwrap();
+    let start = (1 << 32) | 0x18000;
+    let dd = ExtensionKind::DependencyDescriptor;
+    let window = Window::new(Profile::H264, start, 0, ssrc, dd.bit()).unwrap();
+    let authority = NonZeroU64::MIN;
+    let warm = commands
+        .stage_warm_receive(window, authority, expires)
+        .unwrap();
+    assert_eq!(warm.installed(now), None);
+    right.poll(now).unwrap();
+    assert_eq!(warm.installed(now), Some(window));
+    assert_eq!(warm.last_media_at(now), None);
+    assert!(right.receives.is_empty());
+
+    let duplicate = commands
+        .stage_warm_receive(window, authority, expires)
+        .unwrap();
+    right.poll(now).unwrap();
+    assert_eq!(duplicate.installed(now), None);
+    assert_eq!(warm.installed(now), Some(window));
+
+    let spec = WindowSpec {
+        authority,
+        direction: Direction::Send,
+        start,
+        ssrc,
+        purpose: Purpose::Live,
+        expires: expires.into_std(),
+    };
+    let downstream_label = ssrc.saturating_add(1);
+    let downstream = Window::new(Profile::H264, start, 0, downstream_label, dd.bit()).unwrap();
+    let downstream_receive = terminal_commands
+        .stage_warm_receive(downstream, authority, expires)
+        .unwrap();
+    terminal.poll(now).unwrap();
+    assert_eq!(downstream_receive.installed(now), Some(downstream));
+    assert_eq!(downstream_receive.last_media_at(now), None);
+    let cutoff = onward_control.reserve_wan_send(onward.id).unwrap();
+    let mut pending = outbound
+        .install_send(
+            cutoff,
+            downstream,
+            downstream,
+            WindowSpec {
+                ssrc: downstream_label,
+                ..spec
+            },
+            SendPolicy::Protected {
+                wire_bps: NonZeroU64::new(1_000_000).unwrap(),
+            },
+            Some(SendParent::Warm(warm.fence())),
+        )
+        .unwrap();
+    onward.poll(now).unwrap();
+    let std::task::Poll::Ready(Some(output)) = pending.poll() else {
+        panic!("warm transit reservation required")
+    };
+    commands.forward_warm(&warm, output.clone()).unwrap();
+    right.poll(now).unwrap();
+
+    let sender = left.stage_send(now, window, spec).unwrap();
+    left.activate_send(now, sender, window, spec).unwrap();
+    let position = start + 2;
+    let packet = FabricPacket::new(
+        Header {
+            profile: Profile::H264,
+            marker: true,
+            sequence: position as u32,
+            timestamp: 9000,
+        },
+        &[Extension {
+            kind: dd,
+            value: &[0xc0, 0, 0],
+        }],
+        Box::<[u8]>::from([0x65, 1, 2, 3]),
+    )
+    .unwrap();
+    let prepared = left
+        .prepare_projected(now, sender, position, &packet, OmissionRun::new(2))
+        .unwrap();
+    assert!(matches!(
+        submit_paced(&mut left, &mut now, prepared).await,
+        Submission::Accepted { .. }
+    ));
+    pulsebeam_runtime::time::timeout(Duration::from_secs(1), right.socket.readable())
+        .await
+        .unwrap()
+        .unwrap();
+    right.poll(now).unwrap();
+    assert_eq!(warm.last_media_at(now), Some(now));
+    assert!(right.receives.is_empty());
+    pulsebeam_runtime::time::timeout(Duration::from_millis(500), async {
+        loop {
+            let at = Instant::now();
+            onward.poll(at).unwrap();
+            terminal.poll(at).unwrap();
+            if downstream_receive.last_media_at(at).is_some() {
+                break;
+            }
+            pulsebeam_runtime::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(terminal.receives.is_empty());
+
+    let mut present = commands.lookup_warm(warm.fence(), position).unwrap();
+    let mut skipped = commands.lookup_warm(warm.fence(), position - 1).unwrap();
+    right.poll(now).unwrap();
+    let cached = present.try_recv().unwrap().unwrap();
+    assert!(cached.is_live(now));
+    assert_eq!(cached.packet.payload(), packet.payload());
+    assert!(skipped.try_recv().unwrap().is_none());
+
+    assert!(warm.renew(now, expires + Duration::from_secs(1)));
+    assert_eq!(warm.installed(expires), Some(window));
+    drop(warm);
+    assert!(!cached.is_live(now));
+    assert!(!output.is_live());
+    right.poll(expires).unwrap();
+    assert!(!right.warm.contains_key(&ssrc));
+    assert!(right.receives.is_empty());
 }
 
 async fn submit_paced(
@@ -811,7 +1015,7 @@ async fn sparse_repair_requires_exact_receipt_and_live_parent() {
                 purpose: Purpose::Live,
                 ..spec
             },
-            false,
+            SendPolicy::Fixed,
             None,
         )
         .unwrap();
@@ -831,7 +1035,7 @@ async fn sparse_repair_requires_exact_receipt_and_live_parent() {
             repair,
             live,
             spec,
-            false,
+            SendPolicy::Fixed,
             Some(SendParent::Repair(parent.clone())),
         )
         .unwrap();
@@ -845,7 +1049,7 @@ async fn sparse_repair_requires_exact_receipt_and_live_parent() {
             repair,
             repair,
             spec,
-            false,
+            SendPolicy::Fixed,
             Some(SendParent::Repair(parent.clone())),
         )
         .unwrap();
@@ -918,7 +1122,7 @@ async fn sparse_repair_requires_exact_receipt_and_live_parent() {
                 ssrc: fresh.ssrc(),
                 ..spec
             },
-            false,
+            SendPolicy::Fixed,
             Some(SendParent::Repair(parent)),
         )
         .unwrap();

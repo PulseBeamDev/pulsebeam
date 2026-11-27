@@ -7,7 +7,7 @@ use pulsebeam_link::BindingCutoff;
 use pulsebeam_runtime::{sync::oneshot, time::Instant};
 
 use crate::{
-    link::wan_host::ParentSend,
+    link::wan_host::{ParentSend, WarmFence, WarmRepairPacket},
     route::fabric::{
         network_repair::MAX_REPAIR_LIFETIME,
         relay::{LocatedRepair, MediaRepairLookup, MediaRepairParent, PeerRepairLookup},
@@ -20,12 +20,62 @@ const MAX_PENDING: usize = 32;
 const MAX_REQUESTS: usize = 4096;
 
 type RequestKey = (NonZeroU32, NonZeroU64, NonZeroU64);
-type Receipt = oneshot::Receiver<Option<LocatedRepair>>;
+pub(in crate::control::controller) enum Source {
+    Shard(MediaRepairParent),
+    Warm(WarmFence),
+}
+
+pub(in super::super) enum Receipt {
+    Shard(oneshot::Receiver<Option<LocatedRepair>>),
+    Warm(oneshot::Receiver<Option<WarmRepairPacket>>),
+}
+
+pub(in super::super) enum Packet {
+    Shard(LocatedRepair),
+    Warm(WarmRepairPacket),
+}
+
+impl From<LocatedRepair> for Packet {
+    fn from(packet: LocatedRepair) -> Self {
+        Self::Shard(packet)
+    }
+}
+
+impl Packet {
+    pub(in super::super) fn expires(&self) -> Instant {
+        match self {
+            Self::Shard(packet) => packet.expires,
+            Self::Warm(packet) => packet.expires,
+        }
+    }
+
+    fn limit(&mut self, deadline: Instant) {
+        match self {
+            Self::Shard(packet) => packet.expires = packet.expires.min(deadline),
+            Self::Warm(packet) => packet.expires = packet.expires.min(deadline),
+        }
+    }
+}
+
+impl Receipt {
+    fn try_recv(&mut self, position: u64) -> Result<Option<Packet>, oneshot::error::TryRecvError> {
+        Ok(match self {
+            Self::Shard(receipt) => receipt
+                .try_recv()?
+                .filter(|packet| packet.sequence == position)
+                .map(Packet::Shard),
+            Self::Warm(receipt) => receipt
+                .try_recv()?
+                .filter(|packet| packet.position == position)
+                .map(Packet::Warm),
+        })
+    }
+}
 
 pub(in crate::control::controller) struct Grant {
-    pub(in super::super) path: MediaRepairParent,
-    pub(in super::super) parent: ParentSend,
-    pub(in super::super) expires: Instant,
+    pub(in crate::control::controller) path: Source,
+    pub(in crate::control::controller) parent: ParentSend,
+    pub(in crate::control::controller) expires: Instant,
 }
 
 impl Grant {
@@ -53,7 +103,10 @@ impl Grant {
             generation: demand.generation,
             update,
         };
-        match self.path {
+        let Source::Shard(path) = self.path else {
+            return;
+        };
+        match path {
             MediaRepairParent::Publisher(route) => {
                 let _ = actor.stage_publisher_send(PublisherSendChange::Demand(route, update));
             }
@@ -67,9 +120,12 @@ impl Grant {
         self,
         demand: Demand,
     ) -> Option<PeerRepairLookup> {
+        let Source::Shard(parent) = self.path else {
+            return None;
+        };
         (self.parent.window.profile() == pulsebeam_core::fabric::Profile::Vp9).then_some(
             PeerRepairLookup::Refresh(MediaRepairLookup {
-                parent: self.path,
+                parent,
                 position: demand.position,
             }),
         )
@@ -89,7 +145,7 @@ struct Request {
     parent: ParentSend,
     expires: Instant,
     locating: Receipt,
-    located: Option<LocatedRepair>,
+    located: Option<Packet>,
     ready: Option<Ready>,
 }
 
@@ -99,7 +155,7 @@ impl RepairRequests {
         demand: Demand,
         grant: Grant,
         now: Instant,
-        locate: impl FnOnce(MediaRepairParent) -> Option<Receipt>,
+        locate: impl FnOnce(Source) -> Option<Receipt>,
     ) {
         let key = (demand.live, demand.branch, demand.request);
         if self.pending.len() >= MAX_PENDING
@@ -145,7 +201,7 @@ impl RepairRequests {
     pub(in super::super) fn flush(
         &mut self,
         now: Instant,
-        mut handoff: impl FnMut(ParentSend, Ready, LocatedRepair),
+        mut handoff: impl FnMut(ParentSend, Ready, Packet),
     ) {
         self.seen.retain(|_, cutoff| cutoff.is_live());
         self.pending.retain_mut(|request| {
@@ -153,9 +209,9 @@ impl RepairRequests {
                 return false;
             }
             if request.located.is_none() {
-                match request.locating.try_recv() {
-                    Ok(Some(mut located)) if located.sequence == request.demand.position => {
-                        located.expires = located.expires.min(request.expires);
+                match request.locating.try_recv(request.demand.position) {
+                    Ok(Some(mut located)) => {
+                        located.limit(request.expires);
                         request.located = Some(located);
                     }
                     Err(oneshot::error::TryRecvError::Empty) => return true,
@@ -165,7 +221,7 @@ impl RepairRequests {
             if request
                 .located
                 .as_ref()
-                .is_some_and(|located| now >= located.expires)
+                .is_some_and(|located| now >= located.expires())
             {
                 return false;
             }
@@ -216,7 +272,7 @@ mod tests {
             .unwrap();
         let connection = ConnectionId::from_bytes([7; 16]);
         let grant = || Grant {
-            path: MediaRepairParent::Publisher(CompiledPublisherSend {
+            path: Source::Shard(MediaRepairParent::Publisher(CompiledPublisherSend {
                 publisher: PublisherAnchor {
                     publication: connection.fixture_publication(TrackKind::Video, "camera"),
                     connection,
@@ -229,7 +285,7 @@ mod tests {
                     key: NodeRouteKey::from_bytes(demand.live.get().to_be_bytes()),
                 },
                 tx: tx.clone(),
-            }),
+            })),
             parent: ParentSend {
                 cutoff: cutoff.clone(),
                 window: live,
@@ -248,7 +304,10 @@ mod tests {
         let ready = wire(demand);
         book.ready(&ready, demand, now);
         let mut located = None;
-        book.demand(demand, grant(), now, |parent| {
+        book.demand(demand, grant(), now, |source| {
+            let Source::Shard(parent) = source else {
+                panic!("expected shard")
+            };
             let (result, receipt) = oneshot::channel();
             located = Some((
                 result,
@@ -261,7 +320,7 @@ mod tests {
                     expires,
                 },
             ));
-            Some(receipt)
+            Some(Receipt::Shard(receipt))
         });
         let (result, packet) = located.unwrap();
         result.send(Some(packet)).unwrap();
@@ -282,7 +341,7 @@ mod tests {
         book.flush(now, |parent, confirmed, located| {
             assert_eq!(parent.cutoff.id(), cutoff.id());
             assert_eq!(confirmed.demand, demand);
-            assert_eq!(located.expires, now + MAX_REPAIR_LIFETIME);
+            assert_eq!(located.expires(), now + MAX_REPAIR_LIFETIME);
             sent += 1;
         });
         assert_eq!(sent, 1);

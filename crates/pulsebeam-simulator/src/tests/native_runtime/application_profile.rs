@@ -401,6 +401,7 @@ fn application_subscription_profile() {
                     ownership_peers: Vec::new(),
                     region_tree: None,
                     cluster_id: "application-profile".into(),
+                    protected_base_stream_bps: None,
                     topology: pulsebeam::cluster::Topology::SingleNode,
                     listen: gossip,
                     advertise: gossip,

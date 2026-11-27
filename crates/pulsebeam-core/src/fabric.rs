@@ -13,7 +13,7 @@ pub const MAX_WAN_RTP_BYTES: usize = MAX_UDP_PAYLOAD_BYTES as usize - 16;
 
 const RTP_BASE_BYTES: usize = 12;
 const EXTENSION_PREFIX_BYTES: usize = 4;
-const MAX_HOPS: u8 = 7;
+pub const MAX_HOPS: u8 = 7;
 const DATA_RECORD_MIN: usize = 22;
 const DATA_RECORD_MAX: usize = 1_058;
 

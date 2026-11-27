@@ -7,6 +7,123 @@ use crate::route::fabric::local::OwnedPacket;
 
 thread_local! {
     static PROBE: RefCell<Option<Probe>> = const { RefCell::new(None) };
+    static PROTECTED: RefCell<Option<ProtectedProbe>> = const { RefCell::new(None) };
+}
+
+type Edge = (SocketAddr, SocketAddr);
+
+struct ProtectedProbe {
+    edges: [Edge; 2],
+    target: Option<ProtectedReport>,
+    networks: [Option<NetworkId>; 2],
+    selected: Option<(NetworkId, NetworkId)>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ProtectedReport {
+    pub position: u64,
+    pub timestamp: u32,
+    pub dropped_live: [usize; 2],
+    pub independent_offers: usize,
+    pub repaired_timestamp: Option<u32>,
+}
+
+pub fn arm_protected_h264(primary: Edge, standby: Edge) {
+    PROTECTED.with_borrow_mut(|probe| {
+        *probe = Some(ProtectedProbe {
+            edges: [primary, standby],
+            target: None,
+            networks: [None; 2],
+            selected: None,
+        });
+    });
+}
+
+pub fn protected_report() -> Option<ProtectedReport> {
+    PROTECTED.with_borrow(|probe| probe.as_ref()?.target)
+}
+
+pub(crate) fn protected_edge(peer: SocketAddr, local: SocketAddr) -> bool {
+    PROTECTED.with_borrow(|probe| {
+        probe
+            .as_ref()
+            .is_some_and(|probe| probe.edges.contains(&(peer, local)))
+    })
+}
+
+pub(crate) fn select_protected_base(position: u64, timestamp: u32) {
+    PROTECTED.with_borrow_mut(|probe| {
+        if let Some(probe) = probe {
+            probe.target.get_or_insert(ProtectedReport {
+                position,
+                timestamp,
+                dropped_live: [0; 2],
+                independent_offers: 0,
+                repaired_timestamp: None,
+            });
+        }
+    });
+}
+
+pub(crate) fn protected_loss(edge: Edge, network: NetworkId, position: u64, repair: bool) -> bool {
+    PROTECTED.with_borrow_mut(|probe| {
+        let Some(probe) = probe else {
+            return false;
+        };
+        let Some(index) = probe.edges.iter().position(|&candidate| candidate == edge) else {
+            return false;
+        };
+        let Some(target) = probe
+            .target
+            .as_mut()
+            .filter(|target| target.position == position)
+        else {
+            return false;
+        };
+        probe.networks[index] = Some(network);
+        if repair {
+            // In addition to losing the exact live position, the primary is
+            // unavailable for this repair. The independent cache is intact.
+            return index == 0;
+        }
+        target.dropped_live[index] += 1;
+        true
+    })
+}
+
+pub(crate) fn selected_independent_repair(original: NetworkId, other: NetworkId, position: u64) {
+    PROTECTED.with_borrow_mut(|probe| {
+        if let Some(probe) = probe
+            && probe
+                .target
+                .is_some_and(|target| target.position == position)
+            && probe.networks == [Some(original), Some(other)]
+        {
+            probe.selected = Some((original, other));
+        }
+    });
+}
+
+pub(crate) fn admitted_protected_repair(
+    peer: NetworkId,
+    position: u64,
+    timestamp: u32,
+    enqueued: usize,
+) {
+    PROTECTED.with_borrow_mut(|probe| {
+        if let Some(probe) = probe
+            && probe
+                .selected
+                .is_some_and(|(old, other)| old != other && other == peer)
+            && let Some(target) = probe
+                .target
+                .as_mut()
+                .filter(|target| target.position == position)
+        {
+            target.independent_offers += enqueued;
+            target.repaired_timestamp = Some(timestamp);
+        }
+    });
 }
 
 struct Probe {

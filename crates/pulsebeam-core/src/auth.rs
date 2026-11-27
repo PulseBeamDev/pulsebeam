@@ -516,15 +516,33 @@ mod tests {
     }
 
     #[test]
-    fn registry_accepts_rotated_keys_for_one_project() {
-        let registry = KeyRegistry::new(project(1), registry_keys(&[1, 2])).unwrap();
-        assert_eq!(registry.project_id(), project(1));
-        assert_eq!(registry.keys().len(), 2);
-        assert_eq!(
-            registry.public_key(&key_id(2)),
-            Some(&signing(2).public_key())
+    fn registry_replacement_allows_overlap_then_rejects_retired_signing_key() {
+        let project = project(1);
+        let claims = format!(
+            r#"{{"iss":"{project}","aud":"pb","sub":"alice","exp":2000,"jti":"00000000-0000-4000-8000-000000000001","grants":[{{"rooms":["general"],"allow":["join"]}}]}}"#
         );
-        assert_eq!(registry.public_key(&key_id(9)), None);
+        let [old, new] = [1, 2].map(|id| {
+            signed_token(
+                &format!(r#"{{"alg":"EdDSA","kid":"{}","typ":"pb+jwt"}}"#, key_id(id)),
+                &claims,
+                &signing(id),
+            )
+        });
+        for (keys, accepted) in [
+            (&[1][..], [true, false]),
+            (&[1, 2][..], [true, true]),
+            (&[2][..], [false, true]),
+        ] {
+            let registry = KeyRegistry::new(project, registry_keys(keys)).unwrap();
+            for (token, accepted) in [&old, &new].into_iter().zip(accepted) {
+                let result = verify_participant_token(&registry, token, 1000);
+                if accepted {
+                    assert_eq!(result.unwrap().project_id, project);
+                } else {
+                    assert_eq!(result, Err(TokenError::Invalid));
+                }
+            }
+        }
     }
 
     #[test]

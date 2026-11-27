@@ -388,6 +388,7 @@ struct PublisherHop {
     admissions: LiveAdmissions,
     demand: crate::route::fabric::target_demand::Demand,
     projection: crate::route::fabric::relay::SendProjection,
+    base_projection: crate::route::fabric::relay::BaseProjection,
 }
 
 impl Drop for PublisherHop {
@@ -1937,6 +1938,7 @@ impl ShardRuntime {
                 admissions: LiveAdmissions::default(),
                 demand: crate::route::fabric::target_demand::Demand::default(),
                 projection: crate::route::fabric::relay::SendProjection::default(),
+                base_projection: crate::route::fabric::relay::BaseProjection::default(),
             });
         } else {
             return false;
@@ -2526,6 +2528,16 @@ impl ShardRuntime {
                 report.record(outcome);
             }
             for hop in publisher_sends {
+                if hop.route.tx.is_protected_base() {
+                    hop.base_projection.offer(
+                        now,
+                        &hop.route.tx,
+                        &mut hop.admissions,
+                        &frozen,
+                        report,
+                    );
+                    continue;
+                }
                 hop.projection.offer(
                     now,
                     &hop.route.tx,
@@ -3322,7 +3334,7 @@ impl ShardRuntime {
         now: pulsebeam_runtime::time::Instant,
     ) -> Option<(&OwnedPacket, pulsebeam_runtime::time::Instant)> {
         use crate::route::fabric::relay::MediaRepairParent;
-        let (bound, ingress, expires) = match &lookup.parent {
+        let (bound, ingress, tx) = match &lookup.parent {
             MediaRepairParent::Relay(route) => {
                 let source = self.network_fabric_source(route.input.destination)?;
                 let bound = self.fabric_sources.get(source)?;
@@ -3344,7 +3356,7 @@ impl ShardRuntime {
                 let child = children
                     .iter()
                     .find(|child| child.spec == route.input && child.lifetime.is_live())?;
-                (bound, Some(child.ingress), route.tx.expires())
+                (bound, Some(child.ingress), &route.tx)
             }
             MediaRepairParent::Publisher(route) => {
                 let bound = self.fabric_sources.get(publisher_source?)?;
@@ -3359,14 +3371,19 @@ impl ShardRuntime {
                 {
                     return None;
                 }
-                (bound, None, route.tx.expires())
+                (bound, None, &route.tx)
             }
         };
-        let (packet, cached_until) =
+        let (packet, cached_until) = if tx.is_protected_base() {
             bound
                 .fanout
-                .cached_peer_media(lookup.position, ingress, now)?;
-        Some((packet, expires.min(cached_until)))
+                .cached_peer_base(lookup.position, ingress, now)?
+        } else {
+            bound
+                .fanout
+                .cached_peer_media(lookup.position, ingress, now)?
+        };
+        Some((packet, tx.expires().min(cached_until)))
     }
 
     pub(super) fn locate_media_repair(

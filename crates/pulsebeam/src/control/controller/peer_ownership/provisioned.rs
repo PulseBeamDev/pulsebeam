@@ -636,13 +636,16 @@ impl Peer {
         &mut self,
         interest: crate::route::fabric::network_repair::MediaInterest,
         now: Instant,
-    ) {
+    ) -> bool {
         if let Some(assoc) = &mut self.association
             && assoc.network == interest.parent.ingress.association
             && assoc.lane.is_ready()
             && assoc.media_receives.enqueue(interest, now)
         {
             self.next_step = self.next_step.min(now);
+            true
+        } else {
+            false
         }
     }
 
@@ -1227,34 +1230,37 @@ impl Association {
         let relay = self
             .wan_transit
             .media_repair_grant(self.network, demand, now);
+        let regional = actor
+            .regional_routing
+            .as_ref()
+            .map_or([None, None, None], |routing| {
+                routing.media_repair_grants(self.network, demand, now)
+            });
+        let mut grants = [publisher, relay].into_iter().chain(regional).flatten();
+        let (Some(grant), None) = (grants.next(), grants.next()) else {
+            return;
+        };
         if refresh {
-            let regional = actor
-                .regional_routing
-                .as_ref()
-                .map_or([None, None], |routing| {
-                    routing.media_repair_grants(self.network, demand, now)
-                });
-            let mut grants = [publisher, relay].into_iter().chain(regional).flatten();
-            let (Some(grant), None) = (grants.next(), grants.next()) else {
-                tracing::debug!(?demand, "WAN VP9 refresh has no unique live grant");
-                return;
-            };
             if let Some(refresh) = grant.into_refresh(demand) {
                 let _ = actor.stage_repair_lookups(vec![refresh]);
             }
             return;
         }
-        let ((Some(grant), None) | (None, Some(grant))) = (publisher, relay) else {
-            return;
-        };
-        self.media_repairs.demand(demand, grant, now, |parent| {
-            actor
-                .stage_repair_lookups(vec![PeerRepairLookup::Media(MediaRepairLookup {
-                    parent,
-                    position: demand.position,
-                })])
-                .pop()
-        });
+        self.media_repairs
+            .demand(demand, grant, now, |source| match source {
+                media_repair::Source::Shard(parent) => actor
+                    .stage_repair_lookups(vec![PeerRepairLookup::Media(MediaRepairLookup {
+                        parent,
+                        position: demand.position,
+                    })])
+                    .pop()
+                    .map(media_repair::Receipt::Shard),
+                media_repair::Source::Warm(fence) => actor
+                    .links
+                    .as_ref()?
+                    .lookup_protected_wan_packet(fence, demand.position)
+                    .map(media_repair::Receipt::Warm),
+            });
     }
 
     fn receive_wan_repair_ready(

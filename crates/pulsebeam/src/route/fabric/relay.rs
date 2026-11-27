@@ -1,7 +1,7 @@
 use pulsebeam_core::{dd::evidence::ProjectionEvidence, fabric::wan::OmissionRun};
 use pulsebeam_runtime::time::Instant;
 
-use super::local::{LiveWork, MAX_BRANCHES, Offers, OwnedPacket, Transit};
+use super::local::{BasePacket, LiveWork, MAX_BRANCHES, Offers, OwnedPacket, Transit};
 use super::target_demand::Projection;
 use super::{CompiledLiveRelay, LiveAdmissions, LiveNetworkChild, LiveNextHop};
 use crate::{link::wan_host::WanTx, route::NodeRouteAddress};
@@ -27,6 +27,96 @@ pub(crate) fn offer_live_network(
     Some(transit.work.enqueue(now, admissions, || {
         tx.try_send(now, deadline, sequence, transit.packet.clone().into_owned())
     }))
+}
+
+#[derive(Default)]
+pub(crate) struct BaseProjection {
+    through: Option<u64>,
+    omitted: u8,
+}
+
+impl BaseProjection {
+    fn observe(&mut self, position: u64, packet: BasePacket) -> Option<OmissionRun> {
+        if self.through.is_some_and(|through| position <= through) {
+            return None;
+        }
+        if self.through.and_then(|through| through.checked_add(1)) != Some(position) {
+            self.omitted = 0;
+        }
+        self.through = Some(position);
+        match packet {
+            BasePacket::Base => OmissionRun::new(std::mem::take(&mut self.omitted)),
+            BasePacket::Enhancement => {
+                self.omitted = self.omitted.saturating_add(1).min(OmissionRun::MAX);
+                None
+            }
+            BasePacket::Unknown => {
+                self.omitted = 0;
+                None
+            }
+        }
+    }
+
+    pub(crate) fn offer(
+        &mut self,
+        now: Instant,
+        tx: &WanTx,
+        admissions: &mut LiveAdmissions,
+        transit: &Transit<'_>,
+        report: &mut Offers,
+    ) {
+        let position = transit.work.sequence();
+        if !tx.covers(position) {
+            return;
+        }
+        let omitted = self.observe(position, transit.h264_base);
+        tracing::trace!(target: "pulsebeam_protection", position, timestamp = transit.packet.header().timestamp, packet = ?transit.h264_base, ?omitted, "protected publisher classification");
+        if transit.h264_base != BasePacket::Base || transit.packet.remaining_hops() == 0 {
+            return;
+        }
+        let deadline = tx.expires().min(transit.work.expires_at());
+        if now >= deadline {
+            return;
+        }
+        #[cfg(feature = "sim")]
+        if transit.packet.header().marker {
+            crate::sim_metrics::wan_repair::select_protected_base(
+                position,
+                transit.packet.header().timestamp,
+            );
+        }
+        let omitted =
+            omitted.filter(|&run| tx.accommodates_omission(position, &transit.packet, run));
+        report.record(transit.work.enqueue(now, admissions, || {
+            tx.try_send_projected(
+                now,
+                deadline,
+                position,
+                transit.packet.clone().into_owned(),
+                omitted,
+            )
+        }));
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn base_projection_only_proves_consecutive_known_enhancements() {
+    use BasePacket::{Base, Enhancement, Unknown};
+    let mut projection = BaseProjection::default();
+    assert_eq!(projection.observe(10, Base), None);
+    assert_eq!(projection.observe(11, Enhancement), None);
+    assert_eq!(projection.observe(12, Enhancement), None);
+    assert_eq!(projection.observe(13, Base), OmissionRun::new(2));
+    assert_eq!(projection.observe(14, Unknown), None);
+    assert_eq!(projection.observe(14, Enhancement), None);
+    assert_eq!(projection.observe(15, Base), None);
+    assert_eq!(projection.observe(16, Enhancement), None);
+    assert_eq!(projection.observe(18, Base), None);
+    assert_eq!(projection.observe(19, Enhancement), None);
+    assert_eq!(projection.observe(20, Unknown), None);
+    assert_eq!(projection.observe(21, Enhancement), None);
+    assert_eq!(projection.observe(22, Base), OmissionRun::new(1));
 }
 
 /// One outbound window's tentative exclusions. Keep originals until the

@@ -62,7 +62,8 @@ impl Prepared {
         self.route
     }
 
-    pub(super) fn wire_len(&self) -> usize {
+    /// Exact UDP payload bytes that would be handed to the socket.
+    pub fn wire_len(&self) -> usize {
         self.payload.len()
     }
 }

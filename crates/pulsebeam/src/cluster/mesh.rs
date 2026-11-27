@@ -143,6 +143,28 @@ impl<'a> Graph<'a> {
     }
 
     fn shortest_paths(&self, source: Member) -> BTreeMap<Member, Vec<Member>> {
+        self.shortest_paths_with(source, |_, _| true)
+    }
+
+    fn standby_for(&self, source: Member, active: &[Member]) -> Option<Vec<Member>> {
+        let (&destination, active_relays) = active.split_last()?;
+        if !self.carries(source, active) {
+            return None;
+        }
+        self.shortest_paths_with(source, |from, to| {
+            // An alternate may share endpoints, not an interior relay or the
+            // direct edge when the incumbent has no interior relays.
+            !active_relays.iter().any(|relay| relay.node == to.node)
+                && !(active_relays.is_empty() && from == source && to == destination)
+        })
+        .remove(&destination)
+    }
+
+    fn shortest_paths_with(
+        &self,
+        source: Member,
+        permits: impl Fn(Member, Member) -> bool,
+    ) -> BTreeMap<Member, Vec<Member>> {
         let mut routes = BTreeMap::new();
         if self.advertisement(source).is_none() {
             return routes;
@@ -157,7 +179,7 @@ impl<'a> Graph<'a> {
             };
             if best == source || origin.role == Role::Router {
                 for &peer in origin.neighbors.keys() {
-                    if peer == source || routes.contains_key(&peer) {
+                    if peer == source || routes.contains_key(&peer) || !permits(best, peer) {
                         continue;
                     }
                     let Some(cost) = self

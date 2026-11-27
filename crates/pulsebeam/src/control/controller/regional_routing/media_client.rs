@@ -141,6 +141,26 @@ impl Demand {
         self.owners.keys().map(|&(connection, _)| connection)
     }
 
+    pub(super) fn authorized(
+        &self,
+        actor: &ControllerActor,
+        now: Instant,
+        wall: SystemTime,
+    ) -> bool {
+        now < self.expires
+            && media_permit::unix_millis(wall).is_some_and(|wall| wall < self.wall_expiry_ms)
+            && self.owners.iter().any(|(&owner, &revision)| {
+                actor.media_interest_matches(
+                    owner,
+                    revision,
+                    self.endpoint,
+                    self.source.publisher.publication.kind(),
+                    self.track,
+                    wall,
+                )
+            })
+    }
+
     fn refresh(&mut self, actor: &ControllerActor, now: Instant, wall: SystemTime) -> bool {
         if now >= self.expires
             || media_permit::unix_millis(wall).is_none_or(|now| now >= self.wall_expiry_ms)

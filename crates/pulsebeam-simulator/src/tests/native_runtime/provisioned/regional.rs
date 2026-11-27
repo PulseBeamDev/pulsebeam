@@ -17,6 +17,25 @@ pub(super) struct Fixture {
     costs: Vec<[SimLinkCost; 2]>,
     streams: Vec<ControlBridge>,
     hierarchy: Option<Hierarchy>,
+    pub(super) protection: Option<ProtectionFixture>,
+    pub(super) foreign_registry: Option<(usize, pulsebeam_core::auth::KeyRegistry)>,
+}
+
+pub(super) struct ProtectionFixture {
+    pub(super) viewer: usize,
+    pub(super) wire_bps: NonZeroU64,
+    pub(super) constrained_hop: Option<(usize, usize)>,
+    pub(super) control: Option<pulsebeam_runtime::sync::oneshot::Sender<pulsebeam::link::Control>>,
+}
+
+impl ProtectionFixture {
+    pub(super) fn egress_bps(&self, source: usize, destination: usize) -> NonZeroU64 {
+        if self.constrained_hop == Some((source, destination)) {
+            NonZeroU64::MIN
+        } else {
+            self.wire_bps
+        }
+    }
 }
 
 struct Hierarchy {
@@ -43,6 +62,8 @@ impl Fixture {
             roles: vec![Router, Gateway, Gateway, Router],
             costs: vec![std::array::from_fn(|_| SimLinkCost::new(NonZeroU16::MIN)); 3],
             streams: Vec::new(),
+            protection: None,
+            foreign_registry: None,
             hierarchy: Some(Hierarchy {
                 regions: &[
                     ("parent", None, &[0, 1]),
@@ -209,6 +230,8 @@ fn regional_weighted_routes_aggregate_child_demand() -> anyhow::Result<()> {
             .map(|cost| std::array::from_fn(|_| SimLinkCost::new(NonZeroU16::new(cost).unwrap())))
             .into(),
         streams: Vec::new(),
+        protection: None,
+        foreign_registry: None,
         hierarchy: None,
     };
     install_nodes(
@@ -228,6 +251,408 @@ fn regional_weighted_routes_aggregate_child_demand() -> anyhow::Result<()> {
     });
     run_sim_or_timeout(&mut sim, Duration::from_secs(15))
         .map_err(|error| anyhow::anyhow!("regional weighted routes: {error:#}"))
+}
+
+#[test]
+fn regional_wan_does_not_route_foreign_project_demand_for_the_same_names() -> anyhow::Result<()> {
+    use SimRegionalRole::{Edge, Router};
+    use pulsebeam_core::{
+        auth::{DEVELOPMENT_API_KEY_ID, DEVELOPMENT_API_PUBLIC_KEY, KeyRegistry, KeyRegistryEntry},
+        identity::ProjectId,
+    };
+
+    let seed = std::env::var("PULSEBEAM_SIM_SEED")
+        .map(|value| value.parse::<u64>())
+        .unwrap_or(Ok(NATIVE_RUNTIME_SEED))?;
+    let _sim_clocks = crate::sim_clock::SimClocksGuard::init();
+    crate::sim_rand::set_thread_rng(seed);
+    fastrand::seed(seed);
+    let subnet = reserve_subnet();
+    let ips = [1, 2, 3].map(|host| subnet_ip(subnet, host));
+    let client = subnet_ip(subnet, 4);
+    let root = tempfile::tempdir()?;
+    let mut sim = turmoil::Builder::new()
+        .simulation_duration(Duration::from_secs(20))
+        .rng_seed(seed)
+        .build();
+    let project = ProjectId::from_bytes([0, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 55]);
+    let dev_key = pulsebeam_server::insecure_dev_api_key()?;
+    let (_, secret) = dev_key.rsplit_once('.').context("development key format")?;
+    let foreign_key = format!("{project}.{}.{secret}", *DEVELOPMENT_API_KEY_ID);
+    let registry = KeyRegistry::new(
+        project,
+        vec![KeyRegistryEntry {
+            key_id: *DEVELOPMENT_API_KEY_ID,
+            public_key: *DEVELOPMENT_API_PUBLIC_KEY,
+        }],
+    )?;
+    let mut fixture = Fixture {
+        roles: vec![Router, Edge, Edge],
+        costs: vec![std::array::from_fn(|_| SimLinkCost::new(NonZeroU16::MIN)); 2],
+        streams: Vec::new(),
+        hierarchy: Some(Hierarchy {
+            regions: &[("region", None, &[0, 1, 2])],
+            borders: &[],
+            owner: 0,
+        }),
+        protection: None,
+        foreign_registry: Some((2, registry)),
+    };
+    install_nodes(
+        &mut sim,
+        root.path(),
+        &ips,
+        &[(0, 1), (0, 2)],
+        seed,
+        None,
+        RoutingFixture::Regional(&mut fixture, None),
+    )?;
+    sim.client(client, async move {
+        fixture.connect();
+        let observe = async {
+            let (publisher, _) = regional_agent(client, ips[0], "alice", &["join", "publish"])?;
+            let source = publish_feed(&publisher).await?;
+            let (foreign, runtime) =
+                regional_agent_with_key(client, ips[2], "viewer", &["subscribe"], &foreign_key)?;
+            let foreign_feed = subscribe_feed(&foreign)?;
+            runtime.connect().await?;
+            tokio::time::timeout(Duration::from_secs(5), wait_connected(&foreign, None))
+                .await
+                .context("foreign viewer did not connect")??;
+            let (local, runtime) = regional_agent(client, ips[1], "viewer", &["subscribe"])?;
+            let local_feed = subscribe_feed(&local)?;
+            runtime.connect().await?;
+            warm(&source, &local_feed, b"same-project-wan").await?;
+            anyhow::ensure!(
+                foreign_feed.state().source_track_id.is_none(),
+                "foreign demand bound the other project's publication"
+            );
+            let counts = || {
+                [ips[1], ips[2]].map(|viewer| pulsebeam::sim_metrics::wan_live_data(ips[0], viewer))
+            };
+            anyhow::ensure!(
+                counts()[1].0 == 0,
+                "foreign demand created a WAN data branch"
+            );
+
+            // Same application names and API verification key, but a different
+            // project. Show the foreign viewer can receive its own source.
+            let (foreign_publisher, _) = regional_agent_with_key(
+                client,
+                ips[2],
+                "alice",
+                &["join", "publish"],
+                &foreign_key,
+            )?;
+            let foreign_source = publish_feed(&foreign_publisher).await?;
+            warm(&foreign_source, &foreign_feed, b"foreign-project-local").await?;
+            anyhow::ensure!(
+                local_feed.state().source_track_id != foreign_feed.state().source_track_id
+            );
+            probe(
+                &source,
+                &[&local_feed],
+                b"after-foreign-publish",
+                counts,
+                [1, 0],
+            )
+            .await
+        };
+        observe.await.map_err(Into::into)
+    });
+    run_sim_or_timeout(&mut sim, Duration::from_secs(10))
+        .map_err(|error| anyhow::anyhow!("regional project isolation: {error:#}"))
+}
+
+#[test]
+fn regional_h264_protected_pair_withdraws_on_standby_loss() -> anyhow::Result<()> {
+    prove_h264_protection(ProtectionCase::StandbyLoss)
+}
+
+#[test]
+fn regional_h264_protected_playback_survives_abrupt_primary_loss() -> anyhow::Result<()> {
+    prove_h264_protection(ProtectionCase::PrimaryLoss)
+}
+
+#[test]
+fn regional_h264_protected_playback_survives_planned_primary_drain() -> anyhow::Result<()> {
+    prove_h264_protection(ProtectionCase::PlannedDrain)
+}
+
+#[test]
+fn regional_h264_protected_repair_uses_an_independent_relay() -> anyhow::Result<()> {
+    prove_h264_protection(ProtectionCase::IndependentRepair)
+}
+
+#[test]
+fn regional_h264_protected_pair_reports_isolation_and_recovers_degraded() -> anyhow::Result<()> {
+    prove_h264_protection(ProtectionCase::TotalIsolation)
+}
+
+#[test]
+fn regional_h264_protected_pair_refuses_a_constrained_hop() -> anyhow::Result<()> {
+    prove_h264_protection(ProtectionCase::InsufficientCapacity)
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ProtectionCase {
+    StandbyLoss,
+    PrimaryLoss,
+    PlannedDrain,
+    IndependentRepair,
+    TotalIsolation,
+    InsufficientCapacity,
+}
+
+fn prove_h264_protection(scenario: ProtectionCase) -> anyhow::Result<()> {
+    use crate::tests::{
+        native_state::spatial_vp9::{expect_height, open_logical_h264},
+        quic_data::{
+            dd_video::{Graph, TRACK, connect_dd_publisher, replay_graph},
+            sim_quic_tls,
+        },
+    };
+    use SimRegionalRole::{Edge, Router};
+    use pulsebeam::entity::{ProjectRoomKey, PublicationKey, RoomId, TrackKind};
+    use pulsebeam_agent_quic::media::units::Codec;
+
+    let seed = std::env::var("PULSEBEAM_SIM_SEED")
+        .map(|value| value.parse::<u64>())
+        .unwrap_or(Ok(NATIVE_RUNTIME_SEED))?;
+    let _clocks = crate::sim_clock::SimClocksGuard::init();
+    crate::sim_rand::set_thread_rng(seed);
+    fastrand::seed(seed);
+    let subnet = reserve_subnet();
+    let ips = [1, 2, 3, 4].map(|host| subnet_ip(subnet, host));
+    let client = subnet_ip(subnet, 5);
+    let latency = Duration::from_millis(5);
+    let mut sim = turmoil::Builder::new()
+        .min_message_latency(latency)
+        .max_message_latency(latency)
+        .simulation_duration(Duration::from_secs(24))
+        .rng_seed(seed)
+        .build();
+    let root = tempfile::tempdir()?;
+    let (tls, roots) = sim_quic_tls()?;
+    let (control, inspect) = pulsebeam_runtime::sync::oneshot::channel();
+    let mut fixture = Fixture {
+        roles: vec![Router, Router, Router, Edge],
+        costs: [30, 60, 30, 60]
+            .map(|cost| std::array::from_fn(|_| SimLinkCost::new(NonZeroU16::new(cost).unwrap())))
+            .into(),
+        streams: Vec::new(),
+        hierarchy: Some(Hierarchy {
+            regions: &[("region", None, &[0, 1, 2, 3])],
+            borders: &[],
+            owner: 0,
+        }),
+        foreign_registry: None,
+        protection: Some(ProtectionFixture {
+            viewer: 3,
+            wire_bps: NonZeroU64::new(2_000_000).unwrap(),
+            constrained_hop: matches!(scenario, ProtectionCase::InsufficientCapacity)
+                .then_some((2, 3)),
+            control: Some(control),
+        }),
+    };
+    let nodes = install_nodes(
+        &mut sim,
+        root.path(),
+        &ips,
+        &[(0, 1), (0, 2), (1, 3), (2, 3)],
+        seed,
+        None,
+        RoutingFixture::Regional(&mut fixture, Some(tls)),
+    )?;
+    let key = pulsebeam_server::insecure_dev_api_key()?;
+    let expires = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs()
+        + 60;
+    let token = |subject, allow: &[&str]| {
+        pulsebeam_server::sign_participant_token(
+            &key,
+            &serde_json::from_value(json!([{"rooms":["stage"],"allow":allow}]))?,
+            subject,
+            expires,
+        )
+    };
+    let publisher_name = "video-publisher";
+    let publish = token(publisher_name, &["join", "publish"])?;
+    sim.client(client, async move {
+        fixture.connect();
+        let inspect = inspect.await?;
+        let (mut publisher, source) = connect_dd_publisher(
+            (ips[0], 7070).into(),
+            client,
+            (ips[0], 3478).into(),
+            roots,
+            &publish.token,
+            Codec::H264,
+        )
+        .await?;
+        let id = source.publication_id();
+        let room = ProjectRoomKey {
+            project: *pulsebeam_core::auth::DEVELOPMENT_PROJECT_ID,
+            room: RoomId::new("stage")?,
+        };
+        let publication = PublicationKey::new(TrackKind::Video, id.parse()?);
+        let graph = Graph::H264Temporal;
+        let send = replay_graph(&mut publisher, &source, graph);
+        let observe = async {
+            anyhow::ensure!(
+                !inspect
+                    .media_protection(room, publication)
+                    .await
+                    .map_err(relay_error)?
+            );
+            let (_viewer, sink) = open_logical_h264(
+                (ips[3], 7070).into(),
+                NativeHost::bind(client)?,
+                publisher_name,
+                TRACK,
+                id,
+            )
+            .await?;
+            expect_height(&sink, "H264 primary", 720, Duration::from_secs(4), true).await?;
+            let wait = |expected| {
+                let inspect = &inspect;
+                async move {
+                    loop {
+                        if inspect
+                            .media_protection(room, publication)
+                            .await
+                            .map_err(relay_error)?
+                            == expected
+                        {
+                            return anyhow::Ok(());
+                        }
+                        pulsebeam_runtime::time::sleep(Duration::from_millis(25)).await;
+                    }
+                }
+            };
+            use pulsebeam_runtime::time::{Instant, sleep, timeout};
+            if !matches!(scenario, ProtectionCase::InsufficientCapacity) {
+                timeout(Duration::from_secs(4), wait(true))
+                    .await.context("independent H264 paths never became warm")??;
+            }
+            match scenario {
+                ProtectionCase::InsufficientCapacity => {
+                    anyhow::ensure!(
+                        !inspect.drain_media_relay(room, publication, nodes[1]).await.map_err(relay_error)?,
+                        "drained a live primary with no qualified replacement"
+                    );
+                    for _ in 0..40 {
+                        anyhow::ensure!(
+                            !inspect.media_protection(room, publication).await.map_err(relay_error)?,
+                            "underprovisioned hop admitted protection"
+                        );
+                        sleep(Duration::from_millis(25)).await;
+                    }
+                }
+                ProtectionCase::IndependentRepair => {
+                    use pulsebeam::sim_metrics::wan_repair;
+                    wan_repair::arm_protected_h264(
+                        ((ips[1], 7445).into(), (ips[3], 7445).into()),
+                        ((ips[2], 7446).into(), (ips[3], 7446).into()),
+                    );
+                    timeout(Duration::from_secs(3), async {
+                        loop {
+                            if let Some(report) = wan_repair::protected_report()
+                                && report.independent_offers != 0
+                            {
+                                break report;
+                            }
+                            sleep(Duration::from_millis(5)).await;
+                        }
+                    }).await.map_err(|_| anyhow::anyhow!(
+                        "exact H264 repair did not arrive over the independent relay: {:?}",
+                        wan_repair::protected_report(),
+                    )).and_then(|report| {
+                        anyhow::ensure!(report.dropped_live[0] >= 2 && report.dropped_live[1] == 1,
+                            "all copies of the exact position must be lost: {report:?}");
+                        anyhow::ensure!(report.independent_offers == 1 && report.repaired_timestamp == Some(report.timestamp),
+                            "repair did not fill the original position exactly once: {report:?}");
+                        Ok(())
+                    })?;
+                }
+                ProtectionCase::TotalIsolation => {
+                    for relay in [ips[1], ips[2]] {
+                        turmoil::partition(relay, ips[3]);
+                    }
+                    timeout(Duration::from_secs(2), wait(false))
+                        .await.context("protection remained admitted in isolation")??;
+                    while sink.try_next_frame().is_some() {}
+                    sleep(Duration::from_millis(400)).await;
+                    anyhow::ensure!(sink.try_next_frame().is_none(), "viewer decoded during total WAN isolation");
+                    // Restore only the primary. Playback may recover, but the
+                    // still-isolated standby cannot justify protection again.
+                    turmoil::repair(ips[1], ips[3]);
+                }
+                ProtectionCase::StandbyLoss | ProtectionCase::PrimaryLoss | ProtectionCase::PlannedDrain => {
+                    if matches!(scenario, ProtectionCase::PrimaryLoss | ProtectionCase::PlannedDrain) {
+                        let frame = || timeout(Duration::from_millis(350), async {
+                            loop {
+                                if let Some(frame) = sink.try_next_frame() {
+                                    return frame;
+                                }
+                                sleep(Duration::from_millis(5)).await;
+                            }
+                        });
+                        while sink.try_next_frame().is_some() {}
+                        let mut timestamp = frame().await.context("no H264 picture before primary loss")?.rtp_timestamp;
+                        let cut = Instant::now();
+                        if matches!(scenario, ProtectionCase::PlannedDrain) {
+                            anyhow::ensure!(inspect.drain_media_relay(room, publication, nodes[1]).await.map_err(relay_error)?,
+                                "refused to drain a primary with a qualified replacement");
+                            anyhow::ensure!(!inspect.media_protection(room, publication).await.map_err(relay_error)?,
+                                "drained leg was still admitted");
+                            timestamp = frame().await.context("H264 playback stalled while the primary relay was draining")?.rtp_timestamp;
+                        }
+                        tracing::debug!(target: "pulsebeam_protection", timestamp, "cutting primary WAN path");
+                        turmoil::partition(ips[1], ips[3]);
+                        let mut control_disconnected = false;
+                        while Instant::now() - cut < Duration::from_secs(2) {
+                            // Hold the ordinary route on the failed relay long
+                            // enough that only the preinstalled copy can bridge it.
+                            if !control_disconnected && Instant::now() - cut >= Duration::from_millis(500) {
+                                fixture.streams[2].disconnect().await;
+                                control_disconnected = true;
+                            }
+                            let picture = frame().await.context("H264 playback stalled after primary loss")?;
+                            let delta = picture.rtp_timestamp.wrapping_sub(timestamp);
+                            tracing::debug!(target: "pulsebeam_protection", timestamp = picture.rtp_timestamp, delta, "decoded picture after the cut");
+                            anyhow::ensure!(picture.height == 720 && matches!(delta, 3000 | 6000 | 9000 | 12000),
+                                "H264 playback skipped a base interval, duplicated or rewound: delta={delta}");
+                            timestamp = picture.rtp_timestamp;
+                        }
+                    } else {
+                        fixture.streams[3].disconnect().await;
+                    }
+                    timeout(Duration::from_secs(2), wait(false))
+                        .await.context("protection remained admitted after path loss")??;
+                }
+            }
+            while sink.try_next_frame().is_some() {}
+            expect_height(
+                &sink,
+                "H264 playback after the protection scenario",
+                720,
+                Duration::from_secs(3),
+                true,
+            )
+            .await?;
+            if matches!(scenario, ProtectionCase::TotalIsolation) {
+                anyhow::ensure!(!inspect.media_protection(room, publication).await.map_err(relay_error)?,
+                    "a single restored path readmitted protection");
+            }
+            Ok(())
+        };
+        pulsebeam_runtime::select! { result = observe => result, result = send => result }
+            .map_err(Into::into)
+    });
+    run_sim_or_timeout(&mut sim, Duration::from_secs(20))
+        .map_err(|error| anyhow::anyhow!("regional H264 protection ({scenario:?}): {error:#}"))
 }
 
 const SIBLING_EDGES: [(usize, usize); 7] = [(0, 1), (1, 2), (2, 3), (2, 4), (3, 5), (4, 5), (5, 6)];
@@ -257,6 +682,8 @@ fn sibling_regions_share_a_wan_branch_and_reroute_without_replacing_the_source()
             .map(|_| std::array::from_fn(|_| SimLinkCost::new(NonZeroU16::MIN)))
             .collect(),
         streams: Vec::new(),
+        protection: None,
+        foreign_registry: None,
         hierarchy: Some(Hierarchy {
             regions: &[
                 ("parent", None, &[2]),
@@ -520,12 +947,27 @@ fn regional_agent(
     subject: &str,
     allow: &[&str],
 ) -> anyhow::Result<(Arc<Agent>, RuntimeAgent)> {
-    let key = pulsebeam_server::insecure_dev_api_key()?;
+    regional_agent_with_key(
+        client,
+        server,
+        subject,
+        allow,
+        &pulsebeam_server::insecure_dev_api_key()?,
+    )
+}
+
+fn regional_agent_with_key(
+    client: IpAddr,
+    server: IpAddr,
+    subject: &str,
+    allow: &[&str],
+    key: &str,
+) -> anyhow::Result<(Arc<Agent>, RuntimeAgent)> {
     let wall = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs();
     let signed = pulsebeam_server::sign_participant_token(
-        &key,
+        key,
         &serde_json::from_value(json!([{ "rooms": [ROOM], "allow": allow }]))?,
         subject,
         wall + 60,

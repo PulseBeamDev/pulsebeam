@@ -6,8 +6,10 @@ use pulsebeam_runtime::time::Instant;
 use crate::{
     control::{controller::ControllerActor, link::wan::RepairSendPermit},
     link::wan_host::{ParentSend, PendingTx},
-    route::fabric::relay::{LocatedRepair, PeerRepairHandoff},
+    route::fabric::relay::PeerRepairHandoff,
 };
+
+use super::super::media_repair::Packet;
 
 #[derive(Default)]
 pub(in crate::control::controller::peer_ownership) struct RepairSends {
@@ -23,7 +25,7 @@ struct Flight {
 
 struct StagedRepair {
     pending: PendingTx,
-    located: LocatedRepair,
+    packet: Packet,
 }
 
 impl Drop for Flight {
@@ -39,13 +41,14 @@ impl RepairSends {
         peer: NetworkId,
         parent: ParentSend,
         permit: impl Into<RepairSendPermit>,
-        located: LocatedRepair,
+        packet: impl Into<Packet>,
         now: Instant,
     ) -> Option<BindingId> {
         if self.flights.len() >= super::super::provisioned::REPAIR_LOOKUP_BUDGET {
             return None;
         }
-        let expires = located.expires;
+        let packet = packet.into();
+        let expires = packet.expires();
         let (cutoff, pending) = actor
             .links
             .as_mut()?
@@ -56,7 +59,7 @@ impl RepairSends {
             parent: parent.cutoff,
             cutoff,
             expires,
-            staged: Some(Box::new(StagedRepair { pending, located })),
+            staged: Some(Box::new(StagedRepair { pending, packet })),
         });
         Some(binding)
     }
@@ -70,7 +73,7 @@ impl RepairSends {
             if now < flight.expires
                 && flight.parent.is_live()
                 && flight.cutoff.is_live()
-                && flight.advance(actor)
+                && flight.advance(actor, now)
             {
                 return true;
             }
@@ -95,7 +98,7 @@ impl RepairSends {
 }
 
 impl Flight {
-    fn advance(&mut self, actor: &mut ControllerActor) -> bool {
+    fn advance(&mut self, actor: &mut ControllerActor, now: Instant) -> bool {
         let Some(mut staged) = self.staged.take() else {
             return true;
         };
@@ -104,10 +107,15 @@ impl Flight {
                 self.staged = Some(staged);
                 true
             }
-            Poll::Ready(Some(tx)) => actor.stage_wan_repair_handoff(PeerRepairHandoff {
-                located: staged.located,
-                tx: tx,
-            }),
+            Poll::Ready(Some(tx)) => match staged.packet {
+                Packet::Shard(located) => {
+                    actor.stage_wan_repair_handoff(PeerRepairHandoff { located, tx })
+                }
+                Packet::Warm(packet) => {
+                    packet.is_live(now)
+                        && tx.try_send(now, packet.expires, packet.position, packet.packet)
+                }
+            },
             Poll::Ready(None) => false,
         }
     }

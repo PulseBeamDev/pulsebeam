@@ -1199,6 +1199,10 @@ fn install_nodes(
     for (index, (ip, data_dir, identity, credential, receipt_key)) in nodes.iter().enumerate() {
         let ip = *ip;
         let gossip = (ip, 7946).into();
+        let protection = match &routing {
+            RoutingFixture::Regional(fixture, _) => fixture.protection.as_ref(),
+            _ => None,
+        };
         let ownership_peers = edges
             .iter()
             .enumerate()
@@ -1229,6 +1233,7 @@ fn install_nodes(
                         && index != viewer_index
                         && other == viewer_index)
                         .then_some(left_id.0),
+                    protected_egress_bps: protection.map(|plan| plan.egress_bps(index, other)),
                     authority_epoch: [91; 16],
                     receipt_key: receipt_key.clone(),
                     peer_receipt_key: remote_key.public_key(),
@@ -1244,8 +1249,19 @@ fn install_nodes(
             data_dir: data_dir.clone(),
             ownership_peers,
             region_tree: region_tree.clone(),
+            protected_base_stream_bps: protection
+                .filter(|plan| plan.viewer == index)
+                .map(|plan| plan.wire_bps),
         };
         let standby = standby.cloned();
+        let registry = match &routing {
+            RoutingFixture::Regional(fixture, _) => fixture
+                .foreign_registry
+                .as_ref()
+                .filter(|(node, _)| *node == index)
+                .map(|(_, registry)| registry.clone()),
+            _ => None,
+        };
         let quic = match &routing {
             RoutingFixture::DirectQuicPair(tls) => Some(tls.clone()),
             RoutingFixture::DirectQuic(tls) | RoutingFixture::Regional(_, Some(tls))
@@ -1255,12 +1271,22 @@ fn install_nodes(
             }
             _ => None,
         };
+        let link_control = std::cell::RefCell::new(match &mut routing {
+            RoutingFixture::Regional(fixture, _) => fixture
+                .protection
+                .as_mut()
+                .filter(|plan| plan.viewer == index)
+                .and_then(|plan| plan.control.take()),
+            _ => None,
+        });
         let ports = std::cell::RefCell::new(std::mem::take(&mut regional_ports[index]));
         let identities: Vec<_> = nodes.iter().map(|entry| entry.2.0).collect();
         sim.host(ip, move || {
             let options = options.clone();
             let standby = standby.clone();
             let quic = quic.clone();
+            let registry = registry.clone();
+            let link_control = link_control.borrow_mut().take();
             let ports = std::mem::take(&mut *ports.borrow_mut())
                 .into_iter()
                 .map(|(remote, roles, cost, lane)| (identities[remote], roles, cost, lane))
@@ -1268,8 +1294,14 @@ fn install_nodes(
             async move {
                 let mut node = sfu_node_builder(ip, pulsebeam_runtime::rand::seeded_rng(seed), 1)
                     .with_cluster(options);
+                if let Some(registry) = registry {
+                    node = node.with_key_registry(registry);
+                }
                 if let Some(tls) = quic {
                     node = node.with_native_quic("edge.example".into(), tls);
+                }
+                if let Some(control) = link_control {
+                    node = node.with_provisioned_link_control(control);
                 }
                 for (peer, roles, cost, lane) in ports {
                     node = node.with_sim_regional_port(peer, roles, cost, lane);

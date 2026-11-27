@@ -135,6 +135,34 @@ fn media_permit_pins_origin_incarnation_scope_window_descriptor_and_expiry() {
     assert!(demand(&[]).is_none());
     check_branch(&tree, gateway, assertion, &permit, now);
 
+    let video_source = WanSourceWindow {
+        publisher: PublisherAnchor {
+            publication: connection.fixture_publication(TrackKind::Video, "feed"),
+            emission: Emission::new(
+                pulsebeam_core::fabric::Profile::H264,
+                &[pulsebeam_core::fabric::ExtensionKind::DependencyDescriptor],
+            )
+            .unwrap(),
+            ..publisher
+        },
+        ..source
+    };
+    let video_descriptor = Track {
+        publication_id: video_source.publisher.publication.as_str(),
+        kind: Some(Kind::Video(pulsebeam_proto::state::VideoTrack {
+            guarantees_video_dd: true,
+            ..Default::default()
+        })),
+        ..descriptor.clone()
+    };
+    let video = SourceAssertion {
+        descriptor: &video_descriptor,
+        source: video_source,
+        ..assertion
+    };
+    let video_permit = sign(&tree, &origin_key, video, now, until).unwrap();
+    check_branch(&tree, gateway, video, &video_permit, now);
+
     assert!(
         check(
             &tree,
@@ -239,7 +267,7 @@ fn check_branch(
         regional_routing::{
             forwarding::{Arrival, Forwarding, Link, Links, Router},
             frames::{Frame, HOPS, Request},
-            media_branch::{self, Edge, Leases},
+            media_branch::{self, Edge, Leases, ProtectionPath},
             media_read::Row,
         },
     };
@@ -296,10 +324,14 @@ fn check_branch(
     let now = Instant::now();
     let mut fwd = Forwarding::default();
     let mut leases = Leases::default();
-    let mut deliver = |from, ack, visited| {
-        let body =
-            media_branch::encode(Row::new(assertion.descriptor, permit.into()), ack, visited)
-                .unwrap();
+    let mut deliver = |from, ack, visited, protection| {
+        let body = media_branch::encode(
+            Row::new(assertion.descriptor, permit.into()),
+            ack,
+            visited,
+            protection,
+        )
+        .unwrap();
         let frame = Frame::Branch(Request {
             target,
             border: None,
@@ -312,7 +344,7 @@ fn check_branch(
         if let Some(Arrival::Branch(request)) = fwd.receive(&router, from, &frame, now) {
             leases.receive(tree, local, edge, request, now, wall);
         }
-        leases.iter().count()
+        (leases.iter().count(), leases.protected().count())
     };
     assert_eq!(
         deliver(
@@ -321,11 +353,12 @@ fn check_branch(
                 ..link
             },
             ack,
-            vec![downstream]
+            vec![downstream],
+            None,
         ),
-        0
+        (0, 0)
     );
-    assert_eq!(deliver(link, ack, vec![local, downstream]), 0);
+    assert_eq!(deliver(link, ack, vec![local, downstream], None), (0, 0));
     assert_eq!(
         deliver(
             link,
@@ -333,15 +366,49 @@ fn check_branch(
                 sequence_anchor: ack.sequence_anchor + 1,
                 ..ack
             },
-            vec![downstream]
+            vec![downstream],
+            None,
         ),
-        0
+        (0, 0)
     );
-    assert_eq!(deliver(link, ack, vec![downstream]), 1);
+    assert_eq!(deliver(link, ack, vec![downstream], None), (1, 0));
+    let protection = ProtectionPath::new(vec![downstream, local], NonZeroU64::MIN);
+    assert_eq!(
+        deliver(link, ack, vec![downstream], protection.clone()),
+        (1, 0)
+    );
+    let distinct = WanLiveRouteAck {
+        window: Window::new(
+            source.publisher.emission.profile(),
+            source.window_start,
+            source.forms(),
+            NonZeroU32::new(2).unwrap(),
+            source.publisher.emission.wire_profile().1,
+        )
+        .unwrap(),
+        ..ack
+    };
+    let protected_count = usize::from(ack.window.profile().is_video());
+    assert_eq!(
+        deliver(link, distinct, vec![downstream], protection.clone()),
+        (1, protected_count)
+    );
+    if protected_count == 1 {
+        let changed_rate =
+            ProtectionPath::new(vec![downstream, local], NonZeroU64::new(2).unwrap());
+        assert_eq!(
+            deliver(link, distinct, vec![downstream], changed_rate),
+            (1, 1)
+        );
+        let protected = leases.protected().next().unwrap();
+        assert_eq!(protected.ack, distinct);
+        assert_eq!(protected.protection, protection);
+    }
     let lease = leases.iter().next().unwrap();
     assert_eq!(lease.downstream.network, edge.network);
     assert_eq!(lease.ack, ack);
     assert_eq!(lease.source, source);
     leases.expire(now + Duration::from_secs(1), wall + Duration::from_secs(1));
     assert_eq!(leases.iter().count(), 0);
+    assert_eq!(leases.protected().count(), 0);
 }
