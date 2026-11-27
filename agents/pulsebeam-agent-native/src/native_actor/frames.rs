@@ -105,7 +105,7 @@ impl FrameOrigin {
                 state,
                 ..
             } => subscription.is_closed() || state.closed(),
-            Self::Admitted { .. } => false,
+            Self::Admitted { room, admission } => room.check_admitted_media(admission).is_err(),
         }
     }
 
@@ -113,8 +113,17 @@ impl FrameOrigin {
         match self {
             Self::Exact { subscription, .. } => subscription.observe(ReceiveMode::Decoded).await,
             Self::Admitted { room, admission } => {
-                room.observe_admitted_media((**admission).clone(), ReceiveMode::Decoded)
+                match room
+                    .observe_admitted_media((**admission).clone(), ReceiveMode::Decoded)
                     .await
+                {
+                    Err(Error::Core(agent_core::AgentError::OperationFailed(error)))
+                        if error.code == ErrorCode::Replaced =>
+                    {
+                        Err(Error::Closed)
+                    }
+                    result => result,
+                }
             }
         }
     }

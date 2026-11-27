@@ -113,7 +113,12 @@ impl Subscription {
             })
             .await
             .map_err(|_| Error::Closed)?;
-        result.await.map_err(|_| Error::Closed)?
+        match result.await.map_err(|_| Error::Closed)? {
+            Err(Error::Core(agent_core::AgentError::InvalidResource(
+                agent_core::TrackResourceError::Released,
+            ))) if self.is_closed() => Err(Error::Closed),
+            result => result,
+        }
     }
 
     pub async fn configure_video(&self, observation: VideoObservation) -> Result<(), Error> {

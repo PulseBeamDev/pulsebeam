@@ -2827,6 +2827,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn closing_exact_subscription_retires_queued_frame_observation() {
+        let (_agent, mut actor) = Agent::parts(
+            config(),
+            Host::new(Box::new(reqwest::Client::new())),
+            || Ok((rtc::ThreadedRuntime, ())),
+        )
+        .unwrap();
+        let subscription = actor
+            .claim_audio_subscription(agent_core::TrackSelector {
+                room: "room".into(),
+                participant_id: "remote".into(),
+                track_id: "microphone".into(),
+            })
+            .unwrap();
+        let reader = frames::FrameReader::new(
+            subscription.clone(),
+            frames::FrameState::Audio(subscription.audio_observer().unwrap()),
+        )
+        .unwrap();
+        let mut observation = Box::pin(subscription.observe(ReceiveMode::Decoded));
+        let mut frame = Box::pin(reader.next());
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(observation.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(frame.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        subscription.close().await.unwrap();
+        for _ in 0..2 {
+            let command = actor.commands.try_recv().unwrap();
+            assert!(matches!(command, Command::ObserveSubscription { .. }));
+            actor.command(command);
+        }
+        assert!(matches!(observation.await, Err(Error::Closed)));
+        assert!(frame.await.unwrap().is_none());
+        assert!(reader.next().await.unwrap().is_none());
+        assert!(actor.observations.is_empty());
+    }
+
+    #[tokio::test]
     async fn terminal_data_read_failure_wakes_owner_retirement() {
         let (_agent, mut actor) = Agent::parts(
             config(),

@@ -349,9 +349,18 @@ async def witness(endpoint, token, reader_token, catalog_token, room, package):
         assert sibling_audio.state().closed, "second exact audio interest did not close"
         assert not interest.is_closed(), "audio close ended an independent named audio interest"
         waiting_frames = interest.frames()
+
+        async def read_until_audio_close():
+            try:
+                return await waiting_frames.next()
+            except native.NativeError.Operation as error:
+                raise AssertionError(
+                    f"pending audio read failed: {error.info.code}: {error.info.message}"
+                ) from error
+
         try:
             async with asyncio.TaskGroup() as group:
-                waiting = group.create_task(waiting_frames.next())
+                waiting = group.create_task(read_until_audio_close())
                 await asyncio.sleep(0)
                 assert not waiting.done(), "absent source returned a frame or terminated"
                 await interest.close()
