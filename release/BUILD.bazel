@@ -1,5 +1,6 @@
 load("@bazel_lib//lib:run_binary.bzl", "run_binary")
 load("@rules_python//python:defs.bzl", "py_binary", "py_test")
+load("@rules_rust//rust:defs.bzl", "rust_binary")
 load("@rules_pkg//pkg:mappings.bzl", "pkg_attributes", "pkg_files")
 load("@rules_pkg//pkg:tar.bzl", "pkg_tar")
 load("@rules_oci//oci:defs.bzl", "oci_image", "oci_load")
@@ -88,8 +89,32 @@ py_test(
     size = "small",
 )
 
-py_test(name = "contract", srcs = ["contract.py"], main = "contract.py",
-        args = ["--local", "$(rootpath :local)", "--global", "$(rootpath :global)"],
-        data = [":local", ":global"], timeout = "long")
+rust_binary(
+    name = "auth_fixture",
+    srcs = ["auth_fixture.rs"],
+    edition = "2024",
+    testonly = True,
+    deps = ["//crates/pulsebeam-auth", "//server/rust:packaged_server", "@crates//:rcgen", "@crates//:serde_json"],
+)
+
+rust_binary(
+    name = "media_witness",
+    srcs = ["media_witness.rs"],
+    edition = "2024",
+    testonly = True,
+    deps = [
+        "//agents/pulsebeam-agent-native",
+        "@crates//:anyhow",
+        "@crates//:reqwest",
+        "@crates//:serde",
+        "@crates//:serde_json",
+        "@crates//:tokio",
+    ],
+)
+
+py_test(name = "contract", srcs = ["contract.py", "regional_contract.py"], main = "contract.py",
+        args = ["--local", "$(rootpath :local)", "--global", "$(rootpath :global)",
+                "--auth-fixture", "$(rootpath :auth_fixture)", "--media-witness", "$(rootpath :media_witness)"],
+        data = [":local", ":global", ":auth_fixture", ":media_witness"], timeout = "long")
 
 filegroup(name = "all", srcs = [":local", ":global", ":image"])

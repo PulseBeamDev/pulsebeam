@@ -179,6 +179,36 @@ optimization level 2, debug assertions and overflow checks. Named `dev`,
 settings; use those build configurations for runtime binaries, not abort-panic
 settings for libtest.
 
+## Profile installed-binary media
+
+Run the release contract with a viewer sweep to compare revisions on the same
+Linux runner. Disable the test-result cache to take a new sample:
+
+```sh
+./bazel test //release:contract --nocache_test_results --test_output=all \
+  --test_arg=--profile-viewers --test_arg=1 --test_arg=4 \
+  --test_arg=--profile-seconds --test_arg=4
+```
+
+Each load point uses fresh, room-scoped identities for the publisher and viewers.
+The `release-profile.json` test output contains first-decode latency, gaps between
+decoded frames, server CPU and resident memory, aggregate loopback bytes, and
+participant cleanup time. The sweep stops at the first point that misses its
+playback checks. Keep the raw report, including any incomplete point, with the
+binary digest and runner information.
+
+To exercise overload admission, also pass
+`--test_arg=--profile-connection-limit --test_arg=<viewers>`, where
+`<viewers>` is the largest load point. At that point the test attempts one
+more authenticated admission and requires an explicit capacity rejection while
+the admitted viewers continue to meet the same playback checks.
+
+The fixture runs two server processes and all clients on one host, with a
+single regional path and one low-motion 160 × 96 source at 10 FPS. It does not
+measure physical network redundancy, realistic bitrate mixes, or a production
+admission limit. Use `//crates/pulsebeam-simulator:production_soak` for the
+separate deterministic protected-path churn and cleanup checks.
+
 ## Testing contract
 
 ### Keep the QA loop fast

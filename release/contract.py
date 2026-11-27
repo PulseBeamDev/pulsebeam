@@ -1,96 +1,39 @@
 """Exercise versioned installation and updates against local archive fixtures."""
 
 import argparse
-from contextlib import ExitStack
 from functools import partial
 import hashlib
-from http.client import HTTPConnection
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import io
-import json
 import os
 from pathlib import Path
 import platform
-import socket
 import subprocess
 import tarfile
 import tempfile
 from threading import Thread
-import time
 
-
-def smoke_production_listeners(binary, root, env):
-    config = root / "runtime"
-    config.mkdir()
-    policy = config / "leap-seconds.list"
-    # Isolated startup fixture, not an attestation of the runner's UTC source.
-    policy.write_text("#@ 4500000000\n2272060800 10 # 1972 origin\n2287785600 11 # July 1972\n")
-    # Public verification material only. The smoke never issues tokens.
-    (config / "key-registry.json").write_text(json.dumps({
-        "projectId": "p_00000000001R010000000000004",
-        "keys": [{
-            "keyId": "kid_00000000001R010000000000008",
-            "publicKey": "MCowBQYDK2VwAyEA11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
-        }],
-    }))
-    with ExitStack() as sockets:
-        def reserve(family, kind, host, port=0):
-            listener = sockets.enter_context(socket.socket(family, kind))
-            listener.bind((host, port))
-            return listener.getsockname()[1]
-
-        http_port, internal_port = [
-            reserve(socket.AF_INET, socket.SOCK_STREAM, "127.0.0.1") for _ in range(2)
-        ]
-        rtc_port = reserve(socket.AF_INET6, socket.SOCK_STREAM, "::")
-        reserve(socket.AF_INET6, socket.SOCK_DGRAM, "::", rtc_port)
-
-    def require_status(port, path, expected):
-        conn = HTTPConnection("127.0.0.1", port, timeout=2)
-        try:
-            conn.request("GET", path)
-            with conn.getresponse() as response:
-                assert response.status == expected, (path, expected, response.status)
-        finally:
-            conn.close()
-
-    log = config / "server.log"
-    with log.open("wb") as output, subprocess.Popen([
-        str(binary), "--shards", "1", "--rtc-port", str(rtc_port),
-        "--utc-policy", str(policy), "--http-listen", f"127.0.0.1:{http_port}",
-        "--internal-listen", f"127.0.0.1:{internal_port}",
-    ], cwd=config, env=env, stdout=output, stderr=subprocess.STDOUT) as node:
-        try:
-            deadline = time.monotonic() + 10
-            while True:
-                try:
-                    require_status(internal_port, "/healthz", 200)
-                    require_status(http_port, "/api/v1/native/admissions", 405)
-                    require_status(http_port, "/metrics", 404)
-                    require_status(internal_port, "/metrics", 200)
-                    break
-                except ConnectionError:
-                    if node.poll() is not None or time.monotonic() >= deadline:
-                        raise
-                    time.sleep(0.025)
-        except Exception:
-            print(log.read_text(errors="replace"))
-            raise
-        finally:
-            if node.poll() is None:
-                node.terminate()
-                try:
-                    node.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    node.kill()
-                    node.wait()
+from release.regional_contract import smoke_enrolled_restart
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--local", required=True)
     parser.add_argument("--global", dest="global_assets", required=True)
+    parser.add_argument("--auth-fixture", required=True, type=Path)
+    parser.add_argument("--media-witness", required=True, type=Path)
+    parser.add_argument("--profile-viewers", type=int, nargs="+", default=[1])
+    parser.add_argument("--profile-seconds", type=int, default=0)
+    parser.add_argument("--profile-connection-limit", type=int)
     args = parser.parse_args()
+    if args.profile_connection_limit is not None and not (
+        args.profile_seconds and args.profile_connection_limit == max(args.profile_viewers)
+    ):
+        parser.error("a connection-limit rehearsal needs a sample at the configured limit")
+    if not (0 <= args.profile_seconds <= 60 and all(1 <= n <= 128 for n in args.profile_viewers)):
+        parser.error("profile supports 1..128 viewers per point and up to 60 seconds per sample")
+    if not args.profile_seconds and args.profile_viewers != [1]:
+        parser.error("a viewer sweep needs a nonzero profiling interval")
     local = Path(args.local).resolve()
     global_assets = Path(args.global_assets).resolve()
     stem = f"pulsebeam-{platform.machine()}-unknown-linux-gnu"
@@ -147,7 +90,10 @@ def main():
             subprocess.run(command, env=env, check=True)
             binary = Path(env["CARGO_HOME"]) / "bin/pulsebeam"
             subprocess.run([str(binary), "--version"], env=env, check=True)
-            smoke_production_listeners(binary, root, env)
+            smoke_enrolled_restart(
+                binary, args.auth_fixture.resolve(), args.media_witness.resolve(), root / "runtime", env,
+                args.profile_viewers, args.profile_seconds, args.profile_connection_limit,
+            )
             assert not binary.with_name("pulsebeam-update").exists()
             assert not Path(env["XDG_CONFIG_HOME"]).exists(), "installation must not require a receipt"
             assert not (Path(env["CARGO_HOME"]) / "env").exists()
