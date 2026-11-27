@@ -6,12 +6,13 @@ use std::num::NonZeroU64;
 
 use pulsebeam_core::{
     dd::evidence::{
-        Decision, DecodeTarget, Enqueue, FilteredBranch, FrameStatus, Frames, Qualified,
-        SourceContext,
+        Decision, DecodeTarget, Enqueue, FilteredBranch, FrameStatus, Frames, ProjectionEvidence,
+        Qualified, SourceContext,
     },
     fabric::{
         ExtensionKind, FabricPacket, MAJOR, Profile, REGISTRY_REVISION, WireError,
         media_source::{IdentityAdmission, MediaIdentity, Rejected},
+        wan::OmissionRun,
     },
 };
 use pulsebeam_runtime::time::{Duration, Instant};
@@ -252,47 +253,71 @@ pub(crate) struct DecodeTargetRateContext {
 pub(crate) enum DecodeTargetSample {
     #[default]
     None,
-    Unknown,
+    Unknown {
+        through: u64,
+    },
     Measured {
         context: DecodeTargetRateContext,
         through: u64,
         bytes: [u64; crate::rtp::monitor::MAX_LADDER_TARGETS],
+        pictures: [u64; crate::rtp::monitor::MAX_LADDER_TARGETS],
     },
 }
 
 impl DecodeTargetSample {
-    fn record(&mut self, position: u64, qualified: Option<&Qualified>, payload_bytes: usize) {
-        if *self == Self::Unknown {
+    fn record(
+        &mut self,
+        position: u64,
+        qualified: Option<&(Qualified, FrameStatus)>,
+        source: Option<&SourceEvidence>,
+        emission: Emission,
+        payload_bytes: usize,
+    ) {
+        if let Self::Unknown { through } = self {
+            *through = (*through).max(position);
             return;
         }
-        let Some(qualified) = qualified else {
-            *self = Self::Unknown;
+        let Some(qualified) = qualified.and_then(measurement_evidence) else {
+            let through = match *self {
+                Self::Measured { through, .. } => through.max(position),
+                _ => position,
+            };
+            *self = Self::Unknown { through };
             return;
         };
+        let structure = (emission.profile() == Profile::Vp9 && qualified.descriptor.end_of_frame)
+            .then(|| source?.context.structure_for(qualified))
+            .flatten();
         let payload_bytes = u64::try_from(payload_bytes).unwrap_or(u64::MAX);
         let context = DecodeTargetRateContext {
             structure_origin: qualified.structure_origin,
             active_targets: qualified.active_targets,
         };
-        let mut bytes = match *self {
+        use crate::rtp::monitor::MAX_LADDER_TARGETS;
+        let (mut bytes, mut pictures) = match *self {
             Self::Measured {
                 context: previous,
                 bytes,
+                pictures,
                 ..
-            } if previous == context => bytes,
-            _ => [0; crate::rtp::monitor::MAX_LADDER_TARGETS],
+            } if previous == context => (bytes, pictures),
+            _ => ([0; MAX_LADDER_TARGETS], [0; MAX_LADDER_TARGETS]),
         };
         for (target, total) in bytes.iter_mut().enumerate() {
             if (qualified.active_targets & (1 << target)) != 0
                 && qualified.descriptor.is_in_decode_target(target)
             {
                 *total = total.saturating_add(payload_bytes);
+                if vp9_filtered_marker(qualified, structure, target as u8) == Some(true) {
+                    pictures[target] = pictures[target].saturating_add(1);
+                }
             }
         }
         *self = Self::Measured {
             context,
             through: position,
             bytes,
+            pictures,
         };
     }
 }
@@ -323,6 +348,15 @@ pub struct SourceFanout {
     expectations: Option<Box<reliable::Expectations>>,
 }
 
+pub(crate) enum ViewerDemand<Branch> {
+    Unauthorized,
+    Include,
+    Staged {
+        replacement: Branch,
+        allowed_targets: Option<u32>,
+    },
+}
+
 #[derive(Default)]
 struct SourceEvidence {
     context: SourceContext,
@@ -336,11 +370,13 @@ impl SourceEvidence {
         sequence: u64,
         image: &OwnedPacket,
         identity: Option<&MediaIdentity>,
+        omitted: Option<OmissionRun>,
     ) -> Result<Option<(pulsebeam_core::dd::evidence::Qualified, FrameStatus)>, Rejection> {
-        if let Some(identity) = identity {
-            self.context
-                .bridge_padding_before(sequence, |positions| identity.covers_padding(positions));
-        }
+        self.context
+            .bridge_context_neutral_before(sequence, |positions| {
+                covers_omission(omitted, positions.clone())
+                    || identity.is_some_and(|identity| identity.covers_padding(positions))
+            });
         let raw = image
             .extensions()
             .find(|extension| extension.kind == ExtensionKind::DependencyDescriptor)
@@ -391,6 +427,21 @@ fn vp9_filtered_marker(
     Some(descriptor.frame_dependencies.spatial_id == spatial)
 }
 
+fn vp9_projection(
+    emission: Emission,
+    qualified: Option<&(Qualified, FrameStatus)>,
+) -> Option<ProjectionEvidence> {
+    let (dd, frame) = qualified?;
+    if emission.profile() != Profile::Vp9 {
+        return None;
+    }
+    ProjectionEvidence::new(dd, *frame)
+}
+
+fn measurement_evidence((dd, frame): &(Qualified, FrameStatus)) -> Option<&Qualified> {
+    matches!(frame, FrameStatus::Resolved(_)).then_some(dd)
+}
+
 fn dd_structure(
     emission: Emission,
     (qualified, frame): &(Qualified, FrameStatus),
@@ -428,6 +479,17 @@ fn dd_structure(
     Some(facts)
 }
 
+fn covers_omission(run: Option<OmissionRun>, positions: std::ops::Range<u64>) -> bool {
+    run.and_then(|run| run.positions(positions.end))
+        .is_some_and(|proof| proof.start <= positions.start)
+}
+
+#[derive(Clone, Copy)]
+struct NetworkLive {
+    ingress: NonZeroU64,
+    omitted: Option<OmissionRun>,
+}
+
 struct Frozen {
     packet: OwnedPacket,
     capture: Option<pulsebeam_clock::deadline::Timing>,
@@ -435,6 +497,8 @@ struct Frozen {
     live_arrival: Option<Instant>,
     ready_at: Option<std::time::Instant>,
     live_ingress: Option<NonZeroU64>,
+    omitted: Option<OmissionRun>,
+    projection: Option<ProjectionEvidence>,
     endpoint_original: bool,
 }
 
@@ -497,6 +561,7 @@ pub(crate) struct Transit<'a> {
     pub(crate) sender_ntp: Option<u64>,
     pub work: LiveWork,
     pub packet: PacketView<'a>,
+    pub(crate) projection: Option<ProjectionEvidence>,
     pub ready_at: Option<std::time::Instant>,
 }
 
@@ -625,6 +690,62 @@ impl SourceFanout {
                 .as_ref()?
                 .selected_target(),
         )
+    }
+
+    pub(crate) fn viewer_projection(
+        &self,
+        mut viewer: impl FnMut(
+            ParticipantHandle,
+            FabricBranchHandle,
+        ) -> ViewerDemand<FabricBranchHandle>,
+    ) -> Option<super::target_demand::Projection> {
+        use super::target_demand::Projection;
+        let context = self
+            .evidence
+            .as_ref()
+            .and_then(|evidence| evidence.context.projection_demand_context());
+        self.branches
+            .iter()
+            .filter_map(|(handle, branch)| {
+                match viewer(branch.destination, handle) {
+                    ViewerDemand::Unauthorized => return None,
+                    ViewerDemand::Staged {
+                        replacement,
+                        allowed_targets,
+                    } => {
+                        let previous = branch.filter.as_deref();
+                        let next = self
+                            .branches
+                            .get(replacement)
+                            .filter(|next| next.destination == branch.destination)
+                            .and_then(|next| next.filter.as_deref());
+                        if replacement != handle
+                            && let (Some(previous), Some(next)) = (previous, next)
+                        {
+                            let budget_forces_switch = allowed_targets.is_some_and(|mask| {
+                                mask & (1 << previous.selected_target().index()) == 0
+                                    && mask & (1 << next.selected_target().index()) != 0
+                            });
+                            // Keep the RTP leg until the replacement has a qualified entry,
+                            // but don't request enhancements that the hop cannot carry.
+                            if previous.awaiting_entry() || budget_forces_switch {
+                                return None;
+                            }
+                        }
+                    }
+                    ViewerDemand::Include => {}
+                }
+                Some(
+                    branch
+                        .filter
+                        .as_ref()
+                        .and_then(|branch| {
+                            Projection::targets(context?, branch.requested_targets())
+                        })
+                        .unwrap_or(Projection::Whole),
+                )
+            })
+            .reduce(Projection::union)
     }
 
     pub(crate) fn destinations(
@@ -1195,6 +1316,8 @@ impl SourceFanout {
                     live_arrival: None,
                     ready_at: None,
                     live_ingress: None,
+                    omitted: None,
+                    projection: None,
                     endpoint_original: false,
                 },
             );
@@ -1645,6 +1768,8 @@ impl SourceFanout {
                 live_arrival: None,
                 ready_at: None,
                 live_ingress: None,
+                omitted: None,
+                projection: None,
                 endpoint_original: true,
             },
         );
@@ -1704,9 +1829,11 @@ impl SourceFanout {
         arrival: Instant,
         sequence: u64,
         packet: Option<OwnedPacket>,
-        ingress: Option<NonZeroU64>,
+        network: Option<NetworkLive>,
         ready_at: Option<std::time::Instant>,
     ) -> Result<Offers, Rejection> {
+        let ingress = network.map(|live| live.ingress);
+        let omitted = network.and_then(|live| live.omitted);
         if self.fenced {
             return Err(Rejection::Fenced);
         }
@@ -1759,7 +1886,7 @@ impl SourceFanout {
         let qualified = if ordered {
             None
         } else if let Some(evidence) = &mut self.evidence {
-            evidence.qualify_position(sequence, image, self.media_identity.as_deref())?
+            evidence.qualify_position(sequence, image, self.media_identity.as_deref(), omitted)?
         } else {
             None
         };
@@ -1777,16 +1904,21 @@ impl SourceFanout {
         if new_live && self.emission.selects_dd_encoding() && !ordered {
             dd_sample.record(
                 sequence,
-                qualified.as_ref().map(|(dd, _)| dd),
+                qualified.as_ref(),
+                self.evidence.as_deref(),
+                self.emission,
                 image.payload().len(),
             );
         }
         if new_live {
+            let projection = vp9_projection(self.emission, qualified.as_ref());
             self.retire_before(oldest);
             if let Some(frozen) = self.fates.get_mut(&sequence) {
                 frozen.live_arrival = Some(arrival);
                 frozen.ready_at = ready_at;
                 frozen.live_ingress = ingress;
+                frozen.omitted = omitted;
+                frozen.projection = projection;
                 if !frozen.endpoint_original
                     && let Some(packet) = packet
                 {
@@ -1802,6 +1934,8 @@ impl SourceFanout {
                         live_arrival: Some(arrival),
                         ready_at,
                         live_ingress: ingress,
+                        omitted,
+                        projection,
                         endpoint_original: false,
                     },
                 );
@@ -1863,12 +1997,14 @@ impl SourceFanout {
             let Some(arrival) = frozen.live_arrival else {
                 break;
             };
+            let omitted = position > next && covers_omission(frozen.omitted, next..position);
             let padding_only = position > next
                 && self
                     .media_identity
                     .as_ref()
                     .is_some_and(|identity| identity.covers_padding(next..position));
             if position != next
+                && !omitted
                 && !padding_only
                 && high.saturating_sub(next) < DD_REORDER_POSITIONS
                 && now.saturating_duration_since(arrival) < DD_REORDER_WAIT
@@ -1882,13 +2018,20 @@ impl SourceFanout {
                 continue;
             }
             let qualified = evidence
-                .qualify_position(position, &frozen.packet, self.media_identity.as_deref())
+                .qualify_position(
+                    position,
+                    &frozen.packet,
+                    self.media_identity.as_deref(),
+                    frozen.omitted,
+                )
                 .ok()
                 .flatten();
             if self.emission.selects_dd_encoding() {
                 report.dd_sample.record(
                     position,
-                    qualified.as_ref().map(|(dd, _)| dd),
+                    qualified.as_ref(),
+                    Some(evidence),
+                    self.emission,
                     frozen.packet.payload().len(),
                 );
             }
@@ -1904,6 +2047,10 @@ impl SourceFanout {
             };
             for branch in self.branches.values_mut() {
                 branch.discard_stale(now, &self.fates, |_| true);
+                if omitted {
+                    branch.omitted = branch.omitted.saturating_add(position - next);
+                    branch.last_omitted = position.checked_sub(1);
+                }
                 branch.offer(
                     now,
                     work,
@@ -1912,6 +2059,9 @@ impl SourceFanout {
                     true,
                     &mut report,
                 );
+            }
+            if let Some(frozen) = self.fates.get_mut(&position) {
+                frozen.projection = vp9_projection(self.emission, qualified.as_ref());
             }
         }
         report
@@ -1924,9 +2074,17 @@ impl SourceFanout {
         sequence: u64,
         ingress: NonZeroU64,
         packet: OwnedPacket,
+        omitted: Option<OmissionRun>,
     ) -> Result<(u64, Offers), Rejection> {
-        self.offer_from(now, arrival, sequence, Some(packet), Some(ingress), None)
-            .map(|offers| (sequence, offers))
+        self.offer_from(
+            now,
+            arrival,
+            sequence,
+            Some(packet),
+            Some(NetworkLive { ingress, omitted }),
+            None,
+        )
+        .map(|offers| (sequence, offers))
     }
 
     pub(crate) fn attach_sender_ntp(&mut self, sequence: u64, arrival: Instant, ntp: u64) {
@@ -1982,7 +2140,7 @@ impl SourceFanout {
             high.checked_sub(behind)
         }
         .ok_or(Rejection::Stale)?;
-        self.offer_bound_network(now, arrival, sequence, ingress, packet)
+        self.offer_bound_network(now, arrival, sequence, ingress, packet, None)
     }
 
     pub(crate) fn live_sequence_anchor(&self, now: Instant) -> Option<u64> {
@@ -1997,6 +2155,7 @@ impl SourceFanout {
             sender_ntp: frozen.sender_ntp,
             work: LiveWork::new(self.high?, sequence, frozen.live_arrival?, hops)?,
             packet: frozen.packet.arrival_view(hops)?,
+            projection: frozen.projection,
             ready_at: frozen.ready_at,
         })
     }

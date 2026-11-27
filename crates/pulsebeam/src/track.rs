@@ -500,6 +500,7 @@ impl UpstreamTrack {
 #[derive(Debug)]
 pub struct TrackMonitor {
     encodings: Vec<UpstreamTrackLayer>,
+    measure_spatial_dd: bool,
 }
 
 impl PartialEq for TrackMonitor {
@@ -512,7 +513,14 @@ impl Eq for TrackMonitor {}
 
 impl TrackMonitor {
     fn new(encodings: Vec<UpstreamTrackLayer>) -> Self {
-        Self { encodings }
+        Self {
+            encodings,
+            measure_spatial_dd: false,
+        }
+    }
+
+    pub(crate) fn measure_spatial_dd(&mut self) {
+        self.measure_spatial_dd = true;
     }
 
     pub fn process(&mut self, rid: Option<&Rid>, packet: RtpPacket) -> ProcessedRtp {
@@ -611,7 +619,11 @@ impl TrackMonitor {
         else {
             return false;
         };
-        if let Some(vla) = packet.ext_vals.video_layers_allocation().cloned() {
+        // VP9 spatial target identities and rates come from DD and admitted
+        // bytes. A VLA declaration must not override their geometry or liveness.
+        if !self.measure_spatial_dd
+            && let Some(vla) = packet.ext_vals.video_layers_allocation().cloned()
+        {
             if let Some(encoding) = self.encodings.get_mut(index) {
                 encoding.normalizer.learn_vla_index(packet);
             }
@@ -667,6 +679,7 @@ impl TrackMonitor {
         VideoStatsSnapshot {
             layers: self.layer_states(),
             wan_ladder: None,
+            wan_budget: None,
         }
     }
 
@@ -740,10 +753,13 @@ pub struct DataTrack {
     pub reverse: Option<crate::route::NodeRouteAddress>,
 }
 
+mod wan_budget;
+
 #[derive(Debug, Clone, Default)]
 struct VideoStatsSnapshot {
     layers: TrackStates,
     wan_ladder: Option<WanLadderLease>,
+    wan_budget: Option<wan_budget::Lease>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -754,6 +770,14 @@ struct WanLadderLease {
 }
 
 impl VideoTrack {
+    pub(crate) fn uses_spatial_dd(&self) -> bool {
+        self.guarantees_video_dd
+            && self
+                .format
+                .as_ref()
+                .is_some_and(|format| format.mime_type.eq_ignore_ascii_case("video/vp9"))
+    }
+
     pub(crate) fn wan_ladder(
         &self,
         now: Instant,
@@ -766,6 +790,40 @@ impl VideoTrack {
             .map(|lease| lease.ladder)
     }
 
+    pub(crate) fn refresh_wan_video_budget(
+        &self,
+        incarnation: std::num::NonZeroU64,
+        cutoff: pulsebeam_link::BindingCutoff,
+        bps: u32,
+        expires: Instant,
+        now: Instant,
+    ) {
+        let current = self.stats.0.load();
+        if now >= expires
+            || !cutoff.is_live()
+            || current.wan_ladder.is_none_or(|lease| {
+                lease.publisher.incarnation != incarnation || now >= lease.expires
+            })
+        {
+            return;
+        }
+        let next = match current
+            .wan_budget
+            .as_ref()
+            .filter(|budget| budget.applies())
+        {
+            Some(budget) if budget.cutoff.id() == cutoff.id() => {
+                budget.refreshed(bps, expires, now)
+            }
+            Some(_) => return,
+            None => wan_budget::Lease::new(cutoff, bps, expires),
+        };
+        self.stats.0.store(Arc::new(VideoStatsSnapshot {
+            wan_budget: Some(next),
+            ..(**current).clone()
+        }));
+    }
+
     pub(crate) fn refresh_wan_ladder(
         &self,
         publisher: crate::shard_update::PublisherAnchor,
@@ -776,6 +834,8 @@ impl VideoTrack {
         if now >= expires
             || self.meta.id != publisher.publication
             || self.meta.connection_id != publisher.connection
+            || publisher.emission.profile() != pulsebeam_core::fabric::Profile::Vp9
+            || !publisher.emission.carries_video_dd()
             || ladder.is_some_and(|ladder| !ladder.valid())
             || self.layers.len() != 1
             || !self
@@ -797,10 +857,20 @@ impl VideoTrack {
         {
             return false;
         }
-        if current.wan_ladder != next {
+        let &[(encoding, mut stats)] = current.layers.as_slice() else {
+            return false;
+        };
+        if current.wan_ladder != next || !stats.spatial_dd {
+            stats.spatial_dd = true;
             self.stats.0.store(Arc::new(VideoStatsSnapshot {
-                layers: current.layers.clone(),
+                layers: vec![(encoding, stats)],
                 wan_ladder: next,
+                wan_budget: match (current.wan_ladder, next) {
+                    (Some(previous), Some(next)) if previous.publisher == next.publisher => {
+                        current.wan_budget.clone()
+                    }
+                    _ => None,
+                },
             }));
         }
         true
@@ -827,6 +897,7 @@ impl VideoStats {
                 })
                 .collect(),
             wan_ladder: None,
+            wan_budget: None,
         };
         Self(Arc::new(ArcSwap::from_pointee(snapshot)))
     }
@@ -850,6 +921,34 @@ impl VideoStats {
         self.0.store(Arc::new(snapshot));
     }
 
+    pub(crate) fn wan_allowed_targets(&self, now: Instant) -> Option<u32> {
+        let snapshot = self.0.load();
+        let lease = snapshot.wan_ladder.filter(|lease| now < lease.expires)?;
+        let budget = snapshot
+            .wan_budget
+            .as_ref()
+            .filter(|budget| budget.applies())?;
+        Some(budget.restrict(lease.ladder).context.active_targets)
+    }
+
+    pub(crate) fn allocation_layer_states(&self, now: Instant) -> TrackStates {
+        let snapshot = self.0.load();
+        let mut layers = snapshot.layers.clone();
+        if let ([(_, stats)], Some(lease)) = (layers.as_mut_slice(), snapshot.wan_ladder)
+            && now < lease.expires
+        {
+            stats.spatial_ladder = Some(
+                snapshot
+                    .wan_budget
+                    .as_ref()
+                    .filter(|budget| budget.applies())
+                    .map_or(lease.ladder, |budget| budget.restrict(lease.ladder)),
+            );
+        }
+        layers
+    }
+
+    #[cfg(test)]
     pub(crate) fn layer_states(&self) -> TrackStates {
         self.0.load().layers.clone()
     }
@@ -877,12 +976,7 @@ impl FabricVideoMonitor {
         let [layer] = track.layers.as_slice() else {
             return None;
         };
-        if !track.guarantees_video_dd
-            || !track
-                .format
-                .as_ref()
-                .is_some_and(|format| format.mime_type == "video/vp9")
-        {
+        if !track.uses_spatial_dd() {
             return None;
         }
         let seed = StreamStats::new(true, 0, layer.quality.fallback_height());
@@ -962,6 +1056,7 @@ impl FabricVideoMonitor {
         self.stats.0.store(Arc::new(VideoStatsSnapshot {
             layers: vec![(self.encoding, stats)],
             wan_ladder: None,
+            wan_budget: None,
         }));
         self.published = stats;
     }
@@ -1004,6 +1099,7 @@ mod fabric_video_monitor_tests {
             through: 120,
             heights: [180, 0, 720],
             payload_bps: [100_000, 0, 800_000],
+            fps: [30, 0, 30],
         };
         let now = Instant::now();
         let deadline = now + Duration::from_secs(1);
@@ -1071,6 +1167,7 @@ mod fabric_video_monitor_tests {
                         },
                         through: seq,
                         bytes: [250, 500, 1000],
+                        pictures: [1, 1, 1],
                     },
                     ..Offers::default()
                 },
@@ -1091,7 +1188,9 @@ mod fabric_video_monitor_tests {
         monitor.observe(
             start + Duration::from_millis(4050),
             &Offers {
-                dd_sample: DecodeTargetSample::Unknown,
+                dd_sample: DecodeTargetSample::Unknown {
+                    through: ladder.through + 1,
+                },
                 ..Offers::default()
             },
         );

@@ -8,7 +8,7 @@ use std::{
     num::{NonZeroU16, NonZeroU32, NonZeroUsize},
 };
 
-use pulsebeam_core::fabric::wan::Window;
+use pulsebeam_core::fabric::wan::{OmissionRun, Window};
 use pulsebeam_link::{
     LinkTime, LinkTx, NetworkId, ReceiveTime,
     wan::{
@@ -100,6 +100,7 @@ mod activity {
 
 struct LiveReceive {
     window: Staged<Window>,
+    projection_selected: bool,
     deadline: Option<wan::LiveDeadline>,
     activity: Option<ReceiveActivity>,
     timing: Option<crate::route::fabric::WindowTiming>,
@@ -162,7 +163,11 @@ pub(crate) async fn bind_socket(address: SocketAddr) -> io::Result<UdpSocket> {
     options.nonfragmenting_max_datagram_bytes = u16::try_from(wan::MAX_DATAGRAM_BYTES)
         .ok()
         .and_then(NonZeroU16::new);
-    pulsebeam_udp::bind(options).await?.activate()
+    #[cfg(feature = "sim")]
+    let socket = pulsebeam_runtime::net::bind_directed_udp_socket(options).await?;
+    #[cfg(not(feature = "sim"))]
+    let socket = pulsebeam_udp::bind(options).await?;
+    socket.activate()
 }
 
 impl WanHost {
@@ -272,6 +277,7 @@ impl WanHost {
         )?;
         Ok(LiveReceive {
             window: staged,
+            projection_selected: false,
             deadline,
             activity,
             timing: timing.filter(|point| point.position == first.sequence_anchor),
@@ -428,19 +434,32 @@ impl WanHost {
             .map_err(Error::from)
     }
 
+    #[cfg(test)]
     pub(crate) fn submit(&mut self, now: Instant, prepared: wan::Prepared) -> Submission {
+        self.submit_with_reserve(now, prepared, 0)
+    }
+
+    fn submit_with_reserve(
+        &mut self,
+        now: Instant,
+        prepared: wan::Prepared,
+        reserve_bytes: usize,
+    ) -> Submission {
         let socket = &mut self.socket;
         let ect0 = socket.supports_ect0() && self.driver.ecn_marking_allowed();
-        let result = self
-            .driver
-            .submit(now.into_std(), prepared, &mut |destination, bytes| {
+        let result = self.driver.submit_with_reserve(
+            now.into_std(),
+            prepared,
+            reserve_bytes,
+            &mut |destination, bytes| {
                 if ect0 {
                     let report = socket.try_send_ect0(destination, bytes);
                     socket_outcome(report, bytes.len(), true)
                 } else {
                     send(socket, destination, bytes)
                 }
-            });
+            },
+        );
         self.sync_lease(now);
         result
     }
@@ -457,6 +476,50 @@ impl WanHost {
             .map_err(Error::from)
     }
 
+    fn prepare_projected(
+        &mut self,
+        now: Instant,
+        staged: Staged<Window>,
+        position: u64,
+        packet: &OwnedPacket,
+        omitted: Option<OmissionRun>,
+    ) -> Result<wan::Prepared, Error> {
+        let Some(omitted) = omitted else {
+            return self.prepare(now, staged, position, packet);
+        };
+        if staged.spec().purpose != Purpose::Live {
+            return Err(Error::Binding);
+        }
+        self.driver
+            .prepare_with(now.into_std(), staged, position, |codec, staged, dst| {
+                codec.encode_projected(staged.descriptor(), position, packet, omitted, dst)
+            })
+            .map_err(Error::from)
+    }
+
+    fn select_projection(
+        &mut self,
+        now: Instant,
+        window: Window,
+        incarnation: std::num::NonZeroU64,
+    ) -> bool {
+        window.profile() == pulsebeam_core::fabric::Profile::Vp9
+            && self.receives.get_mut(&window.ssrc()).is_some_and(|route| {
+                if route.window.descriptor() != window
+                    || route.window.spec().authority != incarnation
+                    || now.into_std() >= route.expires()
+                    || !route
+                        .destinations
+                        .iter()
+                        .any(|destination| destination.tx.is_live())
+                {
+                    return false;
+                }
+                route.projection_selected = true;
+                true
+            })
+    }
+
     pub(crate) fn poll(&mut self, now: Instant) -> Result<(), Error> {
         let socket = &mut self.socket;
         let result = self.driver.tick(now.into_std(), &mut |destination, bytes| {
@@ -471,6 +534,13 @@ impl WanHost {
             match receiver.try_recv() {
                 Ok(Command::Receive(command)) => self.install(now, command),
                 Ok(Command::Send(install)) => self.install_send(now, *install),
+                Ok(Command::SelectProjection {
+                    window,
+                    incarnation,
+                    receipt,
+                }) => {
+                    let _ = receipt.send(self.select_projection(now, window, incarnation));
+                }
                 Err(pulsebeam_queue::TryRecvError::Empty) => break,
                 Err(pulsebeam_queue::TryRecvError::Closed) => return Err(Error::ControllerClosed),
             }
@@ -544,12 +614,20 @@ impl WanHost {
         ecn: Option<wan::Ecn>,
     ) -> Result<(), Error> {
         let socket = &mut self.socket;
-        let received = self.driver.receive_with_ecn(
+        let receives = &self.receives;
+        let received = self.driver.receive_with_decoder(
             now.into_std(),
             binding,
             bytes,
             ecn,
             &mut |destination, payload| send(socket, destination, payload),
+            |codec, ticket, plaintext| {
+                let selected = ticket.spec().purpose == Purpose::Live
+                    && receives
+                        .get(&ticket.spec().ssrc)
+                        .is_some_and(|route| route.window == ticket && route.projection_selected);
+                codec.decode_live(ticket.descriptor(), plaintext, selected)
+            },
         );
         self.sync_lease(now);
         match received {
@@ -646,7 +724,6 @@ impl WanHost {
 
     async fn ready(&mut self) -> Result<(), Error> {
         let deadline = self.next_deadline();
-        let media_blocked = self.egress.has_blocked();
         let blocked = self.driver.control_write_blocked() || self.egress.socket_write_blocked();
         let timer = async {
             if let Some(deadline) = deadline {
@@ -669,14 +746,6 @@ impl WanHost {
                 std::future::pending::<()>().await;
             }
         };
-        let media = async {
-            if !media_blocked && let Some(media) = &mut self.egress.inbox {
-                if media.readable().await {
-                    return;
-                }
-            }
-            std::future::pending::<()>().await;
-        };
         let receipts = std::future::poll_fn(|cx| {
             if self
                 .pending
@@ -693,14 +762,25 @@ impl WanHost {
             result = writable => result.map_err(Error::from),
             _ = self.driver.control_readable() => Ok(()),
             _ = commands => Ok(()),
-            _ = media => Ok(()),
+            _ = self.egress.readable() => Ok(()),
             _ = receipts => Ok(()),
             _ = timer => Ok(()),
         }
     }
 
-    fn deliver(&mut self, image: wan::Received<OwnedPacket, Window>, observed: ReceiveTime) {
+    fn deliver(
+        &mut self,
+        image: wan::Received<(OwnedPacket, Option<OmissionRun>), Window>,
+        observed: ReceiveTime,
+    ) {
         let spec = image.route.spec();
+        let (packet, omitted) = image.packet;
+        let image = wan::Received {
+            packet,
+            route: image.route,
+            expires: image.expires,
+            position: image.position,
+        };
         #[cfg(feature = "sim")]
         if image.route.descriptor().profile() == pulsebeam_core::fabric::Profile::Data
             && matches!(spec.purpose, Purpose::Repair { .. })
@@ -750,6 +830,7 @@ impl WanHost {
                     );
                 }
                 let mut frame: crate::route::fabric::NetworkPacket = image.into();
+                frame.omitted = omitted;
                 frame.capture = route.timing.and_then(|timing| timing.capture_for(&frame));
                 let mut complete = true;
                 for destination in &route.destinations {
@@ -822,11 +903,11 @@ fn command_channel(
 ) -> (
     Commands,
     pulsebeam_queue::Receiver<Command>,
-    pulsebeam_queue::Receiver<egress::Media>,
+    egress::MediaInbox,
 ) {
     let (sender, receiver) = pulsebeam_queue::bounded(const { NonZeroUsize::new(16).unwrap() });
-    let (media, inbox) = pulsebeam_queue::bounded(const { NonZeroUsize::new(256).unwrap() });
-    (Commands::new(id, sender, media), receiver, inbox)
+    let (media, inbox, budget) = egress::media_channels();
+    (Commands::new(id, sender, media, budget), receiver, inbox)
 }
 
 fn fence_receive(route: &LiveReceive) {

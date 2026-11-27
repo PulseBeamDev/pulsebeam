@@ -8,6 +8,7 @@ pub(crate) mod hop_expectations;
 pub mod local;
 pub(crate) mod network_repair;
 pub(crate) mod relay;
+pub(crate) mod target_demand;
 
 /// The destination installs this exact source incarnation before accepting
 /// in-process offers. No publishing or receiving shard handle crosses the lane.
@@ -119,6 +120,7 @@ pub(crate) struct NetworkPacket {
     pub(crate) window: pulsebeam_core::fabric::wan::Window,
     pub(crate) position: u64,
     pub(crate) packet: local::OwnedPacket,
+    pub(crate) omitted: Option<pulsebeam_core::fabric::wan::OmissionRun>,
     pub(crate) capture: Option<pulsebeam_clock::deadline::Timing>,
 }
 
@@ -135,6 +137,7 @@ impl From<pulsebeam_link::wan::Received<local::OwnedPacket, pulsebeam_core::fabr
             window: input.route.descriptor(),
             position: input.position,
             packet: input.packet,
+            omitted: None,
             capture: None,
         }
     }
@@ -191,12 +194,13 @@ pub(crate) enum PublisherSendChange {
         lifetime: pulsebeam_link::BindingCutoff,
     },
     Retire(CompiledPublisherSend),
+    Demand(CompiledPublisherSend, target_demand::VersionedUpdate),
 }
 
 impl PublisherSendChange {
     pub(crate) fn route(&self) -> &CompiledPublisherSend {
         match self {
-            Self::Install { route, .. } | Self::Retire(route) => route,
+            Self::Install { route, .. } | Self::Retire(route) | Self::Demand(route, _) => route,
         }
     }
 }
@@ -212,12 +216,13 @@ pub(crate) struct CompiledLiveRelay {
 pub(crate) enum LiveRelayChange {
     Install(CompiledLiveRelay),
     Retire(CompiledLiveRelay),
+    Demand(CompiledLiveRelay, target_demand::VersionedUpdate),
 }
 
 impl LiveRelayChange {
     pub(crate) fn route(&self) -> &CompiledLiveRelay {
         match self {
-            Self::Install(route) | Self::Retire(route) => route,
+            Self::Install(route) | Self::Retire(route) | Self::Demand(route, _) => route,
         }
     }
 }

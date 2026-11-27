@@ -21,6 +21,7 @@ use crate::dtls_srtp::wan::{
 const CAPACITY: usize = 8192;
 const RETENTION: Duration = Duration::from_secs(2);
 const FEEDBACK_TIMEOUT: Duration = Duration::from_secs(2);
+const BUDGET_FRESHNESS: Duration = Duration::from_millis(500);
 const MAX_EXPIRATIONS: usize = 256;
 const REPORT_INTERVAL: Duration = Duration::from_millis(10);
 const TIMESTAMP_HZ: i64 = 65_536;
@@ -34,6 +35,7 @@ pub(super) struct History {
     epoch: Epoch,
     remote_clock: Option<(u32, i64)>,
     feedback_wait: HashMap<SpaceId, Instant>,
+    last_feedback: Option<Instant>,
     controller: Controller,
     ecn: EcnValidation,
     samples: Vec<FeedbackSample>,
@@ -75,6 +77,7 @@ impl History {
             epoch,
             remote_clock: None,
             feedback_wait: HashMap::new(),
+            last_feedback: None,
             controller: Controller::new(Default::default()).map_err(|_| Error::Capacity)?,
             ecn: EcnValidation::default(),
             samples: Vec::new(),
@@ -96,6 +99,7 @@ impl History {
             self.receive.clear(self.epoch);
             self.remote_clock = None;
             self.feedback_wait.clear();
+            self.last_feedback = None;
             self.ecn = EcnValidation::default();
             self.lease = lease;
             self.controller = Controller::new(Default::default()).map_err(|_| Error::Capacity)?;
@@ -108,12 +112,29 @@ impl History {
         self.origin.checked_add(elapsed)
     }
 
-    pub(super) fn ready(&self, now: Instant, bytes: usize) -> Readiness {
-        self.controller.ready(
-            self.elapsed(now),
-            self.send.observations().bytes_in_flight,
-            bytes,
+    pub(super) fn send_budget(&self, now: Instant, lease: Lease) -> Option<super::SendBudget> {
+        let feedback_at = self.last_feedback?;
+        let age = now.checked_duration_since(feedback_at)?;
+        let snapshot = self.controller.snapshot();
+        (self.lease == Some(lease) && age < BUDGET_FRESHNESS && !snapshot.feedback_stale).then_some(
+            super::SendBudget {
+                feedback_at,
+                valid_until: feedback_at.checked_add(BUDGET_FRESHNESS)?,
+                payload_bps: snapshot.target_media_payload_rate,
+                pacing_bps: snapshot.nominal_pacing_transport_rate,
+            },
         )
+    }
+
+    pub(super) fn ready(&self, now: Instant, bytes: usize, reserve_bytes: usize) -> Readiness {
+        let flight = self.send.observations().bytes_in_flight;
+        let window = self.controller.snapshot().max_rtp_bytes_in_flight;
+        let size = u64::try_from(bytes).unwrap_or(u64::MAX);
+        let reserve = u64::try_from(reserve_bytes)
+            .unwrap_or(u64::MAX)
+            .min(window.saturating_sub(size));
+        self.controller
+            .ready(self.elapsed(now), flight.saturating_add(reserve), bytes)
     }
 
     pub(super) fn deadline(&self, now: Instant) -> Option<Instant> {
@@ -388,6 +409,7 @@ impl History {
             },
         });
         if self.send.observations().fresh_network_feedback {
+            self.last_feedback = Some(now);
             self.feedback_wait.retain(|&space, since| {
                 *since = now;
                 self.send.source_has_in_flight(space)

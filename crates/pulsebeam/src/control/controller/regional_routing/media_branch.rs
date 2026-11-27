@@ -247,6 +247,26 @@ pub(super) struct OriginSends {
 }
 
 impl OriginSends {
+    pub(super) fn live_media_grant(
+        &self,
+        peer: NetworkId,
+        demand: super::super::peer_ownership::target_demand::Demand,
+        now: Instant,
+    ) -> Option<super::super::peer_ownership::media_repair::Grant> {
+        self.peers
+            .get(&peer)?
+            .live_media_grant(peer, demand.label, demand.incarnation, now)
+    }
+
+    pub(super) fn media_repair_grant(
+        &self,
+        peer: NetworkId,
+        demand: crate::control::controller::peer_ownership::media_repair::Demand,
+        now: Instant,
+    ) -> Option<crate::control::controller::peer_ownership::media_repair::Grant> {
+        self.peers.get(&peer)?.media_repair_grant(peer, demand, now)
+    }
+
     pub(super) fn step(
         &mut self,
         actor: &mut ControllerActor,
@@ -289,13 +309,12 @@ impl OriginSends {
                 *network,
                 desired.remove(network).unwrap_or_default(),
                 now,
-                true,
             );
         }
         self.peers.retain(|_, sends| !sends.is_empty());
         for (network, permits) in desired {
             let mut sends = PublisherSends::default();
-            sends.reconcile(actor, network, permits, now, true);
+            sends.reconcile(actor, network, permits, now);
             if !sends.is_empty() {
                 self.peers.insert(network, sends);
             }

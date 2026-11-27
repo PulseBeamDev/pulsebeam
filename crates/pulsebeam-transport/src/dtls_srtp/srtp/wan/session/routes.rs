@@ -262,6 +262,18 @@ impl Session {
         prepared: Prepared,
         send: &mut Send<'_>,
     ) -> Submission {
+        self.submit_media_with_reserve(now, prepared, 0, send)
+    }
+
+    /// Leave room in the existing flight window for higher priority media.
+    /// Only a successful socket write charges the bytes actually sent.
+    pub fn submit_media_with_reserve(
+        &mut self,
+        now: Instant,
+        prepared: Prepared,
+        reserve_bytes: usize,
+        send: &mut Send<'_>,
+    ) -> Submission {
         if self.advance(now).is_err() || self.enforce_feedback_deadline(now).is_err() {
             return Submission::Dropped(Dropped::Stale);
         }
@@ -284,7 +296,7 @@ impl Session {
         let (Some(protector), Some(path)) = (&self.protector, &mut self.path) else {
             return Submission::Dropped(Dropped::Stale);
         };
-        match self.history.ready(now, prepared.wire_len()) {
+        match self.history.ready(now, prepared.wire_len(), reserve_bytes) {
             pulsebeam_cc::Readiness::Ready => {}
             pulsebeam_cc::Readiness::Pacing { deadline } => {
                 return Submission::Deferred {

@@ -89,6 +89,102 @@ fn fabric_bridge_keeps_an_affordable_upgrade_source_but_never_a_downgraded_rung(
 }
 
 #[test]
+fn spatial_allocation_uses_fresh_publisher_costs_and_ranks_by_geometry() {
+    use crate::route::fabric::local::{DecodeTargetRateContext, Emission};
+    use crate::rtp::monitor::MeasuredTargetLadder;
+    use crate::shard_update::PublisherAnchor;
+    use pulsebeam_core::fabric::{ExtensionKind, Profile};
+
+    let (mut track, _) = scalable_camera();
+    let video = track.as_video_mut().unwrap();
+    // A catalog clone may predate the authenticated WAN capability.
+    assert!(!video.guarantees_video_dd);
+    video.format = pulsebeam_proto::state::CodecFormat::native_quic_baseline("video/vp9");
+    let publisher = PublisherAnchor {
+        publication: video.meta.id,
+        connection: video.meta.connection_id,
+        incarnation: std::num::NonZeroU64::MIN,
+        emission: Emission::new(Profile::Vp9, &[ExtensionKind::DependencyDescriptor]).unwrap(),
+    };
+    let ladder = MeasuredTargetLadder {
+        context: DecodeTargetRateContext {
+            structure_origin: 10,
+            active_targets: 0b101,
+        },
+        through: 20,
+        heights: [720, 0, 180],
+        payload_bps: [700_000, 0, 120_000],
+        fps: [15, 0, 30],
+    };
+    let now = Instant::now();
+    let expiry = now + Duration::from_secs(1);
+    assert!(video.refresh_wan_ladder(publisher, Some(ladder), expiry, now));
+    let mut states = track_states(&track, now);
+    let layer = &track.layers()[0];
+    let stats = state_of_mut(&mut states, layer);
+    stats.set_temporal_ladder(&[1, 2, 3], 0);
+    stats.decode_target_heights = [1, 2, 3];
+    let mut keys = SlotMap::<DownstreamSlotKey, ()>::with_key();
+    let mut slot = view(&track, keys.insert(()), "s0", 0);
+    slot.current_decode_target = DecodeTargetSelection::Target(2);
+    let base = AllocationDecision::ForwardTarget(
+        layer,
+        DecodeTargetSelection::Target(2),
+        Bitrate::from(120_000),
+    );
+    let high = AllocationDecision::ForwardTarget(
+        layer,
+        DecodeTargetSelection::Target(0),
+        Bitrate::from(700_000),
+    );
+    let allocate = |slot: &SlotView<'_>, budget, states: &LayerStates| {
+        let slots = std::slice::from_ref(slot);
+        let engine = AllocationEngine::new(slots, states);
+        match engine.run_compute(Bitrate::from(budget), slots)[slot.key] {
+            AllocationDecision::ForwardTarget(_, target, rate) => (target, rate),
+            decision => panic!("expected a spatial target, got {decision:?}"),
+        }
+    };
+    let engine = AllocationEngine::new(std::slice::from_ref(&slot), &states);
+    assert!(engine.can_bridge_fabric(&slot, &high));
+    assert_eq!(
+        allocate(&slot, 400_000, &states),
+        (DecodeTargetSelection::Target(2), Bitrate::from(120_000))
+    );
+    assert_eq!(
+        allocate(&slot, 1_250_000, &states),
+        (DecodeTargetSelection::Target(0), Bitrate::from(700_000))
+    );
+    slot.min_fps = 25;
+    assert_eq!(
+        allocate(&slot, 1_250_000, &states).0,
+        DecodeTargetSelection::Target(2),
+        "publisher cadence, not the cadence of the received base stream, must rank targets"
+    );
+    slot.min_fps = 0;
+    slot.current_decode_target = DecodeTargetSelection::Target(0);
+    assert!(!engine.can_bridge_fabric(&slot, &base));
+    slot.height_ceiling = Some(360);
+    assert_eq!(
+        allocate(&slot, 1_250_000, &states).0,
+        DecodeTargetSelection::Target(2)
+    );
+
+    let expired = track_states(&track, expiry);
+    let engine = AllocationEngine::new(std::slice::from_ref(&slot), &expired);
+    assert!(
+        engine.choices(&slot).is_empty(),
+        "unproved geometry cannot meet a hard ceiling"
+    );
+    slot.height_ceiling = None;
+    let choices = engine.choices(&slot);
+    assert_eq!(choices.len(), 1);
+    assert_eq!(choices[0].target, DecodeTargetSelection::Target(0));
+    assert_eq!(choices[0].cost, engine.stable_cost(layer));
+    assert_eq!(choices[0].fps, 0, "expired cadence is unknown");
+}
+
+#[test]
 fn positive_target_enforces_one_aggregate_minimum_but_zero_still_suspends() {
     let (track, states) = camera();
     let mut keys = SlotMap::<DownstreamSlotKey, ()>::with_key();

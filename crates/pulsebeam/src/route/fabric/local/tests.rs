@@ -409,7 +409,7 @@ fn exact_media_cache_is_bounded_by_full_position_ingress_and_first_arrival() {
     let original = packet(0x1ffff, &[0x65; 1188]);
     let parent = NonZeroU64::MIN;
     fanout
-        .offer_bound_network(now, now, position, parent, original.clone())
+        .offer_bound_network(now, now, position, parent, original.clone(), None)
         .unwrap();
     let (cached, deadline) = fanout
         .cached_peer_media(position, Some(parent), now)
@@ -429,7 +429,7 @@ fn exact_media_cache_is_bounded_by_full_position_ingress_and_first_arrival() {
     );
     let duplicate = now + Duration::from_millis(60);
     fanout
-        .offer_bound_network(duplicate, duplicate, position, parent, original)
+        .offer_bound_network(duplicate, duplicate, position, parent, original, None)
         .unwrap();
     assert!(
         fanout
@@ -442,7 +442,7 @@ fn exact_media_cache_is_bounded_by_full_position_ingress_and_first_arrival() {
         .unwrap()
         .into_owned();
     fanout
-        .offer_bound_network(duplicate, duplicate, position + 1, parent, exhausted)
+        .offer_bound_network(duplicate, duplicate, position + 1, parent, exhausted, None)
         .unwrap();
     assert!(
         fanout
@@ -455,7 +455,8 @@ fn exact_media_cache_is_bounded_by_full_position_ingress_and_first_arrival() {
             duplicate,
             position,
             parent,
-            packet(0x1ffff, &[0x66])
+            packet(0x1ffff, &[0x66]),
+            None,
         ),
         Err(Rejection::Conflict)
     );
@@ -1282,7 +1283,7 @@ fn prove_branch_isolation(ingress: Option<NonZeroU64>) {
         let packet = packet(sequence, payload);
         if let Some(ingress) = ingress {
             fanout
-                .offer_bound_network(at, at, u64::from(sequence), ingress, packet)
+                .offer_bound_network(at, at, u64::from(sequence), ingress, packet, None)
                 .map(|(_, report)| report)
         } else {
             fanout.offer(at, at, u64::from(sequence), packet)
@@ -1613,6 +1614,7 @@ fn spatial_dd_reports_height_and_cumulative_target_bytes_before_subscribers_exis
                 },
                 through: 100 + u64::from(index),
                 bytes,
+                pictures: if index == 0 { [1, 0, 0] } else { [0, 1, 0] },
             }
         );
         assert_eq!(
@@ -1670,6 +1672,229 @@ fn vp9_picture_marker_follows_the_highest_retained_spatial_frame() {
 }
 
 #[test]
+fn wan_projection_flushes_unproved_or_oversized_runs() {
+    use crate::{
+        link::wan_host::SendFixture,
+        route::fabric::{relay::SendProjection, target_demand::Projection},
+    };
+    use pulsebeam_core::{
+        dd::{
+            DecodeTargetIndication::NotPresent, DependencyDescriptor, FrameDependencyTemplate,
+            evidence::TargetSet,
+        },
+        fabric::{Extension, MAX_WAN_RTP_BYTES, wan::Window},
+    };
+    use std::num::{NonZeroU32, NonZeroUsize};
+    let now = Instant::now();
+    let dd = ExtensionKind::DependencyDescriptor;
+    let window = Window::new(Profile::Vp9, 0, 1, NonZeroU32::MIN, dd.bit()).unwrap();
+    let (mut fixture, _, tx) =
+        SendFixture::with_capacity(window, now + MAX_AGE, NonZeroUsize::new(4).unwrap());
+    let proof = ProjectionEvidence::new(
+        &Qualified {
+            descriptor: DependencyDescriptor {
+                frame_dependencies: FrameDependencyTemplate {
+                    dtis: [NotPresent].into_iter().collect(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            active_targets: 1,
+            structure_origin: 90,
+            structure_sequence: 91,
+            target_chains: Default::default(),
+        },
+        FrameStatus::Resolved(10),
+    )
+    .unwrap();
+    let demand = |attachment| {
+        Projection::targets(
+            pulsebeam_core::dd::evidence::ProjectionContext {
+                active_targets: 1,
+                attachment,
+            },
+            TargetSet::new(1).unwrap(),
+        )
+    };
+    let requested = demand(90);
+    let mut projection = SendProjection::default();
+    let mut admissions = LiveAdmissions::default();
+    let mut offer = |position, excluded: bool, length, requested| {
+        let packet = FabricPacket::new(
+            Header {
+                profile: Profile::Vp9,
+                marker: true,
+                sequence: u32::try_from(position).unwrap(),
+                timestamp: 9000,
+            },
+            &[Extension {
+                kind: dd,
+                value: &[0xc0, 0, 0],
+            }],
+            vec![1; length].into_boxed_slice(),
+        )
+        .unwrap();
+        let work = LiveWork::new(position, position, now, packet.remaining_hops()).unwrap();
+        let transit = Transit {
+            work,
+            packet: packet.arrival_view(packet.remaining_hops()).unwrap(),
+            projection: excluded.then_some(proof),
+            ready_at: None,
+            sender_ntp: None,
+        };
+        let mut report = Offers::default();
+        projection.offer(now, &tx, &mut admissions, requested, &transit, &mut report);
+        report
+    };
+    offer(100, false, 100, requested);
+    offer(101, true, 100, requested);
+    offer(101, true, 100, requested);
+    assert_eq!(fixture.take(), Some((100, None)));
+    assert_eq!(fixture.take(), None);
+    assert_eq!(offer(102, false, 100, requested).omitted, 1);
+    assert_eq!(fixture.take(), Some((102, OmissionRun::new(1))));
+
+    offer(103, true, 100, requested);
+    assert_eq!(offer(105, false, 100, requested).omitted, 0);
+    assert_eq!(fixture.take(), Some((103, None)));
+    assert_eq!(fixture.take(), Some((105, None)));
+
+    offer(106, true, 100, requested);
+    assert_eq!(
+        offer(107, false, MAX_WAN_RTP_BYTES - 20, requested).omitted,
+        0
+    );
+    assert_eq!(fixture.take(), Some((106, None)));
+    assert_eq!(fixture.take(), Some((107, None)));
+
+    offer(108, true, 100, requested);
+    assert_eq!(offer(109, false, 100, None).omitted, 0);
+    assert_eq!(fixture.take(), Some((108, None)));
+    assert_eq!(fixture.take(), Some((109, None)));
+    assert_eq!(fixture.take(), None);
+
+    for position in 110..114 {
+        assert_eq!(offer(position, false, 100, requested).enqueued, 1);
+    }
+    offer(114, true, 100, requested);
+    let saturated = offer(115, false, 100, requested);
+    assert_eq!(saturated.omitted, 0);
+    assert_eq!(saturated.enqueued, 0);
+    for position in 110..114 {
+        assert_eq!(fixture.take(), Some((position, None)));
+    }
+    offer(116, false, 100, requested);
+    assert_eq!(fixture.take(), Some((116, None)));
+
+    offer(117, true, 100, requested);
+    assert_eq!(offer(118, false, 100, demand(91)).omitted, 1);
+    assert_eq!(fixture.take(), Some((118, OmissionRun::new(1))));
+    assert_eq!(fixture.take(), None);
+
+    offer(119, true, 100, demand(91));
+    assert_eq!(offer(120, false, 100, demand(92)).omitted, 0);
+    assert_eq!(fixture.take(), Some((119, None)));
+    assert_eq!(fixture.take(), Some((120, None)));
+}
+
+#[test]
+fn wan_omission_carrier_bridges_only_the_proven_gap() {
+    use pulsebeam_core::dd::{
+        DecodeTargetIndication::Switch, DependencyDescriptor, FrameDependencyTemplate,
+        TemplateDependencyStructure,
+    };
+    let emission = Emission::new(Profile::Vp9, &[ExtensionKind::DependencyDescriptor]).unwrap();
+    let now = Instant::now();
+    let primary = NonZeroU64::MIN;
+    let fallback = primary.saturating_add(1);
+    for (count, expected) in [(2, true), (1, false)] {
+        let mut fanout = SourceFanout::new(emission);
+        let mut destinations = SlotMap::with_key();
+        let destination = destinations.insert(());
+        let branch = fanout
+            .install_filtered_branch(destination, emission, DecodeTarget::new(0).unwrap())
+            .unwrap();
+        let template = FrameDependencyTemplate {
+            dtis: [Switch].into_iter().collect(),
+            ..Default::default()
+        };
+        let mut writer = DependencyDescriptorWriter::new();
+        let mut image = |sequence, first: bool| {
+            write_dd_test_packet(
+                &mut writer,
+                Profile::Vp9,
+                sequence,
+                sequence * 3000,
+                &DependencyDescriptor {
+                    start_of_frame: true,
+                    end_of_frame: true,
+                    frame_number: u16::try_from(sequence).unwrap(),
+                    attached_structure: first.then(|| {
+                        Box::new(TemplateDependencyStructure {
+                            decode_target_count: 1,
+                            templates: [template.clone()].into_iter().collect(),
+                            ..Default::default()
+                        })
+                    }),
+                    frame_dependencies: template.clone(),
+                    ..Default::default()
+                },
+            )
+        };
+        let take = |fanout: &mut SourceFanout, at, expected| {
+            assert_eq!(
+                fanout
+                    .admit_with_evidence(
+                        at,
+                        branch,
+                        destination,
+                        |_| true,
+                        |source, _, output| { Ok::<_, ()>((source, output.output_position)) }
+                    )
+                    .unwrap(),
+                expected
+            );
+        };
+        let entry = image(100, true);
+        assert_eq!(
+            fanout
+                .offer_bound_network(now, now, 100, primary, entry, None)
+                .unwrap()
+                .1
+                .enqueued,
+            1
+        );
+        take(&mut fanout, now, Some((100, 100)));
+        let carrier = image(103, false);
+        let report = fanout
+            .offer_bound_network(
+                now,
+                now,
+                103,
+                primary,
+                carrier.clone(),
+                OmissionRun::new(count),
+            )
+            .unwrap()
+            .1;
+        assert_eq!(report.enqueued, usize::from(expected));
+        take(&mut fanout, now, expected.then_some((103, 101)));
+        let after_wait = now + DD_REORDER_WAIT;
+        assert_eq!(
+            fanout
+                .offer_bound_network(after_wait, after_wait, 103, fallback, carrier, None)
+                .unwrap()
+                .1
+                .enqueued,
+            0
+        );
+        take(&mut fanout, after_wait, None);
+        assert!(!fanout.has_media_position(101));
+        assert!(!fanout.has_media_position(102));
+    }
+}
+
+#[test]
 fn ordered_filter_compacts_only_qualified_omissions() {
     let emission = Emission::new(Profile::H264, &[ExtensionKind::DependencyDescriptor]).unwrap();
     let mut fanout = SourceFanout::new(emission);
@@ -1694,6 +1919,7 @@ fn ordered_filter_compacts_only_qualified_omissions() {
                 },
                 through: u64::from(sequence),
                 bytes: [selected_bytes, 0, 0],
+                pictures: [0; 3],
             }
         );
     }
@@ -1930,6 +2156,78 @@ fn vp9_member_can_stage_whole_or_one_distinct_decode_target_without_replacing_th
     fanout.retain_destinations(|destination| destination != member);
     assert_eq!(fanout.branch_for_target(member, Some(high)), None);
     assert_eq!(fanout.branch_for_target(member, None), None);
+}
+
+#[test]
+fn viewer_demand_omits_a_suspended_target_only_with_its_staged_replacement() {
+    use super::super::target_demand::Projection;
+    use pulsebeam_core::dd::{
+        DecodeTargetIndication::Switch, DependencyDescriptor, FrameDependencyTemplate,
+        TemplateDependencyStructure,
+    };
+    let emission = Emission::new(Profile::Vp9, &[ExtensionKind::DependencyDescriptor]).unwrap();
+    let mut fanout = SourceFanout::new(emission);
+    let frame = FrameDependencyTemplate {
+        dtis: [Switch, Switch].into_iter().collect(),
+        ..Default::default()
+    };
+    let structure = TemplateDependencyStructure {
+        decode_target_count: 2,
+        templates: [frame.clone()].into_iter().collect(),
+        ..Default::default()
+    };
+    let now = Instant::now();
+    let mut writer = DependencyDescriptorWriter::new();
+    let mut keyframe = |position: u16| {
+        write_dd_test_packet(
+            &mut writer,
+            Profile::Vp9,
+            u32::from(position),
+            9000 * u32::from(position),
+            &DependencyDescriptor {
+                start_of_frame: true,
+                end_of_frame: true,
+                frame_number: position,
+                attached_structure: Some(Box::new(structure.clone())),
+                frame_dependencies: frame.clone(),
+                ..Default::default()
+            },
+        )
+    };
+    fanout.offer(now, now, 100, keyframe(100)).unwrap();
+    let destination = SlotMap::<ParticipantHandle, _>::with_key().insert(());
+    let high = fanout
+        .install_filtered_branch(destination, emission, DecodeTarget::new(1).unwrap())
+        .unwrap();
+    let base = fanout
+        .install_filtered_branch(destination, emission, DecodeTarget::new(0).unwrap())
+        .unwrap();
+    let demand =
+        |fanout: &SourceFanout, allowed_targets| match fanout.viewer_projection(|_, branch| {
+            if branch == high {
+                ViewerDemand::Staged {
+                    replacement: base,
+                    allowed_targets,
+                }
+            } else {
+                ViewerDemand::Include
+            }
+        }) {
+            Some(Projection::Targets { targets, .. }) => targets.mask(),
+            other => panic!("expected targeted demand: {other:?}"),
+        };
+    assert_eq!(demand(&fanout, None), 0b01);
+    fanout.offer(now, now, 101, keyframe(101)).unwrap();
+    assert_eq!(demand(&fanout, None), 0b11);
+    assert_eq!(demand(&fanout, Some(0b01)), 0b01);
+    assert_eq!(demand(&fanout, Some(0b00)), 0b11);
+    fanout.branches[high]
+        .filter
+        .as_mut()
+        .unwrap()
+        .lose_context();
+    assert!(fanout.retire_branch(base));
+    assert_eq!(demand(&fanout, Some(0b01)), 0b10);
 }
 
 #[test]

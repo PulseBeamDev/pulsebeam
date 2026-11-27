@@ -134,20 +134,25 @@ fn prove_provisioned_av1(dd: bool, latency: Duration) -> anyhow::Result<()> {
 
 #[test]
 fn provisioned_wan_vp9_remote_only_cold_start() -> anyhow::Result<()> {
-    prove_vp9_cold_start(false)
+    prove_vp9_cold_start(false, false)
 }
 
 #[test]
 fn regional_wan_vp9_remote_only_cold_start() -> anyhow::Result<()> {
-    prove_vp9_cold_start(true)
+    prove_vp9_cold_start(true, false)
 }
 
-fn prove_vp9_cold_start(routed: bool) -> anyhow::Result<()> {
+#[test]
+fn provisioned_wan_shared_hop_keeps_opus_and_vp9_base_playing() -> anyhow::Result<()> {
+    prove_vp9_cold_start(false, true)
+}
+
+fn prove_vp9_cold_start(routed: bool, shared_hop: bool) -> anyhow::Result<()> {
     use crate::tests::{
         native_state::spatial_vp9::{Check, receive},
         quic_data::{
             sim_quic_tls,
-            spatial_vp9::{connect_publisher, replay_on_feedback},
+            spatial_vp9::{connect_publisher, replay, replay_on_feedback},
         },
     };
 
@@ -166,7 +171,7 @@ fn prove_vp9_cold_start(routed: bool) -> anyhow::Result<()> {
         let (sim, hosts) = provisioned_video_pair(
             seed,
             Duration::from_millis(5),
-            Duration::from_secs(20),
+            Duration::from_secs(if shared_hop { 40 } else { 20 }),
             root.path(),
             RoutingFixture::DirectQuic(tls),
         )?;
@@ -200,23 +205,203 @@ fn prove_vp9_cold_start(routed: bool) -> anyhow::Result<()> {
         let publication = source.publication_id().to_owned();
         let counter = pulsebeam::sim_metrics::routing_counter;
         let before = counter("fabric_rtp_vp9_wan_enqueued");
-        pulsebeam_runtime::select! {
-            result = replay_on_feedback(&mut publisher, &source) => result?,
-            result = receive(
+        let edge = shared_hop.then(|| ((ingress, 7443).into(), (egress, 7443).into()));
+        let host = NativeHost::bind(client)?;
+        let (audio_started, audio_ready) = tokio::sync::oneshot::channel();
+        let audio_progress = AudioProgress::default();
+        let video = async {
+            if shared_hop {
+                audio_ready
+                    .await
+                    .context("Opus never started across the shared hop")?;
+            }
+            receive(
                 (egress, 7070).into(),
-                NativeHost::bind(client)?,
+                host.clone(),
                 &publication,
-                Check::ColdStart { publisher: "vp9-source", track: "spatial-camera" },
+                Check::ColdStart {
+                    publisher: "vp9-source",
+                    track: "spatial-camera",
+                    prove_relay_projection: routed,
+                    shared_hop: edge,
+                },
                 || Ok(()),
-            ) => result?,
+            )
+            .await
+        };
+        let audio = async {
+            if !shared_hop {
+                return std::future::pending().await;
+            }
+            observe_shared_hop_opus(&host, ingress, egress, audio_started, &audio_progress).await
+        };
+        let pump = async {
+            if shared_hop {
+                replay(&mut publisher, &source, pulsebeam_runtime::time::Instant::now(), true).await
+            } else {
+                replay_on_feedback(&mut publisher, &source).await
+            }
+        };
+        pulsebeam_runtime::select! {
+            result = pump => result?,
+            result = video => {
+                let gap = audio_progress.gap();
+                if let Err(error) = result {
+                    return Err(format!("{error:#}; maximum decoded Opus gap: {gap:?}").into());
+                }
+                if shared_hop && gap >= Duration::from_millis(250) {
+                    return Err(format!("decoded Opus stalled on the shared WAN hop: gap={gap:?}").into());
+                }
+            },
+            result = audio => result?,
         }
         if counter("fabric_rtp_vp9_wan_enqueued") <= before {
             return Err("VP9 did not cross the WAN".into());
         }
         Ok(())
     });
-    run_sim_or_timeout(&mut sim, Duration::from_secs(25))
-        .map_err(|error| anyhow::anyhow!("VP9 WAN cold start: {error:#}"))
+    run_sim_or_timeout(
+        &mut sim,
+        Duration::from_secs(if shared_hop { 45 } else { 25 }),
+    )
+    .map_err(|error| anyhow::anyhow!("VP9 WAN scenario: {error:#}"))
+}
+
+#[derive(Default)]
+struct AudioProgress {
+    last: std::cell::Cell<Option<tokio::time::Instant>>,
+    longest: std::cell::Cell<Duration>,
+}
+
+impl AudioProgress {
+    fn gap(&self) -> Duration {
+        self.longest.get().max(
+            self.last
+                .get()
+                .map_or(Duration::ZERO, |last| last.elapsed()),
+        )
+    }
+
+    fn decoded(&self) {
+        self.longest.set(self.gap());
+        self.last.set(Some(tokio::time::Instant::now()));
+    }
+}
+
+async fn observe_shared_hop_opus(
+    host: &NativeHost,
+    ingress: IpAddr,
+    egress: IpAddr,
+    ready: tokio::sync::oneshot::Sender<()>,
+    progress: &AudioProgress,
+) -> anyhow::Result<()> {
+    let key = pulsebeam_server::insecure_dev_api_key()?;
+    let expires = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs()
+        + 60;
+    let open = |ip, identity, publishing| -> anyhow::Result<_> {
+        let signed = pulsebeam_server::sign_participant_token(
+            &key,
+            &serde_json::from_value(
+                json!([{"rooms":["stage"],"allow":["join","publish","discover","subscribe"]}]),
+            )?,
+            identity,
+            expires,
+        )?;
+        let mut config = Config::new(pulsebeam_agent_core::AgentConfig {
+            endpoint: format!("http://{ip}:7070"),
+            token: signed.token,
+            retry: Default::default(),
+            log_level: Default::default(),
+        });
+        if publishing {
+            config.media.audio_input = AudioInput::EncodedOpus { channels: 2 };
+        }
+        let host = host.clone();
+        let (runtime, actor) = RuntimeAgent::managed_with_services(
+            config,
+            Host::new(create_http_client()),
+            move || host.runtime(),
+        )?;
+        tokio::task::spawn_local(actor);
+        let agent = Agent::from_runtime(runtime);
+        agent.join("stage".into())?;
+        Ok(agent)
+    };
+    let origin = open(ingress, "opus-source", true)?;
+    let viewer = open(egress, "opus-viewer", false)?;
+    let track = "shared-mic";
+    let publication = origin.audio(track.into())?.publish(Default::default())?;
+    let source = origin.create_audio_input().await?;
+    let _pipe = source.pipe_to(&publication)?;
+    let subscription = viewer
+        .room("stage".into())?
+        .participant("opus-source".into())?
+        .audio(track.into())?
+        .subscribe()?;
+    let received = subscription.frames()?;
+    let counter = || pulsebeam::sim_metrics::routing_counter("fabric_network_opus_receive");
+    let before = counter();
+    let feed = async {
+        tokio::time::timeout(Duration::from_secs(5), publication.ready())
+            .await
+            .context("shared-hop Opus source never ready")??;
+        let mut tick = tokio::time::interval(Duration::from_millis(20));
+        let mut timestamp = 0;
+        for packet in stock_opus_fixture().iter().cycle() {
+            tick.tick().await;
+            let mut frame = packet.clone();
+            frame.timestamp = timestamp;
+            timestamp += frame.samples_per_channel;
+            source.submit(InputFrame::Opus { frame }).await?;
+        }
+        anyhow::bail!("missing stock Opus packets")
+    };
+    let observe = async {
+        let mut ready = Some(ready);
+        loop {
+            let max_gap = Duration::from_secs(6);
+            let audio_egress = || {
+                [
+                    "fabric_wan_opus_intake",
+                    "fabric_wan_opus_intake_full",
+                    "fabric_wan_opus_intake_stale",
+                    "fabric_wan_opus_schedule_full",
+                    "fabric_wan_opus_deferred",
+                    "fabric_wan_opus_sent",
+                    "fabric_wan_opus_transport_dropped",
+                ]
+                .map(pulsebeam::sim_metrics::routing_counter)
+            };
+            let egress_before = audio_egress();
+            let packets_before = counter();
+            tokio::time::timeout(max_gap, async {
+                loop {
+                    let frame = received
+                        .next()
+                        .await?
+                        .context("shared-hop Opus subscription closed")?;
+                    if frame.sample_rate_hz > 0
+                        && frame.samples.iter().any(|&value| value != 0)
+                        && counter() > before
+                    {
+                        return anyhow::Ok(());
+                    }
+                }
+            })
+            .await
+            .with_context(|| {
+                let link = pulsebeam_runtime::net::shaper::directed_stats((ingress, 7443).into(), (egress, 7443).into());
+                format!("decoded PCM stalled on the shared WAN hop: Opus WAN receives {} -> {}; egress (admitted/full/stale/schedule-full/deferred/sent/dropped)={egress_before:?} -> {:?}; link={link:?}", packets_before, counter(), audio_egress())
+            })??;
+            progress.decoded();
+            if let Some(ready) = ready.take() {
+                let _ = ready.send(());
+            }
+        }
+    };
+    tokio::select! { result = feed => result, result = observe => result }
 }
 
 #[test]

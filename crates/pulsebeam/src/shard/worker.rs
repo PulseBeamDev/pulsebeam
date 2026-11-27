@@ -284,6 +284,7 @@ pub(crate) enum ShardEvent {
     PublisherDataExpectation(crate::route::fabric::PublisherExpectation),
     NetworkDataRepair(Box<crate::route::fabric::network_repair::InterestEvent>),
     NetworkMediaRepair(Box<crate::route::fabric::network_repair::MediaInterest>),
+    NetworkMediaRefresh(Box<crate::route::fabric::network_repair::MediaInterest>),
     TransportAuthenticated {
         source: std::net::SocketAddr,
         destination: std::net::SocketAddr,

@@ -1,6 +1,8 @@
+use pulsebeam_core::{dd::evidence::ProjectionEvidence, fabric::wan::OmissionRun};
 use pulsebeam_runtime::time::Instant;
 
-use super::local::{MAX_BRANCHES, Offers, Transit};
+use super::local::{LiveWork, MAX_BRANCHES, Offers, OwnedPacket, Transit};
+use super::target_demand::Projection;
 use super::{CompiledLiveRelay, LiveAdmissions, LiveNetworkChild, LiveNextHop};
 use crate::{link::wan_host::WanTx, route::NodeRouteAddress};
 
@@ -27,6 +29,130 @@ pub(crate) fn offer_live_network(
     }))
 }
 
+/// One outbound window's tentative exclusions. Keep originals until the
+/// carrier can take the proof, so a gap, update or oversized packet can fall
+/// back to ordinary forwarding without turning an omission into false loss.
+#[derive(Default)]
+pub(crate) struct SendProjection {
+    through: Option<u64>,
+    pending: Vec<PendingExclusion>,
+}
+
+struct PendingExclusion {
+    work: LiveWork,
+    packet: OwnedPacket,
+    proof: ProjectionEvidence,
+}
+
+fn excludes(requested: Option<Projection>, proof: ProjectionEvidence) -> bool {
+    match requested {
+        Some(Projection::Targets { context, targets }) => proof.excludes(context, targets),
+        _ => false,
+    }
+}
+
+impl SendProjection {
+    pub(crate) fn offer(
+        &mut self,
+        now: Instant,
+        tx: &WanTx,
+        admissions: &mut LiveAdmissions,
+        requested: Option<Projection>,
+        transit: &Transit<'_>,
+        report: &mut Offers,
+    ) {
+        let position = transit.work.sequence();
+        let expires = tx.expires();
+        if now >= expires || !tx.is_live() || !tx.covers(position) {
+            return;
+        }
+        let fresh = self.through.is_none_or(|previous| position > previous);
+        if !fresh
+            && self
+                .pending
+                .iter()
+                .any(|pending| pending.work.sequence() == position)
+        {
+            return;
+        }
+        let continues = fresh
+            && self.through.and_then(|last| last.checked_add(1)) == Some(position)
+            && self.pending.iter().all(|pending| {
+                now < pending.work.expires_at() && excludes(requested, pending.proof)
+            });
+        if !continues && fresh {
+            self.flush(now, tx, admissions, report);
+        }
+        if fresh {
+            self.through = Some(position);
+        }
+        let exclusion = transit
+            .projection
+            .filter(|&proof| excludes(requested, proof));
+        let deadline = expires.min(transit.work.expires_at());
+        if fresh
+            && let Some(proof) = exclusion
+            && deadline > now
+            && transit.packet.remaining_hops() > 0
+            && self.pending.len() < usize::from(OmissionRun::MAX)
+        {
+            self.pending.push(PendingExclusion {
+                work: transit.work,
+                packet: transit.packet.clone().into_owned(),
+                proof,
+            });
+            return;
+        }
+        if continues
+            && let Some(run) = u8::try_from(self.pending.len())
+                .ok()
+                .and_then(OmissionRun::new)
+            && deadline > now
+            && transit.packet.remaining_hops() != 0
+            && tx.accommodates_omission(position, &transit.packet, run)
+        {
+            let result = transit.work.enqueue(now, admissions, || {
+                tx.try_send_projected(
+                    now,
+                    deadline,
+                    position,
+                    transit.packet.clone().into_owned(),
+                    Some(run),
+                )
+            });
+            if result == super::LiveOffer::Enqueued {
+                report.omitted = report.omitted.saturating_add(self.pending.len());
+                self.pending.clear();
+                report.record(result);
+                return;
+            }
+        }
+        if fresh {
+            self.flush(now, tx, admissions, report);
+        }
+        if let Some(result) = offer_live_network(admissions, tx, expires, transit, now) {
+            report.record(result);
+        }
+    }
+
+    fn flush(
+        &mut self,
+        now: Instant,
+        tx: &WanTx,
+        admissions: &mut LiveAdmissions,
+        report: &mut Offers,
+    ) {
+        for PendingExclusion { work, packet, .. } in self.pending.drain(..) {
+            let deadline = tx.expires().min(work.expires_at());
+            if now < deadline {
+                report.record(work.enqueue(now, admissions, || {
+                    tx.try_send(now, deadline, work.sequence(), packet)
+                }));
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct RepairLookup<R> {
     pub(crate) route: R,
@@ -40,6 +166,7 @@ pub(crate) type PublisherRepairLookup = RepairLookup<super::CompiledPublisherSen
 pub(crate) enum PeerRepairLookup {
     Publisher(PublisherRepairLookup),
     Media(MediaRepairLookup),
+    Refresh(MediaRepairLookup),
 }
 
 #[derive(Clone, Debug)]
@@ -67,7 +194,7 @@ impl PeerRepairLookup {
     pub(crate) fn shard(&self) -> crate::id::ShardId {
         match self {
             Self::Publisher(lookup) => lookup.route.shard,
-            Self::Media(lookup) => lookup.parent.shard(),
+            Self::Media(lookup) | Self::Refresh(lookup) => lookup.parent.shard(),
         }
     }
 }
@@ -89,6 +216,20 @@ struct Branch {
     next: LiveNextHop,
     paths: Vec<CompiledLiveRelay>,
     admissions: LiveAdmissions,
+    projection: Option<RelayProjection>,
+}
+
+struct RelayProjection {
+    input: LiveNetworkChild,
+    tx: WanTx,
+    demand: super::target_demand::Demand,
+    buffer: SendProjection,
+}
+
+impl RelayProjection {
+    fn matches(&self, path: &CompiledLiveRelay) -> bool {
+        self.input == path.input && self.tx == path.tx
+    }
 }
 
 impl LiveRelays {
@@ -102,6 +243,13 @@ impl LiveRelays {
             .position(|branch| branch.next == relay.next);
         for branch in &mut self.branches {
             branch.paths.retain(|path| path.tx.expires() > now);
+            if branch
+                .projection
+                .as_ref()
+                .is_some_and(|projection| now >= projection.tx.expires())
+            {
+                branch.projection = None;
+            }
         }
         if let Some(index) = existing
             && let Some(branch) = self.branches.get_mut(index)
@@ -110,6 +258,14 @@ impl LiveRelays {
                 .iter_mut()
                 .find(|path| path.input == relay.input)
         {
+            if path.tx != relay.tx
+                && branch
+                    .projection
+                    .as_ref()
+                    .is_some_and(|projection| projection.matches(path))
+            {
+                branch.projection = None;
+            }
             *path = relay;
             return true;
         }
@@ -132,6 +288,7 @@ impl LiveRelays {
                 next: relay.next,
                 paths: vec![relay],
                 admissions: LiveAdmissions::default(),
+                projection: None,
             });
         }
         true
@@ -146,6 +303,13 @@ impl LiveRelays {
             branch
                 .paths
                 .retain(|path| path.input != relay.input || path.tx != relay.tx);
+            if branch
+                .projection
+                .as_ref()
+                .is_some_and(|projection| projection.matches(relay))
+            {
+                branch.projection = None;
+            }
         }
     }
 
@@ -154,6 +318,13 @@ impl LiveRelays {
             branch
                 .paths
                 .retain(|path| path.input.destination != address);
+            if branch
+                .projection
+                .as_ref()
+                .is_some_and(|projection| projection.input.destination == address)
+            {
+                branch.projection = None;
+            }
         }
     }
 
@@ -164,6 +335,41 @@ impl LiveRelays {
                     && branch.paths.iter().any(|path| {
                         path.input == route.input && path.tx == route.tx && now < path.tx.expires()
                     })
+            })
+    }
+
+    pub(crate) fn apply_demand(
+        &mut self,
+        now: Instant,
+        route: &CompiledLiveRelay,
+        update: super::target_demand::VersionedUpdate,
+    ) -> bool {
+        if !self.has_live_path(route, now) {
+            return false;
+        }
+        self.branches
+            .iter_mut()
+            .find(|branch| branch.next == route.next)
+            .is_some_and(|branch| {
+                if branch.paths.len() != 1 {
+                    return false;
+                }
+                if branch
+                    .projection
+                    .as_ref()
+                    .is_some_and(|projection| !projection.matches(route))
+                {
+                    branch.projection = None;
+                }
+                let projection = branch.projection.get_or_insert_with(|| RelayProjection {
+                    input: route.input,
+                    tx: route.tx.clone(),
+                    demand: super::target_demand::Demand::default(),
+                    buffer: SendProjection::default(),
+                });
+                projection
+                    .demand
+                    .apply(now, route.tx.expires(), update.generation, update.update)
             })
     }
 
@@ -185,7 +391,29 @@ impl LiveRelays {
             let Some(path) = branch.paths.iter().find(|path| path.input == input) else {
                 continue;
             };
-            if let Some(outcome) = offer_live_network(
+            if let Some(projection) = branch
+                .projection
+                .as_mut()
+                .filter(|projection| projection.matches(path))
+            {
+                let requested = (branch.paths.len() == 1)
+                    .then(|| projection.demand.live(now))
+                    .flatten();
+                #[cfg(feature = "sim")]
+                let omitted = report.omitted;
+                projection.buffer.offer(
+                    now,
+                    &path.tx,
+                    &mut branch.admissions,
+                    requested,
+                    &frozen,
+                    report,
+                );
+                #[cfg(feature = "sim")]
+                if report.omitted != omitted {
+                    crate::sim_metrics::record_routing_counter("fabric_wan_relay_projected_runs");
+                }
+            } else if let Some(outcome) = offer_live_network(
                 &mut branch.admissions,
                 &path.tx,
                 path.tx.expires(),

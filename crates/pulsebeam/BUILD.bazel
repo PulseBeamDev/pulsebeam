@@ -123,6 +123,7 @@ rust_test(
     args = [
         "node::transport_conformance::",
         "protected_boundary_datagrams_reach_only_exactly_acknowledged_shard_windows",
+        "omission_metadata_requires_explicit_selection_on_the_live_window",
         "sparse_repair_requires_exact_receipt_and_live_parent",
         "provisioned_reverse_and_wan_sockets_cannot_activate_either_carrier",
         "wan_host_receives_only_controller_scoped_commits_and_fences_on_peer_close",

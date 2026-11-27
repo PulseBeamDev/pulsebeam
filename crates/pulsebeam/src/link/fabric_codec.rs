@@ -1,6 +1,9 @@
 use std::num::NonZeroU32;
 
-use pulsebeam_core::fabric::{WireError, wan::Window};
+use pulsebeam_core::fabric::{
+    WireError,
+    wan::{OmissionRun, Window},
+};
 use pulsebeam_link::CodecError;
 
 use crate::route::fabric::local::OwnedPacket;
@@ -12,6 +15,38 @@ const _: () = assert!(
 );
 
 pub(crate) struct FabricWanCodec;
+
+impl FabricWanCodec {
+    pub(crate) fn encode_projected(
+        &self,
+        window: Window,
+        position: u64,
+        packet: &OwnedPacket,
+        omitted: OmissionRun,
+        dst: &mut [u8],
+    ) -> Result<usize, CodecError> {
+        window
+            .write_projected(position, packet, omitted, dst)
+            .map_err(to_codec_error)
+    }
+
+    pub(crate) fn decode_live(
+        &self,
+        window: Window,
+        plaintext: &[u8],
+        projection_selected: bool,
+    ) -> Result<(u64, (OwnedPacket, Option<OmissionRun>)), CodecError> {
+        let (position, packet, omitted) = if projection_selected {
+            window.decode_projected(plaintext)
+        } else {
+            window
+                .decode(plaintext)
+                .map(|(position, packet)| (position, packet, None))
+        }
+        .map_err(to_codec_error)?;
+        Ok((position, (packet.into_owned(), omitted)))
+    }
+}
 
 impl pulsebeam_link::wan::Codec<OwnedPacket> for FabricWanCodec {
     type Window = Window;
@@ -38,10 +73,8 @@ impl pulsebeam_link::wan::Codec<OwnedPacket> for FabricWanCodec {
     }
 
     fn decode(&self, window: Window, plaintext: &[u8]) -> Result<(u64, OwnedPacket), CodecError> {
-        window
-            .decode(plaintext)
-            .map(|(position, packet)| (position, packet.into_owned()))
-            .map_err(to_codec_error)
+        self.decode_live(window, plaintext, false)
+            .map(|(position, (packet, _))| (position, packet))
     }
 }
 

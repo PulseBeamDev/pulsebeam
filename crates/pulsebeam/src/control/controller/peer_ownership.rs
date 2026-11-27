@@ -1,7 +1,8 @@
 pub(in crate::control) mod fabric_data;
-mod media_repair;
+pub(super) mod media_repair;
 pub(crate) mod provisioned;
 pub(in crate::control) mod relay;
+pub(super) mod target_demand;
 pub(super) mod transfer;
 
 use std::{

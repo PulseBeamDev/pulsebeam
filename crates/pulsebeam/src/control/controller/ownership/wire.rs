@@ -579,6 +579,7 @@ mod tests {
             through: vp9.sequence_anchor + 1,
             heights: [180, 0, 720],
             payload_bps: [100_000, 0, 1_000_000],
+            fps: [30, 0, 30],
         };
         assert!(h264.with_ladder(Some(ladder)).ladder.is_none());
         assert!(

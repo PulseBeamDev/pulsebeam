@@ -432,13 +432,19 @@ impl Connection {
                 connection_id: self.connection_id,
                 track_id: Some(track_id),
             };
-            let (upstream, mut track) = match video_encodings {
+            let (mut upstream, mut track) = match video_encodings {
                 Some(encodings) => track::new_video_ssrcs(mid, meta, encodings),
                 None => track::new_audio(mid, meta),
             };
             match &mut track {
                 Track::Audio(audio) => audio.format = format,
-                Track::Video(video) => video.format = format,
+                Track::Video(video) => {
+                    video.format = format;
+                    video.guarantees_video_dd = fabric_dd_video;
+                    if video.uses_spatial_dd() {
+                        upstream.monitor.measure_spatial_dd();
+                    }
+                }
                 Track::Data(_) => {}
             }
             (upstream, track)

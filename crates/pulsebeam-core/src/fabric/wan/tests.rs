@@ -97,6 +97,109 @@ fn media_keeps_both_extension_forms_and_minimum_padding() {
 }
 
 #[test]
+fn negotiated_vp9_omission_run_is_not_part_of_the_fabric_image() {
+    let ssrc = NonZeroU32::new(0x0506_0708).unwrap();
+    let window = Window::new(Profile::Vp9, 0x18000, 3, ssrc, 1 << 2).unwrap();
+    let position = 0x18002;
+    let header = Header {
+        profile: Profile::Vp9,
+        marker: true,
+        sequence: low32(position),
+        timestamp: 0x0102_0304,
+    };
+    for (form, expected) in [
+        (
+            Form::One,
+            [0xbe, 0xde, 0, 2, 0x22, 0xc0, 0, 0, 0xa0, 2, 0, 0],
+        ),
+        (Form::Two, [0x10, 0, 0, 2, 2, 3, 0xc0, 0, 0, 10, 1, 2]),
+    ] {
+        let packet = FabricPacket::pack(
+            header,
+            &[Extension {
+                kind: ExtensionKind::DependencyDescriptor,
+                value: &[0xc0, 0, 0],
+            }],
+            [0x65, 0x88],
+            Some(form),
+        )
+        .unwrap();
+        let run = OmissionRun::new(2).unwrap();
+        let mut bytes = [0; 26];
+        assert_eq!(
+            window.write_projected(position, &packet, run, &mut bytes),
+            Ok(26)
+        );
+        assert_eq!(
+            Window::protected_len(&packet, Some(run)),
+            Ok(26 + GCM_TAG_BYTES)
+        );
+        assert_eq!(bytes[..12], [0x90, 0xe6, 0x80, 2, 1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(bytes[12..24], expected);
+        assert!(window.decode(&bytes).is_err());
+        let (decoded_position, decoded, omission) = window.decode_projected(&bytes).unwrap();
+        assert_eq!(decoded_position, position);
+        assert!(decoded.same_content(&packet.arrival_view(6).unwrap()));
+        assert_eq!(
+            omission.and_then(|run| run.positions(position)),
+            Some(0x18000..position)
+        );
+        let count = if form == Form::One { 21 } else { 23 };
+        for invalid in [0, OmissionRun::MAX + 1] {
+            bytes[count] = invalid;
+            assert!(window.decode_projected(&bytes).is_err());
+        }
+        bytes[count] = 3;
+        assert!(matches!(
+            window.decode_projected(&bytes),
+            Err(WireError::Window)
+        ));
+        let mut ordinary = [0; 26];
+        let len = window.write(position, &packet, &mut ordinary).unwrap();
+        assert_eq!(
+            Window::protected_len(&packet, None),
+            Ok(len + GCM_TAG_BYTES)
+        );
+        assert!(
+            window
+                .decode_projected(&ordinary[..len])
+                .unwrap()
+                .2
+                .is_none()
+        );
+        let h264 = Window::new(Profile::H264, 0x18000, 3, ssrc, 1 << 2).unwrap();
+        bytes[count] = 2;
+        assert!(h264.decode_projected(&bytes).is_err());
+    }
+}
+
+#[test]
+fn projected_carrier_cannot_exceed_the_plaintext_budget() {
+    let window = Window::new(Profile::Vp9, 0, 1, NonZeroU32::MIN, 1 << 2).unwrap();
+    let packet = FabricPacket::pack(
+        Header {
+            profile: Profile::Vp9,
+            marker: true,
+            sequence: 1,
+            timestamp: 0,
+        },
+        &[Extension {
+            kind: ExtensionKind::DependencyDescriptor,
+            value: &[0xc0, 0, 0],
+        }],
+        [1; MAX_WAN_RTP_BYTES - 20],
+        Some(Form::One),
+    )
+    .unwrap();
+    let mut bytes = [0; MAX_WAN_RTP_BYTES];
+    assert_eq!(window.write(1, &packet, &mut bytes), Ok(MAX_WAN_RTP_BYTES));
+    assert_eq!(
+        window.write_projected(1, &packet, OmissionRun::new(1).unwrap(), &mut bytes),
+        Err(WireError::Oversize)
+    );
+}
+
+#[test]
 fn protected_wan_primary_can_grow_within_the_path_envelope() {
     let window = Window::new(Profile::Opus, 0, 0, NonZeroU32::new(11).unwrap(), 0).unwrap();
     let packet = FabricPacket::new(

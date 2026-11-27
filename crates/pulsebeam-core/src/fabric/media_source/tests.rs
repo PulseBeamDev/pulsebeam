@@ -125,6 +125,35 @@ fn canonical_sequence_retains_high_bits_across_wrap_and_rejects_window_jumps() {
 }
 
 #[test]
+fn canonical_primary_resumes_idle_without_reopening_old_positions() {
+    let mut identity = source(8, Anchors::default()).into_identity();
+    let now = Instant::now();
+    let idle = now + Duration::from_secs(3);
+    let mut admit =
+        |at, raw, input| identity.admit(at, at, Position::CanonicalSequence(raw), input, |_| None);
+    assert!(admit(now, u32::MAX - 1, media(false, 500, &[])).is_ok());
+    for (raw, input) in [
+        (0, Input::PrimaryPadding),
+        (0, media(true, 502, &[])),
+        (u32::MAX - 1, media(false, 500, &[])),
+        (u32::from(MAX_POSITIONS), media(false, 502, &[])),
+    ] {
+        assert!(matches!(admit(idle, raw, input), Err(Rejected::Epoch)));
+    }
+    assert!(matches!(
+        admit(idle, 0, media(false, 502, &[])),
+        Ok(IdentityAdmission::Media {
+            sequence: 0x1_0000_0000,
+            ..
+        })
+    ));
+    assert!(matches!(
+        admit(idle, u32::MAX, media(false, 501, &[])),
+        Err(Rejected::Stale)
+    ));
+}
+
+#[test]
 fn rtx_first_freezes_image_but_later_primary_fixes_presence() {
     let now = Instant::now();
     let mut source = source(4, Anchors::default());

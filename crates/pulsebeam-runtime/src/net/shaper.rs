@@ -294,6 +294,7 @@ fn losses() -> &'static Mutex<HashMap<IpAddr, Loss>> {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Stats {
     pub delivered: u64,
+    pub admitted_udp_bytes: u64,
     pub gso_batches: u64,
     pub gso_segments: u64,
     pub gro_batches: u64,
@@ -351,9 +352,57 @@ impl Stats {
     }
 }
 
-fn stats_map() -> &'static Mutex<HashMap<IpAddr, Stats>> {
-    static STATS: std::sync::OnceLock<Mutex<HashMap<IpAddr, Stats>>> = std::sync::OnceLock::new();
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+enum Bottleneck {
+    Downlink(IpAddr),
+    Directed(SocketAddr, SocketAddr),
+}
+
+fn stats_map() -> &'static Mutex<HashMap<Bottleneck, Stats>> {
+    static STATS: std::sync::OnceLock<Mutex<HashMap<Bottleneck, Stats>>> =
+        std::sync::OnceLock::new();
     STATS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn directed_limits() -> &'static Mutex<HashMap<Bottleneck, Limit>> {
+    static LIMITS: std::sync::OnceLock<Mutex<HashMap<Bottleneck, Limit>>> =
+        std::sync::OnceLock::new();
+    LIMITS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn set_directed_capacity(
+    from: SocketAddr,
+    to: SocketAddr,
+    capacity: Capacity,
+    max_backlog: Duration,
+) {
+    directed_limits()
+        .lock()
+        .expect("directed shaper limits poisoned")
+        .insert(
+            Bottleneck::Directed(from, to),
+            Limit {
+                capacity,
+                max_backlog,
+                since: None,
+            },
+        );
+}
+
+pub fn remove_directed_capacity(from: SocketAddr, to: SocketAddr) {
+    directed_limits()
+        .lock()
+        .expect("directed shaper limits poisoned")
+        .remove(&Bottleneck::Directed(from, to));
+}
+
+pub fn directed_stats(from: SocketAddr, to: SocketAddr) -> Stats {
+    stats_map()
+        .lock()
+        .expect("shaper stats poisoned")
+        .get(&Bottleneck::Directed(from, to))
+        .copied()
+        .unwrap_or_default()
 }
 
 /// Rate-limit traffic sent to `ip`. Call before the hosts start.
@@ -409,7 +458,7 @@ pub fn stats(ip: IpAddr) -> Stats {
     stats_map()
         .lock()
         .expect("shaper stats poisoned")
-        .get(&ip)
+        .get(&Bottleneck::Downlink(ip))
         .copied()
         .unwrap_or_default()
 }
@@ -424,13 +473,17 @@ pub fn stats(ip: IpAddr) -> Stats {
 pub fn reset_stats_for(ips: impl IntoIterator<Item = IpAddr>) {
     let mut guard = stats_map().lock().expect("shaper stats poisoned");
     for ip in ips {
-        guard.remove(&ip);
+        guard.remove(&Bottleneck::Downlink(ip));
     }
 }
 
 /// Drop every configured limit. The registry is process-global, so a plan that sets limits must
 /// clear them or leak them into whatever runs next.
 pub fn clear() {
+    directed_limits()
+        .lock()
+        .expect("directed shaper limits poisoned")
+        .clear();
     limits().lock().expect("shaper limits poisoned").clear();
     losses().lock().expect("shaper losses poisoned").clear();
     reorders().lock().expect("shaper reorders poisoned").clear();
@@ -519,7 +572,7 @@ pub fn seed_impairments(seed: u64) {
 
 struct ShaperState {
     /// When the link to a destination next falls idle. The backlog is this minus now.
-    next_free: HashMap<IpAddr, Instant>,
+    next_free: HashMap<Bottleneck, Instant>,
     queue: VecDeque<Queued>,
     loss_counter: u64,
     /// Gilbert-Elliott position per destination: true while in the bad state.
@@ -583,7 +636,42 @@ impl Shaper {
             .map(|l| l.max_backlog)
             .unwrap_or(DEFAULT_MAX_BACKLOG);
         let reorder = reorder_for(&dst.ip());
-        self.with(|st| st.offer(now, dst, buf, bits_per_sec, max_backlog, reorder))
+        self.with(|st| {
+            st.offer(
+                now,
+                Bottleneck::Downlink(dst.ip()),
+                dst,
+                buf,
+                (bits_per_sec, max_backlog),
+                reorder,
+            )
+        })
+    }
+
+    pub(super) fn offer_directed(
+        &mut self,
+        now: Instant,
+        from: SocketAddr,
+        dst: SocketAddr,
+        buf: &[u8],
+    ) -> Shaped {
+        let edge = Bottleneck::Directed(from, dst);
+        let rate = directed_limits()
+            .lock()
+            .expect("directed shaper limits poisoned")
+            .get_mut(&edge)
+            .map(|limit| {
+                let since = *limit.since.get_or_insert(now);
+                (
+                    limit
+                        .capacity
+                        .bits_per_sec_at(now.saturating_duration_since(since)),
+                    limit.max_backlog,
+                )
+            });
+        rate.map_or(Shaped::PassThrough, |rate| {
+            self.with(|st| st.offer(now, edge, dst, buf, rate, Reorder::NONE))
+        })
     }
 
     /// Take every packet whose turn on the wire has come.
@@ -634,8 +722,12 @@ impl Shaper {
 }
 
 fn record(ip: IpAddr, f: impl FnOnce(&mut Stats)) {
+    record_link(Bottleneck::Downlink(ip), f);
+}
+
+fn record_link(link: Bottleneck, f: impl FnOnce(&mut Stats)) {
     let mut guard = stats_map().lock().expect("shaper stats poisoned");
-    f(guard.entry(ip).or_default());
+    f(guard.entry(link).or_default());
 }
 
 impl ShaperState {
@@ -670,30 +762,33 @@ impl ShaperState {
     fn offer(
         &mut self,
         now: Instant,
+        link: Bottleneck,
         dst: SocketAddr,
         buf: &[u8],
-        bits_per_sec: u64,
-        max_backlog: Duration,
+        (bits_per_sec, max_backlog): (u64, Duration),
         reorder: Reorder,
     ) -> Shaped {
         // Serialisation delay: how long this packet occupies the link.
         let on_wire =
             Duration::from_secs_f64((buf.len() as f64 * 8.0) / bits_per_sec.max(1) as f64);
 
-        let idle_at = self.next_free.entry(dst.ip()).or_insert(now);
+        let idle_at = self.next_free.entry(link).or_insert(now);
         // A link idle in the past is idle now; it does not accrue credit.
         let release_at = (*idle_at).max(now);
         let backlog = release_at.saturating_duration_since(now);
 
         if backlog > max_backlog {
             // Buffer full. Tail drop, exactly as a bottleneck queue does.
-            record(dst.ip(), |s| s.dropped_overflow += 1);
+            record_link(link, |s| s.dropped_overflow += 1);
             return Shaped::Absorbed;
         }
 
         *idle_at = release_at + on_wire;
-        record(dst.ip(), |s| {
+        record_link(link, |s| {
             s.delivered += 1;
+            s.admitted_udp_bytes = s
+                .admitted_udp_bytes
+                .saturating_add(u64::try_from(buf.len()).unwrap_or(u64::MAX));
             s.max_backlog = s.max_backlog.max(backlog);
             s.backlog_sum = s.backlog_sum.saturating_add(backlog);
         });
@@ -704,7 +799,7 @@ impl ShaperState {
         let mut release_at = release_at;
         if reorder.probability > 0.0 && next_uniform(&mut self.loss_counter) < reorder.probability {
             release_at += reorder.delay;
-            record(dst.ip(), |s| s.reordered += 1);
+            record_link(link, |s| s.reordered += 1);
         }
 
         self.queue.push_back(Queued {

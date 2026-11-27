@@ -152,6 +152,47 @@ pub(super) struct Routing {
 }
 
 impl Routing {
+    pub(super) fn media_repair_grants(
+        &self,
+        peer: NetworkId,
+        demand: super::peer_ownership::media_repair::Demand,
+        now: Instant,
+    ) -> [Option<super::peer_ownership::media_repair::Grant>; 2] {
+        [
+            self.media_sends.media_repair_grant(peer, demand, now),
+            self.media_receives.media_repair_grant(peer, demand, now),
+        ]
+    }
+
+    pub(super) fn target_demand_grants(
+        &self,
+        peer: NetworkId,
+        demand: super::peer_ownership::target_demand::Demand,
+        now: Instant,
+    ) -> [Option<super::peer_ownership::media_repair::Grant>; 2] {
+        [
+            self.media_sends.live_media_grant(peer, demand, now),
+            self.media_receives.live_media_grant(peer, demand, now),
+        ]
+    }
+
+    pub(super) fn request_border_media_refresh(
+        &self,
+        interest: crate::route::fabric::network_repair::MediaInterest,
+        now: Instant,
+    ) {
+        if let Some((_, lane)) = self
+            .borders
+            .values()
+            .find(|border| border.media == Some(interest.parent.ingress.association))
+            .and_then(Border::live)
+        {
+            super::peer_ownership::media_repair::Demand::send_refresh(
+                lane, self.epoch, interest, now,
+            );
+        }
+    }
+
     pub(super) fn catalog_members(&self) -> impl Iterator<Item = Member> + '_ {
         self.reads.keys().copied()
     }
@@ -167,6 +208,10 @@ impl Routing {
     }
 
     fn drive(&mut self, actor: &mut ControllerActor, now: Instant) {
+        use super::peer_ownership::media_repair::Demand;
+        let mut refreshes = Vec::new();
+        let mut target_updates = Vec::new();
+        let mut target_budgets = Vec::new();
         for (&member, border) in &mut self.borders {
             border.advance();
             if let Some(lane) = &mut border.lane
@@ -179,7 +224,63 @@ impl Routing {
                     let Some(bytes) = lane.try_recv() else { break };
                     if recognizes(&bytes) {
                         self.inbox.push_back((Link { member, stream }, bytes));
+                    } else if let Some((network, demand)) =
+                        border.media.zip(Demand::decode_refresh(&bytes))
+                    {
+                        refreshes.push((network, demand));
+                    } else if let Some((network, demand)) = border
+                        .media
+                        .zip(super::peer_ownership::target_demand::Demand::decode(&bytes))
+                    {
+                        target_updates.push((member, network, demand));
+                    } else if let Some((network, budget)) = border
+                        .media
+                        .zip(super::peer_ownership::target_demand::Budget::decode(&bytes))
+                    {
+                        target_budgets.push((network, budget));
                     }
+                }
+            }
+        }
+        let refreshes = refreshes
+            .into_iter()
+            .filter_map(|(network, demand)| {
+                let [origin, relay] = self.media_repair_grants(network, demand, now);
+                let ((Some(grant), None) | (None, Some(grant))) = (origin, relay) else {
+                    return None;
+                };
+                grant.into_refresh(demand)
+            })
+            .collect();
+        let _ = actor.stage_repair_lookups(refreshes);
+        if actor
+            .receipt_trust
+            .as_ref()
+            .is_some_and(super::ownership::receipt::Authority::ready)
+        {
+            for border in self.borders.values() {
+                if let Some((network, (_, lane))) = border.media.zip(border.live()) {
+                    actor.drive_wan_target_demands(network, lane, self.epoch, now);
+                }
+            }
+            for (network, budget) in target_budgets {
+                actor.receive_wan_video_budget(network, budget, now);
+            }
+            for (member, network, demand) in target_updates {
+                let [origin, relay] = self.target_demand_grants(network, demand, now);
+                if let (Some(grant), None) | (None, Some(grant)) = (origin, relay) {
+                    if let Some((_, lane)) = self.borders.get(&member).and_then(Border::live) {
+                        super::peer_ownership::target_demand::reply_with_budget(
+                            actor,
+                            network,
+                            lane,
+                            self.epoch,
+                            now,
+                            demand,
+                            grant.expires(),
+                        );
+                    }
+                    grant.apply_target_demand(actor, demand, now);
                 }
             }
         }

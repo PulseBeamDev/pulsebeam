@@ -183,6 +183,9 @@ impl ShardUpdateApplication {
                     .result
                     .send(execution.update_live_relay(update.change));
             }
+            for sample in delta.viewer_projections.drain(..) {
+                execution.sample_viewer_projection(sample);
+            }
             for ack in delta.cutoff_acks.drain(..) {
                 let _ = ack.send(());
             }

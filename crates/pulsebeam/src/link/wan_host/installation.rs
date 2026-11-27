@@ -13,24 +13,47 @@ type Report = oneshot::Sender<Result<Window, Error>>;
 pub(crate) struct Commands {
     peer: NetworkId,
     sender: pulsebeam_queue::Sender<Command>,
-    pub(super) media: pulsebeam_queue::Sender<super::egress::Media>,
+    pub(super) media: super::egress::MediaSenders,
+    budget: super::egress::BudgetReader,
 }
 
 impl Commands {
     pub(super) fn new(
         peer: NetworkId,
         sender: pulsebeam_queue::Sender<Command>,
-        media: pulsebeam_queue::Sender<super::egress::Media>,
+        media: super::egress::MediaSenders,
+        budget: super::egress::BudgetReader,
     ) -> Self {
         Self {
             peer,
             sender,
             media,
+            budget,
         }
+    }
+
+    pub(crate) fn video_share(&self, now: Instant) -> Option<(u32, Instant)> {
+        (*self.budget.borrow())
+            .filter(|budget| now < budget.expires)
+            .map(|budget| (budget.share_bps, budget.expires))
     }
 
     pub(crate) fn peer(&self) -> NetworkId {
         self.peer
+    }
+
+    pub(crate) fn select_projection(
+        &self,
+        window: Window,
+        incarnation: std::num::NonZeroU64,
+    ) -> Result<oneshot::Receiver<bool>, pulsebeam_link::BindError> {
+        let (receipt, confirmation) = oneshot::channel();
+        self.try_send(Command::SelectProjection {
+            window,
+            incarnation,
+            receipt,
+        })?;
+        Ok(confirmation)
     }
 
     pub(crate) fn try_send(
@@ -55,6 +78,11 @@ pub(crate) struct ChildInstall<T> {
 pub(crate) enum Command {
     Receive(ReceiveCommand),
     Send(Box<super::egress::Install>),
+    SelectProjection {
+        window: Window,
+        incarnation: std::num::NonZeroU64,
+        receipt: oneshot::Sender<bool>,
+    },
 }
 
 impl From<ReceiveCommand> for Command {

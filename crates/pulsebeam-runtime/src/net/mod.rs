@@ -13,6 +13,9 @@ pub use bound_udp::{
     set_wrong_owner_injection_with,
 };
 
+#[cfg(feature = "sim")]
+pub use udp_sim::bind_directed_udp_socket;
+
 pub use pulsebeam_udp::{BATCH_SIZE, ReceiveTime};
 use std::net::SocketAddr;
 #[cfg(target_os = "linux")]

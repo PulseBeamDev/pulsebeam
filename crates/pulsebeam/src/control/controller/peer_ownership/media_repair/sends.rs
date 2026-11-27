@@ -10,7 +10,7 @@ use crate::{
     link::wan_host::ParentSend,
     route::fabric::{
         network_repair::MAX_REPAIR_LIFETIME,
-        relay::{LocatedRepair, MediaRepairParent},
+        relay::{LocatedRepair, MediaRepairLookup, MediaRepairParent, PeerRepairLookup},
     },
 };
 
@@ -22,10 +22,58 @@ const MAX_REQUESTS: usize = 4096;
 type RequestKey = (NonZeroU32, NonZeroU64, NonZeroU64);
 type Receipt = oneshot::Receiver<Option<LocatedRepair>>;
 
-pub(in super::super) struct Grant {
+pub(in crate::control::controller) struct Grant {
     pub(in super::super) path: MediaRepairParent,
     pub(in super::super) parent: ParentSend,
     pub(in super::super) expires: Instant,
+}
+
+impl Grant {
+    pub(in crate::control::controller) fn expires(&self) -> Instant {
+        self.expires
+    }
+
+    pub(in crate::control::controller) fn apply_target_demand(
+        self,
+        actor: &mut crate::control::controller::ControllerActor,
+        demand: super::super::target_demand::Demand,
+        now: Instant,
+    ) {
+        use crate::route::fabric::{
+            LiveRelayChange, PublisherSendChange, relay::MediaRepairParent,
+            target_demand::VersionedUpdate,
+        };
+        if self.parent.window.profile() != pulsebeam_core::fabric::Profile::Vp9 {
+            return;
+        }
+        let Some(update) = demand.update(now, self.expires) else {
+            return;
+        };
+        let update = VersionedUpdate {
+            generation: demand.generation,
+            update,
+        };
+        match self.path {
+            MediaRepairParent::Publisher(route) => {
+                let _ = actor.stage_publisher_send(PublisherSendChange::Demand(route, update));
+            }
+            MediaRepairParent::Relay(route) => {
+                let _ = actor.stage_fabric_relay_change(LiveRelayChange::Demand(route, update));
+            }
+        }
+    }
+
+    pub(in crate::control::controller) fn into_refresh(
+        self,
+        demand: Demand,
+    ) -> Option<PeerRepairLookup> {
+        (self.parent.window.profile() == pulsebeam_core::fabric::Profile::Vp9).then_some(
+            PeerRepairLookup::Refresh(MediaRepairLookup {
+                parent: self.path,
+                position: demand.position,
+            }),
+        )
+    }
 }
 
 #[derive(Default)]

@@ -298,7 +298,7 @@ impl VideoAllocator {
                 return None;
             };
 
-            let states = track_states(track_state);
+            let states = track_states(track_state, Instant::now());
             let meets_floor = |layer: &&TrackLayer| {
                 states.get(&layer.stream_id()).map_or_else(
                     || layer.quality.fallback_height(),
@@ -459,7 +459,7 @@ impl VideoAllocator {
         self.fairness.order(&mut views, now);
 
         // Freeze one coherent measurement input for allocation and demand.
-        let states = self.snapshot_states();
+        let states = self.snapshot_states(now);
         let engine = AllocationEngine::new(&views, &states);
         let mut resume_gates: SecondaryMap<_, _> = self
             .slots
@@ -657,11 +657,15 @@ impl VideoAllocator {
             .then_some((selected.encoding, slot.fabric_target))
     }
 
+    pub(crate) fn wan_allowed_targets(&self, track: TrackHandle, now: Instant) -> Option<u32> {
+        self.tracks.get(track)?.stats()?.wan_allowed_targets(now)
+    }
+
     pub(crate) fn allows_fabric_encoding(
         &self,
         mid: Mid,
         branch: FabricLocalBranch,
-        (track, encoding, target): (TrackHandle, RtpSourceEncoding, u8),
+        (track, encoding, target): (TrackHandle, Option<RtpSourceEncoding>, u8),
         staged: bool,
     ) -> bool {
         let Some((_, slot)) = self
@@ -676,7 +680,7 @@ impl VideoAllocator {
         }
         let matches = |(publication, source): StreamId| {
             self.track_handles.get(&publication) == Some(&track)
-                && source.matches(encoding.primary, encoding.rid)
+                && encoding.is_none_or(|encoding| source.matches(encoding.primary, encoding.rid))
         };
         (staged
             && target == slot.fabric_target
@@ -693,7 +697,7 @@ impl VideoAllocator {
         &mut self,
         mid: Mid,
         branch: FabricLocalBranch,
-        (track, encoding): (TrackHandle, RtpSourceEncoding),
+        (track, encoding): (TrackHandle, Option<RtpSourceEncoding>),
         target: u8,
     ) {
         let Some((_, slot)) = self
@@ -705,7 +709,8 @@ impl VideoAllocator {
         };
         let Some(layer) = slot.target().filter(|layer| {
             self.track_handles.get(&layer.meta.id) == Some(&track)
-                && layer.encoding.matches(encoding.primary, encoding.rid)
+                && encoding
+                    .is_none_or(|encoding| layer.encoding.matches(encoding.primary, encoding.rid))
         }) else {
             return;
         };
@@ -919,10 +924,10 @@ impl VideoAllocator {
             .and_then(|key| self.tracks.get(*key))
     }
 
-    fn snapshot_states(&self) -> LayerStates {
+    fn snapshot_states(&self, now: Instant) -> LayerStates {
         let mut states = LayerStates::new();
         for track in self.tracks.values() {
-            states.extend(track_states(track));
+            states.extend(track_states(track, now));
         }
         #[cfg(test)]
         states.extend(
@@ -934,11 +939,11 @@ impl VideoAllocator {
     }
 }
 
-fn track_states(track: &Track) -> LayerStates {
+fn track_states(track: &Track, now: Instant) -> LayerStates {
     let Some(stats) = track.stats() else {
         return LayerStates::new();
     };
-    let states = stats.layer_states();
+    let states = stats.allocation_layer_states(now);
     debug_assert_eq!(
         states.len(),
         track.layers().len(),
@@ -1474,6 +1479,8 @@ struct LayerSnap {
     /// Full frame rate (fps); `0` = unknown. With `decode_targets` it yields each
     /// decode target's fps for the `min_fps` floor.
     full_fps: u32,
+    spatial_dd: bool,
+    spatial_ladder: Option<crate::rtp::monitor::MeasuredTargetLadder>,
 }
 
 /// Allocation computation context. All methods read the same frozen layer
@@ -1501,7 +1508,17 @@ impl AllocationEngine {
         // repeated 10 times a second per participant, for nothing.
         let layer_count = slots.iter().map(|s| s.track.layers().len()).sum();
         let mut snaps = HashMap::with_capacity_and_hasher(layer_count, Default::default());
-        snaps.extend(slots.iter().flat_map(|s| s.track.layers().iter()).map(|l| {
+        let layers = slots.iter().flat_map(|slot| {
+            let spatial_dd = slot
+                .track
+                .as_video()
+                .is_some_and(crate::track::VideoTrack::uses_spatial_dd);
+            slot.track
+                .layers()
+                .iter()
+                .map(move |layer| (layer, spatial_dd))
+        });
+        snaps.extend(layers.map(|(l, spatial_dd)| {
             let stream_id = l.stream_id();
             let snap = match states.get(&stream_id) {
                 Some(state) => {
@@ -1521,6 +1538,8 @@ impl AllocationEngine {
                         temporal_only: state.temporal_only,
                         decode_target_bps,
                         full_fps: state.full_fps(),
+                        spatial_dd: spatial_dd || state.spatial_dd,
+                        spatial_ladder: state.spatial_ladder,
                     }
                 }
                 None => LayerSnap {
@@ -1534,6 +1553,8 @@ impl AllocationEngine {
                     temporal_only: false,
                     decode_target_bps: [0u64; crate::rtp::monitor::MAX_LADDER_TARGETS],
                     full_fps: 0,
+                    spatial_dd,
+                    spatial_ladder: None,
                 },
             };
             (stream_id, snap)
@@ -1637,6 +1658,7 @@ struct AllocationChoice<'a> {
     layer: &'a TrackLayer,
     target: DecodeTargetSelection,
     decode_target_index: usize,
+    spatial_dd: bool,
     height: u32,
     fps: u32,
     cost: f64,
@@ -1678,7 +1700,11 @@ impl AllocationChoice<'_> {
     fn retained_by(&self, slot: &SlotView<'_>) -> bool {
         slot.forwarding
             && slot.current_stream == Some(self.layer.stream_id())
-            && self.decode_target_index <= Self::target_rank(slot.current_decode_target)
+            && if self.spatial_dd {
+                self.target == slot.current_decode_target
+            } else {
+                self.decode_target_index <= Self::target_rank(slot.current_decode_target)
+            }
     }
 }
 
@@ -1995,7 +2021,8 @@ impl AllocationEngine {
         let Some(current) = slot.current_stream else {
             return false;
         };
-        if current == layer.stream_id()
+        if !self.snap(layer).spatial_dd
+            && current == layer.stream_id()
             && self.forwarded_target_index(decision).is_some_and(|next| {
                 next <= AllocationChoice::target_rank(slot.current_decode_target)
             })
@@ -2022,11 +2049,60 @@ impl AllocationEngine {
         })
     }
 
+    fn spatial_choices<'a>(
+        &self,
+        slot: &SlotView<'a>,
+        layer: &'a TrackLayer,
+    ) -> impl Iterator<Item = AllocationChoice<'a>> {
+        let snap = self.snap(layer);
+        let ladder = snap.spatial_ladder;
+        let fallback = snap
+            .decode_target_heights
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, height)| *height > 0)
+            .min_by_key(|&(_, height)| height)
+            .unwrap_or((0, 0));
+        (0..crate::rtp::monitor::MAX_LADDER_TARGETS).filter_map(move |dt| {
+            let (height, cost, fps) = match ladder {
+                Some(ladder) if ladder.context.active_targets & (1 << dt) != 0 => (
+                    ladder.heights[dt],
+                    f64::from(ladder.payload_bps[dt]),
+                    ladder.fps[dt],
+                ),
+                None if dt == fallback.0 => (fallback.1, snap.stable_bitrate_bps, 0),
+                _ => return None,
+            };
+            let height = u32::from(height);
+            if cost <= 0.0
+                || slot
+                    .height_ceiling
+                    .is_some_and(|ceil| height == 0 || height > ceil)
+            {
+                return None;
+            }
+            Some(AllocationChoice {
+                layer,
+                target: DecodeTargetSelection::Target(dt),
+                decode_target_index: dt,
+                spatial_dd: true,
+                height,
+                fps: u32::from(fps),
+                cost,
+            })
+        })
+    }
+
     fn choices<'a>(&self, slot: &SlotView<'a>) -> Vec<AllocationChoice<'a>> {
         let fallback = self.nothing_healthy(slot);
         let lowest = self.lowest_ladder(slot);
         let mut choices = Vec::new();
         for layer in slot.track.layers() {
+            if self.snap(layer).spatial_dd {
+                choices.extend(self.spatial_choices(slot, layer));
+                continue;
+            }
             if !(self.snap(layer).healthy && self.cost(layer) > 0.0
                 || fallback && Some(layer) == lowest)
             {
@@ -2079,6 +2155,7 @@ impl AllocationEngine {
                         DecodeTargetSelection::Target(dt)
                     },
                     decode_target_index: dt,
+                    spatial_dd: false,
                     height,
                     fps: self.decode_target_fps(layer, dt),
                     cost: stable_cost,
@@ -2122,7 +2199,12 @@ impl AllocationEngine {
                 a.minimum_rank(slot)
                     .cmp(&b.minimum_rank(slot))
                     .then_with(|| {
-                        if slot.min_fps > 0 && a.fps == 0 && b.fps == 0 {
+                        if slot.min_fps > 0
+                            && a.fps == 0
+                            && b.fps == 0
+                            && !a.spatial_dd
+                            && !b.spatial_dd
+                        {
                             AllocationChoice::target_rank(a.target)
                                 .cmp(&AllocationChoice::target_rank(b.target))
                         } else {
@@ -2256,7 +2338,16 @@ impl AllocationEngine {
                         let step = choice.cost - current.cost;
                         step <= 0.0 || step + reserve <= budget
                     })
-                    .min_by_key(|choice| choice.rank(slot))
+                    .min_by(|a, b| {
+                        // A spatial switch awaits a qualified decoder entry.
+                        // Stage the best affordable target in one transition.
+                        let order = a.rank(slot).cmp(&b.rank(slot));
+                        if current.spatial_dd {
+                            order.reverse()
+                        } else {
+                            order
+                        }
+                    })
                 {
                     budget -= upgrade.cost - current.cost;
                     current = upgrade;
@@ -2285,9 +2376,11 @@ impl AllocationEngine {
                         DecodeTargetSelection::Target(dt) => AllocationDecision::ForwardTarget(
                             choice.layer,
                             choice.target,
-                            Bitrate::from(crate::bitrate::saturating_bps(
-                                self.decode_target_cost(choice.layer, dt),
-                            )),
+                            Bitrate::from(crate::bitrate::saturating_bps(if choice.spatial_dd {
+                                choice.cost
+                            } else {
+                                self.decode_target_cost(choice.layer, dt)
+                            })),
                         ),
                     }
                 } else {
@@ -2492,6 +2585,7 @@ mod assignment_tests {
             layer: &same_quality,
             target: DecodeTargetSelection::Full,
             decode_target_index: 2,
+            spatial_dd: false,
             height: 360,
             fps: 30,
             cost: 1.0,

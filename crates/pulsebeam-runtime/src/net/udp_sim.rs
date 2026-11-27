@@ -6,7 +6,7 @@ use pulsebeam_udp::{
     simulation::{Io, Metadata, Readiness},
 };
 use std::task::{Context, Poll};
-use std::{io, net::SocketAddr, rc::Rc};
+use std::{cell::RefCell, io, net::SocketAddr, rc::Rc};
 use turmoil::net::UdpSocket;
 
 type Arrival = (Vec<u8>, SocketAddr, SocketAddr, ReceiveTime);
@@ -37,7 +37,19 @@ impl HostIo {
         mode: UdpMode,
     ) -> io::Result<Self> {
         let local_addr = socket.local_addr()?;
-        let network = Rc::new(Network {
+        Ok(Self {
+            member,
+            mode,
+            pending: None,
+            network: Network::new(socket, false),
+            local_addr,
+        })
+    }
+}
+
+impl Network {
+    fn new(socket: Arc<UdpSocket>, directed: bool) -> Rc<Self> {
+        let network = Rc::new(Self {
             socket,
             shaper: shaper::Shaper::default(),
             wake: Rc::new(tokio::sync::Notify::new()),
@@ -63,19 +75,109 @@ impl HostIo {
                 for (destination, payload) in shaper.drain_due(tokio::time::Instant::now()) {
                     // Preserve the host link's impairment stream: duplication is
                     // sampled only for pass-through sends, not queued releases.
-                    if !shaper.should_drop_packet(destination.ip()) {
+                    if directed || !shaper.should_drop_packet(destination.ip()) {
                         let _ = network.socket.try_send_to(&payload, destination);
                     }
                 }
             }
         });
-        Ok(Self {
-            member,
-            mode,
-            pending: None,
-            network,
-            local_addr,
+        network
+    }
+}
+
+pub async fn bind_directed_udp_socket(
+    options: pulsebeam_udp::BindOptions,
+) -> io::Result<pulsebeam_udp::BoundUdpSocket> {
+    let mut interface = options.local_addr;
+    if interface.ip().is_unspecified()
+        || options.reuse_port
+        || options.mode == pulsebeam_udp::Mode::Batch
+    {
+        return Err(io::ErrorKind::InvalidInput.into());
+    }
+    if interface.ip() == turmoil::current_ip() && !interface.ip().is_loopback() {
+        interface.set_ip(if interface.is_ipv4() {
+            std::net::Ipv4Addr::UNSPECIFIED.into()
+        } else {
+            std::net::Ipv6Addr::UNSPECIFIED.into()
+        });
+    }
+    let socket = UdpSocket::bind(interface).await?;
+    let local_addr = SocketAddr::new(options.local_addr.ip(), socket.local_addr()?.port());
+    let direct = DirectedIo {
+        network: Network::new(Arc::new(socket), true),
+        local_addr,
+        readiness: RefCell::new(None),
+    };
+    pulsebeam_udp::simulation::from_io(options, Box::new(direct))
+}
+
+struct DirectedIo {
+    network: Rc<Network>,
+    local_addr: SocketAddr,
+    readiness: RefCell<Option<Readiness<'static>>>,
+}
+
+impl Io for DirectedIo {
+    fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            max_batch_messages: 1,
+            gro: false,
+            max_gso_segments: 1,
+        }
+    }
+
+    fn poll_readable(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let mut readiness = self.readiness.borrow_mut();
+        let wait = readiness.get_or_insert_with(|| {
+            let socket = self.network.socket.clone();
+            Box::pin(async move { socket.readable().await })
+        });
+        let result = wait.as_mut().poll(cx);
+        if result.is_ready() {
+            *readiness = None;
+        }
+        result
+    }
+
+    fn writable(&self) -> Readiness<'_> {
+        Box::pin(self.network.socket.writable())
+    }
+
+    fn receive(&mut self, payload: &mut [u8]) -> io::Result<Metadata> {
+        let (len, source) = self.network.socket.try_recv_from(payload)?;
+        Ok(Metadata {
+            source,
+            destination: self.local_addr,
+            len,
+            stride: len.max(1),
+            received_at: ReceiveTime::now(),
+            ecn: None,
         })
+    }
+
+    fn submit(&mut self, entry: &SendDatagram<'_>) -> io::Result<()> {
+        let mut shaper = self.network.shaper.clone();
+        match shaper.offer_directed(
+            tokio::time::Instant::now(),
+            self.local_addr,
+            entry.destination,
+            entry.payload,
+        ) {
+            shaper::Shaped::PassThrough => self
+                .network
+                .socket
+                .try_send_to(entry.payload, entry.destination)
+                .map(|_| ()),
+            shaper::Shaped::Absorbed => {
+                self.network.wake.notify_one();
+                Ok(())
+            }
+        }
     }
 }
 
@@ -320,6 +422,71 @@ mod tests {
         });
         sim.run().unwrap();
         shaper::set_loss(destination.ip(), shaper::Loss::Independent(0.0));
+    }
+
+    #[test]
+    fn directed_bottleneck_charges_only_the_configured_tuple() {
+        use std::time::Duration;
+        let mut sim = turmoil::Builder::new().build();
+        sim.client("peer", async {
+            let bind = || {
+                bind_directed_udp_socket(pulsebeam_udp::BindOptions::new(
+                    "127.0.0.1:0".parse().unwrap(),
+                ))
+            };
+            let mut from = bind().await?.activate()?;
+            let mut to = bind().await?.activate()?;
+            let mut other = bind().await?.activate()?;
+            let (source, destination, sibling) =
+                (from.local_addr(), to.local_addr(), other.local_addr());
+            let before = shaper::directed_stats(source, destination);
+            shaper::set_directed_capacity(
+                source,
+                destination,
+                shaper::Capacity::Fixed(8_000),
+                Duration::ZERO,
+            );
+            let packet = |destination| SendDatagram {
+                destination,
+                payload: b"1234567890",
+                gso_segment_size: None,
+            };
+            assert_eq!(
+                from.try_send_batch(&[packet(destination), packet(destination), packet(sibling)])
+                    .accepted,
+                3
+            );
+            assert_eq!(
+                to.try_send_batch(&[packet(source), packet(source)])
+                    .accepted,
+                2
+            );
+            let stats = shaper::directed_stats(source, destination);
+            assert_eq!(stats.admitted_udp_bytes - before.admitted_udp_bytes, 10);
+            assert_eq!(stats.dropped_overflow - before.dropped_overflow, 1);
+            assert_eq!(
+                shaper::directed_stats(destination, source).admitted_udp_bytes,
+                0
+            );
+            assert_eq!(
+                shaper::directed_stats(source, sibling).admitted_udp_bytes,
+                0
+            );
+            for (socket, expected) in [
+                (&mut from, destination),
+                (&mut to, source),
+                (&mut other, source),
+            ] {
+                tokio::time::timeout(Duration::from_secs(1), socket.readable()).await??;
+                let batch = socket.try_recv_batch()?;
+                let packet = batch.iter().next().expect("path delivered a packet");
+                assert_eq!(packet.source, expected);
+                assert_eq!(packet.payload, b"1234567890");
+            }
+            shaper::remove_directed_capacity(source, destination);
+            Ok(())
+        });
+        sim.run().unwrap();
     }
 
     #[test]

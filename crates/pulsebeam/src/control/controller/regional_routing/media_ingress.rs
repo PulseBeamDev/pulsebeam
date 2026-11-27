@@ -284,6 +284,28 @@ pub(super) struct Receives {
 }
 
 impl Receives {
+    pub(super) fn live_media_grant(
+        &self,
+        peer: NetworkId,
+        demand: super::super::peer_ownership::target_demand::Demand,
+        now: Instant,
+    ) -> Option<super::super::peer_ownership::media_repair::Grant> {
+        self.transit
+            .get(&peer)?
+            .live_media_grant(peer, demand.label, demand.incarnation, now)
+    }
+
+    pub(super) fn media_repair_grant(
+        &self,
+        peer: NetworkId,
+        demand: crate::control::controller::peer_ownership::media_repair::Demand,
+        now: Instant,
+    ) -> Option<crate::control::controller::peer_ownership::media_repair::Grant> {
+        self.transit
+            .get(&peer)?
+            .media_repair_grant(peer, demand, now)
+    }
+
     pub(super) fn step(
         &mut self,
         actor: &mut ControllerActor,

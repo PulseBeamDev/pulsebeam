@@ -1,5 +1,11 @@
 //! Bounded control delivery on a provisioned peer session.
 
+use std::{
+    future::Future,
+    pin::pin,
+    task::{Context, Poll},
+};
+
 use super::{Fence, LinkTime, Ordering, SendErrorKind, Shared, network};
 
 pub(super) use pulsebeam_transport::CONTROL_CONTEXT as CONTEXT;
@@ -38,6 +44,17 @@ impl PeerControl {
                 pulsebeam_queue::TrySendError::Full(_) => SendErrorKind::Full,
                 pulsebeam_queue::TrySendError::Closed(_) => SendErrorKind::Closed,
             })
+    }
+
+    /// Register interest in inbound control without consuming a frame.
+    pub fn poll_readable(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        if !self.is_ready() {
+            return Poll::Pending;
+        }
+        match pin!(self.inbound.readable()).poll(cx) {
+            Poll::Ready(true) => Poll::Ready(()),
+            _ => Poll::Pending,
+        }
     }
 
     pub fn try_recv(&mut self) -> Option<Box<[u8]>> {
@@ -162,6 +179,31 @@ fn pair_with_limit(state: Shared<Fence>, frame_bytes: usize) -> (PeerControl, Ho
 mod tests {
     use super::*;
     use futures_lite::future::{block_on, poll_once};
+
+    #[test]
+    fn inbound_control_wakes_reader_without_consuming_frame() {
+        use std::{
+            sync::{Arc, atomic::AtomicBool},
+            task::{Wake, Waker},
+        };
+        struct Signal(AtomicBool);
+        impl Wake for Signal {
+            fn wake(self: Arc<Self>) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let signal = Arc::new(Signal(AtomicBool::new(false)));
+        let waker = Waker::from(signal.clone());
+        let mut cx = Context::from_waker(&waker);
+        let (mut peer, mut stream) = StreamControl::new_authenticated(std::num::NonZeroUsize::MIN);
+        assert_eq!(peer.poll_readable(&mut cx), Poll::Pending);
+        let (_, inbound) = stream.directions();
+        block_on(inbound.send(Box::from([7]))).unwrap();
+        assert!(signal.0.load(Ordering::Acquire));
+        assert_eq!(peer.poll_readable(&mut cx), Poll::Ready(()));
+        assert_eq!(peer.try_recv().as_deref(), Some(&[7][..]));
+        assert_eq!(peer.poll_readable(&mut cx), Poll::Pending);
+    }
 
     #[test]
     fn stream_is_bounded_ordered_and_fenced_on_drop() {

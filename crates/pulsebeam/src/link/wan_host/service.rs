@@ -29,7 +29,7 @@ struct Open {
     id: NetworkId,
     driver: wan::Driver<FabricWanCodec, Window>,
     commands: pulsebeam_queue::Receiver<Command>,
-    media: pulsebeam_queue::Receiver<egress::Media>,
+    media: egress::MediaInbox,
 }
 
 impl Service {

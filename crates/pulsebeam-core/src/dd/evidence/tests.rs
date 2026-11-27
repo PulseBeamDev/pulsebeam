@@ -67,6 +67,29 @@ fn reused_templates_after_a_gap_need_new_context() {
 }
 
 #[test]
+fn projection_demand_survives_a_gap_without_restoring_decode_evidence() {
+    let mut writer = DependencyDescriptorWriter::new();
+    let structure = structure_minimal();
+    let entry = encode(&mut writer, &keyframe(&structure));
+    let delta = encode(&mut writer, &delta(&structure, 0, 1));
+    let mut source = SourceContext::default();
+    assert_eq!(source.projection_demand_context(), None);
+    assert!(source.observe(100, Some(&entry)).unwrap().is_some());
+    let demand = source.projection_demand_context().unwrap();
+    assert_eq!(demand.attachment, 100);
+    assert!(source.observe(102, Some(&delta)).unwrap().is_none());
+    assert_eq!(source.projection_demand_context(), Some(demand));
+    assert!(source.observe(103, Some(&delta)).unwrap().is_none());
+    assert!(
+        source
+            .observe(100 + SEQUENCE_HISTORY, None)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(source.projection_demand_context(), None);
+}
+
+#[test]
 fn repeated_structure_retains_origin_only_with_contiguous_evidence() {
     let structure = structure_minimal();
     let mut writer = DependencyDescriptorWriter::new();
@@ -99,7 +122,7 @@ fn authenticated_padding_preserves_context_but_does_not_bridge_an_unknown_positi
     let plain = encode(&mut writer, &delta(&structure, 0, 1));
     let mut source = SourceContext::default();
     source.observe(100, Some(&seed)).unwrap().unwrap();
-    source.bridge_padding_before(103, |range| range == (101..103));
+    source.bridge_context_neutral_before(103, |range| range == (101..103));
     assert_eq!(
         source
             .observe(103, Some(&plain))
@@ -108,9 +131,9 @@ fn authenticated_padding_preserves_context_but_does_not_bridge_an_unknown_positi
             .structure_sequence,
         100
     );
-    source.bridge_padding_before(106, |range| range == (105..106));
+    source.bridge_context_neutral_before(106, |range| range == (105..106));
     assert!(source.observe(106, Some(&plain)).unwrap().is_none());
-    source.bridge_padding_before(108, |range| range == (107..108));
+    source.bridge_context_neutral_before(108, |range| range == (107..108));
     assert!(source.observe(108, Some(&plain)).unwrap().is_none());
 }
 

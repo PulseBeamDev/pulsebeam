@@ -122,6 +122,7 @@ fn exact_window_ack_gates_link_delivery_of_full_position() {
     assert!(wire.is_empty());
     assert!(tx.lease(now).is_some());
     assert!(rx.lease(now).is_some());
+    assert!(tx.send_budget(now).is_none());
     tx_control
         .try_send(ownership.clone(), LinkTime(u64::MAX))
         .unwrap();
@@ -171,7 +172,12 @@ fn exact_window_ack_gates_link_delivery_of_full_position() {
     ));
     assert!(tx.prepare(now, send, position, &42).is_err());
     tx.activate(now, send, window, spec).unwrap();
-    let sealed = tx.prepare(now, send, position, &42).unwrap();
+    let sealed = tx
+        .prepare_with(now, send, position, |codec, staged, dst| {
+            assert_eq!(staged, send);
+            codec.encode(staged.descriptor(), position, &42, dst)
+        })
+        .unwrap();
     assert!(matches!(
         tx.submit(now, sealed, &mut |destination, bytes| {
             wire.push_back((destination, bytes.to_vec()));
@@ -185,17 +191,35 @@ fn exact_window_ack_gates_link_delivery_of_full_position() {
         SocketOutcome::Accepted { bytes: bytes.len() }
     };
     assert!(
-        rx.receive(now, rx.binding(), &packet, &mut collect)
-            .is_err()
+        rx.receive_with_decoder::<()>(
+            now,
+            rx.binding(),
+            &packet,
+            None,
+            &mut collect,
+            |_, _, _| panic!("inactive receive ticket")
+        )
+        .is_err()
     );
     rx.activate(now, receive, window, receive_spec).unwrap();
     let opened = rx
-        .receive(now, rx.binding(), &packet, &mut collect)
+        .receive_with_decoder(
+            now,
+            rx.binding(),
+            &packet,
+            None,
+            &mut collect,
+            |codec, staged, bytes| {
+                assert_eq!(staged, receive);
+                let (position, value) = codec.decode(staged.descriptor(), bytes)?;
+                Ok((position, (value, staged.spec().purpose)))
+            },
+        )
         .unwrap()
         .unwrap();
     assert_eq!(opened.position, position);
     assert_eq!(opened.route, receive);
-    assert_eq!(opened.packet, 42);
+    assert_eq!(opened.packet, (42, Purpose::Repair { position }));
     assert!(rx.retire(receive));
     assert!(
         rx.receive(now, rx.binding(), &packet, &mut collect)
@@ -203,10 +227,33 @@ fn exact_window_ack_gates_link_delivery_of_full_position() {
     );
     assert!(wire.is_empty());
     tx_control.try_send(ownership, LinkTime(u64::MAX)).unwrap();
+    let feedback_at = now + Duration::from_millis(20);
+    rx.tick(feedback_at, &mut |destination, bytes| {
+        wire.push_back((destination, bytes.to_vec()));
+        SocketOutcome::Accepted { bytes: bytes.len() }
+    })
+    .unwrap();
+    for (_, feedback) in wire.drain(..) {
+        tx.receive(feedback_at, tx.binding(), &feedback, &mut |_, bytes| {
+            SocketOutcome::Accepted { bytes: bytes.len() }
+        })
+        .unwrap();
+    }
+    let budget = tx
+        .send_budget(feedback_at)
+        .expect("fresh outbound feedback");
+    assert_eq!(budget.feedback_at, feedback_at);
+    assert!(budget.pacing_bps > 0);
+    assert!(rx.send_budget(feedback_at).is_none());
+    assert!(
+        tx.send_budget(feedback_at + Duration::from_millis(500))
+            .is_none()
+    );
     let binding = Binding {
         generation: NonZeroU64::MIN.saturating_add(1),
         ..tx.binding()
     };
-    assert!(tx.replace_path(now, binding));
+    assert!(tx.replace_path(feedback_at, binding));
+    assert!(tx.send_budget(feedback_at).is_none());
     assert!(tx_control.is_closed());
 }

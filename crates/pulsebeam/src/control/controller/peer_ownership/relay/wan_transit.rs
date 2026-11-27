@@ -70,22 +70,33 @@ impl Sends {
         self.used.contains(&label) && !self.entries.contains_key(&label)
     }
 
-    pub(in crate::control::controller::peer_ownership) fn media_repair_grant(
+    pub(in crate::control::controller) fn media_repair_grant(
         &self,
         peer: NetworkId,
         demand: super::super::media_repair::Demand,
         now: Instant,
     ) -> Option<super::super::media_repair::Grant> {
+        let grant = self.live_media_grant(peer, demand.live, demand.source, now)?;
+        demand.matches_parent(grant.parent.window).then_some(grant)
+    }
+
+    pub(in crate::control::controller) fn live_media_grant(
+        &self,
+        peer: NetworkId,
+        label: NonZeroU32,
+        incarnation: std::num::NonZeroU64,
+        now: Instant,
+    ) -> Option<super::super::media_repair::Grant> {
         use super::super::media_repair::Grant;
         use crate::{link::wan_host::ParentSend, route::fabric::relay::MediaRepairParent};
-        let entry = self.entries.get(&demand.live)?;
+        let entry = self.entries.get(&label)?;
         let Phase::Active(route) = &entry.phase else {
             return None;
         };
         let window = entry.ack.window;
         if route.next.peer != peer
-            || route.input.incarnation != demand.source
-            || !demand.matches_parent(window)
+            || route.input.incarnation != incarnation
+            || window.profile() == pulsebeam_core::fabric::Profile::Data
             || now >= entry.expires
             || !entry.cutoff.is_live()
             || !route.tx.is_live()

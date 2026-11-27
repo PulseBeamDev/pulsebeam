@@ -27,7 +27,7 @@ pub struct Limits {
     /// Maximum age from authenticated ingress to this ledger, and from first
     /// admission to a competing copy. Neither limit uses RTP or NTP time.
     pub max_age: Duration,
-    /// Require a new authenticated epoch after a gap longer than this.
+    /// Require an advancing authenticated primary after a gap longer than this.
     pub max_idle: Duration,
 }
 
@@ -54,8 +54,8 @@ pub enum Input<'a> {
 #[derive(Clone, Copy)]
 pub enum Position {
     LowSequence(u16),
-    /// Full sequence from an authenticated native binding, not a trusted
-    /// absolute index. Resolve wraps and enforce the same source window here.
+    /// Sequence from the current replay-protected native binding. Extend
+    /// against this incarnation's anchor and enforce its forward window.
     CanonicalSequence(u32),
     AuthenticatedPrimary(u64),
 }
@@ -270,10 +270,13 @@ impl MediaIdentity {
                 .high
                 .map_or_else(|| Ok(u64::from(low)), |high| extend_u16(low, high))
                 .map_err(serial_rejection)?,
-            Position::CanonicalSequence(raw) if !idle => self
-                .high
-                .map_or_else(|| Ok(u64::from(raw)), |high| extend_u32(raw, high))
-                .map_err(serial_rejection)?,
+            Position::CanonicalSequence(raw)
+                if !idle || matches!(&input, Input::Media(copy) if !copy.is_repair) =>
+            {
+                self.high
+                    .map_or_else(|| Ok(u64::from(raw)), |high| extend_u32(raw, high))
+                    .map_err(serial_rejection)?
+            }
             Position::AuthenticatedPrimary(_)
             | Position::LowSequence(_)
             | Position::CanonicalSequence(_) => {

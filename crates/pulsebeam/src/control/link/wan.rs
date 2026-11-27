@@ -21,6 +21,8 @@ use crate::{
     },
 };
 
+mod target_demand;
+
 const RECEIVE_LIMIT: usize = crate::control::controller::peer_ownership::relay::LIMIT;
 
 #[cfg(all(test, target_os = "linux", not(feature = "sim")))]
@@ -95,6 +97,7 @@ struct LiveAdvertisement {
     regional: Option<RegionalReceive>,
     routed: bool,
     evidence: Option<RelayEvidence>,
+    projection: target_demand::ProjectionTx,
 }
 
 struct RegionalReceive {
@@ -105,6 +108,13 @@ struct RegionalReceive {
 }
 
 impl Receive {
+    fn can_sample_projection(&self, now: Instant) -> bool {
+        now < self.expires()
+            && self.pending.is_none()
+            && self.window.profile() == fabric::Profile::Vp9
+            && self.bindings.iter().all(|(_, endpoint)| endpoint.is_live())
+    }
+
     fn expires(&self) -> Instant {
         self.deadline.as_ref().map_or(self.expires, |deadline| {
             Instant::from_std(deadline.expires())
@@ -224,7 +234,6 @@ impl Links {
         source: WanSourceWindow,
         ack: WanLiveRouteAck,
         expires: Instant,
-        renewable: bool,
         now: Instant,
     ) -> Result<(BindingCutoff, wan_host::PendingTx), BindError> {
         if now >= expires || !source.matches_ack(ack) {
@@ -247,7 +256,7 @@ impl Links {
             purpose: pulsebeam_link::wan::Purpose::Live,
             expires: expires.into_std(),
         };
-        self.stage_wan_send(peer, expected, ack.window, spec, renewable, None)
+        self.stage_wan_send(peer, expected, ack.window, spec, true, None)
     }
 
     pub(in crate::control) fn is_wan_peer(&self, peer: NetworkId) -> bool {
@@ -569,9 +578,9 @@ impl Links {
             activity: wan_host::ReceiveActivity::default(),
             warming,
         });
-        let deadline = spec
-            .routed
-            .then(|| pulsebeam_link::wan::LiveDeadline::new(spec.expires.into_std()));
+        let deadline = Some(pulsebeam_link::wan::LiveDeadline::new(
+            spec.expires.into_std(),
+        ));
         if let Err(error) = peer.commands.try_send(ReceiveCommand::Live {
             expires: spec.expires,
             deadline: deadline.clone(),
@@ -605,6 +614,7 @@ impl Links {
                     children: live_children,
                     regional,
                     routed: spec.routed,
+                    projection: target_demand::ProjectionTx::default(),
                     evidence: self.node.map(|local| RelayEvidence {
                         local,
                         peer: self.peer_ids.get(&live.peer).copied(),
@@ -711,6 +721,8 @@ impl Links {
     pub(in crate::control) fn retain_wan_live_receives(
         &mut self,
         peer: NetworkId,
+        now: Instant,
+        expires: Instant,
         mut keep: impl FnMut(
             WanLiveRouteAck,
             NetworkId,
@@ -728,13 +740,23 @@ impl Links {
             if live.routed {
                 return true;
             }
-            if receive.bindings.len() == live.children.len()
+            if now < expires.min(receive.expires())
+                && receive.bindings.len() == live.children.len()
+                && receive.bindings.iter().all(|(_, tx)| tx.is_live())
                 && keep(
                     live.ack,
                     live.canonical_ingress,
                     &live.children,
                     live.regional.as_ref().map(|regional| regional.source),
                 )
+                && if receive.pending.is_some() {
+                    expires >= receive.expires()
+                } else {
+                    receive
+                        .deadline
+                        .as_ref()
+                        .is_some_and(|deadline| deadline.renew(now.into_std(), expires.into_std()))
+                }
             {
                 true
             } else {
@@ -884,6 +906,127 @@ impl Links {
                 })
                 .collect(),
         )
+    }
+
+    pub(in crate::control) fn wan_video_share(
+        &self,
+        network: NetworkId,
+        now: Instant,
+    ) -> Option<(u32, Instant)> {
+        self.wan.get(&network)?.commands.video_share(now)
+    }
+
+    pub(in crate::control) fn accept_wan_video_share(
+        &mut self,
+        network: NetworkId,
+        label: NonZeroU32,
+        incarnation: NonZeroU64,
+        generation: NonZeroU64,
+        now: Instant,
+    ) -> Option<(WanLiveRouteAck, pulsebeam_link::BindingCutoff, Instant)> {
+        let peer = self.wan.get_mut(&network)?;
+        let receive = peer.receives.get_mut(&label)?;
+        let expires = receive.expires();
+        if now >= expires
+            || receive.pending.is_some()
+            || receive.bindings.is_empty()
+            || !receive
+                .bindings
+                .iter()
+                .all(|(_, endpoint)| endpoint.is_live())
+        {
+            return None;
+        }
+        let live = receive.live.as_mut()?;
+        if live.ack.incarnation != incarnation || !live.projection.accepts_budget(generation) {
+            return None;
+        }
+        let cutoff = receive.bindings.first()?.1.local_cutoff()?;
+        Some((live.ack, cutoff, expires))
+    }
+
+    pub(in crate::control) fn poll_wan_target_samples(
+        &mut self,
+        network: NetworkId,
+        now: Instant,
+        cx: &mut Context<'_>,
+    ) -> bool {
+        self.wan.get_mut(&network).is_some_and(|peer| {
+            peer.receives.values_mut().any(|receive| {
+                receive.can_sample_projection(now)
+                    && receive
+                        .live
+                        .as_mut()
+                        .is_some_and(|live| live.projection.poll_delivery(cx))
+            })
+        })
+    }
+
+    pub(in crate::control) fn wan_target_sample_ready(
+        &self,
+        network: NetworkId,
+        now: Instant,
+    ) -> bool {
+        self.wan.get(&network).is_some_and(|peer| {
+            peer.receives.values().any(|receive| {
+                receive.can_sample_projection(now)
+                    && receive
+                        .live
+                        .as_ref()
+                        .is_some_and(|live| live.projection.delivery_ready())
+            })
+        })
+    }
+
+    pub(in crate::control) fn drive_wan_target_demands(
+        &mut self,
+        network: NetworkId,
+        now: Instant,
+        mut sample: impl FnMut(&[LiveNetworkChild]) -> Vec<target_demand::Receipt>,
+        mut emit: impl FnMut(
+            WanLiveRouteAck,
+            NonZeroU64,
+            Option<crate::route::fabric::target_demand::Projection>,
+            Instant,
+        ) -> bool,
+    ) {
+        let Some(peer) = self.wan.get_mut(&network) else {
+            return;
+        };
+        for receive in peer.receives.values_mut() {
+            let expires = receive.expires();
+            if !receive.can_sample_projection(now) {
+                continue;
+            }
+            let Some(live) = &mut receive.live else {
+                continue;
+            };
+            let ack = live.ack;
+            if !live.projection.selected {
+                if let Some(receipt) = &mut live.projection.selecting {
+                    match receipt.try_recv() {
+                        Ok(selected) => {
+                            live.projection.selected = selected;
+                        }
+                        Err(oneshot::error::TryRecvError::Empty) => continue,
+                        Err(oneshot::error::TryRecvError::Closed) => {}
+                    }
+                    live.projection.selecting = None;
+                } else {
+                    live.projection.selecting = peer
+                        .commands
+                        .select_projection(receive.window, ack.incarnation)
+                        .ok();
+                }
+            }
+            if live.projection.selected {
+                live.projection.step(
+                    now,
+                    || sample(&live.children),
+                    |generation, projection| emit(ack, generation, projection, expires),
+                );
+            }
+        }
     }
 
     pub(in crate::control) fn wan_offers(&mut self, network: NetworkId) -> Box<[WanLiveRouteAck]> {

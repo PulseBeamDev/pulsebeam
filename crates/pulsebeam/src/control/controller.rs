@@ -1025,6 +1025,10 @@ impl ControllerActor {
             let maintenance_due = if self.has_ready_egress() {
                 false
             } else {
+                let trusted = self
+                    .receipt_trust
+                    .as_ref()
+                    .is_some_and(ownership::receipt::Authority::ready);
                 pulsebeam_runtime::select! {
                     biased;
                     _ = shutdown.cancelled() => break,
@@ -1034,7 +1038,20 @@ impl ControllerActor {
                     true = shard_event_rx.readable() => false,
                     true = self.native_ready_rx.readable() => false,
                     () = poll_fn(|cx| Self::poll_materializations(&mut self.materializations, cx)) => false,
-                    () = poll_fn(|cx| self.links.as_mut().map_or(Poll::Pending, |links| links.poll_ready(cx))) => false,
+                    () = poll_fn(|cx| {
+                        let links = &mut self.links;
+                        let now = pulsebeam_runtime::time::Instant::now();
+                        if links.as_mut().is_some_and(|links| links.poll_ready(cx).is_ready())
+                            || self.provisioned_peers.iter_mut().any(|peer| {
+                                peer.poll_control(cx).is_ready() || (trusted && links.as_mut()
+                                    .is_some_and(|links| peer.poll_target_samples(links, now, cx)))
+                            })
+                        {
+                            Poll::Ready(())
+                        } else {
+                            Poll::Pending
+                        }
+                    }) => false,
                     Some(bytes) = self.deletion_rx.recv() => {
                         self.release_deletion(bytes);
                         false
@@ -2381,6 +2398,21 @@ impl ControllerActor {
 
     fn handle_shard_event(&mut self, (shard, event): ShardEventMessage) {
         match event {
+            ShardEvent::NetworkMediaRefresh(interest) => {
+                if interest.parent.destination.shard() != shard {
+                    return;
+                }
+                let now = pulsebeam_runtime::time::Instant::now();
+                if let Some(peer) = self
+                    .provisioned_peers
+                    .iter()
+                    .find(|peer| peer.matches_network(interest.parent.ingress.association))
+                {
+                    peer.request_media_refresh(*interest, now);
+                } else if let Some(routing) = &self.regional_routing {
+                    routing.request_border_media_refresh(*interest, now);
+                }
+            }
             ShardEvent::NetworkMediaRepair(interest) => {
                 if interest.parent.destination.shard() == shard
                     && let Some(peer) = self
@@ -3455,6 +3487,107 @@ impl ControllerActor {
         }
         self.publish_staged();
         receive
+    }
+
+    fn receive_wan_video_budget(
+        &mut self,
+        network: pulsebeam_link::NetworkId,
+        budget: peer_ownership::target_demand::Budget,
+        now: pulsebeam_runtime::time::Instant,
+    ) {
+        let Some(expires) = budget.expires(now) else {
+            return;
+        };
+        let Some((ack, cutoff, route_expires)) = self.links.as_mut().and_then(|links| {
+            links.accept_wan_video_share(
+                network,
+                budget.label,
+                budget.incarnation,
+                budget.generation,
+                now,
+            )
+        }) else {
+            return;
+        };
+        if let Some(crate::track::Track::Video(video)) =
+            self.lifecycle.source_exact(ack.room, ack.publication)
+        {
+            video.refresh_wan_video_budget(
+                ack.incarnation,
+                cutoff,
+                budget.bps,
+                expires.min(route_expires),
+                now,
+            );
+        }
+    }
+
+    fn drive_wan_target_demands(
+        &mut self,
+        network: pulsebeam_link::NetworkId,
+        lane: &pulsebeam_link::PeerControl,
+        epoch: pulsebeam_runtime::time::Instant,
+        now: pulsebeam_runtime::time::Instant,
+    ) {
+        use pulsebeam_runtime::time::Duration;
+        if !lane.is_ready() {
+            return;
+        }
+        let Some(links) = &mut self.links else { return };
+        let generation = self.lifecycle.next_generation();
+        let mut touched = Vec::new();
+        links.drive_wan_target_demands(
+            network,
+            now,
+            |children| {
+                children
+                    .iter()
+                    .map(|&child| {
+                        let shard = child.destination.shard();
+                        if let Some(writer) = self
+                            .updates
+                            .get_mut(shard.index())
+                            .filter(|writer| !writer.is_closed())
+                        {
+                            touched.push(shard);
+                            writer.stage_viewer_projection(generation, child)
+                        } else {
+                            let (_, receipt) = oneshot::channel();
+                            receipt
+                        }
+                    })
+                    .collect()
+            },
+            |ack, generation, projection, expires| {
+                let demand = peer_ownership::target_demand::Demand {
+                    label: ack.window.ssrc(),
+                    incarnation: ack.incarnation,
+                    generation,
+                    projection,
+                    ttl_ms: if projection.is_some() { 600 } else { 0 },
+                };
+                let deadline = now
+                    .checked_add(Duration::from_millis(150))
+                    .unwrap_or(now)
+                    .min(expires);
+                let Some(cutoff) = deadline
+                    .checked_duration_since(epoch)
+                    .and_then(|duration| u64::try_from(duration.as_nanos()).ok())
+                    .map(pulsebeam_link::LinkTime)
+                else {
+                    return false;
+                };
+                demand
+                    .encode()
+                    .is_some_and(|frame| lane.try_send(frame, cutoff).is_ok())
+            },
+        );
+        if !touched.is_empty() {
+            for shard in touched {
+                self.mark_update_touched(shard);
+            }
+            self.publish_staged();
+        }
     }
 
     fn sample_wan_publisher_anchors(

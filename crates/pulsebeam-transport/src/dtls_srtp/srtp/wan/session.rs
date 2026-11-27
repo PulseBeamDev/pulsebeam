@@ -58,6 +58,15 @@ enum Emission {
 
 type Send<'a> = dyn FnMut(SocketAddr, &[u8]) -> SocketOutcome + 'a;
 
+/// Feedback-qualified rates for one outbound path, in bits per second.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SendBudget {
+    pub feedback_at: Instant,
+    pub valid_until: Instant,
+    pub payload_bps: u64,
+    pub pacing_bps: u64,
+}
+
 pub struct Session {
     binding: Binding,
     role: Role,
@@ -135,6 +144,10 @@ impl Session {
             return None;
         }
         self.path.as_ref()?.lease(now)
+    }
+
+    pub fn send_budget(&self, now: Instant) -> Option<SendBudget> {
+        self.history.send_budget(now, self.lease(now)?)
     }
 
     pub fn next_deadline(&self) -> Option<Instant> {

@@ -63,22 +63,33 @@ impl PublisherSends {
         self.used.contains(&label) && !self.entries.contains_key(&label)
     }
 
-    pub(in crate::control::controller::peer_ownership) fn media_repair_grant(
+    pub(in crate::control::controller) fn media_repair_grant(
         &self,
         peer: NetworkId,
         demand: super::super::media_repair::Demand,
         now: Instant,
     ) -> Option<super::super::media_repair::Grant> {
+        let grant = self.live_media_grant(peer, demand.live, demand.source, now)?;
+        demand.matches_parent(grant.parent.window).then_some(grant)
+    }
+
+    pub(in crate::control::controller) fn live_media_grant(
+        &self,
+        peer: NetworkId,
+        label: NonZeroU32,
+        incarnation: std::num::NonZeroU64,
+        now: Instant,
+    ) -> Option<super::super::media_repair::Grant> {
         use super::super::media_repair::Grant;
         use crate::route::fabric::relay::MediaRepairParent;
-        let entry = self.entries.get(&demand.live)?;
+        let entry = self.entries.get(&label)?;
         let Phase::Installed(route) = &entry.phase else {
             return None;
         };
         let window = entry.permit.ack.window;
         if route.next.peer != peer
-            || route.publisher.incarnation != demand.source
-            || !demand.matches_parent(window)
+            || route.publisher.incarnation != incarnation
+            || window.profile() == pulsebeam_core::fabric::Profile::Data
             || now >= entry.expires
             || !entry.cutoff.is_live()
             || !route.tx.is_live()
@@ -202,7 +213,6 @@ impl PublisherSends {
                 Some((source, ack, expires))
             }),
             now,
-            false,
         );
     }
 
@@ -216,7 +226,6 @@ impl PublisherSends {
         peer: NetworkId,
         permits: impl IntoIterator<Item = (WanSourceWindow, WanLiveRouteAck, Instant)>,
         now: Instant,
-        routed: bool,
     ) {
         let mut desired = BTreeMap::new();
         for (source, ack, expires) in permits {
@@ -240,7 +249,7 @@ impl PublisherSends {
                     && now < expires.min(entry.expires)
                     && entry.cutoff.is_live()
                     && entry.advance(actor, peer)
-                    && (!routed || entry.renew(now, expires))
+                    && entry.renew(now, expires)
             });
             if !retained {
                 entry.retire(actor);
@@ -257,14 +266,9 @@ impl PublisherSends {
             if self.used.contains(&ssrc) {
                 continue;
             }
-            if let Ok((cutoff, pending)) = links.stage_wan_publisher_transport(
-                peer,
-                permit.source,
-                permit.ack,
-                expires,
-                routed,
-                now,
-            ) {
+            if let Ok((cutoff, pending)) =
+                links.stage_wan_publisher_transport(peer, permit.source, permit.ack, expires, now)
+            {
                 self.used.insert(ssrc);
                 self.entries.insert(
                     ssrc,

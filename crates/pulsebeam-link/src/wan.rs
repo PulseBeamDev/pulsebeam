@@ -13,7 +13,10 @@ pub use pulsebeam_transport::dtls_srtp::wan::{
     Direction, Limits, MAX_DATAGRAM_BYTES,
     handoff::{Prepared, SocketOutcome, Submission},
     path::{Binding, Lease},
-    session::{Config, Ecn, Fingerprint, LiveDeadline, LocalIdentity, Purpose, Role, WindowSpec},
+    session::{
+        Config, Ecn, Fingerprint, LiveDeadline, LocalIdentity, Purpose, Role, SendBudget,
+        WindowSpec,
+    },
 };
 
 use crate::{CodecError, Fence, LinkTime, Ordering, PeerControl, Shared, control, network};
@@ -176,6 +179,10 @@ where
 
     pub fn lease(&self, now: Instant) -> Option<Lease> {
         self.session.lease(now)
+    }
+
+    pub fn send_budget(&self, now: Instant) -> Option<SendBudget> {
+        self.session.send_budget(now)
     }
 
     pub fn next_deadline(&self) -> Option<Instant> {
@@ -373,6 +380,18 @@ where
     where
         C: Codec<P, Window = W>,
     {
+        self.prepare_with(now, staged, position, |codec, window, dst| {
+            codec.encode(window.descriptor(), position, packet, dst)
+        })
+    }
+
+    pub fn prepare_with(
+        &mut self,
+        now: Instant,
+        staged: Staged<W>,
+        position: u64,
+        encode: impl FnOnce(&C, Staged<W>, &mut [u8]) -> Result<usize, CodecError>,
+    ) -> Result<Prepared, Error> {
         let spec = staged.spec();
         if spec.direction != Direction::Send
             || self.windows.get(&(spec.direction, spec.ssrc)) != Some(&staged)
@@ -380,9 +399,7 @@ where
             return Err(Error::Scope);
         }
         let mut bytes = [0; MAX_DATAGRAM_BYTES];
-        let written = self
-            .codec
-            .encode(staged.descriptor, position, packet, &mut bytes)?;
+        let written = encode(&self.codec, staged, &mut bytes)?;
         let plaintext = bytes.get(..written).ok_or(CodecError::TooLarge)?;
         self.session
             .prepare_media(now, staged.route, position, plaintext)
@@ -394,7 +411,19 @@ where
     }
 
     pub fn submit(&mut self, now: Instant, prepared: Prepared, send: &mut Send<'_>) -> Submission {
-        let outcome = self.session.submit_media(now, prepared, send);
+        self.submit_with_reserve(now, prepared, 0, send)
+    }
+
+    pub fn submit_with_reserve(
+        &mut self,
+        now: Instant,
+        prepared: Prepared,
+        reserve_bytes: usize,
+        send: &mut Send<'_>,
+    ) -> Submission {
+        let outcome = self
+            .session
+            .submit_media_with_reserve(now, prepared, reserve_bytes, send);
         if matches!(outcome, Submission::Dropped(_)) {
             self.sync_control(now);
         }
@@ -425,6 +454,22 @@ where
     where
         C: Codec<P, Window = W>,
     {
+        self.receive_with_decoder(now, binding, bytes, ecn, send, |codec, window, bytes| {
+            codec.decode(window.descriptor(), bytes)
+        })
+    }
+
+    /// Select a decoder using the exact activated ticket, after authentication.
+    /// Hop metadata can be returned with the packet without becoming packet data.
+    pub fn receive_with_decoder<P>(
+        &mut self,
+        now: Instant,
+        binding: Binding,
+        bytes: &[u8],
+        ecn: Option<Ecn>,
+        send: &mut Send<'_>,
+        decode: impl FnOnce(&C, Staged<W>, &[u8]) -> Result<(u64, P), CodecError>,
+    ) -> Result<Option<Received<P, W>>, Error> {
         if binding != self.binding {
             return Ok(None);
         }
@@ -451,7 +496,7 @@ where
                     .copied()
                     .filter(|route| route.route == opened.window)
                     .ok_or(Error::Scope)?;
-                let (position, packet) = self.codec.decode(route.descriptor, &opened.plaintext)?;
+                let (position, packet) = decode(&self.codec, route, &opened.plaintext)?;
                 if position != opened.position {
                     return Err(Error::Scope);
                 }

@@ -5,7 +5,9 @@
 //! selects the profile, SSRC, aligned 32,768-position window and allowed RTP
 //! extensions. The header has V=2, P=0, CC=0, optional X, M, PT=96+H, low
 //! sequence bits, timestamp and SSRC. Fields are big-endian. An RFC 8285 block
-//! uses ascending IDs 2–9 and minimum zero padding. The full RTP plaintext is
+//! uses ascending IDs 2–9 and minimum zero padding. An explicitly selected
+//! VP9 forward projection may append a hop-only omission run at ID 10. It
+//! does not become part of the Fabric image. The full RTP plaintext is
 //! limited to 1,216 bytes before the 16-byte SRTP tag. No format sniffing.
 //!
 //! Association authorization, SRTP, DATA record projection and DD context are
@@ -13,7 +15,7 @@
 //!
 //! [rfc]: https://github.com/PulseBeamDev/pulsebeam/issues/275
 
-use std::num::{NonZeroU16, NonZeroU32};
+use std::num::{NonZeroU8, NonZeroU16, NonZeroU32};
 
 use super::{
     BorrowedPacket, ExtensionKind, FabricPacket, Form, Header, MAX_HOPS, MAX_WAN_RTP_BYTES,
@@ -28,6 +30,40 @@ const HOP_PT: u8 = 96;
 pub const FEEDBACK_SSRC: u32 = 0x0a0b_0c0d;
 const KNOWN_EXTENSIONS: u16 = 0x03fc;
 const GCM_TAG_BYTES: usize = 16;
+const OMISSION_ID: u8 = 10;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OmissionRun(NonZeroU8);
+
+impl OmissionRun {
+    pub const MAX: u8 = 16;
+
+    pub fn new(count: u8) -> Option<Self> {
+        NonZeroU8::new(count)
+            .filter(|count| count.get() <= Self::MAX)
+            .map(Self)
+    }
+
+    pub fn positions(self, carrier: u64) -> Option<std::ops::Range<u64>> {
+        Some(carrier.checked_sub(u64::from(self.0.get()))?..carrier)
+    }
+
+    fn fits(self, window: Window, carrier: u64) -> bool {
+        window.profile == Profile::Vp9
+            && window.contains(carrier)
+            && self
+                .positions(carrier)
+                .is_some_and(|range| window.contains(range.start))
+    }
+
+    fn element(self, form: Form) -> ([u8; 3], usize) {
+        let count = self.0.get();
+        match form {
+            Form::One => ([OMISSION_ID << 4, count, 0], 2),
+            Form::Two => ([OMISSION_ID, 1, count], 3),
+        }
+    }
+}
 
 /// Immutable wire facts for one installed forward or repair window. The owner
 /// also binds its association, direction, purpose and key lifetime.
@@ -200,6 +236,23 @@ impl Window {
 
     /// Decode one authenticated RTP plaintext under the exact window binding.
     pub fn decode(self, bytes: &[u8]) -> Result<(u64, BorrowedPacket<'_>), WireError> {
+        self.decode_inner(bytes, false)
+            .map(|(position, packet, _)| (position, packet))
+    }
+
+    /// Only for a forward window whose receiver explicitly selected projection.
+    pub fn decode_projected(
+        self,
+        bytes: &[u8],
+    ) -> Result<(u64, BorrowedPacket<'_>, Option<OmissionRun>), WireError> {
+        self.decode_inner(bytes, true)
+    }
+
+    fn decode_inner(
+        self,
+        bytes: &[u8],
+        allow_omission: bool,
+    ) -> Result<(u64, BorrowedPacket<'_>, Option<OmissionRun>), WireError> {
         if bytes.len() > MAX_WAN_RTP_BYTES {
             return Err(WireError::Oversize);
         }
@@ -232,7 +285,7 @@ impl Window {
         if hops == MAX_HOPS {
             return Err(WireError::NetworkHop);
         }
-        let (form, optional, payload) = if *first == 0x90 {
+        let (form, optional, omission, payload) = if *first == 0x90 {
             let [a, b, c, d, rest @ ..] = body else {
                 return Err(WireError::ExtensionLayout);
             };
@@ -241,9 +294,13 @@ impl Window {
             let (block, payload) = rest
                 .split_at_checked(block_len)
                 .ok_or(WireError::ExtensionLayout)?;
-            (form, self.optional_bytes(form, block)?, payload)
+            let (optional, omission) = self.optional_bytes(form, block, allow_omission)?;
+            if omission.is_some_and(|run| !run.fits(self, position)) {
+                return Err(WireError::Window);
+            }
+            (form, optional, omission, payload)
         } else {
-            (Form::One, &[][..], body)
+            (Form::One, &[][..], None, body)
         };
         self.profile.validate_payload(payload.len())?;
         let protected = bytes.len().saturating_add(GCM_TAG_BYTES);
@@ -264,6 +321,7 @@ impl Window {
                 source_protected_bytes: None,
                 wan_received_bytes,
             },
+            omission,
         ))
     }
 
@@ -273,6 +331,58 @@ impl Window {
         self,
         position: u64,
         packet: &FabricPacket<P, E>,
+        output: &mut [u8],
+    ) -> Result<usize, WireError> {
+        self.write_inner(position, packet, None, output)
+    }
+
+    /// Complete UDP payload size after the fixed SRTP authentication tag.
+    /// This does not replace the encoder's window and packet validation.
+    pub fn protected_len<P: AsRef<[u8]>, E: AsRef<[u8]>>(
+        packet: &FabricPacket<P, E>,
+        run: Option<OmissionRun>,
+    ) -> Result<usize, WireError> {
+        let optional_len = packet
+            .optional
+            .as_ref()
+            .len()
+            .saturating_add(run.map_or(0, |run| run.element(packet.form).1));
+        Ok(check_wan_size(optional_len, packet.payload().len())?.saturating_add(GCM_TAG_BYTES))
+    }
+
+    pub fn accommodates_omission<P: AsRef<[u8]>, E: AsRef<[u8]>>(
+        self,
+        position: u64,
+        packet: &FabricPacket<P, E>,
+        run: OmissionRun,
+    ) -> bool {
+        let optional = packet.optional.as_ref();
+        run.fits(self, position)
+            && !optional.is_empty()
+            && self.allows_form(packet.form)
+            && check_wan_size(
+                optional.len().saturating_add(run.element(packet.form).1),
+                packet.payload().len(),
+            )
+            .is_ok()
+    }
+
+    /// Only for a forward window whose receiver explicitly selected projection.
+    pub fn write_projected<P: AsRef<[u8]>, E: AsRef<[u8]>>(
+        self,
+        position: u64,
+        packet: &FabricPacket<P, E>,
+        run: OmissionRun,
+        output: &mut [u8],
+    ) -> Result<usize, WireError> {
+        self.write_inner(position, packet, Some(run), output)
+    }
+
+    fn write_inner<P: AsRef<[u8]>, E: AsRef<[u8]>>(
+        self,
+        position: u64,
+        packet: &FabricPacket<P, E>,
+        run: Option<OmissionRun>,
         output: &mut [u8],
     ) -> Result<usize, WireError> {
         let header = packet.header();
@@ -287,12 +397,20 @@ impl Window {
         for ext in packet.extensions() {
             self.check_extension(ext.kind as u8, ext.value)?;
         }
-        if !optional.is_empty() && !self.allows_form(packet.form) {
+        let (element, element_len) = match run {
+            Some(run) if run.fits(self, position) && !optional.is_empty() => {
+                run.element(packet.form)
+            }
+            Some(_) => return Err(WireError::Window),
+            None => ([0; 3], 0),
+        };
+        let optional_len = optional.len().saturating_add(element_len);
+        if optional_len > 0 && !self.allows_form(packet.form) {
             return Err(WireError::ExtensionLayout);
         }
         let payload = packet.payload();
-        let len = check_wan_size(optional.len(), payload.len())?;
-        let header_len = wan_size(optional.len(), 0);
+        let len = check_wan_size(optional_len, payload.len())?;
+        let header_len = wan_size(optional_len, 0);
         let (rtp, payload_out) = output
             .get_mut(..len)
             .and_then(|out| out.split_at_mut_checked(header_len))
@@ -324,9 +442,11 @@ impl Window {
                 .map_err(|_| WireError::Oversize)?
                 .to_be_bytes();
             let (dst, pad) = body
-                .split_at_mut_checked(optional.len())
+                .split_at_mut_checked(optional_len)
                 .ok_or(WireError::OutputTooSmall)?;
-            dst.copy_from_slice(optional);
+            let (canonical, hop) = dst.split_at_mut(optional.len());
+            canonical.copy_from_slice(optional);
+            hop.copy_from_slice(&element[..element_len]);
             pad.fill(0);
         }
         payload_out.copy_from_slice(payload);
@@ -342,19 +462,35 @@ impl Window {
             != 0
     }
 
-    fn optional_bytes(self, form: Form, block: &[u8]) -> Result<&[u8], WireError> {
+    fn optional_bytes(
+        self,
+        form: Form,
+        block: &[u8],
+        allow_omission: bool,
+    ) -> Result<(&[u8], Option<OmissionRun>), WireError> {
         if !self.allows_form(form) {
             return Err(WireError::ExtensionLayout);
         }
         let mut rest = block;
         let mut last = 1;
         let mut needs_two = false;
+        let mut omission = None;
+        let mut canonical_len = 0;
         while rest.first().is_some_and(|byte| *byte != 0) {
             let (id, value, next) = form.read_element(rest)?;
-            if id <= last {
+            if id <= last || omission.is_some() {
                 return Err(WireError::ExtensionLayout);
             }
+            if allow_omission && id == OMISSION_ID && last != 1 {
+                let [count] = value else {
+                    return Err(WireError::ExtensionLayout);
+                };
+                omission = Some(OmissionRun::new(*count).ok_or(WireError::ExtensionLayout)?);
+                rest = next;
+                continue;
+            }
             self.check_extension(id, value)?;
+            canonical_len = block.len() - next.len();
             needs_two |= value.len() > 16;
             last = id;
             rest = next;
@@ -366,9 +502,7 @@ impl Window {
         {
             return Err(WireError::ExtensionLayout);
         }
-        block
-            .get(..block.len().saturating_sub(rest.len()))
-            .ok_or(WireError::ExtensionLayout)
+        Ok((&block[..canonical_len], omission))
     }
 
     fn check_extension(self, id: u8, value: &[u8]) -> Result<(), WireError> {

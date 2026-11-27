@@ -789,6 +789,7 @@ impl ShardCore {
         #[cfg(feature = "sim")]
         let wan_protected_bytes = image.packet.wan_received_bytes();
         let position = image.position;
+        let omitted = image.omitted;
         let capture = image.capture;
         let result = self
             .execution
@@ -841,11 +842,15 @@ impl ShardCore {
                 if let Some(interest) = self
                     .execution
                     .runtime
-                    .observe_network_media_position(address, ingress, position, now)
+                    .observe_network_media_position(address, ingress, position, omitted, now)
                 {
                     self.execution.pipeline.push_network_media_repair(interest);
                 }
                 self.execution.drain_fabric_rtp(source, now);
+                if profile == pulsebeam_core::fabric::Profile::Vp9 {
+                    self.execution
+                        .refresh_after_fabric_offer(source, now, &report);
+                }
             } else if report.enqueued != 0 {
                 self.execution.drain_fabric_data(source, now);
             }
@@ -1193,7 +1198,7 @@ impl ShardExecution {
                     receiver.fabric_io_authorized()
                         && receiver.handoff_pending(handoff.id)
                         && runtime
-                            .fabric_dd_source(handoff.branch.source())
+                            .fabric_branch_video_source(handoff.branch)
                             .is_none_or(|(track, encoding)| {
                                 runtime
                                     .fabric_branch_target(handoff.branch)
@@ -1209,6 +1214,35 @@ impl ShardExecution {
                 })
     }
 
+    pub(super) fn sample_viewer_projection(
+        &mut self,
+        sample: crate::shard_update::SampleViewerProjection,
+    ) {
+        let now = Instant::now();
+        let runtime = &self.runtime;
+        let result = runtime.sample_viewer_projection(sample.child, |destination, branch| {
+            use crate::route::fabric::local::ViewerDemand;
+            let Some(receiver) = self
+                .registry
+                .resolve_mut(destination)
+                .filter(|receiver| receiver.fabric_io_authorized())
+            else {
+                return ViewerDemand::Unauthorized;
+            };
+            let Some(replacement) = receiver.staged_fabric_replacement(branch) else {
+                return ViewerDemand::Include;
+            };
+            let allowed_targets = runtime
+                .fabric_branch_video_source(branch)
+                .and_then(|(track, _)| receiver.wan_allowed_targets(track, now));
+            ViewerDemand::Staged {
+                replacement,
+                allowed_targets,
+            }
+        });
+        let _ = sample.result.send(result);
+    }
+
     pub(super) fn update_live_relay(
         &mut self,
         change: crate::route::fabric::LiveRelayChange,
@@ -1219,6 +1253,10 @@ impl ShardExecution {
                 self.runtime.install_live_relay(Instant::now(), relay)
             }
             LiveRelayChange::Retire(relay) => self.runtime.retire_live_relay(&relay),
+            LiveRelayChange::Demand(route, demand) => {
+                self.runtime
+                    .apply_relay_demand(Instant::now(), &route, demand)
+            }
         }
     }
 
@@ -1535,6 +1573,15 @@ impl ShardExecution {
                 installed
             }
             PublisherSendChange::Retire(route) => self.runtime.retire_publisher_send(&route),
+            PublisherSendChange::Demand(route, demand) => {
+                let Some((publisher, source)) = self.rtp_publisher_source(route.publisher) else {
+                    return false;
+                };
+                self.fabric_publisher_authorized(publisher, source)
+                    && self
+                        .runtime
+                        .apply_publisher_demand(Instant::now(), source, &route, demand)
+            }
         }
     }
 
@@ -1568,11 +1615,12 @@ impl ShardExecution {
         request: crate::shard_update::LocateRelayRepair,
     ) {
         use crate::route::fabric::relay::PeerRepairLookup;
-        if request.result.is_closed() {
+        if request.result.is_closed() && !matches!(&request.lookup, PeerRepairLookup::Refresh(_)) {
             return;
         }
         let now = Instant::now();
         match request.lookup {
+            PeerRepairLookup::Refresh(lookup) => self.forward_peer_vp9_refresh(lookup, now),
             PeerRepairLookup::Media(lookup) => {
                 let located = self.locate_peer_media_repair(lookup, now);
                 let _ = request.result.send(located);
@@ -1679,6 +1727,57 @@ impl ShardExecution {
             .then_some((participant, source))
     }
 
+    fn forward_peer_vp9_refresh(
+        &mut self,
+        lookup: crate::route::fabric::relay::MediaRepairLookup,
+        now: Instant,
+    ) {
+        use crate::route::fabric::relay::MediaRepairParent;
+        match lookup.parent {
+            MediaRepairParent::Relay(route) => {
+                let interest = self.runtime.relay_vp9_refresh(&route, lookup.position, now);
+                tracing::debug!(
+                    position = lookup.position,
+                    forwarded = interest.is_some(),
+                    "Resolved WAN VP9 relay refresh"
+                );
+                if let Some(interest) = interest {
+                    self.pipeline
+                        .push_shard_event(ShardEvent::NetworkMediaRefresh(Box::new(interest)));
+                }
+            }
+            MediaRepairParent::Publisher(route) => {
+                if route.publisher.emission.profile() != pulsebeam_core::fabric::Profile::Vp9 {
+                    return;
+                }
+                let Some((publisher, source)) =
+                    self.authorized_rtp_publisher_source(route.publisher)
+                else {
+                    return;
+                };
+                let unix_now = self.fabric_unix_time();
+                let registry = &mut self.registry;
+                let dirty = &mut self.dirty;
+                self.quic_data_ready |= self.runtime.request_peer_media_refresh(
+                    source,
+                    &route,
+                    lookup.position,
+                    now,
+                    |ssrc| {
+                        Self::deliver_fabric_refresh(
+                            registry,
+                            dirty,
+                            (now, unix_now),
+                            source,
+                            publisher,
+                            ssrc,
+                        )
+                    },
+                );
+            }
+        }
+    }
+
     fn locate_peer_media_repair(
         &mut self,
         lookup: crate::route::fabric::relay::MediaRepairLookup,
@@ -1716,6 +1815,7 @@ impl ShardExecution {
         use crate::route::fabric::relay::PeerRepairLookup;
         let now = Instant::now();
         let (publisher_source, original) = match handoff.located.lookup.as_ref() {
+            PeerRepairLookup::Refresh(_) => return,
             PeerRepairLookup::Media(lookup) => {
                 use crate::route::fabric::relay::MediaRepairParent;
                 match &lookup.parent {
@@ -3028,10 +3128,12 @@ impl ShardExecution {
         let Some(receiver) = self.registry.resolve_mut(destination) else {
             return;
         };
-        let whole = self
-            .runtime
-            .fabric_source_for_track(track)
-            .filter(|&source| self.runtime.fabric_dd_source(source).is_none());
+        let track_source = self.runtime.fabric_source_for_track(track);
+        let project_wan = managed
+            && profile == pulsebeam_core::fabric::Profile::Vp9
+            && track_source.is_some_and(|source| self.runtime.can_project_network_vp9(source));
+        let whole = track_source
+            .filter(|&source| !project_wan && self.runtime.fabric_dd_source(source).is_none());
         let selected = whole
             .is_none()
             .then(|| receiver.selected_fabric_video_encoding(mid, track))
@@ -3049,16 +3151,19 @@ impl ShardExecution {
                 self.retire_bound_fabric_rtp(destination, branch);
             }
             if bound_live {
-                let Some((bound_track, encoding)) = self.runtime.fabric_dd_source(bound.source())
-                else {
+                if Some(bound.source()) == whole {
                     return;
-                };
-                if track == bound_track
-                    && selected.is_some_and(|(selected, target)| {
-                        selected.matches(encoding.primary, encoding.rid)
-                            && self.runtime.fabric_branch_target(bound) == Some(target)
-                    })
-                {
+                }
+                if self.runtime.fabric_branch_video_source(bound).is_some_and(
+                    |(bound_track, encoding)| {
+                        track == bound_track
+                            && selected.is_some_and(|(selected, target)| {
+                                encoding.is_none_or(|encoding| {
+                                    selected.matches(encoding.primary, encoding.rid)
+                                }) && self.runtime.fabric_branch_target(bound) == Some(target)
+                            })
+                    },
+                ) {
                     return;
                 }
                 // A new request can replace a staged branch, but it cannot replace
@@ -3073,10 +3178,11 @@ impl ShardExecution {
                 self.retire_bound_fabric_rtp(destination, branch);
             }
         }
-        let source = if let Some((selected, _)) = selected {
-            self.runtime.fabric_source_for_encoding(track, selected)
-        } else {
-            self.runtime.fabric_source_for_track(track)
+        let source = match selected {
+            Some((encoding, _)) if !project_wan => {
+                self.runtime.fabric_source_for_encoding(track, encoding)
+            }
+            _ => track_source,
         };
         let Some(source) = source else { return };
         let Some(emission) = self
@@ -3086,18 +3192,13 @@ impl ShardExecution {
         else {
             return;
         };
-        let requires_dd = self.runtime.fabric_dd_source(source).is_some();
+        let requires_dd = project_wan || self.runtime.fabric_dd_source(source).is_some();
         let vp9_dd = profile == pulsebeam_core::fabric::Profile::Vp9 && emission.carries_video_dd();
-        // Network ingress has no local encoding selector. Preserve qualified DD
-        // for the entire admitted WAN stream instead of guessing a target.
-        let wan_whole_dd =
-            managed && vp9_dd && self.runtime.is_windowed_network_fabric_source(source);
-        if (requires_dd && selected.is_none())
-            || (managed && vp9_dd && !requires_dd && !wan_whole_dd)
-        {
+        if (requires_dd && selected.is_none()) || (managed && vp9_dd && !requires_dd) {
             return;
         }
-        let install_branch = self.runtime.source_origin(track).is_some()
+        let install_branch = project_wan
+            || self.runtime.source_origin(track).is_some()
             || self.runtime.is_shard_fabric_source(source);
         let reuse = committed.filter(|&branch| {
             branch.source() == source
@@ -3117,6 +3218,12 @@ impl ShardExecution {
             let Some(plan) = self.plans.get(track) else {
                 return;
             };
+            if project_wan {
+                // The whole-stream reservation is not used by a managed VP9
+                // viewer. Remove it before reserving the projected branch.
+                self.runtime
+                    .retire_unbound_network_video_branch(source, destination);
+            }
             self.runtime.install_fabric_branch(
                 track,
                 source,
@@ -3137,12 +3244,32 @@ impl ShardExecution {
         } else {
             None
         };
-        let Some(branch) = branch else { return };
+        let Some(branch) = branch else {
+            if project_wan {
+                tracing::debug!(
+                    ?destination,
+                    ?selected,
+                    "WAN VP9 projection branch unavailable"
+                );
+            }
+            return;
+        };
         if !self.registry.resolve_mut(destination).is_some_and(|owner| {
-            owner.bind_local_rtp_output(branch, mid, primary, emission, requires_dd || wan_whole_dd)
+            owner.bind_local_rtp_output(branch, mid, primary, emission, requires_dd)
         }) {
             if install_branch && reuse.is_none() {
                 self.runtime.retire_fabric_branch(branch, destination);
+            }
+        } else if project_wan {
+            tracing::debug!(
+                ?destination,
+                ?branch,
+                ?selected,
+                "Staged WAN VP9 projection"
+            );
+            if let Some(interest) = self.runtime.network_vp9_refresh(source, Instant::now()) {
+                self.pipeline
+                    .push_shard_event(ShardEvent::NetworkMediaRefresh(Box::new(interest)));
             }
         } else if requires_dd
             || matches!(
@@ -3171,8 +3298,8 @@ impl ShardExecution {
             let mut iter = self.runtime.fabric_destinations(source);
             std::array::from_fn(|_| iter.next())
         };
-        let video_source = self.runtime.fabric_dd_source(source);
         for (branch, destination) in branches.into_iter().flatten() {
+            let video_source = self.runtime.fabric_branch_video_source(branch);
             if self.registry.is_quic_owner(destination) {
                 self.quic_data_ready = true;
                 continue;
@@ -3526,6 +3653,13 @@ impl ShardExecution {
         if !self.fabric_refresh_receiver_authorized(destination) {
             return;
         }
+        if self.runtime.can_project_network_vp9(branch.source()) {
+            if let Some(interest) = self.runtime.network_vp9_refresh(branch.source(), now) {
+                self.pipeline
+                    .push_shard_event(ShardEvent::NetworkMediaRefresh(Box::new(interest)));
+            }
+            return;
+        }
         let unix_now = self.fabric_unix_time();
         let registry = &mut self.registry;
         let dirty = &mut self.dirty;
@@ -3857,7 +3991,16 @@ impl ShardExecution {
                                 Some(crate::shard::router::FabricOwner::Local(_)) => {
                                     self.request_fabric_refresh(destination, branch, now());
                                 }
-                                _ => {}
+                                Some(crate::shard::router::FabricOwner::Network) => {
+                                    if let Some(interest) =
+                                        self.runtime.network_vp9_refresh(branch.source(), now())
+                                    {
+                                        self.pipeline.push_shard_event(
+                                            ShardEvent::NetworkMediaRefresh(Box::new(interest)),
+                                        );
+                                    }
+                                }
+                                None => {}
                             }
                         }
                     }

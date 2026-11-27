@@ -126,7 +126,7 @@ pub(super) fn reconcile_wan_receives(
             Some((source, canonical, addresses.clone(), may_stage))
         }));
     }
-    links.retain_wan_live_receives(peer, |ack, canonical, children, regional| {
+    links.retain_wan_live_receives(peer, now, expires, |ack, canonical, children, regional| {
         if let Some(index) = desired
             .iter()
             .position(|(source, selected, destinations, _)| {

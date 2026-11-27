@@ -1068,7 +1068,7 @@ impl Connection {
         &self,
         branch: FabricLocalBranch,
         track: TrackHandle,
-        encoding: crate::route::fabric::RtpSourceEncoding,
+        encoding: Option<crate::route::fabric::RtpSourceEncoding>,
         target: u8,
     ) -> bool {
         self.media_egress.iter().any(|(&mid, output)| {
@@ -1080,6 +1080,20 @@ impl Connection {
                     output.branch == branch,
                 )
         })
+    }
+
+    pub(crate) fn staged_fabric_replacement(
+        &self,
+        committed: FabricLocalBranch,
+    ) -> Option<FabricLocalBranch> {
+        self.media_egress.values().find_map(|output| {
+            (output.branch != committed && output.leg.committed_branch() == Some(committed))
+                .then_some(output.branch)
+        })
+    }
+
+    pub(crate) fn wan_allowed_targets(&self, track: TrackHandle, now: Instant) -> Option<u32> {
+        self.downstream.video.wan_allowed_targets(track, now)
     }
 
     pub(crate) fn fabric_rtp_output_branches(
@@ -1232,7 +1246,7 @@ impl Connection {
         &mut self,
         branch: FabricLocalBranch,
         packet: CandidatePacket<'_, '_>,
-        video_source: Option<(TrackHandle, crate::route::fabric::RtpSourceEncoding)>,
+        video_source: Option<(TrackHandle, Option<crate::route::fabric::RtpSourceEncoding>)>,
         now: Instant,
     ) -> Result<Option<FabricLocalBranch>, AdmissionError> {
         use pulsebeam_core::dd::output::Mode;

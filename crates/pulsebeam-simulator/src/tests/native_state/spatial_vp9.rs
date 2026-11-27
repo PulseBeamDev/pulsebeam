@@ -16,6 +16,8 @@ pub(in crate::tests) enum Check {
     ColdStart {
         publisher: &'static str,
         track: &'static str,
+        prove_relay_projection: bool,
+        shared_hop: Option<(SocketAddr, SocketAddr)>,
     },
     HeightChanges,
     Bandwidth {
@@ -143,16 +145,16 @@ pub(in crate::tests) async fn receive(
         Check::WanRepair {
             publisher, track, ..
         }
-        | Check::ColdStart { publisher, track } => {
-            wire::resource_spec::Declaration::LogicalSubscription(wire::LogicalSubscriptionSpec {
-                source: Some(wire::LogicalSourceAddress {
-                    room: "stage".into(),
-                    participant_id: publisher.into(),
-                    kind: wire::TrackKind::Video as i32,
-                    track_id: track.into(),
-                }),
-            })
-        }
+        | Check::ColdStart {
+            publisher, track, ..
+        } => wire::resource_spec::Declaration::LogicalSubscription(wire::LogicalSubscriptionSpec {
+            source: Some(wire::LogicalSourceAddress {
+                room: "stage".into(),
+                participant_id: publisher.into(),
+                kind: wire::TrackKind::Video as i32,
+                track_id: track.into(),
+            }),
+        }),
         _ => wire::resource_spec::Declaration::Subscription(wire::SubscriptionSpec {
             publication_id: publication.into(),
             kind: wire::TrackKind::Video as i32,
@@ -167,7 +169,15 @@ pub(in crate::tests) async fn receive(
             enabled: Some(true),
             receive: Some(wire::resource_settings::Receive::Video(
                 wire::VideoReceiveOptions {
-                    max_height: matches!(check, Check::HeightChanges).then_some(180),
+                    max_height: matches!(
+                        check,
+                        Check::HeightChanges
+                            | Check::ColdStart {
+                                prove_relay_projection: true,
+                                ..
+                            }
+                    )
+                    .then_some(180),
                     ..Default::default()
                 },
             )),
@@ -309,7 +319,50 @@ pub(in crate::tests) async fn receive(
                 "WAN VP9 logical subscription did not recover within the lease and reopen budget",
             )?
         }
-        Check::ColdStart { .. } => {
+        Check::ColdStart {
+            prove_relay_projection,
+            shared_hop,
+            ..
+        } => {
+            if prove_relay_projection {
+                let counter =
+                    || pulsebeam::sim_metrics::routing_counter("fabric_wan_relay_projected_runs");
+                let before = counter();
+                let wait = Duration::from_secs(8);
+                expect_height(&sink, "regional cold VP9 at base", 180, wait, true).await?;
+                tokio::time::timeout(wait, async {
+                    while counter() == before {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .context("regional egress never projected the authorized base demand")?;
+                expect_height(&sink, "projected regional VP9 base", 180, wait, true).await?;
+                spec.settings = Some(wire::ResourceSettings {
+                    enabled: Some(true),
+                    receive: Some(wire::resource_settings::Receive::Video(
+                        wire::VideoReceiveOptions {
+                            max_height: Some(720),
+                            ..Default::default()
+                        },
+                    )),
+                });
+                use wire::logical_subscription_state::Execution;
+                let revision = 3; // Revision 2 was the prepared receiver report.
+                let source_revision = first_source.context("missing original source revision")?;
+                let installed = Execution::Installed(binding.clone());
+                viewer.desire(reference, revision, Some(spec.clone()));
+                tokio::time::timeout(
+                    wait,
+                    viewer.logical_when(revision, |state| {
+                        state.spec.as_ref() == Some(&spec)
+                            && state.source_revision == source_revision
+                            && state.execution.as_ref() == Some(&installed)
+                    }),
+                )
+                .await
+                .context("regional VP9 promotion did not retain its original binding")??;
+            }
             expect_height(
                 &sink,
                 "remote-only VP9 startup",
@@ -317,7 +370,26 @@ pub(in crate::tests) async fn receive(
                 Duration::from_secs(10),
                 false,
             )
-            .await
+            .await?;
+            if let Some(edge) = shared_hop {
+                let worst_gap = check_shared_hop_squeeze(&sink, edge).await?;
+                expect_height(
+                    &sink,
+                    "shared-hop recovery",
+                    720,
+                    Duration::from_secs(20),
+                    false,
+                )
+                .await
+                .with_context(|| {
+                    format!("maximum decoded VP9 gap during squeeze: {worst_gap:?}")
+                })?;
+                anyhow::ensure!(
+                    worst_gap < Duration::from_millis(450),
+                    "VP9 playback stalled during the WAN squeeze: gap={worst_gap:?}"
+                );
+            }
+            Ok(())
         }
         Check::HeightChanges => {
             let wait = Duration::from_secs(3);
@@ -369,6 +441,140 @@ pub(in crate::tests) async fn receive(
             .await
         }
     }
+}
+
+async fn check_shared_hop_squeeze(
+    sink: &VideoSink,
+    (from, to): (SocketAddr, SocketAddr),
+) -> anyhow::Result<Duration> {
+    use pulsebeam_runtime::net::shaper::{
+        Capacity, directed_stats, remove_directed_capacity, set_directed_capacity,
+    };
+    use pulsebeam_runtime::time::Instant;
+
+    const SQUEEZE_BPS: u64 = 650_000;
+    const BACKLOG: Duration = Duration::from_millis(100);
+    const RAMP: Duration = Duration::from_secs(3);
+    const STEADY: Duration = Duration::from_millis(1_200);
+    let reverse = directed_stats(to, from);
+    while sink.try_next_frame().is_some() {}
+    set_directed_capacity(
+        from,
+        to,
+        Capacity::Ramp {
+            from: 3_000_000,
+            to: SQUEEZE_BPS,
+            over: RAMP,
+        },
+        BACKLOG,
+    );
+    let start = Instant::now();
+    let mut last_frame = start;
+    let counters = || {
+        [
+            "fabric_network_vp9_receive",
+            "fabric_network_vp9_branch_offer",
+            "fabric_rtp_vp9_wan_enqueued",
+        ]
+        .map(pulsebeam::sim_metrics::routing_counter)
+    };
+    let mut last_frame_counters = counters();
+    let mut worst_gap = Duration::ZERO;
+    let mut base = None;
+    let mut heights = [0; 3];
+    loop {
+        let now = Instant::now();
+        let stats = directed_stats(from, to);
+        worst_gap = worst_gap.max(now - last_frame);
+        if now - last_frame >= Duration::from_millis(450) {
+            base = None;
+        }
+        while let Some(frame) = sink.try_next_frame() {
+            let current = counters();
+            let gap = now - last_frame;
+            if gap >= Duration::from_millis(100) {
+                let delta = std::array::from_fn::<_, 3, _>(|i| {
+                    current[i].saturating_sub(last_frame_counters[i])
+                });
+                tracing::debug!(?gap, elapsed = ?(now - start), first_height = frame.height,
+                    wan_receives = delta[0], branch_offers = delta[1], rtc_enqueued = delta[2],
+                    ?stats, "VP9 decode resumed during WAN squeeze");
+            }
+            last_frame_counters = current;
+            last_frame = now;
+            let index = match frame.height {
+                180 => 0,
+                360 => 1,
+                720 => 2,
+                height => anyhow::bail!("unexpected decoded VP9 height {height}"),
+            };
+            heights[index] += 1;
+            if index == 0 && now - start >= RAMP {
+                base.get_or_insert((now, stats, heights[0]));
+            } else {
+                base = None;
+            }
+        }
+        if let Some((since, before, first_base)) = base
+            && now - since >= STEADY
+        {
+            let bytes = stats.admitted_udp_bytes - before.admitted_udp_bytes;
+            let cap = u128::from(SQUEEZE_BPS) * (now - since + BACKLOG).as_millis() / 8_000;
+            anyhow::ensure!(
+                bytes > 0
+                    && u128::from(bytes) <= cap
+                    && heights[0] - first_base >= 10
+                    && stats.dropped_overflow == before.dropped_overflow,
+                "expected sustained decoded VP9 base without overflow at the directed wire-byte cap; bytes={bytes}/{cap}; heights={heights:?}; link={before:?} -> {stats:?}"
+            );
+            break;
+        }
+        anyhow::ensure!(
+            now - start < Duration::from_secs(9),
+            "no sustained decoded base under the WAN squeeze; heights={heights:?}; gap={worst_gap:?}; link={stats:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    remove_directed_capacity(from, to);
+    anyhow::ensure!(
+        directed_stats(to, from) == reverse,
+        "WAN squeeze also shaped the reverse direction"
+    );
+    Ok(worst_gap)
+}
+
+async fn bind_logical_video(
+    viewer: &mut WirePeer,
+    publication: &str,
+    binding: &wire::TrackBinding,
+    report_revision: u64,
+    previous_source: u64,
+) -> anyhow::Result<u64> {
+    use wire::logical_subscription_state::Execution;
+    let offer = viewer
+        .logical_when(1, |state| {
+            state.source_revision > previous_source && state.source.is_some()
+        })
+        .await?;
+    anyhow::ensure!(
+        offer
+            .source
+            .as_ref()
+            .is_some_and(|source| source.publication_id == publication),
+        "logical VP9 intent resolved to a different publication: {offer:?}"
+    );
+    viewer.report_prepared_receiver(offer.source_revision, report_revision, binding.clone());
+    let settled = viewer
+        .logical_when(1, |state| {
+            state.source_revision >= offer.source_revision && state.execution.is_some()
+        })
+        .await?;
+    anyhow::ensure!(
+        settled.source_revision == offer.source_revision
+            && settled.execution == Some(Execution::Installed(binding.clone())),
+        "logical VP9 receiver did not install: {settled:?}"
+    );
+    Ok(offer.source_revision)
 }
 
 async fn install(

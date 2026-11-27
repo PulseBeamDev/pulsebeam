@@ -146,6 +146,7 @@ fn wan_child_receipt_requires_the_installed_plan_and_exact_window() {
     let image = || NetworkPacket {
         window,
         position,
+        omitted: None,
         capture: None,
         packet: packet(),
     };
@@ -176,6 +177,7 @@ fn wan_child_receipt_requires_the_installed_plan_and_exact_window() {
     for wrong in [NetworkPacket {
         window,
         position: 1,
+        omitted: None,
         capture: None,
         packet: packet(),
     }] {
@@ -226,6 +228,7 @@ fn wan_child_receipt_requires_the_installed_plan_and_exact_window() {
     let next_image = |position, sequence| NetworkPacket {
         window: next_window,
         position,
+        omitted: None,
         capture: None,
         packet: FabricPacket::new(
             Header {

@@ -544,6 +544,110 @@ async fn protected_boundary_datagrams_reach_only_exactly_acknowledged_shard_wind
 }
 
 #[pulsebeam_runtime::test(crate = "pulsebeam_runtime::__harness")]
+async fn omission_metadata_requires_explicit_selection_on_the_live_window() {
+    use pulsebeam_core::fabric::{Extension, ExtensionKind};
+    let (mut left, mut right, mut control) = ready_pair().await.unwrap();
+    let ssrc = NonZeroU32::new(0x0506_0708).unwrap();
+    let start = 0x18000;
+    let dd = ExtensionKind::DependencyDescriptor;
+    let window = Window::new(Profile::Vp9, start, 1, ssrc, dd.bit()).unwrap();
+    let address = NodeRouteAddress::new(RouteId::new(ShardId::new(0), 1), 1);
+    let (port, mut rx) = control.create_port().unwrap();
+    let (_, tx) = control
+        .bind_send(LinkDestination::Local {
+            port,
+            tag: delivery_tag(address),
+        })
+        .unwrap();
+    let child = LiveNetworkChild {
+        ingress: pulsebeam_link::FabricIngress {
+            association: right.id,
+            key: NodeRouteKey::from_bytes(ssrc.get().to_be_bytes()),
+            purpose: pulsebeam_link::FabricPurpose::Live,
+        },
+        destination: address,
+        publication: ConnectionId::from_bytes([7; 16]).fixture_publication(TrackKind::Video, "wan"),
+        incarnation: NonZeroU64::MIN,
+        major: 0,
+        revision: 0,
+        sequence_anchor: start,
+        emission: Emission::new(Profile::Vp9, &[dd]).unwrap(),
+        window: Some(window),
+    };
+    let mut now = Instant::now();
+    let expires = now + Duration::from_secs(2);
+    let (installed, receipt) = oneshot::channel();
+    let (report, mut active) = oneshot::channel();
+    right.install(
+        now,
+        ReceiveCommand::Live {
+            expires,
+            deadline: None,
+            timing: None,
+            activity: None,
+            children: vec![ChildInstall { child, tx, receipt }],
+            report,
+        },
+    );
+    assert!(!right.select_projection(now, window, child.incarnation));
+    installed.send(Some(child)).unwrap();
+    right.poll(now).unwrap();
+    assert_eq!(active.try_recv().unwrap().unwrap(), window);
+    assert!(!right.select_projection(now, window, child.incarnation.saturating_add(1)));
+    let spec = WindowSpec {
+        authority: child.incarnation,
+        direction: Direction::Send,
+        start,
+        ssrc,
+        purpose: Purpose::Live,
+        expires: expires.into_std(),
+    };
+    let sender = left.stage_send(now, window, spec).unwrap();
+    left.activate_send(now, sender, window, spec).unwrap();
+    let run = OmissionRun::new(1).unwrap();
+    for (delta, selected) in [(1, false), (3, true)] {
+        if selected {
+            assert!(right.select_projection(now, window, child.incarnation));
+        }
+        let position = start + delta;
+        let packet = FabricPacket::new(
+            Header {
+                profile: Profile::Vp9,
+                marker: true,
+                sequence: u32::try_from(position).unwrap(),
+                timestamp: 9000,
+            },
+            &[Extension {
+                kind: dd,
+                value: &[0xc0, 0, 0],
+            }],
+            vec![1; 100].into_boxed_slice(),
+        )
+        .unwrap();
+        let prepared = left
+            .prepare_projected(now, sender, position, &packet, Some(run))
+            .unwrap();
+        assert!(matches!(
+            submit_paced(&mut left, &mut now, prepared).await,
+            Submission::Accepted { .. }
+        ));
+        pulsebeam_runtime::time::timeout(Duration::from_secs(1), right.socket.readable())
+            .await
+            .unwrap()
+            .unwrap();
+        right.poll(now).unwrap();
+        let mut frames = Vec::new();
+        assert_eq!(rx.try_recv_batch(&mut frames, 2), usize::from(selected));
+        if selected {
+            assert!(
+                matches!(frames.pop().unwrap().packet, ShardFrame::FabricWanImage { image, .. }
+                if image.position == position && image.omitted == Some(run) && image.packet.same_content(&packet))
+            );
+        }
+    }
+}
+
+#[pulsebeam_runtime::test(crate = "pulsebeam_runtime::__harness")]
 async fn sparse_repair_requires_exact_receipt_and_live_parent() {
     use crate::participant::data_fabric::{
         admit_dd_fixture, maximum_dd_bytes, reconstruct_dd_fixture,

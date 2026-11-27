@@ -279,17 +279,16 @@ async fn wan_host_receives_only_controller_scoped_commits_and_fences_on_peer_clo
                 ..ack
             },
             deadline,
-            false,
             now
         ),
         Err(BindError::Closed)
     ));
     assert!(matches!(
-        links.stage_wan_publisher_transport(sender_peer, source, ack, now, false, now),
+        links.stage_wan_publisher_transport(sender_peer, source, ack, now, now),
         Err(BindError::Closed)
     ));
     let (send_cutoff, mut pending) = links
-        .stage_wan_publisher_transport(sender_peer, source, ack, deadline, false, now)
+        .stage_wan_publisher_transport(sender_peer, source, ack, deadline, now)
         .unwrap();
     let tx = pulsebeam_runtime::time::timeout(timeout, async {
         loop {
@@ -492,7 +491,14 @@ async fn wan_host_receives_only_controller_scoped_commits_and_fences_on_peer_clo
     let retired_label = [live_window.ssrc().get().to_be_bytes()];
     assert!(!links.accept_wan_retirements(sender_peer, &retired_label));
     assert!(relay_tx.is_live());
-    links.retain_wan_live_receives(peer, |current, ingress, children, _| {
+    let renewed = deadline + Duration::from_secs(3);
+    links.retain_wan_live_receives(peer, now, renewed, |current, _, _, _| current == ack);
+    assert_eq!(
+        links.wan[&peer].receives[&live_window.ssrc()].expires(),
+        renewed
+    );
+    assert!(live_cutoff.is_live());
+    links.retain_wan_live_receives(peer, now, renewed, |current, ingress, children, _| {
         assert_eq!(current, ack);
         assert_eq!(ingress, peer);
         assert_eq!(children, [child]);
@@ -551,7 +557,6 @@ async fn wan_host_receives_only_controller_scoped_commits_and_fences_on_peer_clo
             replacement_source,
             replacement_ack,
             deadline,
-            false,
             now,
         )
         .unwrap();

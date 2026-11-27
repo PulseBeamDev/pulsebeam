@@ -2,7 +2,8 @@ mod receives;
 mod sends;
 
 pub(super) use receives::RepairReceives;
-pub(super) use sends::{Grant, RepairRequests};
+pub(in crate::control::controller) use sends::Grant;
+pub(super) use sends::RepairRequests;
 
 use std::num::{NonZeroU32, NonZeroU64};
 
@@ -13,13 +14,14 @@ use pulsebeam_core::fabric::{
 
 const DEMAND: [u8; 2] = [1, 0x0c];
 const READY: [u8; 2] = [1, 0x0d];
+const REFRESH: [u8; 2] = [1, 0x18];
 const DEMAND_BYTES: usize = 38;
 const READY_BYTES: usize = DEMAND_BYTES + WINDOW_TUPLE_BYTES;
 
 /// Source-position repair on an authenticated live media branch, not endpoint RTX.
 /// Decoding establishes wire identity only. The owner must authorize the demand.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct Demand {
+pub(in crate::control::controller) struct Demand {
     pub(super) live: NonZeroU32,
     pub(super) source: NonZeroU64,
     pub(super) branch: NonZeroU64,
@@ -68,6 +70,52 @@ impl Demand {
         let mut bytes = Vec::with_capacity(DEMAND_BYTES);
         self.write(&mut bytes, DEMAND);
         Some(bytes.into_boxed_slice())
+    }
+
+    pub(in crate::control::controller) fn send_refresh(
+        lane: &pulsebeam_link::PeerControl,
+        epoch: pulsebeam_runtime::time::Instant,
+        interest: crate::route::fabric::network_repair::MediaInterest,
+        now: pulsebeam_runtime::time::Instant,
+    ) -> bool {
+        let Some(window) = interest
+            .parent
+            .window
+            .filter(|window| window.contains(interest.position))
+        else {
+            return false;
+        };
+        if now >= interest.expires {
+            return false;
+        }
+        let Some(deadline) = interest
+            .expires
+            .checked_duration_since(epoch)
+            .and_then(|elapsed| u64::try_from(elapsed.as_nanos()).ok())
+            .map(pulsebeam_link::LinkTime)
+        else {
+            return false;
+        };
+        let refresh = Self {
+            live: window.ssrc(),
+            source: interest.parent.incarnation,
+            branch: interest.branch,
+            request: interest.branch,
+            position: interest.position,
+        };
+        let sent = lane.try_send(refresh.encode_refresh(), deadline).is_ok();
+        tracing::debug!(?refresh, sent, "Sent WAN VP9 refresh request");
+        sent
+    }
+
+    fn encode_refresh(self) -> Box<[u8]> {
+        let mut bytes = Vec::with_capacity(DEMAND_BYTES);
+        self.write(&mut bytes, REFRESH);
+        bytes.into_boxed_slice()
+    }
+
+    pub(in crate::control::controller) fn decode_refresh(bytes: &[u8]) -> Option<Self> {
+        (bytes.len() == DEMAND_BYTES && bytes.starts_with(&REFRESH)).then(|| Self::prefix(bytes))?
     }
 
     pub(super) fn matches_parent(self, parent: Window) -> bool {
@@ -162,6 +210,11 @@ mod tests {
         assert_eq!(ready.encode(parent).unwrap().as_ref(), ready_wire);
         assert_eq!(Ready::decode(&demand_wire, parent), None);
         assert_eq!(Demand::decode(&ready_wire), None);
+        let refresh_wire = demand.encode_refresh();
+        assert_eq!(Demand::decode_refresh(&refresh_wire), Some(demand));
+        assert_eq!(Demand::decode_refresh(&demand_wire), None);
+        assert_eq!(Demand::decode(&refresh_wire), None);
+        assert_eq!(Ready::read_demand(&refresh_wire), None);
         assert_eq!(Demand::decode(&demand_wire[..37]), None);
         assert_eq!(Ready::decode(&ready_wire[..54], parent), None);
 

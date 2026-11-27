@@ -4,6 +4,7 @@
 use std::{
     collections::HashSet,
     num::{NonZeroU16, NonZeroU64},
+    task::{Context, Poll},
     time::Duration,
 };
 
@@ -519,6 +520,27 @@ impl Peer {
         self.next_step
     }
 
+    pub(in crate::control) fn poll_control(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        self.association
+            .as_mut()
+            .filter(|association| association.session.is_some())
+            .map_or(Poll::Pending, |association| {
+                association.lane.poll_readable(cx)
+            })
+    }
+
+    pub(in crate::control) fn poll_target_samples(
+        &self,
+        links: &mut crate::control::link::Links,
+        now: Instant,
+        cx: &mut Context<'_>,
+    ) -> bool {
+        self.association.as_ref().is_some_and(|association| {
+            association.can_deliver_target_sample(now)
+                && links.poll_wan_target_samples(association.network, now, cx)
+        })
+    }
+
     pub(in crate::control) fn matches_network(&self, peer: NetworkId) -> bool {
         self.association
             .as_ref()
@@ -594,6 +616,20 @@ impl Peer {
         if let Some(bytes) = frame.encode() {
             let _ = association.lane.try_send(bytes, expires_at);
         }
+    }
+
+    pub(in crate::control) fn request_media_refresh(
+        &self,
+        interest: crate::route::fabric::network_repair::MediaInterest,
+        now: Instant,
+    ) {
+        let Some(association) = self.association.as_ref().filter(|association| {
+            association.network == interest.parent.ingress.association
+                && association.lane.is_ready()
+        }) else {
+            return;
+        };
+        media_repair::Demand::send_refresh(&association.lane, association.epoch, interest, now);
     }
 
     pub(in crate::control) fn request_media_repair(
@@ -703,6 +739,21 @@ impl Peer {
             self.next_step = now.checked_add(REOPEN).unwrap_or(now);
         }
         if now < self.next_step {
+            if let Some(assoc) = &mut self.association
+                && let Some(session) = assoc.session
+                && assoc.lane.is_ready()
+            {
+                assoc.drain_control(actor, self.remote, session, &mut self.last_revision, now);
+                if assoc.can_deliver_target_sample(now)
+                    && actor.receipt_trust.as_ref().is_some_and(Authority::ready)
+                    && actor
+                        .links
+                        .as_ref()
+                        .is_some_and(|links| links.wan_target_sample_ready(assoc.network, now))
+                {
+                    actor.drive_wan_target_demands(assoc.network, &assoc.lane, assoc.epoch, now);
+                }
+            }
             return;
         }
         self.next_step = now.checked_add(transfer::RETRY).unwrap_or(now);
@@ -783,6 +834,14 @@ impl Association {
             refresh: now,
             live_until: now.checked_add(LIVENESS).unwrap_or(now),
         }
+    }
+
+    fn can_deliver_target_sample(&self, now: Instant) -> bool {
+        self.session.is_some()
+            && self.lane.is_ready()
+            && !self.awaiting_wan_refresh
+            && now < self.live_until
+            && self.reply_deadline(now).is_some()
     }
 
     fn has_live_view(&self, now: Instant) -> bool {
@@ -1118,10 +1177,47 @@ impl Association {
         }
     }
 
+    fn receive_target_demand(
+        &self,
+        actor: &mut ControllerActor,
+        demand: super::target_demand::Demand,
+        now: Instant,
+    ) {
+        let publisher = self.wan_publishers.live_media_grant(
+            self.network,
+            demand.label,
+            demand.incarnation,
+            now,
+        );
+        let relay =
+            self.wan_transit
+                .live_media_grant(self.network, demand.label, demand.incarnation, now);
+        let regional = actor
+            .regional_routing
+            .as_ref()
+            .map_or([None, None], |routing| {
+                routing.target_demand_grants(self.network, demand, now)
+            });
+        let mut grants = [publisher, relay].into_iter().chain(regional).flatten();
+        if let (Some(grant), None) = (grants.next(), grants.next()) {
+            super::target_demand::reply_with_budget(
+                actor,
+                self.network,
+                &self.lane,
+                self.epoch,
+                now,
+                demand,
+                grant.expires,
+            );
+            grant.apply_target_demand(actor, demand, now);
+        }
+    }
+
     fn receive_media_repair_demand(
         &mut self,
         actor: &mut ControllerActor,
         demand: media_repair::Demand,
+        refresh: bool,
         now: Instant,
     ) {
         use crate::route::fabric::relay::{MediaRepairLookup, PeerRepairLookup};
@@ -1131,6 +1227,23 @@ impl Association {
         let relay = self
             .wan_transit
             .media_repair_grant(self.network, demand, now);
+        if refresh {
+            let regional = actor
+                .regional_routing
+                .as_ref()
+                .map_or([None, None], |routing| {
+                    routing.media_repair_grants(self.network, demand, now)
+                });
+            let mut grants = [publisher, relay].into_iter().chain(regional).flatten();
+            let (Some(grant), None) = (grants.next(), grants.next()) else {
+                tracing::debug!(?demand, "WAN VP9 refresh has no unique live grant");
+                return;
+            };
+            if let Some(refresh) = grant.into_refresh(demand) {
+                let _ = actor.stage_repair_lookups(vec![refresh]);
+            }
+            return;
+        }
         let ((Some(grant), None) | (None, Some(grant))) = (publisher, relay) else {
             return;
         };
@@ -1352,37 +1465,47 @@ impl Association {
         let Some(limit_ms) = wall.checked_add(interest::TTL).and_then(interest::millis) else {
             return false;
         };
-        let Some(routes) = actor
-            .links
-            .as_mut()
-            .and_then(|links| links.relay_targets(self.network, relay::LIMIT))
-        else {
+        let Some(session) = self.session else {
             return false;
         };
+        const FRAMES: usize = 4;
+        let after = self.interest_after;
+        let mut page = std::collections::BTreeMap::new();
+        // The authenticated ownership image can return before the media
+        // window. Discover demand without requiring an installed relay route.
+        for endpoint in actor.peer_ownership.endpoints_for_session(session) {
+            for (track, network) in actor.lifecycle.ingress_sources(endpoint) {
+                let key = relay::Key::new(endpoint.room, track.id(), false);
+                if network != self.network || after.is_some_and(|after| key <= after) {
+                    continue;
+                }
+                let Some(assertion) = interest::Assertion::for_track(actor, track, wall, limit_ms)
+                else {
+                    continue;
+                };
+                page.insert(key, assertion);
+                if page.len() > FRAMES * interest::BATCH {
+                    page.pop_last();
+                }
+            }
+        }
         let want_probe = !self.reader.pending(now) && now >= self.wan_refresh.pull_after;
         let mut probe = false;
-        let after = self.interest_after;
         let mut batch = Vec::new();
         let mut frames = 0;
-        for (&key, _) in routes
-            .iter()
-            .filter(|(key, _)| after.is_none_or(|after| **key > after))
-        {
+        for (key, assertion) in page {
             self.interest_after = Some(key);
-            let Some((room, publication)) = key.forward() else {
-                continue;
-            };
-            if actor.lifecycle.ingress_peer(room, publication) != Some(self.network) {
-                continue;
-            }
-            let Some(assertion) = actor
-                .lifecycle
-                .source_exact(room, publication)
-                .and_then(|track| interest::Assertion::for_track(actor, track, wall, limit_ms))
-            else {
-                continue;
-            };
-            probe |= want_probe && !views.sources.iter().any(|source| source.scope() == key);
+            // An active receiver needs the first measured ladder sooner than
+            // the normal ownership refresh, but uses the same bounded pull.
+            probe |= want_probe
+                && views
+                    .sources
+                    .iter()
+                    .find(|source| source.scope() == key)
+                    .is_none_or(|source| {
+                        source.publisher.emission.profile() == pulsebeam_core::fabric::Profile::Vp9
+                            && source.ladder.is_none()
+                    });
             batch.push(assertion);
             if batch.len() == interest::BATCH {
                 if interest::encode(&batch)
@@ -1392,7 +1515,7 @@ impl Association {
                 }
                 batch.clear();
                 frames += 1;
-                if frames == 4 {
+                if frames == FRAMES {
                     return probe;
                 }
             }
@@ -1404,170 +1527,19 @@ impl Association {
         probe
     }
 
-    fn step(
+    fn drain_control(
         &mut self,
         actor: &mut ControllerActor,
         remote: (NodeId, NonZeroU64),
+        session: Session,
         last_revision: &mut u64,
         now: Instant,
     ) {
-        if !self.lane.is_ready() {
-            return;
-        }
-        if self
-            .remote_wan
-            .as_ref()
-            .is_some_and(|(expires, _)| now >= *expires)
-        {
-            self.remote_wan = None;
-        }
-        let session = if let Some(session) = self.session {
-            session
-        } else {
-            let session = match actor.open_ownership_peer(remote.0, remote.1, Some(self.network)) {
-                Ok(session) => session,
-                Err(error) => {
-                    tracing::debug!(?remote, ?error, "WAN ownership open rejected");
-                    return;
-                }
-            };
-            tracing::debug!(?remote, "WAN ownership opened");
-            self.session = Some(session);
-            session
-        };
-        let Some(expires_at) = now.checked_add(FRAME_TTL).and_then(|at| {
-            u64::try_from(at.saturating_duration_since(self.epoch).as_nanos())
-                .ok()
-                .map(LinkTime)
-        }) else {
+        let Some(expires_at) = self.reply_deadline(now) else {
             return;
         };
-        if self.awaiting_wan_refresh {
-            // Existing media can drain on its bounded leases, but an expired
-            // receive must not be re-advertised on the replacement stream.
-            self.local_wan_receipts = actor
-                .links
-                .as_mut()
-                .map_or_else(Box::default, |links| links.wan_offers(self.network));
-        } else {
-            let sources = self
-                .remote_wan
-                .as_ref()
-                .map(|(deadline, image)| (*deadline, image.sources.as_ref()));
-            let regional_peer = self.mesh_outbound.as_ref().map(|_| mesh::Member {
-                node: remote.0,
-                generation: remote.1,
-            });
-            super::relay::reconcile_wan_receives(
-                actor,
-                self.network,
-                session,
-                regional_peer,
-                sources,
-                now,
-            );
-            let acknowledged = self
-                .remote_wan
-                .as_ref()
-                .map(|(deadline, image)| (*deadline, image.routes.as_ref()));
-            self.wan_publishers.step(
-                actor,
-                self.network,
-                &self.local_wan_sources,
-                acknowledged,
-                now,
-            );
-            self.wan_transit.step(
-                actor,
-                self.network,
-                &self.exports,
-                &self.local_wan_sources,
-                acknowledged,
-                now,
-            );
-            if actor.receipt_trust.as_ref().is_some_and(Authority::ready) {
-                self.media_receives
-                    .flush(actor, &self.lane, self.epoch, now, expires_at);
-                self.media_repairs.flush(now, |parent, ready, located| {
-                    self.wan_repairs.start(
-                        actor,
-                        self.network,
-                        parent,
-                        ready.send_permit(),
-                        located,
-                        now,
-                    );
-                });
-            }
-            self.wan_repairs.step(actor, now);
-            let offers = actor
-                .links
-                .as_mut()
-                .map_or_else(Box::default, |links| links.wan_offers(self.network));
-            if self
-                .local_wan_receipts
-                .iter()
-                .any(|ack| !offers.contains(ack))
-            {
-                self.sender.invalidate();
-            }
-            if self.local_wan_receipts != offers {
-                self.wan_refresh.announce = true;
-            }
-            self.local_wan_receipts = offers;
-            let retired = self.wan_retired_labels();
-            if self.wan_refresh.retired != retired {
-                self.wan_refresh.announce |= !retired.is_empty();
-                self.wan_refresh.retired = retired;
-            }
-            if self.wan_refresh.announce
-                && now >= self.wan_refresh.announce_after
-                && self
-                    .lane
-                    .try_send(transfer::WAN_IMAGE_CHANGED.into(), expires_at)
-                    .is_ok()
-            {
-                self.wan_refresh.announce = false;
-                self.wan_refresh.announce_after =
-                    now.checked_add(WAN_REFRESH_MIN_INTERVAL).unwrap_or(now);
-            }
-        }
-        self.flush_repair_lookups(now, expires_at);
-        self.flush_data_expectations(actor, now, expires_at);
-        self.flush_repair_interests(actor, now, expires_at);
-        self.flush_ownership_image(actor, now);
-        let direct_interest = self.mesh_outbound.is_none()
-            && actor.receipt_trust.as_ref().is_some_and(Authority::ready);
-        let probe = direct_interest && self.send_direct_interests(actor, expires_at, now);
+        let direct_interest = self.accepts_direct_interest(actor);
         let mut interests = Vec::new();
-        // Schedule the local pull before responding to the peer's bulk window.
-        // Both directions remain bounded even when media or the peer is stalled.
-        if self.wan_refresh.pull && now >= self.wan_refresh.pull_after {
-            self.wan_refresh.pull = false;
-            self.wan_refresh.pull_after = now.checked_add(WAN_REFRESH_MIN_INTERVAL).unwrap_or(now);
-            // A replacement grant may have invalidated the image in the current round.
-            let _ = self.reader.start(now);
-        } else if probe || (now >= self.refresh && !self.reader.pending(now)) {
-            if probe {
-                self.wan_refresh.pull_after =
-                    now.checked_add(WAN_REFRESH_MIN_INTERVAL).unwrap_or(now);
-            }
-            let _ = self.reader.start(now);
-        }
-        if let Some(frame) = self.reader.pull(now) {
-            let _ = self.lane.try_send(frame, expires_at);
-        }
-        if let Some(offer) = actor.publisher_handoffs.offer(remote, now) {
-            let _ = self.lane.try_send(offer, expires_at);
-        }
-        if !actor.standby_outbox.is_empty()
-            && let Some(Authority::Provisioned(trust)) = &actor.receipt_trust
-            && actor.provisioned_claim_views_ready(trust, now)
-        {
-            actor
-                .standby_outbox
-                .send(&self.lane, expires_at, &mut self.standby_cursor);
-        }
         let mut sampled = false;
         let mut catalog_read = false;
         for _ in 0..RECEIVE_BUDGET {
@@ -1648,8 +1620,20 @@ impl Association {
                 continue;
             }
             if actor.receipt_trust.as_ref().is_some_and(Authority::ready) {
+                if let Some(budget) = super::target_demand::Budget::decode(&bytes) {
+                    actor.receive_wan_video_budget(self.network, budget, now);
+                    continue;
+                }
+                if let Some(demand) = super::target_demand::Demand::decode(&bytes) {
+                    self.receive_target_demand(actor, demand, now);
+                    continue;
+                }
                 if let Some(demand) = media_repair::Demand::decode(&bytes) {
-                    self.receive_media_repair_demand(actor, demand, now);
+                    self.receive_media_repair_demand(actor, demand, false, now);
+                    continue;
+                }
+                if let Some(refresh) = media_repair::Demand::decode_refresh(&bytes) {
+                    self.receive_media_repair_demand(actor, refresh, true, now);
                     continue;
                 }
                 if let Some(demand) = media_repair::Ready::read_demand(&bytes) {
@@ -1745,6 +1729,179 @@ impl Association {
         if !interests.is_empty() {
             actor.stage_publisher_interests(interests);
         }
+    }
+
+    fn reply_deadline(&self, now: Instant) -> Option<LinkTime> {
+        let at = now.checked_add(FRAME_TTL)?;
+        u64::try_from(at.saturating_duration_since(self.epoch).as_nanos())
+            .ok()
+            .map(LinkTime)
+    }
+
+    fn accepts_direct_interest(&self, actor: &ControllerActor) -> bool {
+        self.mesh_outbound.is_none() && actor.receipt_trust.as_ref().is_some_and(Authority::ready)
+    }
+
+    fn step(
+        &mut self,
+        actor: &mut ControllerActor,
+        remote: (NodeId, NonZeroU64),
+        last_revision: &mut u64,
+        now: Instant,
+    ) {
+        if !self.lane.is_ready() {
+            return;
+        }
+        if self
+            .remote_wan
+            .as_ref()
+            .is_some_and(|(expires, _)| now >= *expires)
+        {
+            self.remote_wan = None;
+        }
+        let session = if let Some(session) = self.session {
+            session
+        } else {
+            let session = match actor.open_ownership_peer(remote.0, remote.1, Some(self.network)) {
+                Ok(session) => session,
+                Err(error) => {
+                    tracing::debug!(?remote, ?error, "WAN ownership open rejected");
+                    return;
+                }
+            };
+            tracing::debug!(?remote, "WAN ownership opened");
+            self.session = Some(session);
+            session
+        };
+        let Some(expires_at) = self.reply_deadline(now) else {
+            return;
+        };
+        if self.awaiting_wan_refresh {
+            // Existing media can drain on its bounded leases, but an expired
+            // receive must not be re-advertised on the replacement stream.
+            self.local_wan_receipts = actor
+                .links
+                .as_mut()
+                .map_or_else(Box::default, |links| links.wan_offers(self.network));
+        } else {
+            let sources = self
+                .remote_wan
+                .as_ref()
+                .map(|(deadline, image)| (*deadline, image.sources.as_ref()));
+            let regional_peer = self.mesh_outbound.as_ref().map(|_| mesh::Member {
+                node: remote.0,
+                generation: remote.1,
+            });
+            super::relay::reconcile_wan_receives(
+                actor,
+                self.network,
+                session,
+                regional_peer,
+                sources,
+                now,
+            );
+            let acknowledged = self
+                .remote_wan
+                .as_ref()
+                .map(|(deadline, image)| (*deadline, image.routes.as_ref()));
+            self.wan_publishers.step(
+                actor,
+                self.network,
+                &self.local_wan_sources,
+                acknowledged,
+                now,
+            );
+            self.wan_transit.step(
+                actor,
+                self.network,
+                &self.exports,
+                &self.local_wan_sources,
+                acknowledged,
+                now,
+            );
+            if actor.receipt_trust.as_ref().is_some_and(Authority::ready) {
+                actor.drive_wan_target_demands(self.network, &self.lane, self.epoch, now);
+                self.media_receives
+                    .flush(actor, &self.lane, self.epoch, now, expires_at);
+                self.media_repairs.flush(now, |parent, ready, located| {
+                    self.wan_repairs.start(
+                        actor,
+                        self.network,
+                        parent,
+                        ready.send_permit(),
+                        located,
+                        now,
+                    );
+                });
+            }
+            self.wan_repairs.step(actor, now);
+            let offers = actor
+                .links
+                .as_mut()
+                .map_or_else(Box::default, |links| links.wan_offers(self.network));
+            if self
+                .local_wan_receipts
+                .iter()
+                .any(|ack| !offers.contains(ack))
+            {
+                self.sender.invalidate();
+            }
+            if self.local_wan_receipts != offers {
+                self.wan_refresh.announce = true;
+            }
+            self.local_wan_receipts = offers;
+            let retired = self.wan_retired_labels();
+            if self.wan_refresh.retired != retired {
+                self.wan_refresh.announce |= !retired.is_empty();
+                self.wan_refresh.retired = retired;
+            }
+            if self.wan_refresh.announce
+                && now >= self.wan_refresh.announce_after
+                && self
+                    .lane
+                    .try_send(transfer::WAN_IMAGE_CHANGED.into(), expires_at)
+                    .is_ok()
+            {
+                self.wan_refresh.announce = false;
+                self.wan_refresh.announce_after =
+                    now.checked_add(WAN_REFRESH_MIN_INTERVAL).unwrap_or(now);
+            }
+        }
+        self.flush_repair_lookups(now, expires_at);
+        self.flush_data_expectations(actor, now, expires_at);
+        self.flush_repair_interests(actor, now, expires_at);
+        self.flush_ownership_image(actor, now);
+        let probe = self.accepts_direct_interest(actor)
+            && self.send_direct_interests(actor, expires_at, now);
+        // Schedule the local pull before responding to the peer's bulk window.
+        // Both directions remain bounded even when media or the peer is stalled.
+        if self.wan_refresh.pull && now >= self.wan_refresh.pull_after {
+            self.wan_refresh.pull = false;
+            self.wan_refresh.pull_after = now.checked_add(WAN_REFRESH_MIN_INTERVAL).unwrap_or(now);
+            // A replacement grant may have invalidated the image in the current round.
+            let _ = self.reader.start(now);
+        } else if probe || (now >= self.refresh && !self.reader.pending(now)) {
+            if probe {
+                self.wan_refresh.pull_after =
+                    now.checked_add(WAN_REFRESH_MIN_INTERVAL).unwrap_or(now);
+            }
+            let _ = self.reader.start(now);
+        }
+        if let Some(frame) = self.reader.pull(now) {
+            let _ = self.lane.try_send(frame, expires_at);
+        }
+        if let Some(offer) = actor.publisher_handoffs.offer(remote, now) {
+            let _ = self.lane.try_send(offer, expires_at);
+        }
+        if !actor.standby_outbox.is_empty()
+            && let Some(Authority::Provisioned(trust)) = &actor.receipt_trust
+            && actor.provisioned_claim_views_ready(trust, now)
+        {
+            actor
+                .standby_outbox
+                .send(&self.lane, expires_at, &mut self.standby_cursor);
+        }
+        self.drain_control(actor, remote, session, last_revision, now);
         if actor.regional_routing.is_none() {
             self.drive_catalog_reads(actor, remote, expires_at, now);
         }

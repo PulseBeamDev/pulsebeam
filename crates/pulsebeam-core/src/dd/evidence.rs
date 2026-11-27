@@ -6,9 +6,11 @@ use super::{DdReadError, DependencyDescriptor, DependencyDescriptorReader, MAX_D
 
 mod ancestry;
 mod frames;
+mod projection;
 mod selection;
 pub use ancestry::dependencies_satisfied;
 pub use frames::{FRAME_HISTORY, FrameStatus, Frames};
+pub use projection::{ProjectionContext, ProjectionEvidence, TargetSet};
 pub use selection::{Decision, DecodeTarget, Enqueue, FilteredBranch};
 
 const SEQUENCE_HISTORY: u64 = 4096;
@@ -67,9 +69,27 @@ pub struct SourceContext {
 }
 
 impl SourceContext {
-    /// Advance over authenticated positions known not to carry a descriptor.
-    /// A missing or mixed range cannot stand in for that evidence.
-    pub fn bridge_padding_before(
+    /// Demand may reference a recent authenticated attachment even while
+    /// local decode is suspended. The sender still has to prove that its
+    /// current packet matches that attachment's structure and active targets.
+    /// This does not restore any local descriptor or frame ancestry.
+    pub fn projection_demand_context(&self) -> Option<ProjectionContext> {
+        let (structure, reader) = match self.structure {
+            Some(structure) => (structure, &self.reader),
+            None => {
+                let interval = self.history.back()?;
+                (interval.structure, &interval.reader)
+            }
+        };
+        Some(ProjectionContext {
+            attachment: structure.attachment,
+            active_targets: reader.active_decode_targets(),
+        })
+    }
+
+    /// Advance over a range proven not to change descriptor context, such as
+    /// source padding or authenticated hop omissions. Uncovered loss cannot bridge it.
+    pub fn bridge_context_neutral_before(
         &mut self,
         sequence: u64,
         covers: impl FnOnce(std::ops::Range<u64>) -> bool,

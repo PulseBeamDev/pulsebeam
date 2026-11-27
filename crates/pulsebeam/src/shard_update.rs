@@ -227,6 +227,12 @@ pub(crate) struct SamplePublisherAnchor {
     pub result: oneshot::Sender<Option<PublisherPosition>>,
 }
 
+#[derive(Debug)]
+pub(crate) struct SampleViewerProjection {
+    pub child: LiveNetworkChild,
+    pub result: oneshot::Sender<Option<crate::route::fabric::target_demand::Projection>>,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PublisherInterest {
     pub publisher: PublisherAnchor,
@@ -265,6 +271,7 @@ pub(crate) struct ShardUpdate {
     pub data_expectations: Vec<ObserveNetworkDataExpectation>,
     pub publisher_observations: Vec<crate::route::fabric::PublisherObservation>,
     pub source_anchors: Vec<SamplePublisherAnchor>,
+    pub viewer_projections: Vec<SampleViewerProjection>,
     pub publisher_interests: Vec<PublisherInterest>,
     pub repair_lookups: Vec<LocateRelayRepair>,
     pub repair_handoffs: Vec<crate::route::fabric::relay::PeerRepairHandoff>,
@@ -289,6 +296,7 @@ impl ShardUpdate {
             data_expectations: Vec::new(),
             publisher_observations: Vec::new(),
             source_anchors: Vec::new(),
+            viewer_projections: Vec::new(),
             publisher_interests: Vec::new(),
             repair_lookups: Vec::new(),
             repair_handoffs: Vec::new(),
@@ -310,6 +318,7 @@ impl ShardUpdate {
             && self.data_expectations.is_empty()
             && self.publisher_observations.is_empty()
             && self.source_anchors.is_empty()
+            && self.viewer_projections.is_empty()
             && self.publisher_interests.is_empty()
             && self.repair_lookups.is_empty()
             && self.repair_handoffs.is_empty()
@@ -494,6 +503,24 @@ impl ShardUpdateWriter {
             pulsebeam_runtime::fatal!("a publisher interest must target its shard generation");
         }
         commit.publisher_interests.push(interest);
+    }
+
+    pub(crate) fn stage_viewer_projection(
+        &mut self,
+        generation: u64,
+        child: LiveNetworkChild,
+    ) -> oneshot::Receiver<Option<crate::route::fabric::target_demand::Projection>> {
+        let commit = self
+            .staged
+            .get_or_insert_with(|| Box::new(ShardUpdate::new(self.shard, generation)));
+        if commit.generation != generation {
+            pulsebeam_runtime::fatal!("viewer demand must be sampled at its shard generation");
+        }
+        let (result, receipt) = oneshot::channel();
+        commit
+            .viewer_projections
+            .push(SampleViewerProjection { child, result });
+        receipt
     }
 
     pub(crate) fn stage_publisher_anchor(

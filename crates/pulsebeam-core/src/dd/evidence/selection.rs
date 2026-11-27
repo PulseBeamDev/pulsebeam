@@ -86,6 +86,13 @@ impl FilteredBranch {
         self.target
     }
 
+    pub fn requested_targets(&self) -> super::TargetSet {
+        let current = super::TargetSet::single(self.target);
+        self.pending.map_or(current, |pending| {
+            current.union(super::TargetSet::single(pending))
+        })
+    }
+
     pub fn select(&mut self, target: DecodeTarget) {
         self.pending = (target != self.target).then_some(target);
     }

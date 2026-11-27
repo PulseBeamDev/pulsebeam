@@ -10,6 +10,7 @@ use crate::route::fabric::{
     ShardBinding, ShardOffer, network_repair::Interest, relay::LiveRelays,
 };
 use crate::route::{NodeRouteAddress, RouteAction, RouteRuntime};
+use pulsebeam_runtime::time::Instant;
 use slotmap::SlotMap;
 use std::{collections::HashMap, num::NonZeroU64};
 
@@ -327,6 +328,7 @@ enum FabricIngress {
         children: Vec<NetworkChild>,
         repairs: Vec<NetworkRepair>,
         media_repairs: Vec<NetworkMediaRepair>,
+        last_media_refresh: Option<Instant>,
         last_ingress: NonZeroU64,
         members: Vec<ParticipantHandle>,
         wan_transit: bool,
@@ -384,6 +386,8 @@ struct PublisherHop {
     route: CompiledPublisherSend,
     lifetime: pulsebeam_link::BindingCutoff,
     admissions: LiveAdmissions,
+    demand: crate::route::fabric::target_demand::Demand,
+    projection: crate::route::fabric::relay::SendProjection,
 }
 
 impl Drop for PublisherHop {
@@ -881,9 +885,14 @@ impl ShardRuntime {
                     .iter()
                     .any(|member| member.spec.window.is_some() != child.window.is_some())
                 || members.len() != plan.local.len()
-                || !plan.local.iter().all(|member| {
-                    members.contains(member) && source.fanout.branch_for(*member).is_some()
-                })
+                || !plan.local.iter().all(|member| members.contains(member))
+                || (child.window.is_none()
+                    || child.emission.profile() != pulsebeam_core::fabric::Profile::Vp9
+                    || !child.emission.carries_video_dd())
+                    && !plan
+                        .local
+                        .iter()
+                        .all(|member| source.fanout.branch_for(*member).is_some())
             {
                 return None;
             }
@@ -925,6 +934,7 @@ impl ShardRuntime {
                     }],
                     repairs: Vec::new(),
                     media_repairs: Vec::new(),
+                    last_media_refresh: None,
                     last_ingress: NonZeroU64::MIN,
                     members: plan.local.clone(),
                     wan_transit: plan.wan_transit,
@@ -1171,6 +1181,30 @@ impl ShardRuntime {
         relays.install(now, compiled)
     }
 
+    pub(super) fn apply_relay_demand(
+        &mut self,
+        now: pulsebeam_runtime::time::Instant,
+        route: &CompiledLiveRelay,
+        update: crate::route::fabric::target_demand::VersionedUpdate,
+    ) -> bool {
+        let Some(source) = self
+            .network_fabric_source(route.input.destination)
+            .and_then(|source| self.fabric_sources.get_mut(source))
+        else {
+            return false;
+        };
+        let FabricIngress::Network {
+            children, relays, ..
+        } = &mut source.ingress
+        else {
+            return false;
+        };
+        children
+            .iter()
+            .any(|child| child.spec == route.input && child.lifetime.is_live())
+            && relays.apply_demand(now, route, update)
+    }
+
     pub(super) fn retire_live_relay(&mut self, relay: &CompiledLiveRelay) -> bool {
         if relay.tx.is_live() {
             return false;
@@ -1360,6 +1394,7 @@ impl ShardRuntime {
                 position,
                 packet,
                 capture: None,
+                omitted: None,
             },
         ))
     }
@@ -1369,6 +1404,7 @@ impl ShardRuntime {
         address: NodeRouteAddress,
         ingress: pulsebeam_link::FabricIngress,
         position: u64,
+        omitted: Option<pulsebeam_core::fabric::wan::OmissionRun>,
         now: pulsebeam_runtime::time::Instant,
     ) -> Option<crate::route::fabric::network_repair::MediaInterest> {
         let source = self.network_fabric_source(address)?;
@@ -1381,9 +1417,11 @@ impl ShardRuntime {
                 && child.spec.ingress == ingress
                 && child.lifetime.is_live()
         })?;
-        let (position, expires) = path.media_gaps.observe(position, now, |candidate| {
-            bound.fanout.has_media_position(candidate)
-        })?;
+        let (position, expires) = path
+            .media_gaps
+            .observe(position, omitted, now, |candidate| {
+                bound.fanout.has_media_position(candidate)
+            })?;
         Some(crate::route::fabric::network_repair::MediaInterest {
             parent: path.spec,
             branch: path.ingress,
@@ -1436,15 +1474,20 @@ impl ShardRuntime {
             position,
             packet,
             capture,
+            omitted,
         } = image;
         if input.window != Some(window) || !window.contains(position) {
             return Err(Rejection::Binding);
         }
         let hops = packet.remaining_hops();
-        let admission =
-            bound
-                .fanout
-                .offer_bound_network(now, arrival, position, child.ingress, packet);
+        let admission = bound.fanout.offer_bound_network(
+            now,
+            arrival,
+            position,
+            child.ingress,
+            packet,
+            omitted,
+        );
         let (sequence, mut report) = match admission {
             Ok(admitted) => admitted,
             Err(error) => {
@@ -1673,6 +1716,88 @@ impl ShardRuntime {
             .then_some((source.track, source.encoding?))
     }
 
+    pub(super) fn fabric_branch_video_source(
+        &self,
+        branch: FabricLocalBranch,
+    ) -> Option<(TrackHandle, Option<crate::route::fabric::RtpSourceEncoding>)> {
+        let source = self.fabric_sources.get(branch.source)?;
+        if let Some((track, encoding)) = self.fabric_dd_source(branch.source) {
+            return Some((track, Some(encoding)));
+        }
+        (source.fanout.branch_target(branch.branch).is_some()
+            && self.can_project_network_vp9(branch.source))
+        .then_some((source.track, None))
+    }
+
+    pub(super) fn sample_viewer_projection(
+        &self,
+        child: LiveNetworkChild,
+        mut viewer: impl FnMut(
+            ParticipantHandle,
+            FabricLocalBranch,
+        ) -> crate::route::fabric::local::ViewerDemand<FabricLocalBranch>,
+    ) -> Option<crate::route::fabric::target_demand::Projection> {
+        use crate::route::fabric::{local::ViewerDemand, target_demand::Projection};
+        let Some(handle) = self.network_fabric_source(child.destination) else {
+            return Some(Projection::Whole);
+        };
+        let Some(source) = self.fabric_sources.get(handle) else {
+            return Some(Projection::Whole);
+        };
+        let FabricIngress::Network {
+            children,
+            wan_transit,
+            ..
+        } = &source.ingress
+        else {
+            return Some(Projection::Whole);
+        };
+        if *wan_transit
+            || !children
+                .iter()
+                .any(|path| path.spec == child && path.lifetime.is_live())
+        {
+            return Some(Projection::Whole);
+        }
+        source.fanout.viewer_projection(|destination, branch| {
+            let current = FabricLocalBranch {
+                source: handle,
+                branch,
+            };
+            match viewer(destination, current) {
+                ViewerDemand::Unauthorized => ViewerDemand::Unauthorized,
+                ViewerDemand::Staged {
+                    replacement,
+                    allowed_targets,
+                } if replacement.source == handle => ViewerDemand::Staged {
+                    replacement: replacement.branch,
+                    allowed_targets,
+                },
+                ViewerDemand::Include | ViewerDemand::Staged { .. } => ViewerDemand::Include,
+            }
+        })
+    }
+
+    pub(super) fn can_project_network_vp9(&self, source: FabricSourceHandle) -> bool {
+        self.is_windowed_network_fabric_source(source)
+            && self.fabric_emission(source).is_some_and(|emission| {
+                emission.profile() == pulsebeam_core::fabric::Profile::Vp9
+                    && emission.carries_video_dd()
+            })
+    }
+
+    pub(super) fn retire_unbound_network_video_branch(
+        &mut self,
+        source: FabricSourceHandle,
+        destination: ParticipantHandle,
+    ) {
+        if let Some(source) = self.fabric_sources.get_mut(source)
+            && let Some(branch) = source.fanout.branch_for_target(destination, None)
+        {
+            source.fanout.retire_branch(branch);
+        }
+    }
+
     pub(super) fn fabric_source_for_encoding(
         &self,
         track: TrackHandle,
@@ -1808,11 +1933,45 @@ impl ShardRuntime {
                 route,
                 lifetime,
                 admissions: LiveAdmissions::default(),
+                demand: crate::route::fabric::target_demand::Demand::default(),
+                projection: crate::route::fabric::relay::SendProjection::default(),
             });
         } else {
             return false;
         }
         true
+    }
+
+    pub(super) fn apply_publisher_demand(
+        &mut self,
+        now: pulsebeam_runtime::time::Instant,
+        source: FabricSourceHandle,
+        route: &CompiledPublisherSend,
+        update: crate::route::fabric::target_demand::VersionedUpdate,
+    ) -> bool {
+        use crate::route::fabric::hop_expectations::Path;
+        let Some(bound) = self.fabric_sources.get_mut(source) else {
+            return false;
+        };
+        let FabricIngress::Publisher {
+            publisher_sends, ..
+        } = &mut bound.ingress
+        else {
+            return false;
+        };
+        publisher_sends
+            .iter_mut()
+            .find(|hop| {
+                hop.route.matches(route) && hop.lifetime.is_live() && hop.route.tx.is_live()
+            })
+            .is_some_and(|hop| {
+                hop.demand.apply(
+                    now,
+                    hop.route.tx.expires(),
+                    update.generation,
+                    update.update,
+                )
+            })
     }
 
     pub(super) fn retire_publisher_send(&mut self, route: &CompiledPublisherSend) -> bool {
@@ -2365,15 +2524,14 @@ impl ShardRuntime {
                 report.record(outcome);
             }
             for hop in publisher_sends {
-                if let Some(outcome) = crate::route::fabric::relay::offer_live_network(
-                    &mut hop.admissions,
-                    &hop.route.tx,
-                    hop.route.tx.expires(),
-                    &frozen,
+                hop.projection.offer(
                     now,
-                ) {
-                    report.record(outcome);
-                }
+                    &hop.route.tx,
+                    &mut hop.admissions,
+                    hop.demand.live(now),
+                    &frozen,
+                    report,
+                );
             }
         }
     }
@@ -2402,13 +2560,15 @@ impl ShardRuntime {
         authorized: impl FnMut(ParticipantHandle) -> bool,
     ) -> Option<(FabricLocalBranch, ParticipantHandle)> {
         let bound = self.fabric_sources.get(source)?;
-        if !matches!(
-            &bound.ingress,
-            FabricIngress::Publisher {
-                refresh: Some(_),
-                ..
-            } | FabricIngress::Shard { .. }
-        ) {
+        if !self.can_project_network_vp9(source)
+            && !matches!(
+                &bound.ingress,
+                FabricIngress::Publisher {
+                    refresh: Some(_),
+                    ..
+                } | FabricIngress::Shard { .. }
+            )
+        {
             return None;
         }
         let (branch, destination) = bound.fanout.awaiting_entry(authorized)?;
@@ -2427,6 +2587,96 @@ impl ShardRuntime {
                     .fanout
                     .lose_output_context(handle.branch, destination)
             })
+    }
+
+    pub(super) fn network_vp9_refresh(
+        &mut self,
+        source: FabricSourceHandle,
+        now: Instant,
+    ) -> Option<crate::route::fabric::network_repair::MediaInterest> {
+        let bound = self.fabric_sources.get_mut(source)?;
+        if bound.fanout.emission().profile() != pulsebeam_core::fabric::Profile::Vp9 {
+            return None;
+        }
+        let FabricIngress::Network {
+            children,
+            last_media_refresh,
+            ..
+        } = &mut bound.ingress
+        else {
+            return None;
+        };
+        if last_media_refresh.is_some_and(|last| {
+            now.saturating_duration_since(last) < crate::track::KEYFRAME_DEBOUNCE
+        }) {
+            return None;
+        }
+        let live = children.iter().filter(|child| child.lifetime.is_live());
+        let high = bound.fanout.live_sequence_anchor(now);
+        let (path, position) = high
+            .and_then(|position| {
+                live.clone()
+                    .find(|child| {
+                        child
+                            .spec
+                            .window
+                            .is_some_and(|window| window.contains(position))
+                    })
+                    .map(|path| (path, position))
+            })
+            .or_else(|| {
+                live.filter_map(|path| Some((path, path.spec.window?.start())))
+                    .max_by_key(|(_, start)| *start)
+            })?;
+        *last_media_refresh = Some(now);
+        Some(crate::route::fabric::network_repair::MediaInterest {
+            parent: path.spec,
+            branch: path.ingress,
+            position,
+            expires: now.checked_add(crate::route::fabric::network_repair::MAX_REPAIR_LIFETIME)?,
+        })
+    }
+
+    pub(super) fn relay_vp9_refresh(
+        &mut self,
+        route: &crate::route::fabric::CompiledLiveRelay,
+        position: u64,
+        now: Instant,
+    ) -> Option<crate::route::fabric::network_repair::MediaInterest> {
+        let source = self.network_fabric_source(route.input.destination)?;
+        let bound = self.fabric_sources.get_mut(source)?;
+        let FabricIngress::Network {
+            children,
+            relays,
+            last_media_refresh,
+            ..
+        } = &mut bound.ingress
+        else {
+            return None;
+        };
+        if !route.tx.covers(position) || !relays.has_live_path(route, now) {
+            return None;
+        }
+        let upstream = children
+            .iter()
+            .find(|child| child.spec == route.input && child.lifetime.is_live())?;
+        let window = upstream.spec.window?;
+        if window.profile() != pulsebeam_core::fabric::Profile::Vp9
+            || !window.contains(position)
+            || last_media_refresh.is_some_and(|last| {
+                now.saturating_duration_since(last) < crate::track::KEYFRAME_DEBOUNCE
+            })
+        {
+            return None;
+        }
+        let interest = crate::route::fabric::network_repair::MediaInterest {
+            parent: upstream.spec,
+            branch: upstream.ingress,
+            position,
+            expires: now.checked_add(crate::route::fabric::network_repair::MAX_REPAIR_LIFETIME)?,
+        };
+        *last_media_refresh = Some(now);
+        Some(interest)
     }
 
     pub(super) fn request_fabric_refresh(
@@ -3142,6 +3392,7 @@ impl ShardRuntime {
         use crate::route::fabric::relay::PeerRepairLookup;
         let located = &handoff.located;
         let (source, window, count, fragment) = match located.lookup.as_ref() {
+            PeerRepairLookup::Refresh(_) => return,
             PeerRepairLookup::Media(lookup) => {
                 if lookup.position == located.sequence
                     && let Some((cached, expires)) =
