@@ -22,6 +22,7 @@ const TAG: &[u8; 6] = b"PBDF\x01\x00";
 const BATCH: usize = 8;
 const RECEIVE_BUDGET: usize = 64;
 const FLUSH: Duration = Duration::from_millis(30);
+const REPORT: Duration = Duration::from_secs(1);
 const REFRESH_MS: u64 = 3_000;
 const MAX_UNCERTAINTY_NS: u64 = 150_000_000;
 
@@ -66,6 +67,7 @@ pub(super) struct Discovery {
     sent: BTreeMap<Link, BTreeMap<NodeId, Stamp>>,
     issue_at: u64,
     flush_at: Option<Instant>,
+    report_at: Option<Instant>,
     time_floor_ms: u64,
 }
 
@@ -92,6 +94,7 @@ impl Discovery {
             sent: BTreeMap::new(),
             issue_at: 0,
             flush_at: None,
+            report_at: None,
             time_floor_ms: 0,
         }
     }
@@ -136,7 +139,7 @@ impl Discovery {
                 && batch.len() <= BATCH * FRAME_BYTES
             {
                 for frame in batch.chunks_exact(FRAME_BYTES).take(budget) {
-                    budget -= 1;
+                    budget = budget.saturating_sub(1);
                     self.observe(tree, frame, time);
                 }
             }
@@ -199,7 +202,33 @@ impl Discovery {
                 },
             );
         }
+        self.report(tree, links, time.is_some(), now);
         changes
+    }
+
+    fn report(&mut self, tree: &RegionTree, links: &Connected<'_>, qualified: bool, now: Instant) {
+        if self.report_at.is_some_and(|next| now < next) {
+            return;
+        }
+        self.report_at = now.checked_add(REPORT);
+        let live = links.discovery_links().len();
+        let expected = self.direct.len();
+        let total = tree.discovery_slots().count();
+        let routed = total.saturating_sub(expected.saturating_add(1));
+        let discovered = self.current.len();
+        for (kind, available, unavailable) in [
+            ("direct", live, expected.saturating_sub(live)),
+            ("routed", discovered, routed.saturating_sub(discovered)),
+        ] {
+            metrics::gauge!("regional_control_boot_slots", "kind" => kind, "state" => "available")
+                .set(available as f64);
+            metrics::gauge!("regional_control_boot_slots", "kind" => kind, "state" => "unavailable").set(unavailable as f64);
+        }
+        metrics::gauge!("regional_boot_discovery_clock_qualified").set(if qualified {
+            1.0
+        } else {
+            0.0
+        });
     }
 
     fn observe(&mut self, tree: &RegionTree, frame: &[u8], time: u64) {
@@ -291,7 +320,8 @@ impl Discovery {
                 updates.push((node, record.stamp));
             }
             if !batch.is_empty()
-                && links.send(link, batch.into_boxed_slice(), now + Duration::from_secs(1))
+                && let Some(expires) = now.checked_add(Duration::from_secs(1))
+                && links.send(link, batch.into_boxed_slice(), expires)
             {
                 sent.extend(updates);
             }

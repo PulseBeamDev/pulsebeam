@@ -204,18 +204,20 @@ struct SpatialPicture {
 }
 
 impl SpatialPicture {
-    fn finish(mut self) -> (Access, Vec<u8>) {
+    fn finish(mut self) -> Result<(Access, Vec<u8>)> {
         if self.vp9_sizes.len() > 1 {
             // The libvpx input is one VP9 superframe, with little-endian layer sizes.
             const SIZE_BYTES: u8 = 4;
-            let marker = 0xc0 | ((SIZE_BYTES - 1) << 3) | (self.vp9_sizes.len() as u8 - 1);
+            let layers = u8::try_from(self.vp9_sizes.len())?;
+            ensure!(layers <= 8, "too many VP9 superframe layers");
+            let marker = 0xc0 | ((SIZE_BYTES - 1) << 3) | (layers - 1);
             self.data.push(marker);
             for size in self.vp9_sizes {
                 self.data.extend_from_slice(&size.to_le_bytes());
             }
             self.data.push(marker);
         }
-        (self.access, self.data)
+        Ok((self.access, self.data))
     }
 }
 
@@ -350,7 +352,8 @@ pub(in crate::tests) async fn prove_dd_cadence(
                         if let Framing::Vp9 { descriptor, .. } = &unit.framing {
                             ensure!(descriptor.layer.context("missing VP9 layer")?.temporal_id == temporal_id);
                         }
-                        let timestamp = unit.rtp_time.context("missing media RTP time")? as u32;
+                        let [a, b, c, d, ..] = unit.rtp_time.context("missing media RTP time")?.to_le_bytes();
+                        let timestamp = u32::from_le_bytes([a, b, c, d]);
                         let (access, data) = if spatial {
                             let (spatial_id, end_of_picture) = match &unit.framing {
                                 Framing::Av1 { layer, end_of_picture, .. } => (layer.spatial_id, *end_of_picture),
@@ -367,7 +370,7 @@ pub(in crate::tests) async fn prove_dd_cadence(
                                 }
                                 // L3T1_KEY only depends on lower spatial layers in key pictures.
                                 let starts_at = if key_picture && unit.access == Access::DependentVideo {
-                                    target as u8
+                                    u8::try_from(target)?
                                 } else {
                                     0
                                 };
@@ -396,7 +399,7 @@ pub(in crate::tests) async fn prove_dd_cadence(
                                 continue;
                             }
                             ensure!(u32::from(complete.next_layer) == target + 1, "wrong top layer for {name} target {target}");
-                            complete.finish()
+                            complete.finish()?
                         } else {
                             (unit.access, unit.data)
                         };
@@ -528,13 +531,21 @@ pub(in crate::tests) async fn replay_on_feedback(
     publisher: &mut Agent,
     source: &Publication,
 ) -> Result<()> {
+    replay_graph_on_feedback(publisher, source, Graph::InterLayer).await
+}
+
+pub(in crate::tests) async fn replay_graph_on_feedback(
+    publisher: &mut Agent,
+    source: &Publication,
+    graph: Graph,
+) -> Result<()> {
     replay_capture(
         publisher,
         source,
         Instant::now(),
         true,
         Refresh::Wait,
-        Graph::InterLayer,
+        graph,
     )
     .await
 }
@@ -619,7 +630,7 @@ async fn replay_capture(
                 last_picture = Some(rtp.timestamp);
                 pictures_sent += 1;
             }
-            let sequence = next.unwrap_or(u32::from(rtp.sequence));
+            let sequence = next.unwrap_or_else(|| u32::from(rtp.sequence));
             ensure!(
                 captured_next.is_none_or(|expected| expected == rtp.sequence),
                 "capture sequence discontinuity"
@@ -629,7 +640,8 @@ async fn replay_capture(
             let mut dd = rtp.descriptor.to_vec();
             let mut payload = rtp.payload.to_vec();
             if picture_offset != 0 {
-                let picture_shift = picture_offset as u16;
+                let [low, high, ..] = picture_offset.to_le_bytes();
+                let picture_shift = u16::from_le_bytes([low, high]);
                 let frame = u16::from_be_bytes([dd[1], dd[2]]);
                 dd[1..3].copy_from_slice(
                     &frame
@@ -701,12 +713,14 @@ fn shift_picture_id(payload: &mut [u8], shift: u16) -> Result<()> {
         *first = high | 0x80;
         *second = low;
     } else {
-        *first = first.wrapping_add(shift as u8) & 0x7f;
+        let [low, _] = shift.to_le_bytes();
+        *first = first.wrapping_add(low) & 0x7f;
     }
     if *flags & 0x10 == 0 && *flags & 0x20 != 0 {
         let index = if *first & 0x80 != 0 { 2 } else { 1 };
         let tl0 = rest.get_mut(index).context("short VP9 TL0 index")?;
-        *tl0 = tl0.wrapping_add(shift as u8);
+        let [low, _] = shift.to_le_bytes();
+        *tl0 = tl0.wrapping_add(low);
     }
     Ok(())
 }

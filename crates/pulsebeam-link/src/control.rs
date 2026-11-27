@@ -182,24 +182,21 @@ mod tests {
 
     #[test]
     fn inbound_control_wakes_reader_without_consuming_frame() {
-        use std::{
-            sync::{Arc, atomic::AtomicBool},
-            task::{Wake, Waker},
-        };
-        struct Signal(AtomicBool);
+        use std::task::{Wake, Waker};
+        struct Signal(Fence);
         impl Wake for Signal {
-            fn wake(self: Arc<Self>) {
-                self.0.store(true, Ordering::Release);
+            fn wake(self: Shared<Self>) {
+                self.0.store(1, Ordering::Release);
             }
         }
-        let signal = Arc::new(Signal(AtomicBool::new(false)));
+        let signal = Shared::new(Signal(Fence::new(0)));
         let waker = Waker::from(signal.clone());
         let mut cx = Context::from_waker(&waker);
         let (mut peer, mut stream) = StreamControl::new_authenticated(std::num::NonZeroUsize::MIN);
         assert_eq!(peer.poll_readable(&mut cx), Poll::Pending);
         let (_, inbound) = stream.directions();
         block_on(inbound.send(Box::from([7]))).unwrap();
-        assert!(signal.0.load(Ordering::Acquire));
+        assert_eq!(signal.0.load(Ordering::Acquire), 1);
         assert_eq!(peer.poll_readable(&mut cx), Poll::Ready(()));
         assert_eq!(peer.try_recv().as_deref(), Some(&[7][..]));
         assert_eq!(peer.poll_readable(&mut cx), Poll::Pending);

@@ -14,7 +14,7 @@ use pulsebeam_runtime::{
 };
 use std::{
     net::{IpAddr, Ipv6Addr, SocketAddr},
-    num::NonZeroU16,
+    num::{NonZeroU16, NonZeroUsize},
     path::{Path, PathBuf},
 };
 use tracing_subscriber::util::SubscriberInitExt;
@@ -73,6 +73,9 @@ struct Args {
     /// Logical shards per worker (default 16, or 1 for thread-per-core).
     #[arg(short, long)]
     shards: Option<usize>,
+    /// Maximum committed and materializing connections on this node.
+    #[arg(long)]
+    max_connections: Option<NonZeroUsize>,
     /// Optional TOML configuration. Gossip is trusted-network-only and opt-in.
     #[arg(long)]
     config: Option<PathBuf>,
@@ -276,6 +279,7 @@ async fn run(
         .host_utc_policy(args.host_clock.utc_policy, args.host_clock.unsmeared_utc)
         .with_operator_socket(args.operator_socket)
         .workers(execution.workers)
+        .max_connections(args.max_connections)
         .local_addr(local_addr)
         .external_addrs(external_addrs)
         .rng(rng)

@@ -102,7 +102,7 @@ impl PublisherSends {
             return None;
         }
         Some(Grant {
-            path: Source::Shard(MediaRepairParent::Publisher(route.clone())),
+            path: Source::Shard(Box::new(MediaRepairParent::Publisher(route.clone()))),
             parent: ParentSend {
                 cutoff: entry.cutoff.clone(),
                 window,

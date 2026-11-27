@@ -109,7 +109,7 @@ impl PublicationFact {
             Profile::H264
         } else if format.mime_type.eq_ignore_ascii_case("video/av1") {
             Profile::Av1
-        } else if self.layers[0].1.is_none() {
+        } else if self.layers.first().is_some_and(|layer| layer.1.is_none()) {
             match format.known_codec() {
                 Some(wire::codec_format::Codec::Vp8(_)) => Profile::Vp8,
                 Some(wire::codec_format::Codec::Vp9(wire::Vp9Parameters {

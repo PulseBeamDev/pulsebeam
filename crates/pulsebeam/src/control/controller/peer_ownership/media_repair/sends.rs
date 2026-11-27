@@ -21,7 +21,7 @@ const MAX_REQUESTS: usize = 4096;
 
 type RequestKey = (NonZeroU32, NonZeroU64, NonZeroU64);
 pub(in crate::control::controller) enum Source {
-    Shard(MediaRepairParent),
+    Shard(Box<MediaRepairParent>),
     Warm(WarmFence),
 }
 
@@ -106,7 +106,7 @@ impl Grant {
         let Source::Shard(path) = self.path else {
             return;
         };
-        match path {
+        match *path {
             MediaRepairParent::Publisher(route) => {
                 let _ = actor.stage_publisher_send(PublisherSendChange::Demand(route, update));
             }
@@ -123,12 +123,11 @@ impl Grant {
         let Source::Shard(parent) = self.path else {
             return None;
         };
-        (self.parent.window.profile() == pulsebeam_core::fabric::Profile::Vp9).then_some(
-            PeerRepairLookup::Refresh(MediaRepairLookup {
-                parent,
+        crate::route::fabric::network_repair::supports_media_refresh(self.parent.window.profile())
+            .then_some(PeerRepairLookup::Refresh(MediaRepairLookup {
+                parent: *parent,
                 position: demand.position,
-            }),
-        )
+            }))
     }
 }
 
@@ -272,20 +271,22 @@ mod tests {
             .unwrap();
         let connection = ConnectionId::from_bytes([7; 16]);
         let grant = || Grant {
-            path: Source::Shard(MediaRepairParent::Publisher(CompiledPublisherSend {
-                publisher: PublisherAnchor {
-                    publication: connection.fixture_publication(TrackKind::Video, "camera"),
-                    connection,
-                    incarnation: demand.source,
-                    emission: Emission::new(Profile::H264, &[]).unwrap(),
+            path: Source::Shard(Box::new(MediaRepairParent::Publisher(
+                CompiledPublisherSend {
+                    publisher: PublisherAnchor {
+                        publication: connection.fixture_publication(TrackKind::Video, "camera"),
+                        connection,
+                        incarnation: demand.source,
+                        emission: Emission::new(Profile::H264, &[]).unwrap(),
+                    },
+                    shard: ShardId::new(0),
+                    next: LiveNextHop {
+                        peer,
+                        key: NodeRouteKey::from_bytes(demand.live.get().to_be_bytes()),
+                    },
+                    tx: tx.clone(),
                 },
-                shard: ShardId::new(0),
-                next: LiveNextHop {
-                    peer,
-                    key: NodeRouteKey::from_bytes(demand.live.get().to_be_bytes()),
-                },
-                tx: tx.clone(),
-            })),
+            ))),
             parent: ParentSend {
                 cutoff: cutoff.clone(),
                 window: live,
@@ -313,7 +314,7 @@ mod tests {
                 result,
                 LocatedRepair {
                     lookup: Box::new(PeerRepairLookup::Media(MediaRepairLookup {
-                        parent,
+                        parent: *parent,
                         position: demand.position,
                     })),
                     sequence: demand.position,

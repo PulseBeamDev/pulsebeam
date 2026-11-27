@@ -22,8 +22,10 @@ impl ProtectionPath {
         wire_bps: NonZeroU64,
     ) -> Option<Self> {
         let nodes: BTreeSet<_> = path.iter().map(|hop| hop.node).collect();
-        (path.len() >= 2 && path.len() <= usize::from(MAX_HOPS) + 1 && nodes.len() == path.len())
-            .then_some(Self { path, wire_bps })
+        (path.len() >= 2
+            && path.len() <= usize::from(MAX_HOPS).saturating_add(1)
+            && nodes.len() == path.len())
+        .then_some(Self { path, wire_bps })
     }
 
     pub(in crate::control::controller::regional_routing) fn wire_bps(&self) -> NonZeroU64 {
@@ -35,14 +37,14 @@ impl ProtectionPath {
         current: Member,
     ) -> Option<Member> {
         let index = self.path.iter().position(|member| *member == current)?;
-        self.path.get(index + 1).copied()
+        self.path.get(index.checked_add(1)?).copied()
     }
 
     pub(in crate::control::controller::regional_routing) fn includes_relay(
         &self,
         relay: Member,
     ) -> bool {
-        self.path[1..self.path.len() - 1].contains(&relay)
+        matches!(self.path.as_slice(), [_, middle @ .., _] if middle.contains(&relay))
     }
 
     pub(super) fn matches_hop(
@@ -58,14 +60,15 @@ impl ProtectionPath {
                 .strip_prefix(traversed)
                 .and_then(|rest| rest.first())
                 != Some(&local)
-            || self.path.len() > usize::from(MAX_HOPS) + 1
+            || self.path.len() > usize::from(MAX_HOPS).saturating_add(1)
         {
             return false;
         }
         let nodes: BTreeSet<_> = self.path.iter().map(|hop| hop.node).collect();
         nodes.len() == self.path.len()
             && self.path.windows(2).enumerate().all(|(index, edge)| {
-                tree.adjacency(edge[0], edge[1]).is_some_and(|adjacent| {
+                let [from, to] = edge else { return false };
+                tree.adjacency(*from, *to).is_some_and(|adjacent| {
                     !adjacent.is_border() && (index == 0 || adjacent.roles.0 == Role::Router)
                 })
             })

@@ -164,6 +164,7 @@ impl ApiError {
             Self::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "Too Many Requests"),
             Self::JoinError(
                 controller::ControllerError::ServiceUnavailable
+                | controller::ControllerError::ConnectionCapacity
                 | controller::ControllerError::SourceUnavailable,
             )
             | Self::ServiceUnavailable => (StatusCode::SERVICE_UNAVAILABLE, "Service Unavailable"),

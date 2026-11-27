@@ -8,13 +8,13 @@ use super::*;
 mod protection;
 mod schedule;
 use protection::Envelope;
-use schedule::{Class, Schedule};
+use schedule::{Class, Lanes, Schedule};
 
 const BUDGET: usize = 32;
 
-pub(super) type MediaSenders = [pulsebeam_queue::Sender<Media>; Class::ALL.len()];
+pub(super) type MediaSenders = Lanes<pulsebeam_queue::Sender<Media>>;
 pub(super) struct MediaInbox {
-    lanes: [pulsebeam_queue::Receiver<Media>; Class::ALL.len()],
+    lanes: Lanes<pulsebeam_queue::Receiver<Media>>,
     budget: pulsebeam_runtime::sync::watch::Sender<Option<VideoBudget>>,
 }
 
@@ -32,14 +32,12 @@ pub(super) fn media_channels() -> (MediaSenders, MediaInbox, BudgetReader) {
         (protected, protected_rx),
         (live, live_rx),
         (repair, repair_rx),
-    ] = Class::ALL.map(|class| {
-        pulsebeam_queue::bounded(NonZeroUsize::new(class.capacity()).expect("bounded WAN class"))
-    });
+    ] = Class::ALL.map(|class| pulsebeam_queue::bounded(class.capacity()));
     let (budget, watch) = pulsebeam_runtime::sync::watch::channel(None);
     (
-        [audio, protected, live, repair],
+        Lanes([audio, protected, live, repair]),
         MediaInbox {
-            lanes: [audio_rx, protected_rx, live_rx, repair_rx],
+            lanes: Lanes([audio_rx, protected_rx, live_rx, repair_rx]),
             budget,
         },
         watch,
@@ -61,7 +59,7 @@ pub(super) struct Egress {
     pub(super) protected_egress_bps: Option<NonZeroU64>,
     routes: BTreeMap<NonZeroU32, Active>,
     queued: Schedule<Media>,
-    blocked: [Option<Blocked>; Class::ALL.len()],
+    blocked: Lanes<Option<Blocked>>,
     departures: Departures,
     budget_at: Option<Instant>,
 }
@@ -489,7 +487,7 @@ impl Commands {
             expires: Instant::from_std(spec.expires),
             deadline: deadline.clone(),
             class,
-            sender: self.media[class as usize].clone(),
+            sender: self.media[class].clone(),
         };
         let pending = PendingTx {
             tx: Some(tx),
@@ -530,13 +528,13 @@ impl Egress {
     fn priority_allows(&self, class: Class) -> bool {
         Class::PRIORITY
             .into_iter()
-            .all(|priority| !priority.precedes(class) || self.blocked[priority as usize].is_none())
+            .all(|priority| !priority.precedes(class) || self.blocked[priority].is_none())
     }
 
     pub(super) async fn readable(&mut self) {
         if Class::ALL.into_iter().any(|class| {
             self.priority_allows(class)
-                && self.blocked[class as usize].is_none()
+                && self.blocked[class].is_none()
                 && self.queued.has_packets(class)
         }) {
             return;
@@ -547,7 +545,7 @@ impl Egress {
             }
         }
         if let Some(MediaInbox {
-            lanes: [audio, protected, live, repair],
+            lanes: Lanes([audio, protected, live, repair]),
             ..
         }) = &mut self.inbox
         {
@@ -597,7 +595,7 @@ impl Egress {
                 let Some(media) = self
                     .inbox
                     .as_mut()
-                    .and_then(|inbox| inbox.lanes[class as usize].try_recv().ok())
+                    .and_then(|inbox| inbox.lanes[class].try_recv().ok())
                 else {
                     break;
                 };
@@ -626,7 +624,7 @@ impl Egress {
     pub(super) fn socket_write_blocked(&self) -> bool {
         Class::ALL.into_iter().any(|class| {
             self.priority_allows(class)
-                && self.blocked[class as usize]
+                && self.blocked[class]
                     .as_ref()
                     .is_some_and(|blocked| matches!(blocked.wait, Wait::Writable))
         })
@@ -637,17 +635,15 @@ impl Egress {
             .values()
             .map(Active::expires)
             .chain(Class::ALL.into_iter().flat_map(|class| {
-                self.blocked[class as usize]
-                    .iter()
-                    .flat_map(move |blocked| {
-                        let retry = match blocked.wait {
-                            Wait::Congestion(deadline) if self.priority_allows(class) => deadline,
-                            _ => None,
-                        };
-                        [Some(blocked.scope.deadline.into_std()), retry]
-                            .into_iter()
-                            .flatten()
-                    })
+                self.blocked[class].iter().flat_map(move |blocked| {
+                    let retry = match blocked.wait {
+                        Wait::Congestion(deadline) if self.priority_allows(class) => deadline,
+                        _ => None,
+                    };
+                    [Some(blocked.scope.deadline.into_std()), retry]
+                        .into_iter()
+                        .flatten()
+                })
             }))
             .min()
     }
@@ -693,12 +689,11 @@ impl Egress {
             }
         }
         for class in Class::ALL {
-            let index = class as usize;
-            if self.blocked[index]
+            if self.blocked[class]
                 .as_ref()
                 .is_some_and(|blocked| self.route(now, blocked.scope).is_none())
             {
-                self.blocked[index] = None;
+                self.blocked[class] = None;
             }
         }
     }
@@ -837,35 +832,33 @@ impl WanHost {
             self.egress
                 .routes
                 .values()
-                .fold([false; Class::ALL.len()], |mut live, active| {
+                .fold(Lanes::<bool>::default(), |mut live, active| {
                     let class = active.class();
                     if Class::PRIORITY.contains(&class)
                         && active.is_live()
                         && now.into_std() < active.expires()
                     {
-                        live[class as usize] = true;
+                        live[class] = true;
                     }
                     live
                 });
-        let mut deferred = [false; Class::ALL.len()];
+        let mut deferred = Lanes::<bool>::default();
         for _ in 0..BUDGET {
             // Waiting priority traffic gets the next pacer/window credit
             // instead of letting an ordinary send refill the window.
-            let allowed = Class::ALL.map(|class| self.egress.priority_allows(class));
+            let allowed = Lanes(Class::ALL.map(|class| self.egress.priority_allows(class)));
             let Some(class) = self.egress.queued.pick(|class, queued| {
-                let i = class as usize;
-                allowed[i] && !deferred[i] && self.egress.blocked[i].as_ref().map_or(queued, |blocked| {
+                allowed[class] && !deferred[class] && self.egress.blocked[class].as_ref().map_or(queued, |blocked| {
                     !matches!(blocked.wait, Wait::Congestion(Some(deadline)) if now.into_std() < deadline)
                         || now >= blocked.scope.deadline
                 })
             }) else { break };
-            let index = class as usize;
             let Blocked {
                 scope,
                 queued_at,
                 prepared,
                 ..
-            } = if let Some(blocked) = self.egress.blocked[index].take() {
+            } = if let Some(blocked) = self.egress.blocked[class].take() {
                 blocked
             } else {
                 let Some(media) = self.egress.queued.pop(class) else {
@@ -905,7 +898,7 @@ impl WanHost {
             }
             let reserve = if Class::PRIORITY
                 .into_iter()
-                .any(|priority| priority_live[priority as usize] && priority.precedes(class))
+                .any(|priority| priority_live[priority] && priority.precedes(class))
             {
                 wan::MAX_DATAGRAM_BYTES
             } else {
@@ -920,6 +913,10 @@ impl WanHost {
                     (prepared, Wait::Congestion(deadline))
                 }
                 Submission::Accepted { bytes } => {
+                    #[cfg(feature = "sim")]
+                    if class == Class::Protected {
+                        crate::sim_metrics::record_routing_counter("fabric_wan_protected_sent");
+                    }
                     if class == Class::Protected
                         && let Some(rate) = self.egress.protection(scope)
                     {
@@ -944,13 +941,13 @@ impl WanHost {
                     continue;
                 }
             };
-            self.egress.blocked[index] = Some(Blocked {
+            self.egress.blocked[class] = Some(Blocked {
                 scope,
                 queued_at,
                 prepared,
                 wait,
             });
-            deferred[index] = true;
+            deferred[class] = true;
         }
     }
 }

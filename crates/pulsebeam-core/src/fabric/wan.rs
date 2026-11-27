@@ -448,7 +448,11 @@ impl Window {
                 .ok_or(WireError::OutputTooSmall)?;
             let (canonical, hop) = dst.split_at_mut(optional.len());
             canonical.copy_from_slice(optional);
-            hop.copy_from_slice(&element[..element_len]);
+            hop.copy_from_slice(
+                element
+                    .get(..element_len)
+                    .ok_or(WireError::ExtensionLayout)?,
+            );
             pad.fill(0);
         }
         payload_out.copy_from_slice(payload);
@@ -492,7 +496,7 @@ impl Window {
                 continue;
             }
             self.check_extension(id, value)?;
-            canonical_len = block.len() - next.len();
+            canonical_len = block.len().saturating_sub(next.len());
             needs_two |= value.len() > 16;
             last = id;
             rest = next;
@@ -504,7 +508,10 @@ impl Window {
         {
             return Err(WireError::ExtensionLayout);
         }
-        Ok((&block[..canonical_len], omission))
+        let canonical = block
+            .get(..canonical_len)
+            .ok_or(WireError::ExtensionLayout)?;
+        Ok((canonical, omission))
     }
 
     fn check_extension(self, id: u8, value: &[u8]) -> Result<(), WireError> {

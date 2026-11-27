@@ -165,6 +165,14 @@ pub(crate) struct MeasuredTargetLadder {
 }
 
 impl MeasuredTargetLadder {
+    pub(crate) fn target(&self, index: usize) -> Option<(u16, u16, u32)> {
+        Some((
+            *self.heights.get(index)?,
+            *self.fps.get(index)?,
+            *self.payload_bps.get(index)?,
+        ))
+    }
+
     pub(crate) fn valid(self) -> bool {
         self.context.structure_origin <= self.through
             && self.context.active_targets != 0
@@ -173,12 +181,13 @@ impl MeasuredTargetLadder {
                 .heights
                 .into_iter()
                 .zip(self.payload_bps)
+                .zip(self.fps)
                 .enumerate()
-                .all(|(target, (height, bps))| {
+                .all(|(target, ((height, bps), fps))| {
                     if self.context.active_targets & (1 << target) != 0 {
                         height != 0 && bps != 0
                     } else {
-                        height == 0 && bps == 0 && self.fps[target] == 0
+                        height == 0 && bps == 0 && fps == 0
                     }
                 })
     }
@@ -581,14 +590,20 @@ impl StreamMonitor {
         let mut heights = [0; MAX_LADDER_TARGETS];
         let mut payload_bps = [0; MAX_LADDER_TARGETS];
         let mut fps = [0; MAX_LADDER_TARGETS];
-        for target in 0..count {
+        for (target, ((height, bps), fps)) in heights
+            .iter_mut()
+            .zip(&mut payload_bps)
+            .zip(&mut fps)
+            .take(count)
+            .enumerate()
+        {
             if context.active_targets & (1 << target) == 0 {
                 continue;
             }
-            heights[target] = stats.decode_target_heights[target];
-            payload_bps[target] = stats.measured_decode_target_bps[target];
-            fps[target] = self.target_rates.fps[target];
-            if heights[target] == 0 || payload_bps[target] == 0 {
+            *height = *stats.decode_target_heights.get(target)?;
+            *bps = *stats.measured_decode_target_bps.get(target)?;
+            *fps = *self.target_rates.fps.get(target)?;
+            if *height == 0 || *bps == 0 {
                 return None;
             }
         }

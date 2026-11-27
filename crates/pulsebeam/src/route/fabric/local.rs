@@ -327,13 +327,15 @@ impl DecodeTargetSample {
             } if previous == context => (bytes, pictures),
             _ => ([0; MAX_LADDER_TARGETS], [0; MAX_LADDER_TARGETS]),
         };
-        for (target, total) in bytes.iter_mut().enumerate() {
+        for (target, (total, pictures)) in bytes.iter_mut().zip(&mut pictures).enumerate() {
             if (qualified.active_targets & (1 << target)) != 0
                 && qualified.descriptor.is_in_decode_target(target)
             {
                 *total = total.saturating_add(payload_bytes);
-                if spatial_filtered_marker(qualified, structure, target as u8) == Some(true) {
-                    pictures[target] = pictures[target].saturating_add(1);
+                if let Ok(target) = u8::try_from(target)
+                    && spatial_filtered_marker(qualified, structure, target) == Some(true)
+                {
+                    *pictures = pictures.saturating_add(1);
                 }
             }
         }
@@ -2149,8 +2151,8 @@ impl SourceFanout {
             let skipped = frozen
                 .omitted
                 .and_then(|run| run.positions(position))
-                .map_or(0, |proof| position - proof.start.max(next));
-            let omitted = position > next && skipped == position - next;
+                .map_or(0, |proof| position.saturating_sub(proof.start.max(next)));
+            let omitted = position > next && skipped == position.saturating_sub(next);
             let padding_only = position > next
                 && self
                     .media_identity
@@ -2201,7 +2203,7 @@ impl SourceFanout {
             for branch in self.branches.values_mut() {
                 branch.discard_stale(now, &self.fates, |_| true);
                 if evidence.protected_omissions && !padding_only {
-                    branch.reserve_missing(now, next..position - skipped);
+                    branch.reserve_missing(now, next..position.saturating_sub(skipped));
                 }
                 if skipped != 0 && (omitted || evidence.protected_omissions) {
                     branch.omitted = branch.omitted.saturating_add(skipped);
@@ -2500,7 +2502,9 @@ impl SourceFanout {
 
 impl Branch {
     fn reserve_missing(&mut self, now: Instant, range: std::ops::Range<u64>) {
-        if self.requires_dd() || range.is_empty() || range.end - range.start > DD_REORDER_POSITIONS
+        if self.requires_dd()
+            || range.is_empty()
+            || range.end.saturating_sub(range.start) > DD_REORDER_POSITIONS
         {
             return;
         }
@@ -2510,7 +2514,7 @@ impl Branch {
         self.missing.retain(|gap| now < gap.expires);
         for source in range {
             if let Some(output) = source.checked_sub(self.omitted) {
-                if self.missing.len() >= DD_REORDER_POSITIONS as usize {
+                if u64::try_from(self.missing.len()).unwrap_or(u64::MAX) >= DD_REORDER_POSITIONS {
                     self.missing.pop_front();
                 }
                 self.missing.push_back(MissingPosition {

@@ -2603,13 +2603,15 @@ impl ShardRuntime {
             })
     }
 
-    pub(super) fn network_vp9_refresh(
+    pub(super) fn network_media_refresh(
         &mut self,
         source: FabricSourceHandle,
         now: Instant,
     ) -> Option<crate::route::fabric::network_repair::MediaInterest> {
         let bound = self.fabric_sources.get_mut(source)?;
-        if bound.fanout.emission().profile() != pulsebeam_core::fabric::Profile::Vp9 {
+        if !crate::route::fabric::network_repair::supports_media_refresh(
+            bound.fanout.emission().profile(),
+        ) {
             return None;
         }
         let FabricIngress::Network {
@@ -2651,7 +2653,7 @@ impl ShardRuntime {
         })
     }
 
-    pub(super) fn relay_vp9_refresh(
+    pub(super) fn relay_media_refresh(
         &mut self,
         route: &crate::route::fabric::CompiledLiveRelay,
         position: u64,
@@ -2675,7 +2677,7 @@ impl ShardRuntime {
             .iter()
             .find(|child| child.spec == route.input && child.lifetime.is_live())?;
         let window = upstream.spec.window?;
-        if window.profile() != pulsebeam_core::fabric::Profile::Vp9
+        if !crate::route::fabric::network_repair::supports_media_refresh(window.profile())
             || !window.contains(position)
             || last_media_refresh.is_some_and(|last| {
                 now.saturating_duration_since(last) < crate::track::KEYFRAME_DEBOUNCE

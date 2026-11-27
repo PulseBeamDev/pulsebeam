@@ -11,12 +11,13 @@ pub struct TargetSet(NonZeroU32);
 impl TargetSet {
     pub fn new(mask: u32) -> Option<Self> {
         let mask = NonZeroU32::new(mask)?;
-        ((u32::BITS - mask.get().leading_zeros()) as usize <= MAX_DECODE_TARGETS)
-            .then_some(Self(mask))
+        let top = usize::try_from(mask.get().ilog2()).ok()?;
+        (top < MAX_DECODE_TARGETS).then_some(Self(mask))
     }
 
     pub fn single(target: DecodeTarget) -> Self {
-        Self(NonZeroU32::new(1 << target.index()).unwrap())
+        let bit = NonZeroU32::MIN.get().rotate_left(u32::from(target.index()));
+        Self(NonZeroU32::new(bit).unwrap_or(NonZeroU32::MIN))
     }
 
     pub fn union(self, other: Self) -> Self {

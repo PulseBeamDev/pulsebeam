@@ -394,8 +394,14 @@ fn regional_h264_protected_pair_refuses_a_constrained_hop() -> anyhow::Result<()
     prove_h264_protection(ProtectionCase::InsufficientCapacity)
 }
 
+#[test]
+fn regional_h264_protected_late_viewer_decodes_without_periodic_idr() -> anyhow::Result<()> {
+    prove_h264_protection(ProtectionCase::LateViewer)
+}
+
 #[derive(Clone, Copy, Debug)]
 enum ProtectionCase {
+    LateViewer,
     StandbyLoss,
     PrimaryLoss,
     PlannedDrain,
@@ -408,7 +414,9 @@ fn prove_h264_protection(scenario: ProtectionCase) -> anyhow::Result<()> {
     use crate::tests::{
         native_state::spatial_vp9::{expect_height, open_logical_h264},
         quic_data::{
-            dd_video::{Graph, TRACK, connect_dd_publisher, replay_graph},
+            dd_video::{
+                Graph, TRACK, connect_dd_publisher, replay_graph, replay_graph_on_feedback,
+            },
             sim_quic_tls,
         },
     };
@@ -498,7 +506,13 @@ fn prove_h264_protection(scenario: ProtectionCase) -> anyhow::Result<()> {
         };
         let publication = PublicationKey::new(TrackKind::Video, id.parse()?);
         let graph = Graph::H264Temporal;
-        let send = replay_graph(&mut publisher, &source, graph);
+        let send = async {
+            if matches!(scenario, ProtectionCase::LateViewer) {
+                replay_graph_on_feedback(&mut publisher, &source, graph).await
+            } else {
+                replay_graph(&mut publisher, &source, graph).await
+            }
+        };
         let observe = async {
             anyhow::ensure!(
                 !inspect
@@ -506,15 +520,32 @@ fn prove_h264_protection(scenario: ProtectionCase) -> anyhow::Result<()> {
                     .await
                     .map_err(relay_error)?
             );
-            let (_viewer, sink) = open_logical_h264(
+            let (mut viewer, sink) = open_logical_h264(
                 (ips[3], 7070).into(),
                 NativeHost::bind(client)?,
+                "video-viewer",
                 publisher_name,
                 TRACK,
                 id,
             )
             .await?;
             expect_height(&sink, "H264 primary", 720, Duration::from_secs(4), true).await?;
+            if matches!(scenario, ProtectionCase::LateViewer) {
+                let refreshes = || pulsebeam::sim_metrics::routing_counter("fabric_wan_h264_refresh");
+                let before = refreshes();
+                let (_late, late_sink) = open_logical_h264(
+                    (ips[3], 7070).into(),
+                    NativeHost::bind(client)?,
+                    "late-video-viewer",
+                    publisher_name,
+                    TRACK,
+                    id,
+                )
+                .await?;
+                expect_height(&late_sink, "feedback-only H264 late viewer", 720, Duration::from_secs(4), true).await?;
+                anyhow::ensure!(refreshes() > before, "late viewer did not refresh the remote publisher");
+                return Ok(());
+            }
             let wait = |expected| {
                 let inspect = &inspect;
                 async move {
@@ -536,7 +567,16 @@ fn prove_h264_protection(scenario: ProtectionCase) -> anyhow::Result<()> {
                 timeout(Duration::from_secs(4), wait(true))
                     .await.context("independent H264 paths never became warm")??;
             }
+            let frame = || timeout(Duration::from_millis(350), async {
+                loop {
+                    if let Some(frame) = sink.try_next_frame() {
+                        return frame;
+                    }
+                    sleep(Duration::from_millis(5)).await;
+                }
+            });
             match scenario {
+                ProtectionCase::LateViewer => unreachable!("handled before warming the pair"),
                 ProtectionCase::InsufficientCapacity => {
                     anyhow::ensure!(
                         !inspect.drain_media_relay(room, publication, nodes[1]).await.map_err(relay_error)?,
@@ -589,16 +629,40 @@ fn prove_h264_protection(scenario: ProtectionCase) -> anyhow::Result<()> {
                     // still-isolated standby cannot justify protection again.
                     turmoil::repair(ips[1], ips[3]);
                 }
-                ProtectionCase::StandbyLoss | ProtectionCase::PrimaryLoss | ProtectionCase::PlannedDrain => {
-                    if matches!(scenario, ProtectionCase::PrimaryLoss | ProtectionCase::PlannedDrain) {
-                        let frame = || timeout(Duration::from_millis(350), async {
-                            loop {
-                                if let Some(frame) = sink.try_next_frame() {
-                                    return frame;
-                                }
-                                sleep(Duration::from_millis(5)).await;
+                ProtectionCase::StandbyLoss => {
+                    while sink.try_next_frame().is_some() {}
+                    let mut previous = frame().await.context("no H264 picture before churn")?.rtp_timestamp;
+                    for control_cut in [true, false, false] {
+                        let transition = async {
+                            if control_cut {
+                                fixture.streams[3].disconnect().await;
+                            } else {
+                                turmoil::partition_oneway(ips[2], ips[3]);
                             }
-                        });
+                            timeout(Duration::from_secs(2), wait(false))
+                                .await.context("protection stayed admitted without a fresh standby")??;
+                            if control_cut {
+                                fixture.streams[3].connect();
+                            } else {
+                                turmoil::repair_oneway(ips[2], ips[3]);
+                            }
+                            timeout(Duration::from_secs(4), wait(true))
+                                .await.context("protection did not rewarm after standby rejoined")??;
+                            anyhow::Ok(())
+                        };
+                        let playback = async {
+                            loop {
+                                let picture = frame().await.context("H264 decode deadline during standby churn")?;
+                                let delta = picture.rtp_timestamp.wrapping_sub(previous);
+                                anyhow::ensure!(picture.height == 720 && matches!(delta, 3000 | 6000 | 9000 | 12000),
+                                    "H264 playback missed or rewound a base interval during churn: delta={delta}");
+                                previous = picture.rtp_timestamp;
+                            }
+                        };
+                        pulsebeam_runtime::select! { result = transition => result, result = playback => result }?;
+                    }
+                }
+                ProtectionCase::PrimaryLoss | ProtectionCase::PlannedDrain => {
                         while sink.try_next_frame().is_some() {}
                         let mut timestamp = frame().await.context("no H264 picture before primary loss")?.rtp_timestamp;
                         let cut = Instant::now();
@@ -626,9 +690,6 @@ fn prove_h264_protection(scenario: ProtectionCase) -> anyhow::Result<()> {
                                 "H264 playback skipped a base interval, duplicated or rewound: delta={delta}");
                             timestamp = picture.rtp_timestamp;
                         }
-                    } else {
-                        fixture.streams[3].disconnect().await;
-                    }
                     timeout(Duration::from_secs(2), wait(false))
                         .await.context("protection remained admitted after path loss")??;
                 }
@@ -645,6 +706,26 @@ fn prove_h264_protection(scenario: ProtectionCase) -> anyhow::Result<()> {
             if matches!(scenario, ProtectionCase::TotalIsolation) {
                 anyhow::ensure!(!inspect.media_protection(room, publication).await.map_err(relay_error)?,
                     "a single restored path readmitted protection");
+            }
+            if matches!(scenario, ProtectionCase::StandbyLoss) {
+                let traffic = || pulsebeam::sim_metrics::routing_counter("fabric_wan_protected_sent");
+                anyhow::ensure!(traffic() > 0, "the warmed pair sent no protected packets");
+                timeout(Duration::from_secs(2), viewer.remove_owned(1, 3))
+                    .await.context("subscriber withdrawal was not confirmed")??;
+                timeout(Duration::from_secs(4), wait(false))
+                    .await.context("protection remained admitted without a subscriber")??;
+                timeout(Duration::from_secs(4), async {
+                    let mut counters = traffic();
+                    let mut quiet_since = Instant::now();
+                    while quiet_since.elapsed() < Duration::from_millis(500) {
+                        sleep(Duration::from_millis(25)).await;
+                        let current = traffic();
+                        if current != counters {
+                            quiet_since = Instant::now();
+                            counters = current;
+                        }
+                    }
+                }).await.context("WAN traffic did not quiesce after subscriber withdrawal")?;
             }
             Ok(())
         };

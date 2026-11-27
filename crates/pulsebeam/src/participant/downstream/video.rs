@@ -2066,11 +2066,10 @@ impl AllocationEngine {
             .unwrap_or((0, 0));
         (0..crate::rtp::monitor::MAX_LADDER_TARGETS).filter_map(move |dt| {
             let (height, cost, fps) = match ladder {
-                Some(ladder) if ladder.context.active_targets & (1 << dt) != 0 => (
-                    ladder.heights[dt],
-                    f64::from(ladder.payload_bps[dt]),
-                    ladder.fps[dt],
-                ),
+                Some(ladder) if ladder.context.active_targets & (1 << dt) != 0 => {
+                    let (height, fps, bps) = ladder.target(dt)?;
+                    (height, f64::from(bps), fps)
+                }
                 None if dt == fallback.0 => (fallback.1, snap.stable_bitrate_bps, 0),
                 _ => return None,
             };

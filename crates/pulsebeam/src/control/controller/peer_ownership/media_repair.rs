@@ -104,7 +104,7 @@ impl Demand {
             position: interest.position,
         };
         let sent = lane.try_send(refresh.encode_refresh(), deadline).is_ok();
-        tracing::debug!(?refresh, sent, "Sent WAN VP9 refresh request");
+        tracing::debug!(?refresh, sent, "Sent WAN media refresh request");
         sent
     }
 

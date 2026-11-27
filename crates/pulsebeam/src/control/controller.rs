@@ -463,6 +463,8 @@ pub enum ControllerError {
     OfferRejected(#[from] NegotiatorError),
     #[error("server is busy, please try again later.")]
     ServiceUnavailable,
+    #[error("node connection limit reached")]
+    ConnectionCapacity,
     #[error("participant connection was superseded")]
     Superseded,
     #[error("participant authorization expired")]
@@ -817,6 +819,7 @@ pub struct ControllerActor {
     standby_outbox: standby_egress::Outbox,
     delivery_budget: creation::DeliveryBudget,
     steering: Option<Box<dyn Steering>>,
+    max_connections: Option<std::num::NonZeroUsize>,
     materializations: VecDeque<MaterializationWork>,
     native_connections: std::collections::HashMap<ConnectionId, NativeService>,
     retiring_native: std::collections::HashMap<ConnectionId, native_service::RetiringNative>,
@@ -909,6 +912,7 @@ impl ControllerActor {
             standby_outbox: standby_egress::Outbox::default(),
             delivery_budget: creation::DeliveryBudget::new(),
             steering: None,
+            max_connections: None,
             materializations: VecDeque::new(),
             native_connections: std::collections::HashMap::new(),
             retiring_native: std::collections::HashMap::new(),
@@ -924,6 +928,24 @@ impl ControllerActor {
     #[cfg(feature = "sim")]
     pub(crate) fn set_sim_ownership_peer(&mut self, peer: ownership::sim::SimOwnershipPeer) {
         self.receipt_trust = Some(ownership::receipt::Authority::Local(peer.trust()));
+    }
+
+    pub(crate) fn set_max_connections(&mut self, limit: Option<std::num::NonZeroUsize>) {
+        self.max_connections = limit;
+    }
+
+    fn check_connection_capacity(&self) -> Result<(), ControllerError> {
+        let in_use = self
+            .core
+            .registry
+            .connection_count()
+            .saturating_add(self.materializations.len());
+        if let Some(limit) = self.max_connections
+            && in_use >= limit.get()
+        {
+            return Err(ControllerError::ConnectionCapacity);
+        }
+        Ok(())
     }
 
     pub(crate) fn set_quic_authority(&mut self, authority: Option<(String, u16)>) {
@@ -4229,6 +4251,7 @@ impl ControllerActor {
             }
             _ => return Err(NegotiatorError::InvalidResources.into()),
         };
+        self.check_connection_capacity()?;
         let (slot, shard) = self.select_placement(scope, participant_id)?;
         let at = self
             .clock
@@ -5327,6 +5350,7 @@ mod replacement_tests {
                 standby_outbox: standby_egress::Outbox::default(),
                 delivery_budget: creation::DeliveryBudget::new(),
                 steering: None,
+                max_connections: None,
                 materializations: VecDeque::new(),
                 native_connections: std::collections::HashMap::new(),
                 retiring_native: std::collections::HashMap::new(),
@@ -6114,6 +6138,8 @@ mod replacement_tests {
     #[test]
     fn pending_materialization_does_not_block_other_completion_or_teardown() {
         let (mut actor, _receivers) = actor_with_receivers(2);
+        actor.set_max_connections(std::num::NonZeroUsize::new(2));
+        assert!(actor.check_connection_capacity().is_ok());
         let room_id = RoomId::new("materializations").unwrap();
         let participants = [
             crate::entity::fixture_participant_id(),
@@ -6168,6 +6194,10 @@ mod replacement_tests {
                 started: pulsebeam_runtime::time::Instant::now(),
             });
         }
+        assert!(matches!(
+            actor.check_connection_capacity(),
+            Err(ControllerError::ConnectionCapacity)
+        ));
         let mut cx = Context::from_waker(std::task::Waker::noop());
         assert!(
             ControllerActor::poll_materializations(&mut actor.materializations, &mut cx)
@@ -6183,6 +6213,10 @@ mod replacement_tests {
             mailbox::bounded(const { core::num::NonZeroUsize::new(4).unwrap() });
         actor.tick(&mut commands, &mut events, false);
         assert_eq!(replies[1].try_recv().unwrap().unwrap().answer, "answer");
+        assert!(matches!(
+            actor.check_connection_capacity(),
+            Err(ControllerError::ConnectionCapacity)
+        ));
         assert!(matches!(
             replies[0].try_recv(),
             Err(oneshot::error::TryRecvError::Empty)
@@ -6214,6 +6248,7 @@ mod replacement_tests {
             )
             .unwrap();
         actor.tick(&mut commands, &mut events, false);
+        assert!(actor.check_connection_capacity().is_ok());
         assert!(
             actor
                 .core

@@ -149,6 +149,10 @@ impl RoomRegistry {
         room.add_participant(&participant_id, shard_id, partition_index);
     }
 
+    pub(super) fn connection_count(&self) -> usize {
+        self.connections.len()
+    }
+
     pub(super) fn connections(&self) -> impl Iterator<Item = &ParticipantMeta> {
         self.connections.values()
     }

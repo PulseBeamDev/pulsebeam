@@ -99,7 +99,8 @@ impl TargetRates {
             *bytes = 0;
         }
         for (fps, pictures) in self.fps.iter_mut().zip(&mut self.pictures) {
-            *fps = (*pictures as f64 / elapsed.as_secs_f64()).round() as u16;
+            let rate = (*pictures as f64 / elapsed.as_secs_f64()).round();
+            *fps = u16::try_from(crate::bitrate::saturating_bps(rate)).unwrap_or(u16::MAX);
             *pictures = 0;
         }
         self.start = Some(now);

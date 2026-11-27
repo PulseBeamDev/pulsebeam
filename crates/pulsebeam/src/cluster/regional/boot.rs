@@ -12,7 +12,7 @@ const OFFER: &[u8] = b"PBRB\x02\x01";
 const REPLY: &[u8] = b"PBRB\x02\x02";
 const CONFIRM: &[u8] = b"PBRB\x02\x03";
 const ACCEPTED: &[u8] = b"PBRB\x02\x04";
-const FRAME_BYTES: usize = 6 + 32 + 8 + 32 + 16;
+pub(super) const FRAME_BYTES: usize = 6 + 32 + 8 + 32 + 16;
 
 type Challenge = [u8; 16];
 type DigestBytes = [u8; 32];
@@ -52,7 +52,7 @@ pub(super) struct Binding {
 
 impl Binding {
     pub(super) fn acceptance(self) -> Vec<u8> {
-        let mut frame = Vec::with_capacity(ACCEPTED.len() + self.session.len());
+        let mut frame = Vec::with_capacity(ACCEPTED.len().saturating_add(self.session.len()));
         frame.extend_from_slice(ACCEPTED);
         frame.extend_from_slice(&self.session);
         frame
@@ -104,7 +104,7 @@ impl AwaitReply {
             return None;
         }
         let binding = bind(self.peer, remote, self.offer, reply);
-        let mut confirm = Vec::with_capacity(CONFIRM.len() + binding.session.len());
+        let mut confirm = Vec::with_capacity(CONFIRM.len().saturating_add(binding.session.len()));
         confirm.extend_from_slice(CONFIRM);
         confirm.extend_from_slice(&binding.session);
         Some((confirm, binding))

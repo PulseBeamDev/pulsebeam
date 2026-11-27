@@ -1279,7 +1279,7 @@ impl Association {
             .demand(demand, grant, now, |source| match source {
                 media_repair::Source::Shard(parent) => actor
                     .stage_repair_lookups(vec![PeerRepairLookup::Media(MediaRepairLookup {
-                        parent,
+                        parent: *parent,
                         position: demand.position,
                     })])
                     .pop()
@@ -1527,7 +1527,7 @@ impl Association {
         let want_probe = !self.reader.pending(now) && now >= self.wan_refresh.pull_after;
         let mut probe = false;
         let mut batch = Vec::new();
-        let mut frames = 0;
+        let mut frames = 0_usize;
         for (key, assertion) in page {
             self.interest_after = Some(key);
             // An active receiver needs the first measured ladder sooner than
@@ -1549,7 +1549,7 @@ impl Association {
                     return probe;
                 }
                 batch.clear();
-                frames += 1;
+                frames = frames.saturating_add(1);
                 if frames == FRAMES {
                     return probe;
                 }

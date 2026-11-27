@@ -219,10 +219,10 @@ pub(crate) mod fixture {
     }
 
     impl State {
-        pub(crate) fn new() -> Self {
-            let path = tempfile::tempdir().unwrap();
-            let identity = Identity::allocate(path.path()).unwrap();
-            Self { identity, path }
+        pub(crate) fn new() -> Result<Self> {
+            let path = tempfile::tempdir()?;
+            let identity = Identity::allocate(path.path())?;
+            Ok(Self { identity, path })
         }
 
         pub(crate) fn node(&self) -> NodeId {
@@ -234,7 +234,7 @@ pub(crate) mod fixture {
             epoch: [u8; 16],
             direct: &[NodeId],
             other: &[NodeId],
-        ) -> (Journal, DiscoveryPort) {
+        ) -> Result<(Journal, DiscoveryPort)> {
             let slots = |nodes: &[NodeId]| {
                 nodes
                     .iter()
@@ -248,10 +248,9 @@ pub(crate) mod fixture {
                 epoch,
                 slots(direct),
                 slots(other),
-            )
-            .unwrap();
+            )?;
             let (broker, port) = DiscoveryBroker::channel(8);
-            (Journal { store, broker }, port)
+            Ok((Journal { store, broker }, port))
         }
     }
 
@@ -261,9 +260,9 @@ pub(crate) mod fixture {
     }
 
     impl Journal {
-        pub(crate) fn drive(&mut self) {
+        pub(crate) fn drive(&mut self) -> Result<()> {
             while let Ok(candidate) = self.broker.candidates.try_recv() {
-                if self.store.discover(&candidate).unwrap() {
+                if self.store.discover(&candidate)? {
                     assert!(
                         self.broker
                             .admitted
@@ -272,6 +271,7 @@ pub(crate) mod fixture {
                     );
                 }
             }
+            Ok(())
         }
     }
 }

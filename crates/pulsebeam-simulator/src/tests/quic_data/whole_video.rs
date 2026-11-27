@@ -288,10 +288,11 @@ pub(in crate::tests) async fn prove_whole_video(
                 (unit.access, &unit.data) == (expected[index].0, &expected[index].1),
                 "{name} unit {index} changed in transit"
             );
-            let timestamp = unit
+            let [a, b, c, d, ..] = unit
                 .rtp_time
                 .with_context(|| format!("{name} unit missing RTP time"))?
-                as u32;
+                .to_le_bytes();
+            let timestamp = u32::from_le_bytes([a, b, c, d]);
             ensure!(
                 previous.is_none_or(|last| timestamp.wrapping_sub(last) == 3000),
                 "{name} unit {index} has a nonconsecutive RTP timestamp"

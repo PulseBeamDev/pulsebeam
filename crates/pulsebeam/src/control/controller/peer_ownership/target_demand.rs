@@ -41,16 +41,16 @@ impl Budget {
         if bytes.len() != BUDGET_SIZE || !bytes.starts_with(&BUDGET_TAG) {
             return None;
         }
-        let label = NonZeroU32::new(u32::from_be_bytes(bytes[2..6].try_into().ok()?))?;
-        let ttl_ms = u16::from_be_bytes(bytes[26..28].try_into().ok()?);
+        let label = NonZeroU32::new(u32::from_be_bytes(bytes.get(2..6)?.try_into().ok()?))?;
+        let ttl_ms = u16::from_be_bytes(bytes.get(26..28)?.try_into().ok()?);
         if label.get() == FEEDBACK_SSRC || !(1..=BUDGET_TTL_MS).contains(&ttl_ms) {
             return None;
         }
         Some(Self {
             label,
-            incarnation: NonZeroU64::new(u64::from_be_bytes(bytes[6..14].try_into().ok()?))?,
-            generation: NonZeroU64::new(u64::from_be_bytes(bytes[14..22].try_into().ok()?))?,
-            bps: u32::from_be_bytes(bytes[22..26].try_into().ok()?),
+            incarnation: NonZeroU64::new(u64::from_be_bytes(bytes.get(6..14)?.try_into().ok()?))?,
+            generation: NonZeroU64::new(u64::from_be_bytes(bytes.get(14..22)?.try_into().ok()?))?,
+            bps: u32::from_be_bytes(bytes.get(22..26)?.try_into().ok()?),
             ttl_ms,
         })
     }
@@ -88,7 +88,7 @@ impl Budget {
             incarnation: demand.incarnation,
             generation: demand.generation,
             bps,
-            ttl_ms: ttl_ms - 60,
+            ttl_ms: ttl_ms.checked_sub(60)?,
         };
         lane.try_send(budget.encode(), cutoff).ok()
     }
@@ -153,16 +153,16 @@ impl Demand {
         if bytes.len() != SIZE || !bytes.starts_with(&TAG) {
             return None;
         }
-        let label = NonZeroU32::new(u32::from_be_bytes(bytes[2..6].try_into().ok()?))?;
-        let incarnation = NonZeroU64::new(u64::from_be_bytes(bytes[6..14].try_into().ok()?))?;
-        let generation = NonZeroU64::new(u64::from_be_bytes(bytes[14..22].try_into().ok()?))?;
-        let ttl_ms = u16::from_be_bytes(bytes[22..24].try_into().ok()?);
+        let label = NonZeroU32::new(u32::from_be_bytes(bytes.get(2..6)?.try_into().ok()?))?;
+        let incarnation = NonZeroU64::new(u64::from_be_bytes(bytes.get(6..14)?.try_into().ok()?))?;
+        let generation = NonZeroU64::new(u64::from_be_bytes(bytes.get(14..22)?.try_into().ok()?))?;
+        let ttl_ms = u16::from_be_bytes(bytes.get(22..24)?.try_into().ok()?);
         if label.get() == FEEDBACK_SSRC || Duration::from_millis(u64::from(ttl_ms)) > MAX_LEASE {
             return None;
         }
-        let attachment = u64::from_be_bytes(bytes[24..32].try_into().ok()?);
-        let active_targets = u32::from_be_bytes(bytes[32..36].try_into().ok()?);
-        let mask = u32::from_be_bytes(bytes[36..40].try_into().ok()?);
+        let attachment = u64::from_be_bytes(bytes.get(24..32)?.try_into().ok()?);
+        let active_targets = u32::from_be_bytes(bytes.get(32..36)?.try_into().ok()?);
+        let mask = u32::from_be_bytes(bytes.get(36..40)?.try_into().ok()?);
         let projection = match (ttl_ms, attachment, active_targets, mask) {
             (0, 0, 0, 0) => None,
             (0, ..) => return None,

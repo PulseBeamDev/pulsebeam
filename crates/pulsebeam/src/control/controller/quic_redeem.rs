@@ -40,7 +40,9 @@ pub(super) fn denial(error: &OwnedAdmissionError) -> Denial {
             ControllerError::AuthorizationRejected | ControllerError::AuthorizationExpired,
         ) => Denial::Denied,
         OwnedAdmissionError::Authority(ownership::Error::Capacity)
-        | OwnedAdmissionError::Request(ControllerError::ServiceUnavailable)
+        | OwnedAdmissionError::Request(
+            ControllerError::ServiceUnavailable | ControllerError::ConnectionCapacity,
+        )
         | OwnedAdmissionError::Image(_) => Denial::Capacity,
         _ => Denial::AttemptUnavailable,
     }
@@ -133,6 +135,7 @@ impl ControllerActor {
             },
             wall_now,
             |actor, mut state| {
+                actor.check_connection_capacity()?;
                 let authorization = state
                     .authorization
                     .take()

@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use anyhow::{Context, Result, ensure};
 use rustls::{
     CertificateError, DigitallySignedStruct, Error, RootCertStore, SignatureScheme,
@@ -17,7 +15,7 @@ use tonic::transport::{ClientTlsConfig, Endpoint};
 )]
 #[derive(Debug)]
 struct PinnedLeaf {
-    webpki: Arc<WebPkiServerVerifier>,
+    webpki: std::sync::Arc<WebPkiServerVerifier>,
     expected_leaf: Box<[u8]>,
 }
 
@@ -80,6 +78,8 @@ pub(super) fn configure(
     for certificate in CertificateDer::pem_slice_iter(root_pem) {
         roots.add(certificate.context("reading regional server CA certificate")?)?;
     }
+    use std::sync::Arc;
+
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let webpki = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider)
         .build()

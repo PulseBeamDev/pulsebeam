@@ -484,13 +484,13 @@ pub(super) fn receiver_plans<'a>(
             .and_modify(|demand| *demand = None)
             .or_insert(Some(demand));
     }
-    let mut unavailable = 0;
+    let mut unavailable = 0_usize;
     let routes = sources
         .into_iter()
         .filter_map(|(key, demand)| {
             let plan = ReceiverPlan::new(router, demand?, wire_bps, now)?;
             if plan.hops.is_empty() {
-                unavailable += 1;
+                unavailable = unavailable.saturating_add(1);
                 return None;
             }
             Some((key, plan))
@@ -624,7 +624,11 @@ impl Receivers {
         let mut updates = Vec::new();
         if let Some(state) = self.routes.get_mut(&source.scope()) {
             for index in (0..state.legs.len()).rev() {
-                if state.legs[index].hop.path.includes_relay(relay) {
+                if state
+                    .legs
+                    .get(index)
+                    .is_some_and(|leg| leg.hop.path.includes_relay(relay))
+                {
                     state
                         .legs
                         .remove(index)
@@ -717,7 +721,7 @@ impl Receivers {
     ) -> Vec<Update> {
         let mut updates = Vec::new();
         let mut next = BTreeMap::new();
-        let mut observed = [plans.unavailable + plans.routes.len(), 0, 0];
+        let mut observed = [plans.unavailable.saturating_add(plans.routes.len()), 0, 0];
         for (key, mut plan) in plans.routes {
             let permit = plan.permit;
             let drained = primary.drained_relay(plan.demand);
@@ -775,9 +779,17 @@ impl Receivers {
                         .filter(|leg| leg.fresh_media(links, now))
                         .count()
                 });
-                if fresh > 0 {
-                    observed[0] -= 1;
-                    observed[fresh] += 1;
+                let [unavailable, degraded, protected] = &mut observed;
+                match fresh {
+                    0 => {}
+                    1 => {
+                        *unavailable = unavailable.saturating_sub(1);
+                        *degraded = degraded.saturating_add(1);
+                    }
+                    _ => {
+                        *unavailable = unavailable.saturating_sub(1);
+                        *protected = protected.saturating_add(1);
+                    }
                 }
                 next.insert(key, ReceiveLegs { canonical, legs });
             }

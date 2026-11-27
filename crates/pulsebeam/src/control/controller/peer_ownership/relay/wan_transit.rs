@@ -104,7 +104,7 @@ impl Sends {
             return None;
         }
         Some(Grant {
-            path: Source::Shard(MediaRepairParent::Relay(route.clone())),
+            path: Source::Shard(Box::new(MediaRepairParent::Relay(route.clone()))),
             parent: ParentSend {
                 cutoff: entry.cutoff.clone(),
                 window,

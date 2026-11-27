@@ -5,8 +5,8 @@
 //! probe controller, and the failure modes only appear once both are in the loop.
 
 use super::common::{
-    Capacity, LinkProfile, LinkReport, LocalNodeSim, Participant, Playback,
-    PlaybackExpectation, Property, Reorder, Room, Step, VideoQuality, media::native_temporal_fixture,
+    Capacity, LinkProfile, LinkReport, LocalNodeSim, Participant, Playback, PlaybackExpectation,
+    Property, Reorder, Room, Step, VideoQuality, media::native_temporal_fixture,
 };
 use std::time::Duration;
 

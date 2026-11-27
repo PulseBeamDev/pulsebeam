@@ -1498,10 +1498,14 @@ impl ShardExecution {
                     self.publisher_interests.swap_remove(index);
                     continue;
                 };
-                self.publisher_interests[index].refresh_at = now + crate::track::KEYFRAME_DEBOUNCE;
+                if let Some(interest) = self.publisher_interests.get_mut(index) {
+                    interest.refresh_at = now
+                        .checked_add(crate::track::KEYFRAME_DEBOUNCE)
+                        .unwrap_or(lease.expires);
+                }
                 let live_path = self.runtime.has_live_publisher_path(source, now);
                 if live_path && refreshed_live_path {
-                    index += 1;
+                    index = index.saturating_add(1);
                     continue;
                 }
                 let registry = &mut self.registry;
@@ -1522,9 +1526,11 @@ impl ShardExecution {
                 // Initial feedback establishes a real window, which may arrive
                 // before any child can see the keyframe. Request one more once
                 // a downstream WAN route can actually carry it.
-                self.publisher_interests[index].refreshed_live_path = live_path && refreshed;
+                if let Some(interest) = self.publisher_interests.get_mut(index) {
+                    interest.refreshed_live_path = live_path && refreshed;
+                }
             }
-            index += 1;
+            index = index.saturating_add(1);
         }
     }
 
@@ -1675,7 +1681,7 @@ impl ShardExecution {
         }
         let now = Instant::now();
         match request.lookup {
-            PeerRepairLookup::Refresh(lookup) => self.forward_peer_vp9_refresh(lookup, now),
+            PeerRepairLookup::Refresh(lookup) => self.forward_peer_media_refresh(lookup, now),
             PeerRepairLookup::Media(lookup) => {
                 let located = self.locate_peer_media_repair(lookup, now);
                 let _ = request.result.send(located);
@@ -1782,7 +1788,7 @@ impl ShardExecution {
             .then_some((participant, source))
     }
 
-    fn forward_peer_vp9_refresh(
+    fn forward_peer_media_refresh(
         &mut self,
         lookup: crate::route::fabric::relay::MediaRepairLookup,
         now: Instant,
@@ -1790,11 +1796,13 @@ impl ShardExecution {
         use crate::route::fabric::relay::MediaRepairParent;
         match lookup.parent {
             MediaRepairParent::Relay(route) => {
-                let interest = self.runtime.relay_vp9_refresh(&route, lookup.position, now);
+                let interest = self
+                    .runtime
+                    .relay_media_refresh(&route, lookup.position, now);
                 tracing::debug!(
                     position = lookup.position,
                     forwarded = interest.is_some(),
-                    "Resolved WAN VP9 relay refresh"
+                    "Resolved WAN media relay refresh"
                 );
                 if let Some(interest) = interest {
                     self.pipeline
@@ -1802,7 +1810,8 @@ impl ShardExecution {
                 }
             }
             MediaRepairParent::Publisher(route) => {
-                if route.publisher.emission.profile() != pulsebeam_core::fabric::Profile::Vp9 {
+                let profile = route.publisher.emission.profile();
+                if !crate::route::fabric::network_repair::supports_media_refresh(profile) {
                     return;
                 }
                 let Some((publisher, source)) =
@@ -1813,7 +1822,7 @@ impl ShardExecution {
                 let unix_now = self.fabric_unix_time();
                 let registry = &mut self.registry;
                 let dirty = &mut self.dirty;
-                self.quic_data_ready |= self.runtime.request_peer_media_refresh(
+                let requested = self.runtime.request_peer_media_refresh(
                     source,
                     &route,
                     lookup.position,
@@ -1829,6 +1838,11 @@ impl ShardExecution {
                         )
                     },
                 );
+                self.quic_data_ready |= requested;
+                #[cfg(feature = "sim")]
+                if requested && profile == pulsebeam_core::fabric::Profile::H264 {
+                    crate::sim_metrics::record_routing_counter("fabric_wan_h264_refresh");
+                }
             }
         }
     }
@@ -3322,7 +3336,7 @@ impl ShardExecution {
                 ?selected,
                 "Staged WAN VP9 projection"
             );
-            if let Some(interest) = self.runtime.network_vp9_refresh(source, Instant::now()) {
+            if let Some(interest) = self.runtime.network_media_refresh(source, Instant::now()) {
                 self.pipeline
                     .push_shard_event(ShardEvent::NetworkMediaRefresh(Box::new(interest)));
             }
@@ -3709,7 +3723,7 @@ impl ShardExecution {
             return;
         }
         if self.runtime.can_project_network_vp9(branch.source()) {
-            if let Some(interest) = self.runtime.network_vp9_refresh(branch.source(), now) {
+            if let Some(interest) = self.runtime.network_media_refresh(branch.source(), now) {
                 self.pipeline
                     .push_shard_event(ShardEvent::NetworkMediaRefresh(Box::new(interest)));
             }
@@ -4048,7 +4062,7 @@ impl ShardExecution {
                                 }
                                 Some(crate::shard::router::FabricOwner::Network) => {
                                     if let Some(interest) =
-                                        self.runtime.network_vp9_refresh(branch.source(), now())
+                                        self.runtime.network_media_refresh(branch.source(), now())
                                     {
                                         self.pipeline.push_shard_event(
                                             ShardEvent::NetworkMediaRefresh(Box::new(interest)),

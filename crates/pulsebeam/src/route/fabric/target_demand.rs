@@ -79,7 +79,10 @@ impl Demand {
             Update::Lease {
                 projection,
                 expires,
-            } if now < expires && expires <= route_expires && expires - now <= MAX_LEASE => {
+            } if now < expires
+                && expires <= route_expires
+                && expires.saturating_duration_since(now) <= MAX_LEASE =>
+            {
                 Some((projection, expires))
             }
             Update::Lease { .. } => return false,

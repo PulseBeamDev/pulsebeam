@@ -195,16 +195,21 @@ fn reject_boot() -> Status {
     Status::failed_precondition("regional boot transcript did not match")
 }
 
-fn boot_metadata(metadata: &MetadataMap) -> Result<tonic::codegen::Bytes, Status> {
+fn boot_metadata(metadata: &MetadataMap) -> Result<[u8; boot::FRAME_BYTES], Status> {
     if metadata.get(ORIGIN).is_some() || metadata.get(TARGET).is_some() {
         return Err(Status::failed_precondition(
             "mixed regional admission modes",
         ));
     }
-    metadata
+    let invalid = |_| Status::invalid_argument("invalid regional boot negotiation");
+    let bytes = metadata
         .get_bin(BOOT)
         .ok_or_else(|| Status::failed_precondition("regional boot negotiation is required"))?
         .to_bytes()
+        .map_err(invalid)?;
+    bytes
+        .as_ref()
+        .try_into()
         .map_err(|_| Status::invalid_argument("invalid regional boot negotiation"))
 }
 

@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, VecDeque},
-    num::NonZeroU32,
+    num::{NonZeroU32, NonZeroUsize},
+    ops::{Index, IndexMut},
 };
 
 pub(super) const PACKETS_PER_FLOW: usize = 32;
@@ -27,25 +28,53 @@ impl Class {
         }
     }
 
-    pub(super) const fn capacity(self) -> usize {
+    pub(super) const fn capacity(self) -> NonZeroUsize {
         match self {
-            Self::Audio => 48,
-            Self::Protected => 128,
-            Self::Live => 128,
-            Self::Repair => 16,
+            Self::Audio => const { NonZeroUsize::new(48).unwrap() },
+            Self::Protected | Self::Live => const { NonZeroUsize::new(128).unwrap() },
+            Self::Repair => const { NonZeroUsize::new(16).unwrap() },
+        }
+    }
+}
+
+#[derive(Default)]
+pub(in crate::link::wan_host) struct Lanes<T>(pub(super) [T; Class::ALL.len()]);
+
+impl<T> Index<Class> for Lanes<T> {
+    type Output = T;
+
+    fn index(&self, class: Class) -> &T {
+        let [audio, protected, live, repair] = &self.0;
+        match class {
+            Class::Audio => audio,
+            Class::Protected => protected,
+            Class::Live => live,
+            Class::Repair => repair,
+        }
+    }
+}
+
+impl<T> IndexMut<Class> for Lanes<T> {
+    fn index_mut(&mut self, class: Class) -> &mut T {
+        let [audio, protected, live, repair] = &mut self.0;
+        match class {
+            Class::Audio => audio,
+            Class::Protected => protected,
+            Class::Live => live,
+            Class::Repair => repair,
         }
     }
 }
 
 pub(super) struct Schedule<T> {
-    lanes: [Lane<T>; Class::ALL.len()],
+    lanes: Lanes<Lane<T>>,
     turn: usize,
 }
 
 impl<T> Default for Schedule<T> {
     fn default() -> Self {
         Self {
-            lanes: std::array::from_fn(|_| Lane::default()),
+            lanes: Lanes::default(),
             turn: 0,
         }
     }
@@ -83,8 +112,8 @@ impl<T> Default for Lane<T> {
 
 impl<T> Schedule<T> {
     pub(super) fn push(&mut self, class: Class, key: NonZeroU32, bytes: usize, item: T) -> bool {
-        let lane = &mut self.lanes[class as usize];
-        if lane.packets >= class.capacity() || !(1..=QUANTUM).contains(&bytes) {
+        let lane = &mut self.lanes[class];
+        if lane.packets >= class.capacity().get() || !(1..=QUANTUM).contains(&bytes) {
             return false;
         }
         let flow = lane.flows.entry(key).or_default();
@@ -95,7 +124,7 @@ impl<T> Schedule<T> {
             lane.active.push_back(key);
         }
         flow.queue.push_back((bytes, item));
-        lane.packets += 1;
+        lane.packets = lane.packets.saturating_add(1);
         true
     }
 
@@ -106,10 +135,10 @@ impl<T> Schedule<T> {
             }
         }
         for offset in 0..CYCLE.len() {
-            let index = (self.turn + offset) % CYCLE.len();
-            let class = CYCLE[index];
+            let index = self.turn.saturating_add(offset).checked_rem(CYCLE.len())?;
+            let &class = CYCLE.get(index)?;
             if ready(class, self.has_packets(class)) {
-                self.turn = (index + 1) % CYCLE.len();
+                self.turn = index.saturating_add(1).checked_rem(CYCLE.len())?;
                 return Some(class);
             }
         }
@@ -117,19 +146,19 @@ impl<T> Schedule<T> {
     }
 
     pub(super) fn has_packets(&self, class: Class) -> bool {
-        self.lanes[class as usize].packets != 0
+        self.lanes[class].packets != 0
     }
 
     pub(super) fn pop(&mut self, class: Class) -> Option<T> {
-        let lane = &mut self.lanes[class as usize];
+        let lane = &mut self.lanes[class];
         let key = lane.active.pop_front()?;
-        let flow = lane.flows.get_mut(&key).expect("active WAN flow");
-        let (cost, item) = flow.queue.pop_front().expect("nonempty WAN flow");
+        let flow = lane.flows.get_mut(&key)?;
+        let (cost, item) = flow.queue.pop_front()?;
         if flow.credit < cost {
-            flow.credit += QUANTUM;
+            flow.credit = flow.credit.saturating_add(QUANTUM);
         }
-        flow.credit -= cost;
-        lane.packets -= 1;
+        flow.credit = flow.credit.saturating_sub(cost);
+        lane.packets = lane.packets.saturating_sub(1);
         if let Some((next, _)) = flow.queue.front() {
             if flow.credit >= *next {
                 lane.active.push_front(key);

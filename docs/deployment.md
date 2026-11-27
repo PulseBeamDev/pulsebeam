@@ -103,6 +103,12 @@ logical routes on one shared uplink do not protect against loss of that uplink.
   TLS name, CA, and peer certificate in DER form. Both sides check the exact TLS
   leaf; the dialing side also checks the TLS name. Restrict these ports to the
   configured peers. Keep private TLS and receipt keys separate from API keys.
+- Set `--max-connections` per node from a load rehearsal of the deployed
+  workload, including reconnect and single-node-loss headroom. It counts
+  materializing and committed connections across projects and transports.
+  At the limit, new materializations, including replacements, are rejected
+  before allocating a media transport. The flag is optional and does not
+  limit viewers per source or replace the directed-link budgets.
 - Set `cluster.protected_base_stream_bps` for the subscribed base stream and
   `protected_egress_bps` independently for each qualified directed adjacency.
   Reserve enough capacity for the surviving route before accepting protected
@@ -138,12 +144,19 @@ TLS and receipt-key changes still require coordinated pin changes.
 
 ## Check protection and recover service
 
-Scrape `/metrics` on the internal listener. `regional_media_protection_sources`
-reports aggregate receiver-side source counts by `state`. It covers eligible,
-resolved regional protection demand considered by the receiver planner, not all
-sessions. `protected` means two fresh protected receive legs, `degraded` means
-one, and `unavailable` means none. These counts do not show whether a client
-actually decoded a frame. Zero across all three can mean no eligible demand.
+Scrape `/metrics` on the internal listener. `regional_control_boot_slots`
+counts available and unavailable `direct` control lanes and `routed` boot slots.
+If routed slots stay unavailable and `regional_boot_discovery_clock_qualified`
+is zero, check the host clock and leap-second policy before investigating routes.
+These gauges do not indicate that a media path is carrying traffic.
+
+`regional_media_protection_sources` reports aggregate receiver-side source counts
+by `state`. It covers resolved regional protection demand considered by the
+receiver planner, not all sessions. `protected` means two fresh protected receive
+legs, `degraded` means one leg remains from an established pair, and `unavailable`
+means no fresh protected legs. Media can still play on an ordinary route when
+protection is unavailable. Zero across all three can mean no eligible demand.
+Always verify that the receiver decoded media as well as checking these counts.
 
 - During a controlled rehearsal with eligible media playing, check that the
   source is protected before removing a route. Cut one independent path and

@@ -14,6 +14,10 @@ use crate::entity::{PublicationKey, TrackKind};
 const PENDING_LIMIT: usize = 32;
 pub(crate) const MAX_REPAIR_LIFETIME: Duration = Duration::from_secs(2);
 
+pub(crate) const fn supports_media_refresh(profile: Profile) -> bool {
+    matches!(profile, Profile::H264 | Profile::Vp9)
+}
+
 /// Repair authority is separate from live relay authority: it names one
 /// authenticated ingress, source incarnation, and destination branch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

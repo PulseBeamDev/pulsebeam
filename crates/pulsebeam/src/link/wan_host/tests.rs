@@ -365,7 +365,7 @@ async fn warm_receive_relays_authenticated_media_without_installing_a_shard_rout
         Header {
             profile: Profile::H264,
             marker: true,
-            sequence: position as u32,
+            sequence: u32::try_from(position & u64::from(u32::MAX)).unwrap(),
             timestamp: 9000,
         },
         &[Extension {

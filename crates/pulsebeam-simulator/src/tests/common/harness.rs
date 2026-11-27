@@ -5009,7 +5009,13 @@ async fn execute_plan(
                     .copied()
                     .unwrap_or(0);
                 let frames = decoded.frames.saturating_sub(baseline);
-                (frames > 0).then_some((*name, DecodedVideoWindow { frames, height: decoded.height }))
+                (frames > 0).then_some((
+                    *name,
+                    DecodedVideoWindow {
+                        frames,
+                        height: decoded.height,
+                    },
+                ))
             })
             .collect();
         report.forwarded_height = height_by_publisher.clone();

@@ -48,7 +48,11 @@ pub(crate) fn publication(
         fabric_profile(&binding.codec.parameters).ok_or(wire::FailureCode::Unsupported)?;
     if profile == Profile::Vp9
         || binding.encodings.len() != 1
-        || kind == wire::TrackKind::Audio && binding.encodings[0].rid.is_some()
+        || kind == wire::TrackKind::Audio
+            && binding
+                .encodings
+                .first()
+                .is_some_and(|encoding| encoding.rid.is_some())
         || parameters.encodings.iter().any(|encoding| {
             encoding.scalability_mode.as_deref().is_some_and(|mode| {
                 mode != wire::RtpScalabilityMode::L1t1.as_str()

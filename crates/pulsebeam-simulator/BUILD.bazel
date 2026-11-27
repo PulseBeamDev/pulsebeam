@@ -117,6 +117,15 @@ py_test(
     exec_properties = {"cpu_count": str(SIMULATION_JOBS), "memory_kb": str(SIMULATION_JOBS * 1024 * 1024)},
 )
 
+py_test(
+    name = "production_soak",
+    srcs = ["//tools:run-simulations.py"],
+    main = "//tools:run-simulations.py",
+    args = ["$(rootpath :sim_binary)", "--filter", "regional_h264_protected_"] + CANDIDATE_ARGS,
+    data = [":sim_binary", ":candidate"],
+    size = "medium",
+)
+
 REPLAY_ARGS = ["$(rootpath :sim_binary)"] + CANDIDATE_ARGS
 
 py_binary(

@@ -109,7 +109,10 @@ pub struct NodeBuilder {
     operator_listener: Option<std::os::unix::net::UnixListener>,
     provisioned_peers: Vec<ProvisionedPeer>,
     #[cfg(not(feature = "sim"))]
-    enrolled_boot: Option<(crate::cluster::admission::LocalBoot, Vec<crate::cluster::EnrolledPeer>)>,
+    enrolled_boot: Option<(
+        crate::cluster::admission::LocalBoot,
+        Vec<crate::cluster::EnrolledPeer>,
+    )>,
     publisher_handoff_store: Option<crate::cluster::handoff::Store>,
     link_listen: Option<SocketAddr>,
     link_control: Option<pulsebeam_runtime::sync::oneshot::Sender<crate::link::Control>>,
@@ -127,6 +130,8 @@ pub struct NodeBuilder {
     /// UDP datagram loss select exactly the transport their shaper controls.
     udp_only: bool,
     ice_tcp: Option<IceTcpConfig>,
+
+    max_connections: Option<std::num::NonZeroUsize>,
 
     /// How many participants of one room share a shard before the next join
     /// spills to another.
@@ -199,6 +204,7 @@ impl NodeBuilder {
             tcp_only: false,
             udp_only: false,
             ice_tcp: None,
+            max_connections: None,
             room_partition_size: crate::control::core::DEFAULT_ROOM_PARTITION_SIZE,
             room_placement: crate::control::core::RoomPartitionPlacement::Balanced,
         }
@@ -287,6 +293,12 @@ impl NodeBuilder {
             "a room partition must hold at least one participant"
         );
         self.room_partition_size = participants;
+        self
+    }
+
+    /// Cap committed and materializing connections. Placement tickets do not consume slots.
+    pub fn max_connections(mut self, limit: Option<std::num::NonZeroUsize>) -> Self {
+        self.max_connections = limit;
         self
     }
 
@@ -546,7 +558,8 @@ impl NodeBuilder {
             Topology::SingleNode => OwnershipMode::Standalone,
             Topology::MultiNode => OwnershipMode::Unavailable,
         };
-        let has_configured_links = !options.ownership_peers.is_empty() || !options.enrolled_peers.is_empty();
+        let has_configured_links =
+            !options.ownership_peers.is_empty() || !options.enrolled_peers.is_empty();
         anyhow::ensure!(
             !has_configured_links || self.link_listen.is_none(),
             "an explicit Link listener cannot be combined with provisioned Fabric WAN peers"
@@ -568,7 +581,9 @@ impl NodeBuilder {
         let mut membership = membership;
         #[cfg(not(feature = "sim"))]
         if let Some(boot) = membership.boot.take() {
-            self.region_tree.as_mut().context("boot admission requires a region tree")?
+            self.region_tree
+                .as_mut()
+                .context("boot admission requires a region tree")?
                 .begin_boot_admission(boot.member)?;
             self.enrolled_boot = Some((boot, enrolled));
         }
@@ -987,6 +1002,7 @@ impl NodeBuilder {
             self.room_placement,
             view_writers,
         );
+        controller.set_max_connections(self.max_connections);
         controller.set_ownership_mode(ownership_mode);
         controller.set_quic_authority(quic_authority);
         if let Some(store) = self.publisher_handoff_store {
@@ -1263,7 +1279,9 @@ impl NodeBuilder {
         }
         #[cfg(not(feature = "sim"))]
         for result in boot_results {
-            result.await.context("regional boot service stopped without reporting")?
+            result
+                .await
+                .context("regional boot service stopped without reporting")?
                 .context("regional boot service failed")?;
         }
         if let Some(error) = control_error {

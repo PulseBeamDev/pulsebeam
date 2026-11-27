@@ -431,9 +431,10 @@ mod tests {
         assert_eq!(validation::validate_capabilities(&audio_only), Ok(()));
         assert_eq!(validation::validate_capabilities(&current), Ok(()));
         assert_eq!(audio_only.codecs, current.codecs[..1]);
-        for (candidate, mime) in current.codecs[1..]
-            .iter()
-            .zip(["video/h264", "video/vp8", "video/vp9", "video/av1"])
+        for (candidate, mime) in
+            current.codecs[1..]
+                .iter()
+                .zip(["video/h264", "video/vp8", "video/vp9", "video/av1"])
         {
             assert!(candidate.scalability_modes.is_empty());
             let format = candidate.format.as_ref().unwrap();

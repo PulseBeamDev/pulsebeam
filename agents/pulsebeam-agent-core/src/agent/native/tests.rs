@@ -945,10 +945,14 @@ fn quic_reserves_nonreused_payload_ids_without_rtc_effects() {
             format: state::CodecFormat::native_quic_baseline("video/vp9"),
             ..Default::default()
         });
-    session.capabilities.rtp.codecs.push(state::RtpCodecCapability {
-        format: state::CodecFormat::native_quic_baseline("video/h264"),
-        ..Default::default()
-    });
+    session
+        .capabilities
+        .rtp
+        .codecs
+        .push(state::RtpCodecCapability {
+            format: state::CodecFormat::native_quic_baseline("video/h264"),
+            ..Default::default()
+        });
     assert!(quic_rtp_binding(session, &video, None, h264_dd, None, &mut ids).is_none());
     assert!(quic_rtp_binding(session, &video, None, vp8, None, &mut ids).is_none());
     assert!(quic_rtp_binding(session, &video, None, vp9_dd, None, &mut ids).is_none());

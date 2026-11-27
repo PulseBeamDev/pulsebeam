@@ -10,9 +10,8 @@ pub mod oracle;
 pub mod provenance;
 
 pub use harness::{
-    Capacity, Content, Experience, LinkProfile, LinkReport, LocalNodeSim,
-    MAX_TIME_TO_FIRST_FRAME, Participant, Playback, PlaybackExpectation, Property, Reorder, Room,
-    Step, VideoQuality,
+    Capacity, Content, Experience, LinkProfile, LinkReport, LocalNodeSim, MAX_TIME_TO_FIRST_FRAME,
+    Participant, Playback, PlaybackExpectation, Property, Reorder, Room, Step, VideoQuality,
 };
 
 use pulsebeam_core::auth::{

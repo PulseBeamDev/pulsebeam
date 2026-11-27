@@ -296,7 +296,8 @@ mod tests {
     const EPOCH: [u8; 16] = [7; 16];
 
     fn generation(value: u64) -> NonZeroU64 {
-        NonZeroU64::new(value).unwrap()
+        assert_ne!(value, 0, "test generation must be nonzero");
+        NonZeroU64::new(value).unwrap_or(NonZeroU64::MIN)
     }
 
     fn pin(byte: u8) -> PeerFingerprint {

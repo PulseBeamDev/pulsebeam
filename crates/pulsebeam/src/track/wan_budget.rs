@@ -57,17 +57,17 @@ impl Lease {
 
 fn restrict(mut ladder: MeasuredTargetLadder, bps: u32) -> MeasuredTargetLadder {
     let active = |index: usize| ladder.context.active_targets & (1 << index) != 0;
-    let base = (0..MAX_LADDER_TARGETS)
-        .filter(|&index| active(index))
-        .min_by_key(|&index| {
-            (
-                ladder.heights[index],
-                ladder.fps[index],
-                ladder.payload_bps[index],
-            )
-        });
-    ladder.context.active_targets = (0..MAX_LADDER_TARGETS)
-        .filter(|&index| active(index) && (base == Some(index) || ladder.payload_bps[index] <= bps))
+    let measured = || {
+        (0..MAX_LADDER_TARGETS)
+            .filter(|&index| active(index))
+            .filter_map(|index| Some((index, ladder.target(index)?)))
+    };
+    let base = measured()
+        .min_by_key(|&(_, geometry)| geometry)
+        .map(|(index, _)| index);
+    ladder.context.active_targets = measured()
+        .filter(|&(index, (_, _, rate))| base == Some(index) || rate <= bps)
+        .map(|(index, _)| index)
         .fold(0, |mask, index| mask | (1 << index));
     ladder
 }

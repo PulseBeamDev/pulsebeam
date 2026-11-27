@@ -982,13 +982,13 @@ fn association_replacement_reuses_pinned_identities_but_not_bindings_or_queued_p
 }
 
 #[test]
-fn replacement_wan_peer_pin_rejects_retired_quic_credential() {
+fn replacement_wan_peer_pin_rejects_retired_quic_credential() -> Result<(), &'static str> {
     let mut pair = Pair::with_backend(true);
     pair.connect();
 
     let replacement = QuicCredential::generate().unwrap();
     let PeerConfig::Quic(responder) = &mut pair.b_peer else {
-        unreachable!();
+        return Err("expected QUIC responder");
     };
     responder.expected_peer = replacement.fingerprint();
     pair.reset();
@@ -1006,7 +1006,7 @@ fn replacement_wan_peer_pin_rejects_retired_quic_credential() {
     );
 
     let PeerConfig::Quic(initiator) = &mut pair.a_peer else {
-        unreachable!();
+        return Err("expected QUIC initiator");
     };
     initiator.credential = replacement;
     pair.reset();
@@ -1021,6 +1021,7 @@ fn replacement_wan_peer_pin_rejects_retired_quic_credential() {
     let mut batch = Vec::new();
     assert_eq!(rx.try_recv_batch(&mut batch, 2), 1);
     assert!(matches!(&batch[0].packet, Packet::Wire(bytes) if bytes.as_ref() == [1]));
+    Ok(())
 }
 
 #[test]

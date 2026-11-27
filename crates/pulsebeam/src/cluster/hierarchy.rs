@@ -308,7 +308,7 @@ impl RegionTree {
             .all(|(_, member)| member.boot_key.is_some())
     }
 
-    pub(super) fn discovery_slots(&self) -> impl Iterator<Item = Member> + '_ {
+    pub(crate) fn discovery_slots(&self) -> impl Iterator<Item = Member> + '_ {
         self.members
             .values()
             .filter_map(|(_, member)| member.boot_key.map(|_| member.identity()))

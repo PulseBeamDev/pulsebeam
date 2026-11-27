@@ -202,7 +202,12 @@ async fn foreign_witness(
     let output = tokio::time::timeout(timeout, command.output()).await;
     responder.abort();
     let response = responder.await;
-    let output = output.context("installed consumer did not finish")??;
+    let output = output.with_context(|| {
+        let acknowledged = received_rx.try_recv().is_ok();
+        format!(
+            "installed consumer {participant} did not finish; Rust acknowledged ordered bytes: {acknowledged}; responder: {response:?}"
+        )
+    })??;
     ensure!(
         output.status.success(),
         "installed consumer {participant} failed: {}\n{}; responder: {response:?}",
