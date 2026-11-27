@@ -227,6 +227,12 @@ pub(crate) struct SamplePublisherAnchor {
     pub result: oneshot::Sender<Option<PublisherPosition>>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PublisherInterest {
+    pub publisher: PublisherAnchor,
+    pub expires: pulsebeam_runtime::time::Instant,
+}
+
 #[derive(Debug)]
 pub(crate) struct LocateRelayRepair {
     pub lookup: crate::route::fabric::relay::PeerRepairLookup,
@@ -259,6 +265,7 @@ pub(crate) struct ShardUpdate {
     pub data_expectations: Vec<ObserveNetworkDataExpectation>,
     pub publisher_observations: Vec<crate::route::fabric::PublisherObservation>,
     pub source_anchors: Vec<SamplePublisherAnchor>,
+    pub publisher_interests: Vec<PublisherInterest>,
     pub repair_lookups: Vec<LocateRelayRepair>,
     pub repair_handoffs: Vec<crate::route::fabric::relay::PeerRepairHandoff>,
     pub repair_unavailable: Vec<crate::route::fabric::network_repair::Interest>,
@@ -282,6 +289,7 @@ impl ShardUpdate {
             data_expectations: Vec::new(),
             publisher_observations: Vec::new(),
             source_anchors: Vec::new(),
+            publisher_interests: Vec::new(),
             repair_lookups: Vec::new(),
             repair_handoffs: Vec::new(),
             repair_unavailable: Vec::new(),
@@ -302,6 +310,7 @@ impl ShardUpdate {
             && self.data_expectations.is_empty()
             && self.publisher_observations.is_empty()
             && self.source_anchors.is_empty()
+            && self.publisher_interests.is_empty()
             && self.repair_lookups.is_empty()
             && self.repair_handoffs.is_empty()
             && self.repair_unavailable.is_empty()
@@ -471,6 +480,20 @@ impl ShardUpdateWriter {
             .publisher_sends
             .push(UpdatePublisherSend { change, result });
         receipt
+    }
+
+    pub(crate) fn stage_publisher_interest(
+        &mut self,
+        generation: u64,
+        interest: PublisherInterest,
+    ) {
+        let commit = self
+            .staged
+            .get_or_insert_with(|| Box::new(ShardUpdate::new(self.shard, generation)));
+        if commit.generation != generation {
+            pulsebeam_runtime::fatal!("a publisher interest must target its shard generation");
+        }
+        commit.publisher_interests.push(interest);
     }
 
     pub(crate) fn stage_publisher_anchor(

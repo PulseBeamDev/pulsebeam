@@ -25,7 +25,10 @@ enum RoutingFixture<'a> {
     Direct,
     DirectQuic(pulsebeam_agent_quic::transport::ServerConfig),
     StaticTransit,
-    Regional(&'a mut regional::Fixture),
+    Regional(
+        &'a mut regional::Fixture,
+        Option<pulsebeam_agent_quic::transport::ServerConfig>,
+    ),
 }
 
 #[test]
@@ -127,6 +130,93 @@ fn prove_provisioned_av1(dd: bool, latency: Duration) -> anyhow::Result<()> {
     });
     run_sim_or_timeout(&mut sim, Duration::from_secs(25))
         .map_err(|error| anyhow::anyhow!("two-node AV1 (DD={dd}) failed: {error:#}"))
+}
+
+#[test]
+fn provisioned_wan_vp9_remote_only_cold_start() -> anyhow::Result<()> {
+    prove_vp9_cold_start(false)
+}
+
+#[test]
+fn regional_wan_vp9_remote_only_cold_start() -> anyhow::Result<()> {
+    prove_vp9_cold_start(true)
+}
+
+fn prove_vp9_cold_start(routed: bool) -> anyhow::Result<()> {
+    use crate::tests::{
+        native_state::spatial_vp9::{Check, receive},
+        quic_data::{
+            sim_quic_tls,
+            spatial_vp9::{connect_publisher, replay_on_feedback},
+        },
+    };
+
+    let seed = std::env::var("PULSEBEAM_SIM_SEED")
+        .map(|value| value.parse::<u64>())
+        .unwrap_or(Ok(NATIVE_RUNTIME_SEED))?;
+    let _clocks = crate::sim_clock::SimClocksGuard::init();
+    crate::sim_rand::set_thread_rng(seed);
+    fastrand::seed(seed);
+    let root = tempfile::tempdir()?;
+    let (tls, roots) = sim_quic_tls()?;
+    let (mut sim, [ingress, egress, client], mut regional) = if routed {
+        let (sim, hosts, fixture) = regional::Fixture::cold_path(seed, root.path(), tls)?;
+        (sim, hosts, Some(fixture))
+    } else {
+        let (sim, hosts) = provisioned_video_pair(
+            seed,
+            Duration::from_millis(5),
+            Duration::from_secs(20),
+            root.path(),
+            RoutingFixture::DirectQuic(tls),
+        )?;
+        (sim, hosts, None)
+    };
+    sim.client(client, async move {
+        if let Some(fixture) = &mut regional {
+            fixture.connect();
+        }
+        let key = pulsebeam_server::insecure_dev_api_key()?;
+        let expires = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs()
+            + 60;
+        let token = pulsebeam_server::sign_participant_token(
+            &key,
+            &serde_json::from_value(
+                json!([{"rooms":["stage"],"allow":["join","publish","discover"]}]),
+            )?,
+            "vp9-source",
+            expires,
+        )?;
+        let (mut publisher, source) = connect_publisher(
+            (ingress, 7070).into(),
+            client,
+            (ingress, 3478).into(),
+            roots,
+            &token.token,
+        )
+        .await?;
+        let publication = source.publication_id().to_owned();
+        let counter = pulsebeam::sim_metrics::routing_counter;
+        let before = counter("fabric_rtp_vp9_wan_enqueued");
+        pulsebeam_runtime::select! {
+            result = replay_on_feedback(&mut publisher, &source) => result?,
+            result = receive(
+                (egress, 7070).into(),
+                NativeHost::bind(client)?,
+                &publication,
+                Check::ColdStart { publisher: "vp9-source", track: "spatial-camera" },
+                || Ok(()),
+            ) => result?,
+        }
+        if counter("fabric_rtp_vp9_wan_enqueued") <= before {
+            return Err("VP9 did not cross the WAN".into());
+        }
+        Ok(())
+    });
+    run_sim_or_timeout(&mut sim, Duration::from_secs(25))
+        .map_err(|error| anyhow::anyhow!("VP9 WAN cold start: {error:#}"))
 }
 
 #[test]
@@ -753,11 +843,11 @@ fn install_nodes(
         .collect::<anyhow::Result<_>>()?;
     let relay_images = matches!(routing, RoutingFixture::StaticTransit);
     let mut regional_ports = match &mut routing {
-        RoutingFixture::Regional(fixture) => fixture.ports(nodes.len(), edges),
+        RoutingFixture::Regional(fixture, _) => fixture.ports(nodes.len(), edges),
         _ => (0..nodes.len()).map(|_| Vec::new()).collect(),
     };
     let region_tree = match &routing {
-        RoutingFixture::Regional(fixture) => fixture.region_tree(|index| {
+        RoutingFixture::Regional(fixture, _) => fixture.region_tree(|index| {
             let (_, _, (node, generation), _, key) = &nodes[index];
             (*node, *generation, key.public_key())
         })?,
@@ -816,7 +906,11 @@ fn install_nodes(
         };
         let standby = standby.cloned();
         let quic = match &routing {
-            RoutingFixture::DirectQuic(tls) if index == 0 => Some(tls.clone()),
+            RoutingFixture::DirectQuic(tls) | RoutingFixture::Regional(_, Some(tls))
+                if index == 0 =>
+            {
+                Some(tls.clone())
+            }
             _ => None,
         };
         let ports = std::cell::RefCell::new(std::mem::take(&mut regional_ports[index]));

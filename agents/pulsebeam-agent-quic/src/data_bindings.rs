@@ -111,36 +111,15 @@ impl FabricOffer {
 
     /// Match the installed publication's encoding rather than inferring DD
     /// emission from the association's receive capabilities.
-    pub fn bind_publisher(
-        mut self,
-        peer: Self,
-        profile: Profile,
-        publishes_h264_dd: bool,
-    ) -> Result<FabricBinding, WireError> {
-        let dd = ExtensionKind::DependencyDescriptor.bit();
-        let required = match (profile, publishes_h264_dd) {
-            (Profile::H264, true) => dd,
-            (_, true) => return Err(WireError::ExtensionProfile),
-            (Profile::H264, false) => {
-                self.supported &= !dd;
-                0
-            }
-            (Profile::Data, false) => return self.bind_data(peer, false),
-            _ => 0,
-        };
-        self.bind(peer, profile, required)
-    }
-
     pub fn bind_rtp_publisher(
         self,
         peer: Self,
         profile: Profile,
-        legacy_h264_dd: bool,
         emits_video_dd: Option<bool>,
     ) -> Result<FabricBinding, WireError> {
-        match (legacy_h264_dd, emits_video_dd) {
-            (legacy, None) => self.bind_publisher(peer, profile, legacy),
-            (false, Some(emission)) => {
+        match emits_video_dd {
+            None if profile == Profile::Opus => self.bind(peer, profile, 0),
+            Some(emission) if profile.is_video() => {
                 let emission = if emission {
                     QuicVideoDd::Emit
                 } else {
@@ -148,7 +127,7 @@ impl FabricOffer {
                 };
                 self.bind_video_direction(peer, profile, emission, QuicVideoDd::Accept)
             }
-            (true, Some(_)) => Err(WireError::RequiredFeature),
+            _ => Err(WireError::RequiredFeature),
         }
     }
 
@@ -161,7 +140,7 @@ impl FabricOffer {
         reception: Option<QuicVideoDd>,
     ) -> Result<FabricBinding, WireError> {
         match reception {
-            None => self.bind(peer, profile, 0),
+            None if profile == Profile::Opus => self.bind(peer, profile, 0),
             Some(QuicVideoDd::Absent) => {
                 self.bind_video_direction(peer, profile, QuicVideoDd::Absent, QuicVideoDd::Absent)
             }
@@ -400,12 +379,12 @@ mod tests {
                 Err(WireError::RequiredFeature),
             );
             assert_eq!(
-                publisher.bind_rtp_publisher(receiver, Profile::H264, false, Some(true)),
+                publisher.bind_rtp_publisher(receiver, Profile::H264, Some(true)),
                 Err(WireError::RequiredFeature),
             );
             assert_eq!(
-                publisher.bind_publisher(receiver, Profile::H264, true),
-                legacy.bind_publisher(legacy, Profile::H264, true),
+                publisher.bind_rtp_publisher(receiver, Profile::H264, None),
+                Err(WireError::RequiredFeature),
             );
         }
         let binding = directional
@@ -440,7 +419,7 @@ mod tests {
         assert_eq!(old_data.agreement.extension_mask(), 0x000c);
         assert_eq!(old.bind(current, Profile::Data, 0x000c), Ok(old_data));
         for peer in [old, current] {
-            let logical_data = current.bind_publisher(peer, Profile::Data, false).unwrap();
+            let logical_data = current.bind_data(peer, false).unwrap();
             assert_eq!(logical_data.agreement.extension_mask(), 0);
         }
         assert_eq!(

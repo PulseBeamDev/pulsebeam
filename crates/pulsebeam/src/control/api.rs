@@ -363,8 +363,6 @@ struct NativeResponse<'a> {
     #[schema(value_type = Vec<String>)]
     data_delivery: &'static [pulsebeam_proto::state::DataDelivery],
     #[serde(skip_serializing_if = "Option::is_none")]
-    data_version: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     room_id: Option<&'a str>,
     #[schema(value_type = String)]
     participant_id: ParticipantId,
@@ -388,7 +386,6 @@ impl<'a> NativeResponse<'a> {
                 pulsebeam_proto::state::DataDelivery::Lossy,
                 pulsebeam_proto::state::DataDelivery::Ordered,
             ],
-            data_version: Some(u32::from(pulsebeam_proto::data_endpoint::DATA_V1)),
             room_id: authorization
                 .room_id
                 .as_ref()
@@ -1518,10 +1515,6 @@ mod tests {
             authorization.room_id.as_ref().unwrap().as_str()
         );
         assert!(response_body.get("room_external_id").is_none());
-        assert_eq!(
-            response_body["data_version"],
-            u32::from(pulsebeam_proto::data_endpoint::DATA_V1)
-        );
         let long_location = HeaderValue::from_bytes(&vec![b'a'; 300_000]).unwrap();
         let escaped = "\0".repeat(MAX_NATIVE_SDP_BYTES);
         assert!(matches!(

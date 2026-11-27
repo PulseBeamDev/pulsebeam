@@ -282,11 +282,6 @@ pub fn validate_spec_for(spec: &ResourceSpec, profile: BindingProfile) -> Result
                 .ok_or(ValidationError::Identity)?;
             crate::catalog::validate_address(source).map_err(|_| ValidationError::Identity)?;
             let kind = TrackKind::try_from(source.kind).map_err(|_| ValidationError::Binding)?;
-            if let Some(version) = subscription.data_version
-                && (kind != TrackKind::Data || version != u32::from(crate::data_endpoint::DATA_V1))
-            {
-                return Err(ValidationError::Binding);
-            }
             validate_receive_settings(settings, kind)
         }
         resource_spec::Declaration::SubscriptionSelector(selector) => {
@@ -461,20 +456,15 @@ fn validate_live_for(live: &LiveResource, profile: BindingProfile) -> Result {
         .ok_or(ValidationError::Settings)?;
     let execution =
         ExecutionStatus::try_from(live.execution).map_err(|_| ValidationError::Confirmed)?;
-    let data_v1_publication = matches!(
+    let data_publication = matches!(
         &spec.declaration,
         Some(resource_spec::Declaration::Publication(publication))
-            if matches!(
-                &publication.kind,
-                Some(publication_spec::Kind::Data(data))
-                    if matches!(data.binding.as_ref().and_then(|binding| binding.transport.as_ref()),
-                        Some(track_binding::Transport::SctpDataV1(_) | track_binding::Transport::QuicDataV1(_)))
-            )
+            if matches!(&publication.kind, Some(publication_spec::Kind::Data(_)))
     );
     if live.data_v1_source == Some(0)
-        || (live.data_v1_source.is_some() && !data_v1_publication)
+        || (live.data_v1_source.is_some() && !data_publication)
         || (execution == ExecutionStatus::Installed
-            && data_v1_publication
+            && data_publication
             && live.data_v1_source.is_none())
     {
         return Err(ValidationError::Binding);
@@ -612,13 +602,15 @@ fn validate_logical_subscription_for(
         if !matches_source_address(track, address) {
             return Err(ValidationError::Identity);
         }
-        let data_v1_requested = declaration.data_version.is_some();
-        if let Some(offer) = &subscription.data_v1
-            && (!data_v1_requested
-                || offer.endpoint().is_none()
-                || !matches!(&track.kind, Some(track::Kind::Data(data)) if data.capture_clock == offer.capture_clock))
-        {
-            return Err(ValidationError::Binding);
+        let data = match &track.kind {
+            Some(track::Kind::Data(data)) => Some(data),
+            _ => None,
+        };
+        match (data, &subscription.data_v1) {
+            (Some(data), Some(offer))
+                if offer.endpoint().is_some() && data.capture_clock == offer.capture_clock => {}
+            (None, None) => {}
+            _ => return Err(ValidationError::Binding),
         }
         match &subscription.execution {
             Some(logical_subscription_state::Execution::Installed(binding)) => {
@@ -628,13 +620,17 @@ fn validate_logical_subscription_for(
                         track_binding::Transport::SctpDataV1(_)
                             | track_binding::Transport::QuicDataV1(_)
                     )
-                ) != data_v1_requested
-                    || data_v1_requested != subscription.data_v1.is_some()
+                ) != data.is_some()
                 {
                     return Err(ValidationError::Binding);
                 }
-                if let Some(track::Kind::Data(data)) = &track.kind {
+                if let Some(data) = data {
                     validate_data_binding(Some(binding), data.delivery, profile)?;
+                    if data.record_dd
+                        && !matches!(binding.transport, Some(track_binding::Transport::QuicDataV1(parameters)) if parameters.record_dd)
+                    {
+                        return Err(ValidationError::Binding);
+                    }
                 } else {
                     let kind =
                         TrackKind::try_from(address.kind).map_err(|_| ValidationError::Binding)?;
@@ -734,25 +730,22 @@ fn validate_data_binding(
     delivery: i32,
     profile: BindingProfile,
 ) -> Result {
-    if !known::<DataDelivery>(delivery) {
-        return Err(ValidationError::Binding);
-    }
-    if let Some(data) = binding.and_then(DataV1Binding::from_track) {
-        return (matches!(
-            (profile, data),
-            (BindingProfile::Rtc, DataV1Binding::Sctp(_))
-                | (BindingProfile::Quic, DataV1Binding::Quic(_))
-        ) && data.matches_delivery(delivery))
-        .then_some(())
-        .ok_or(ValidationError::Binding);
-    }
-    validate_binding(binding, TrackKind::Data, false, profile)
+    let data = binding
+        .and_then(DataV1Binding::from_track)
+        .ok_or(ValidationError::Binding)?;
+    (matches!(
+        (profile, data),
+        (BindingProfile::Rtc, DataV1Binding::Sctp(_))
+            | (BindingProfile::Quic, DataV1Binding::Quic(_))
+    ) && data.matches_delivery(delivery))
+    .then_some(())
+    .ok_or(ValidationError::Binding)
 }
 
 fn binding_profile(transport: &track_binding::Transport) -> BindingProfile {
     use track_binding::Transport::*;
     match transport {
-        Rtp(_) | Sctp(_) | SctpDataV1(_) => BindingProfile::Rtc,
+        Rtp(_) | SctpDataV1(_) => BindingProfile::Rtc,
         QuicDataV1(_) | QuicRtp(_) => BindingProfile::Quic,
     }
 }
@@ -772,15 +765,8 @@ fn validate_binding(
         {
             Ok(())
         }
-        Some(track_binding::Transport::QuicRtp(parameters))
-            if publication || !parameters.publishes_h264_dd =>
-        {
+        Some(track_binding::Transport::QuicRtp(parameters)) => {
             QuicRtpBinding::compile(parameters, kind)?.validate_video_dd_direction(publication)
-        }
-        Some(track_binding::Transport::Sctp(sctp))
-            if kind == TrackKind::Data && matches!(sctp.stream_id, Some(1..=65534)) =>
-        {
-            Ok(())
         }
         Some(track_binding::Transport::SctpDataV1(sctp))
             if kind == TrackKind::Data && sctp.format().is_some() =>
@@ -806,7 +792,6 @@ pub struct QuicRtpBinding<'a> {
     payload_type: u8,
     format: &'a CodecFormat,
     feedback: &'a [String],
-    publishes_h264_dd: bool,
     video_dd: Option<QuicVideoDd>,
 }
 
@@ -834,15 +819,14 @@ impl<'a> QuicRtpBinding<'a> {
             .map(|value| QuicVideoDd::try_from(value).map_err(|_| ValidationError::Binding))
             .transpose()?;
         if let Some(dd) = video_dd {
-            if kind != TrackKind::Video || rtp.publishes_h264_dd || dd == QuicVideoDd::Unspecified {
+            if kind != TrackKind::Video || dd == QuicVideoDd::Unspecified {
                 return Err(ValidationError::Binding);
             }
             VideoMode::for_format(format, RtpScalabilityMode::L1t1.as_str())?;
         } else {
             match (kind, format.known_codec()) {
                 (TrackKind::Audio, Some(codec_format::Codec::Opus(_)))
-                    if !rtp.publishes_h264_dd && !video_feedback(&codec.feedback) => {}
-                (TrackKind::Video, Some(codec_format::Codec::H264(_))) => {}
+                    if !video_feedback(&codec.feedback) => {}
                 _ => return Err(ValidationError::Format),
             }
         }
@@ -853,7 +837,6 @@ impl<'a> QuicRtpBinding<'a> {
             payload_type: pt,
             format,
             feedback: &codec.feedback,
-            publishes_h264_dd: rtp.publishes_h264_dd,
             video_dd,
         })
     }
@@ -887,10 +870,6 @@ impl<'a> QuicRtpBinding<'a> {
             | (false, Some(QuicVideoDd::Accept | QuicVideoDd::Require)) => Ok(()),
             _ => Err(ValidationError::Binding),
         }
-    }
-
-    pub const fn publishes_h264_dd(self) -> bool {
-        self.publishes_h264_dd
     }
 }
 
@@ -1049,7 +1028,6 @@ pub fn bindings_equivalent(left: Option<&TrackBinding>, right: Option<&TrackBind
     ) {
         (Some(Transport::QuicDataV1(left)), Some(Transport::QuicDataV1(right))) => left == right,
         (Some(Transport::QuicRtp(left)), Some(Transport::QuicRtp(right))) => left == right,
-        (Some(Transport::Sctp(left)), Some(Transport::Sctp(right))) => left == right,
         (Some(Transport::SctpDataV1(left)), Some(Transport::SctpDataV1(right))) => left == right,
         (Some(Transport::Rtp(left)), Some(Transport::Rtp(right))) => {
             left.mid == right.mid

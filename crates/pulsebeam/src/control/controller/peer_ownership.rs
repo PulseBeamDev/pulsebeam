@@ -210,52 +210,6 @@ pub(super) struct EncoderAdvertisement {
     pub(super) grant: standby::Grant,
 }
 
-#[cfg(test)]
-#[allow(
-    clippy::unwrap_used,
-    reason = "an invalid snapshot fails the simulation"
-)]
-pub(in crate::control) async fn transfer_fixture_snapshot(
-    source: &mut pulsebeam_link::PeerControl,
-    target: &mut pulsebeam_link::PeerControl,
-    bytes: Vec<u8>,
-) -> ownership::wire::Decoded {
-    use pulsebeam_link::LinkTime;
-    use transfer::Frame;
-
-    let mut reader = transfer::Reader::default();
-    let mut sender = transfer::Sender::default();
-    let mut bytes = Some(bytes);
-    assert!(reader.start(Instant::now()));
-    let ttl = LinkTime::from_nanos(u64::MAX);
-    loop {
-        let now = Instant::now();
-        if let Some(pull) = reader.pull(now) {
-            let _ = target.try_send(pull, ttl);
-        }
-        while let Some(pull) = source.try_recv() {
-            if let Some(Frame::Pull(pull)) = Frame::decode(&pull) {
-                if sender.needs_image(pull) {
-                    sender.set_image(now, bytes.take().unwrap());
-                }
-                for frame in sender.respond(now, pull) {
-                    if source.try_send(frame, ttl).is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-        while let Some(chunk) = target.try_recv() {
-            if let Some(Frame::Chunk(chunk)) = Frame::decode(&chunk)
-                && let Some((received, _)) = reader.receive(now, chunk)
-            {
-                return ownership::wire::decode(&received, None).unwrap();
-            }
-        }
-        pulsebeam_runtime::time::sleep(Duration::from_millis(5)).await;
-    }
-}
-
 #[derive(Debug)]
 pub struct Command(Box<Action>);
 

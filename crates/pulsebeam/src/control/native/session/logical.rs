@@ -6,7 +6,7 @@ use wire::logical_subscription_state::Execution;
 pub(super) struct Binding {
     pub(super) id: u64,
     pub(super) exact: wire::ResourceSpec,
-    pub(super) data_v1_endpoint: Option<pulsebeam_proto::data_control::SubscriberBinding>,
+    pub(super) data_v1_offer: Option<wire::DataV1ReceiverOffer>,
     pub(super) wanted_revision: u64,
     evaluated_revision: u64,
     pub(super) retiring: bool,
@@ -63,29 +63,23 @@ impl NativeSession {
         match report.outcome {
             Some(Outcome::Failure(error)) => self.fail_logical_binding(reference, error),
             Some(Outcome::Prepared(transport)) if owned.logical_binding.is_none() => {
-                let data_v1_requested = matches!(
-                    &spec.declaration,
-                    Some(wire::resource_spec::Declaration::LogicalSubscription(spec)) if spec.data_version.is_some()
-                );
+                let address = observed_address(spec).ok_or(OutputError::InvalidObservation)?;
+                let is_data = address.kind == wire::TrackKind::Data as i32;
                 if matches!(
                     transport.transport,
                     Some(
                         wire::track_binding::Transport::SctpDataV1(_)
                             | wire::track_binding::Transport::QuicDataV1(_)
                     )
-                ) != data_v1_requested
-                    || data_v1_requested != state.data_v1.is_some()
+                ) != is_data
+                    || is_data != state.data_v1.is_some()
                 {
                     return self.fail_logical_binding(
                         reference,
                         failure(wire::FailureCode::InvalidConfiguration),
                     );
                 }
-                let address = observed_address(spec).ok_or(OutputError::InvalidObservation)?;
-                let data_v1_endpoint = state
-                    .data_v1
-                    .as_ref()
-                    .and_then(wire::DataV1ReceiverOffer::endpoint);
+                let data_v1_offer = state.data_v1.clone();
                 let exact = wire::ResourceSpec {
                     settings: spec.settings.clone(),
                     declaration: Some(wire::resource_spec::Declaration::Subscription(
@@ -121,7 +115,7 @@ impl NativeSession {
                 owned.logical_binding = Some(Box::new(Binding {
                     id: revision,
                     exact,
-                    data_v1_endpoint,
+                    data_v1_offer,
                     wanted_revision: revision,
                     evaluated_revision: 0,
                     retiring: false,

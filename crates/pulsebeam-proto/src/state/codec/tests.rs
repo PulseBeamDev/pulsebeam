@@ -65,8 +65,13 @@ fn publication(revision: u64) -> ClientStateBatch {
                                     capture_clock: None,
                                     delivery: DataDelivery::Lossy as i32,
                                     binding: Some(TrackBinding {
-                                        transport: Some(track_binding::Transport::Sctp(
-                                            SctpParameters { stream_id: Some(1) },
+                                        transport: Some(track_binding::Transport::SctpDataV1(
+                                            SctpDataV1Parameters {
+                                                stream_id: Some(1),
+                                                version: u32::from(crate::data_endpoint::DATA_V1),
+                                                channel_incarnation: 1,
+                                                delivery: DataV1Delivery::Unreliable as i32,
+                                            },
                                         )),
                                     }),
                                 })),
@@ -236,7 +241,7 @@ fn data_v1_requires_its_exact_negotiated_transport_variant() {
 }
 
 #[test]
-fn quic_binding_uses_new_wire_arm_and_is_scoped_to_the_negotiated_profile() {
+fn data_bindings_are_scoped_to_their_carrier_and_reject_retired_sctp() {
     use track_binding::Transport;
     let mut batch = publication(1);
     let Some(desired_state::Value::Present(spec)) = desired(&mut batch).value.as_mut() else {
@@ -249,8 +254,6 @@ fn quic_binding_uses_new_wire_arm_and_is_scoped_to_the_negotiated_profile() {
     let Some(publication_spec::Kind::Data(data)) = publication.kind.as_mut() else {
         panic!("DATA fixture")
     };
-    let rtc = data.binding.clone().unwrap();
-    let rtc_bytes = rtc.encode_to_vec();
     let binding = TrackBinding {
         transport: Some(Transport::QuicDataV1(QuicDataV1Parameters {
             binding_id: 7,
@@ -265,23 +268,21 @@ fn quic_binding_uses_new_wire_arm_and_is_scoped_to_the_negotiated_profile() {
         quic_bytes,
         [0x22, 15, 8, 7, 16, 1, 25, 9, 0, 0, 0, 0, 0, 0, 0, 32, 1]
     );
-    #[derive(prost::Message)]
-    struct LegacyTrackBinding {
-        #[prost(message, optional, tag = "2")]
-        sctp: Option<SctpParameters>,
-    }
-    assert!(
-        LegacyTrackBinding::decode(rtc_bytes.as_slice())
-            .unwrap()
-            .sctp
-            .is_some()
+    let retired = TrackBinding::decode(&[0x12, 2, 8, 1][..]).unwrap();
+    assert!(retired.transport.is_none());
+    let active = data.binding.replace(retired);
+    assert_eq!(
+        validation::validate_spec(spec),
+        Err(ValidationError::Binding)
     );
-    assert!(
-        LegacyTrackBinding::decode(quic_bytes.as_slice())
-            .unwrap()
-            .sctp
-            .is_none()
-    );
+    let Some(resource_spec::Declaration::Publication(publication)) = spec.declaration.as_mut()
+    else {
+        panic!("publication fixture")
+    };
+    let Some(publication_spec::Kind::Data(data)) = publication.kind.as_mut() else {
+        panic!("DATA fixture")
+    };
+    data.binding = active;
     assert_eq!(validation::validate_spec(spec), Ok(()));
     assert_eq!(
         validation::validate_spec_for(spec, validation::BindingProfile::Quic),
@@ -326,7 +327,6 @@ fn quic_rtp_binding_compiles_opus_coordinates_without_rtc_fields() {
         binding_id: 7,
         incarnation: 9,
         primary_ssrc: 11,
-        publishes_h264_dd: false,
         video_dd: None,
         codec: Some(RtpCodecParameters {
             payload_type: Some(111),
@@ -348,12 +348,12 @@ fn quic_rtp_binding_compiles_opus_coordinates_without_rtc_fields() {
         Err(ValidationError::Format)
     );
 
-    parameters.publishes_h264_dd = true;
+    parameters.video_dd = Some(QuicVideoDd::Emit as i32);
     assert_eq!(
         QuicRtpBinding::compile(&parameters, TrackKind::Audio),
-        Err(ValidationError::Format)
+        Err(ValidationError::Binding)
     );
-    parameters.publishes_h264_dd = false;
+    parameters.video_dd = None;
     parameters.codec.as_mut().unwrap().payload_type = Some(72);
     assert_eq!(
         QuicRtpBinding::compile(&parameters, TrackKind::Audio),
@@ -362,14 +362,13 @@ fn quic_rtp_binding_compiles_opus_coordinates_without_rtc_fields() {
 }
 
 #[test]
-fn directional_video_dd_keeps_legacy_h264_and_checks_direction() {
+fn h264_requires_an_explicit_directional_video_dd_contract() {
     use validation::QuicRtpBinding;
 
     let mut parameters = QuicRtpParameters {
         binding_id: 7,
         incarnation: 9,
         primary_ssrc: 11,
-        publishes_h264_dd: true,
         video_dd: None,
         codec: Some(RtpCodecParameters {
             payload_type: Some(102),
@@ -379,12 +378,7 @@ fn directional_video_dd_keeps_legacy_h264_and_checks_direction() {
             ..Default::default()
         }),
     };
-    let legacy = QuicRtpBinding::compile(&parameters, TrackKind::Video).unwrap();
-    assert!(legacy.publishes_h264_dd());
-    assert_eq!(legacy.video_dd(), None);
-    parameters.video_dd = Some(QuicVideoDd::Emit as i32);
     assert!(QuicRtpBinding::compile(&parameters, TrackKind::Video).is_err());
-    parameters.publishes_h264_dd = false;
     for (declared, publish, subscribe) in [
         (QuicVideoDd::Absent, true, true),
         (QuicVideoDd::Emit, true, false),
@@ -424,28 +418,7 @@ fn installed_data_v1_publication_requires_the_authenticated_source_incarnation()
         execution: ExecutionStatus::Installed as i32,
         ..Default::default()
     };
-    assert_eq!(validation::validate_live(&live), Ok(()));
     live.data_v1_source = Some(u64::MAX);
-    assert_eq!(
-        validation::validate_live(&live),
-        Err(ValidationError::Binding)
-    );
-    let Some(resource_spec::Declaration::Publication(publication)) =
-        &mut live.spec.as_mut().unwrap().declaration
-    else {
-        panic!("publication fixture");
-    };
-    let Some(publication_spec::Kind::Data(data)) = &mut publication.kind else {
-        panic!("DATA fixture");
-    };
-    data.binding = Some(TrackBinding {
-        transport: Some(track_binding::Transport::SctpDataV1(SctpDataV1Parameters {
-            stream_id: Some(1),
-            version: u32::from(crate::data_endpoint::DATA_V1),
-            channel_incarnation: u64::MAX,
-            delivery: DataV1Delivery::Unreliable as i32,
-        })),
-    });
     assert_eq!(validation::validate_live(&live), Ok(()));
     for source in [None, Some(0)] {
         live.data_v1_source = source;
@@ -489,7 +462,6 @@ fn logical_subscription_accepts_only_an_enabled_exact_source_offer() {
                     kind: TrackKind::Data as i32,
                     track_id: String::from("cursor"),
                 }),
-                data_version: None,
             },
         )),
     };
@@ -511,9 +483,22 @@ fn logical_subscription_accepts_only_an_enabled_exact_source_offer() {
         Err(ValidationError::Confirmed)
     );
     subscription.source_revision = (1 << 53) + 1;
+    assert_eq!(
+        validation::validate_logical_subscription(&subscription),
+        Err(ValidationError::Binding),
+        "DATA needs an offer as soon as a source is present",
+    );
+    subscription.data_v1 = Some(DataV1ReceiverOffer {
+        source: u64::MAX,
+        branch: (1 << 53) + 1,
+        capture_clock: None,
+    });
     let binding = TrackBinding {
-        transport: Some(track_binding::Transport::Sctp(SctpParameters {
+        transport: Some(track_binding::Transport::SctpDataV1(SctpDataV1Parameters {
             stream_id: Some(5),
+            version: u32::from(crate::data_endpoint::DATA_V1),
+            channel_incarnation: 9,
+            delivery: DataV1Delivery::Unreliable as i32,
         })),
     };
     let mut report = LogicalReceiverReport {
@@ -552,21 +537,17 @@ fn logical_subscription_accepts_only_an_enabled_exact_source_offer() {
         }],
         ..Default::default()
     };
-    assert_eq!(decode_server(&encode_server(&server).unwrap()), Ok(server));
+    assert_eq!(
+        decode_server(&encode_server(&server).unwrap()),
+        Ok(server.clone())
+    );
 
-    let opt_in = |subscription: &mut LogicalSubscriptionState| {
-        let Some(resource_spec::Declaration::LogicalSubscription(spec)) =
-            &mut subscription.spec.as_mut().unwrap().declaration
-        else {
-            panic!("logical spec");
-        };
-        spec.data_version = Some(u32::from(crate::data_endpoint::DATA_V1));
-    };
     for (delivery, expected) in [
         (DataV1Delivery::Unreliable, Ok(())),
         (DataV1Delivery::Latest, Err(ValidationError::Binding)),
     ] {
         let mut data_v1 = subscription.clone();
+        data_v1.data_v1 = None;
         data_v1.execution = Some(logical_subscription_state::Execution::Installed(
             TrackBinding {
                 transport: Some(track_binding::Transport::SctpDataV1(SctpDataV1Parameters {
@@ -591,11 +572,6 @@ fn logical_subscription_accepts_only_an_enabled_exact_source_offer() {
         });
         assert_eq!(
             validation::validate_logical_subscription(&data_v1),
-            Err(ValidationError::Binding)
-        );
-        opt_in(&mut data_v1);
-        assert_eq!(
-            validation::validate_logical_subscription(&data_v1),
             Err(ValidationError::Binding),
             "a receiver offer cannot change the source clock",
         );
@@ -611,22 +587,74 @@ fn logical_subscription_accepts_only_an_enabled_exact_source_offer() {
             validation::validate_logical_subscription(&data_v1),
             expected
         );
-        let mut legacy = subscription.clone();
-        opt_in(&mut legacy);
-        legacy.source = data_v1.source.take();
-        legacy.data_v1 = data_v1.data_v1.take();
+        data_v1.execution = Some(logical_subscription_state::Execution::Installed(
+            TrackBinding { transport: None },
+        ));
         assert_eq!(
-            validation::validate_logical_subscription(&legacy),
+            validation::validate_logical_subscription(&data_v1),
             Err(ValidationError::Binding)
         );
-        legacy.execution = None;
-        assert_eq!(validation::validate_logical_subscription(&legacy), Ok(()));
-        legacy.data_v1.as_mut().unwrap().branch = 0;
+        data_v1.execution = None;
+        assert_eq!(validation::validate_logical_subscription(&data_v1), Ok(()));
+        data_v1.data_v1.as_mut().unwrap().branch = 0;
         assert_eq!(
-            validation::validate_logical_subscription(&legacy),
+            validation::validate_logical_subscription(&data_v1),
             Err(ValidationError::Binding)
         );
     }
+
+    let mut with_dd = server;
+    let Some(confirmed_state::Value::LogicalSubscription(state)) = with_dd.records[0]
+        .confirmed
+        .as_mut()
+        .unwrap()
+        .value
+        .as_mut()
+    else {
+        panic!("logical subscription fixture");
+    };
+    let Some(track::Kind::Data(source)) = state
+        .source
+        .as_mut()
+        .and_then(|source| source.kind.as_mut())
+    else {
+        panic!("DATA fixture");
+    };
+    source.record_dd = true;
+    assert_eq!(
+        validation::validate_logical_subscription(state),
+        Err(ValidationError::Binding)
+    );
+    let mut quic = QuicDataV1Parameters {
+        binding_id: 5,
+        version: u32::from(crate::data_endpoint::DATA_V1),
+        incarnation: 9,
+        delivery: DataV1Delivery::Unreliable as i32,
+        record_dd: false,
+    };
+    let mut quic_batch = |quic| {
+        let Some(confirmed_state::Value::LogicalSubscription(state)) = with_dd.records[0]
+            .confirmed
+            .as_mut()
+            .unwrap()
+            .value
+            .as_mut()
+        else {
+            panic!("logical subscription fixture");
+        };
+        state.execution = Some(logical_subscription_state::Execution::Installed(
+            TrackBinding {
+                transport: Some(track_binding::Transport::QuicDataV1(quic)),
+            },
+        ));
+        encode_quic_server(&with_dd)
+    };
+    assert_eq!(
+        quic_batch(quic),
+        Err(EncodeError::Validation(ValidationError::Binding))
+    );
+    quic.record_dd = true;
+    assert!(quic_batch(quic).is_ok());
 
     let mut missing_source = subscription.clone();
     missing_source.source = None;
@@ -1111,6 +1139,7 @@ fn owned_confirmation_is_self_contained_and_execution_failure_is_not_rejection()
         Err(ValidationError::Identity)
     );
     let mut invalid = live;
+    invalid.data_v1_source = Some(1);
     invalid.execution = ExecutionStatus::Installed as i32;
     assert_eq!(
         validation::validate_live(&invalid),
@@ -1258,7 +1287,8 @@ fn immutable_declarations_use_codec_defaults_without_reassociating_sources() {
     let Some(publication_spec::Kind::Data(d)) = &mut p.kind else {
         panic!("data")
     };
-    let Some(track_binding::Transport::Sctp(sctp)) = d.binding.as_mut().unwrap().transport.as_mut()
+    let Some(track_binding::Transport::SctpDataV1(sctp)) =
+        d.binding.as_mut().unwrap().transport.as_mut()
     else {
         panic!("sctp")
     };

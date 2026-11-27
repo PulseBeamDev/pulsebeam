@@ -273,7 +273,6 @@ struct NativeResponse {
     connection_id: String,
     rtp_capabilities: pulsebeam_proto::state::RtpCapabilities,
     data_delivery: Vec<serde_json::Value>,
-    data_version: Option<u32>,
     room_id: Option<String>,
     participant_id: String,
     answer: String,
@@ -943,7 +942,7 @@ impl Agent {
         let active = self
             .active
             .as_mut()
-            .filter(|session| !session.signaling_terminal && session.capabilities.data_v1)?;
+            .filter(|session| !session.signaling_terminal)?;
         let live = active.state.eligible(&resource)?;
         let channel = *active.payload_resources.get(&resource)?;
         let prepared = active
@@ -1217,9 +1216,10 @@ impl Agent {
     }
 
     fn project_topic_bindings(&mut self) {
-        let session = self.active.as_ref().filter(|session| {
-            self.closing.is_none() && !session.signaling_terminal && session.capabilities.data_v1
-        });
+        let session = self
+            .active
+            .as_ref()
+            .filter(|session| self.closing.is_none() && !session.signaling_terminal);
         let mut changed = false;
         for status in &mut self.snapshot.topics.publishers {
             let registration = &status.registration;
@@ -2891,11 +2891,10 @@ impl Agent {
                     room_id: room_id.clone(),
                 }),
         )?;
-        let reliable_data_enabled = candidate.capabilities.data_v1
-            && candidate
-                .capabilities
-                .data_delivery
-                .contains(&pulsebeam_proto::state::DataDelivery::Ordered);
+        let reliable_data_enabled = candidate
+            .capabilities
+            .data_delivery
+            .contains(&pulsebeam_proto::state::DataDelivery::Ordered);
         let mut session = Session::new(
             attempt.generation,
             candidate.credential,
@@ -3946,8 +3945,6 @@ fn parse_create_response(
             capabilities: crate::BootstrapCapabilities {
                 rtp: body.rtp_capabilities,
                 data_delivery,
-                data_v1: body.data_version
-                    == Some(u32::from(pulsebeam_proto::data_endpoint::DATA_V1)),
             },
             resource_uri: resource_uri.to_string(),
             room_id: body.room_id,

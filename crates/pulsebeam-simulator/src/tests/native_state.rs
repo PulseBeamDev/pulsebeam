@@ -32,7 +32,6 @@ struct WirePeer {
     payload: [DataChannel; 3],
     gathered: bool,
     initial_complete: bool,
-    data_v1: bool,
     _factory: PeerConnectionFactory,
     _lease: Rc<RuntimeLease>,
     _host: NativeHost,
@@ -192,7 +191,6 @@ impl WirePeer {
             payload,
             gathered: false,
             initial_complete: false,
-            data_v1: false,
             _factory: factory,
             _lease: lease,
             _host: host,
@@ -306,8 +304,6 @@ impl WirePeer {
                 .collect::<Vec<_>>(),
         );
         let body: serde_json::Value = serde_json::from_slice(response.body())?;
-        result.data_v1 = body.get("data_version").and_then(serde_json::Value::as_u64)
-            == Some(u64::from(DATA_V1));
         let participant = body["participant_id"]
             .as_str()
             .context("canonical participant")?
@@ -510,7 +506,6 @@ impl WirePeer {
             Some(wire::ResourceSpec {
                 declaration: Some(wire::resource_spec::Declaration::LogicalSubscription(
                     wire::LogicalSubscriptionSpec {
-                        data_version: None,
                         source: Some(wire::LogicalSourceAddress {
                             room: room.into(),
                             participant_id: publisher.into(),
@@ -659,7 +654,6 @@ fn subscription(source: &Published, enabled: bool) -> wire::ResourceSpec {
         }),
         declaration: Some(wire::resource_spec::Declaration::LogicalSubscription(
             wire::LogicalSubscriptionSpec {
-                data_version: Some(u32::from(DATA_V1)),
                 source: Some(wire::LogicalSourceAddress {
                     room: DATA_ROOM.into(),
                     participant_id: source.track.participant_id.clone(),
@@ -735,7 +729,6 @@ async fn run_publisher(
     // partition must differ from the later audio listener's first partition.
     anyhow::ensure!(matches!(rx.recv().await, Some(PeerStep::ReceiverConnected)));
     let (mut peer, participant) = WirePeer::connect(ip, server, "publisher", true).await?;
-    assert!(peer.data_v1);
     let spec = publication(1, true);
     peer.desire(1, 1, Some(spec.clone()));
     let first = live(peer.confirmed(1, 1).await?, &spec, &participant);
@@ -806,7 +799,6 @@ async fn run_receiver(
     mut rx: tokio::sync::mpsc::Receiver<PeerStep>,
 ) -> anyhow::Result<()> {
     let (mut peer, _) = WirePeer::connect(ip, server, "receiver", false).await?;
-    assert!(peer.data_v1);
     tx.send(PeerStep::ReceiverConnected).await?;
     let Some(PeerStep::Source(first)) = rx.recv().await else {
         anyhow::bail!("first source not announced");

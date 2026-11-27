@@ -21,7 +21,7 @@ use super::{
         receipt::{Authority, Issuer, epoch::Trust, standby::wire::Frame as StandbyFrame},
         wire,
     },
-    relay::{wan_source::WanSourceWindow, wan_transit},
+    relay::{self, interest, wan_source::WanSourceWindow, wan_transit},
     transfer::{self, Frame},
 };
 
@@ -451,6 +451,7 @@ struct Association {
     transit_advertisements: Vec<wan_transit::Advertisement>,
     exports: Vec<wan_transit::Export>,
     remote_wan: Option<(Instant, wire::WanOwnership)>,
+    interest_after: Option<relay::Key>,
     wan_refresh: WanRefresh,
     refresh: Instant,
     live_until: Instant,
@@ -777,6 +778,7 @@ impl Association {
             transit_advertisements: Vec::new(),
             exports: Vec::new(),
             remote_wan: None,
+            interest_after: None,
             wan_refresh: WanRefresh::new(now),
             refresh: now,
             live_until: now.checked_add(LIVENESS).unwrap_or(now),
@@ -1022,11 +1024,11 @@ impl Association {
         snapshot.sort_by_key(|(key, _)| *key);
         let snapshot = snapshot.into_boxed_slice();
         let wan_sources = wan_sources.into_boxed_slice();
-        let image = wire::encode(
+        let image = wire::encode_wan(
             revision,
             trust.checkpoint(),
             &snapshot,
-            wire::RouteImage::Wan {
+            wire::WanRoutes {
                 offers: self
                     .local_wan_receipts
                     .iter()
@@ -1337,6 +1339,71 @@ impl Association {
         });
     }
 
+    fn send_direct_interests(
+        &mut self,
+        actor: &mut ControllerActor,
+        expires_at: LinkTime,
+        now: Instant,
+    ) -> bool {
+        let Some((_, views)) = &self.remote_wan else {
+            return false;
+        };
+        let wall = super::SystemTime::now();
+        let Some(limit_ms) = wall.checked_add(interest::TTL).and_then(interest::millis) else {
+            return false;
+        };
+        let Some(routes) = actor
+            .links
+            .as_mut()
+            .and_then(|links| links.relay_targets(self.network, relay::LIMIT))
+        else {
+            return false;
+        };
+        let want_probe = !self.reader.pending(now) && now >= self.wan_refresh.pull_after;
+        let mut probe = false;
+        let after = self.interest_after;
+        let mut batch = Vec::new();
+        let mut frames = 0;
+        for (&key, _) in routes
+            .iter()
+            .filter(|(key, _)| after.is_none_or(|after| **key > after))
+        {
+            self.interest_after = Some(key);
+            let Some((room, publication)) = key.forward() else {
+                continue;
+            };
+            if actor.lifecycle.ingress_peer(room, publication) != Some(self.network) {
+                continue;
+            }
+            let Some(assertion) = actor
+                .lifecycle
+                .source_exact(room, publication)
+                .and_then(|track| interest::Assertion::for_track(actor, track, wall, limit_ms))
+            else {
+                continue;
+            };
+            probe |= want_probe && !views.sources.iter().any(|source| source.scope() == key);
+            batch.push(assertion);
+            if batch.len() == interest::BATCH {
+                if interest::encode(&batch)
+                    .is_none_or(|bytes| self.lane.try_send(bytes, expires_at).is_err())
+                {
+                    return probe;
+                }
+                batch.clear();
+                frames += 1;
+                if frames == 4 {
+                    return probe;
+                }
+            }
+        }
+        if let Some(bytes) = interest::encode(&batch) {
+            let _ = self.lane.try_send(bytes, expires_at);
+        }
+        self.interest_after = None;
+        probe
+    }
+
     fn step(
         &mut self,
         actor: &mut ControllerActor,
@@ -1469,6 +1536,10 @@ impl Association {
         self.flush_data_expectations(actor, now, expires_at);
         self.flush_repair_interests(actor, now, expires_at);
         self.flush_ownership_image(actor, now);
+        let direct_interest = self.mesh_outbound.is_none()
+            && actor.receipt_trust.as_ref().is_some_and(Authority::ready);
+        let probe = direct_interest && self.send_direct_interests(actor, expires_at, now);
+        let mut interests = Vec::new();
         // Schedule the local pull before responding to the peer's bulk window.
         // Both directions remain bounded even when media or the peer is stalled.
         if self.wan_refresh.pull && now >= self.wan_refresh.pull_after {
@@ -1476,7 +1547,11 @@ impl Association {
             self.wan_refresh.pull_after = now.checked_add(WAN_REFRESH_MIN_INTERVAL).unwrap_or(now);
             // A replacement grant may have invalidated the image in the current round.
             let _ = self.reader.start(now);
-        } else if now >= self.refresh && !self.reader.pending(now) {
+        } else if probe || (now >= self.refresh && !self.reader.pending(now)) {
+            if probe {
+                self.wan_refresh.pull_after =
+                    now.checked_add(WAN_REFRESH_MIN_INTERVAL).unwrap_or(now);
+            }
             let _ = self.reader.start(now);
         }
         if let Some(frame) = self.reader.pull(now) {
@@ -1562,6 +1637,16 @@ impl Association {
                 }
                 continue;
             }
+            if direct_interest && let Some(assertions) = interest::decode(&bytes) {
+                if let Some(wall) = interest::millis(super::SystemTime::now()) {
+                    interests.extend(
+                        assertions
+                            .into_iter()
+                            .filter_map(|item| item.resolve(actor, now, wall)),
+                    );
+                }
+                continue;
+            }
             if actor.receipt_trust.as_ref().is_some_and(Authority::ready) {
                 if let Some(demand) = media_repair::Demand::decode(&bytes) {
                     self.receive_media_repair_demand(actor, demand, now);
@@ -1618,7 +1703,6 @@ impl Association {
                 Some(Frame::Chunk(chunk)) => {
                     if let Some((bytes, deadline)) = self.reader.receive(now, chunk)
                         && let Ok(image) = wire::decode_wan(&bytes)
-                        && let Some(wan) = image.wan
                         && self.lane.is_ready()
                         && actor.links.is_some()
                         && actor
@@ -1631,6 +1715,7 @@ impl Association {
                             )
                             .is_ok()
                     {
+                        let wan = image.wan;
                         if let Some(links) = &mut actor.links
                             && links.accept_wan_retirements(self.network, &wan.retired)
                         {
@@ -1656,6 +1741,9 @@ impl Association {
                 }
                 None => {}
             }
+        }
+        if !interests.is_empty() {
+            actor.stage_publisher_interests(interests);
         }
         if actor.regional_routing.is_none() {
             self.drive_catalog_reads(actor, remote, expires_at, now);

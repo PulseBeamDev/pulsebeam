@@ -1148,6 +1148,18 @@ impl NativeSession {
         Ok(())
     }
 
+    pub(in crate::control) fn wants_media(&self, reference: u64) -> bool {
+        self.rows.get(&Key::Owned(reference)).is_some_and(|row| {
+            matches!(
+                row.value.value.as_ref(),
+                Some(
+                    wire::confirmed_state::Value::LogicalSubscription(_)
+                        | wire::confirmed_state::Value::SubscriptionSelector(_)
+                )
+            )
+        })
+    }
+
     pub(crate) fn take_lookup_changes(&mut self) -> Vec<LookupInterestChange> {
         let changes = self.lookup_changes.drain(..).collect::<Vec<_>>();
         let bytes = changes.iter().fold(0usize, |total, change| {
@@ -1475,12 +1487,12 @@ impl NativeSession {
                 source(address).and_then(|source| {
                     let fabric_source = source.track.fabric_data_source();
                     let track = track_descriptor(source.track)?;
-                    let wire::resource_spec::Declaration::LogicalSubscription(logical) =
-                        spec.declaration.as_ref()?
-                    else {
-                        return None;
-                    };
-                    if logical.data_version.is_some() != fabric_source.is_some() {
+                    if matches!(
+                        &spec.declaration,
+                        Some(wire::resource_spec::Declaration::LogicalSubscription(_))
+                    ) && (address.kind == wire::TrackKind::Data as i32)
+                        != fabric_source.is_some()
+                    {
                         return None;
                     }
                     validation::matches_source_address(&track, address)
@@ -1730,18 +1742,18 @@ impl NativeSession {
         {
             return Err(failure(wire::FailureCode::PermissionDenied));
         }
-        let data_v1_endpoint = work
+        let data_v1_offer = work
             .logical_owner
             .and_then(|owner| self.rows.get(&Key::Owned(owner.get())))
             .and_then(|row| row.owned.as_ref()?.logical_binding.as_ref())
             .filter(|binding| binding.id == work.reference && !binding.retiring)
-            .and_then(|binding| binding.data_v1_endpoint);
+            .and_then(|binding| binding.data_v1_offer.as_ref());
         let (transport, policy) = crate::control::native::receiver(
             spec,
             source.track,
             &track,
             capabilities,
-            data_v1_endpoint,
+            data_v1_offer,
         )
         .map_err(|code| wire::Failure {
             diagnostic: "native receiver transport preparation failed".to_owned(),

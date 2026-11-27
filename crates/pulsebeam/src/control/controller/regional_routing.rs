@@ -277,7 +277,7 @@ impl Routing {
             self.media_branches.iter(),
             |target| self.media_client.attempt_for(target),
         );
-        self.media_owner.stage(actor, now);
+        self.media_owner.stage(actor, now, wall_now);
         let updates = self.media_receives.step(actor, plans, now);
         self.media_sends
             .step(actor, self.local, &self.media_branches, now, wall_now);

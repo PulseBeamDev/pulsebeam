@@ -397,11 +397,30 @@ impl Client {
             let Some(expires) = now.checked_add(ROUTED_READ_TTL) else {
                 break;
             };
+            let Some(expires_ms) = wall
+                .checked_add(ROUTED_READ_TTL)
+                .and_then(media_permit::unix_millis)
+            else {
+                continue;
+            };
+            let grant_expires_ms = query
+                .interests
+                .iter()
+                .map(|interest| interest.expires_unix.saturating_mul(1_000))
+                .max()
+                .unwrap_or_default();
             let get = Get {
                 id,
                 project: interest.project,
                 scope: interest.scope.clone(),
                 after: query.after,
+                expires_ms: expires_ms.min(grant_expires_ms),
+                demand_expires_ms: query
+                    .interests
+                    .iter()
+                    .filter(|interest| interest.wants_media)
+                    .map(|interest| interest.expires_unix.saturating_mul(1_000).min(expires_ms))
+                    .max(),
             };
             let attempt = self.attempt_for(target).wrapping_add(query.retry);
             if get.encode().is_some_and(|payload| {

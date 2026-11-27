@@ -9,10 +9,7 @@ use core::num::{NonZeroU16, NonZeroU64};
 use pulsebeam_proto::{
     data_control::{PublisherBinding, SubscriberBinding},
     data_endpoint::{self, Delivery, Endpoint, Format},
-    state::{
-        DataV1Delivery, QuicDataV1Parameters, SctpDataV1Parameters, SctpParameters,
-        track_binding::Transport,
-    },
+    state::{DataV1Delivery, QuicDataV1Parameters, SctpDataV1Parameters, track_binding::Transport},
 };
 
 fn accepted(parameters: SctpDataV1Parameters) -> TrackBinding {
@@ -61,11 +58,7 @@ fn pair(ids: &mut IdGenerator) -> (Channel, Channel) {
     let rx = Channel::from_accepted(ids.channel(), sub_binding, &prepared, &accepted(parameters))
         .unwrap();
     for rejected in [
-        TrackBinding {
-            transport: Some(Transport::Sctp(SctpParameters {
-                stream_id: parameters.stream_id,
-            })),
-        },
+        TrackBinding { transport: None },
         accepted(SctpDataV1Parameters {
             stream_id: Some(2),
             ..parameters

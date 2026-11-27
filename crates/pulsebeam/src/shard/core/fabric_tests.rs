@@ -1376,7 +1376,6 @@ fn quic_raw_video_uses_one_authenticated_fabric_timeline() {
             (Profile::Av1, "av1"),
         ])
     {
-        let explicit = profile != Profile::H264;
         let parameters = wire::QuicRtpParameters {
             binding_id: 7,
             incarnation: 9,
@@ -1386,21 +1385,17 @@ fn quic_raw_video_uses_one_authenticated_fabric_timeline() {
                 format: candidate.format,
                 ..Default::default()
             }),
-            video_dd: explicit.then_some(wire::QuicVideoDd::Absent as i32),
+            video_dd: Some(wire::QuicVideoDd::Absent as i32),
             ..Default::default()
         };
         let binding = QuicRtpBinding::compile(&parameters, wire::TrackKind::Video).unwrap();
         let ingress = QuicRtpIngress::new(binding).unwrap();
         let tx = offer
-            .bind_rtp_publisher(offer, profile, false, explicit.then_some(false))
+            .bind_rtp_publisher(offer, profile, Some(false))
             .unwrap()
             .agreement;
         let rx = offer
-            .bind_rtp_receiver(
-                offer,
-                profile,
-                explicit.then_some(wire::QuicVideoDd::Accept),
-            )
+            .bind_rtp_receiver(offer, profile, Some(wire::QuicVideoDd::Accept))
             .unwrap()
             .agreement;
         let emission = |agreement: pulsebeam_core::fabric::packet::Agreement| {
@@ -1413,7 +1408,7 @@ fn quic_raw_video_uses_one_authenticated_fabric_timeline() {
             .unwrap()
         };
         let publication = publisher_id.fixture_publication(TrackKind::Video, label);
-        let (source, _) = core
+        let (source, incarnation) = core
             .install_quic_rtp_source(
                 publisher,
                 publication,
@@ -1426,13 +1421,6 @@ fn quic_raw_video_uses_one_authenticated_fabric_timeline() {
                 },
                 emission(tx),
             )
-            .unwrap();
-        core.execution.apply_plan(&TrackPlanUpdate {
-            publication_id: publication,
-            plan: Some(TrackPlan::new([receiver_id], [], None)),
-        });
-        let branch = core
-            .install_quic_rtp_branch(receiver, publication, emission(rx), None)
             .unwrap();
         let capture = [0x24; 8];
         let media = FabricPacket::new(
@@ -1452,6 +1440,58 @@ fn quic_raw_video_uses_one_authenticated_fabric_timeline() {
         let mut input = [0; MAX_PACKET_BYTES];
         let len = tx.write(&media, &mut input).unwrap();
         let packet = tx.decode(&input[..len]).unwrap();
+        let track = core.execution.runtime.track_handle(publication).unwrap();
+        let publisher_anchor = crate::shard_update::PublisherAnchor {
+            publication,
+            connection: publisher_id,
+            incarnation,
+            emission: emission(tx),
+        };
+        let expiry = now + std::time::Duration::from_millis(100);
+        if publisher_anchor.emission.supports_wan_rtp() {
+            use crate::shard_update::PublisherInterest;
+            let stale = crate::shard_update::PublisherAnchor {
+                incarnation: incarnation.checked_add(1).unwrap(),
+                ..publisher_anchor
+            };
+            core.execution.renew_publisher_interest(
+                PublisherInterest {
+                    publisher: stale,
+                    expires: expiry,
+                },
+                now,
+            );
+            assert!(!core.execution.has_publisher_interest(track, now));
+            let lease = PublisherInterest {
+                publisher: publisher_anchor,
+                expires: expiry,
+            };
+            core.execution.renew_publisher_interest(lease, now);
+            core.execution.renew_publisher_interest(lease, now);
+            assert_eq!(core.execution.publisher_interests.len(), 1);
+            assert!(core.execution.has_publisher_interest(track, now));
+        }
+        assert_eq!(
+            core.execution.runtime.fabric_sequence_anchor(source, now),
+            None
+        );
+        core.ingest_quic_media_packet(source, publisher, ingress, &packet, expiry);
+        assert_eq!(
+            core.execution
+                .runtime
+                .fabric_sequence_anchor(source, expiry),
+            None
+        );
+        core.execution.advance_publisher_interests(expiry);
+        assert!(core.execution.publisher_interests.is_empty());
+        core.execution.apply_plan(&TrackPlanUpdate {
+            publication_id: publication,
+            plan: Some(TrackPlan::new([receiver_id], [], None)),
+        });
+        let branch = core
+            .install_quic_rtp_branch(receiver, publication, emission(rx), None)
+            .unwrap();
+        let now = expiry;
         core.ingest_quic_media_packet(source, receiver, ingress, &packet, now);
         assert_eq!(
             core.admit_quic_rtp(branch, receiver, now, |_, _, _| panic!("foreign owner")),

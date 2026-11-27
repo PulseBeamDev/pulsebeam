@@ -135,14 +135,11 @@ fn video_spec(
                                         ..Default::default()
                                     }),
                                     header_extensions,
-                                    encodings: [ssrc, ssrc + 2, ssrc + 4]
-                                        .into_iter()
-                                        .map(|ssrc| wire::RtpEncodingParameters {
-                                            ssrc: Some(ssrc),
-                                            scalability_mode: Some(mode.into()),
-                                            ..Default::default()
-                                        })
-                                        .collect(),
+                                    encodings: vec![wire::RtpEncodingParameters {
+                                        ssrc: Some(ssrc),
+                                        scalability_mode: Some(mode.into()),
+                                        ..Default::default()
+                                    }],
                                     rtcp: Some(wire::RtcpParameters {
                                         cname: "component-video-source".into(),
                                         reduced_size: false,
@@ -244,7 +241,7 @@ fn whole_opus_ingress_uses_the_committed_owner_and_fanout_before_first_packet() 
 }
 
 #[test]
-fn simulcast_fabric_preparation_uses_all_exact_committed_encodings() {
+fn dd_fabric_preparation_uses_the_exact_committed_encoding() {
     let mut participant =
         participant_with_capabilities(native_data::unix_now() + 60, Some(capabilities()));
     let mut sink = MockParticipantSink::new();
@@ -254,7 +251,7 @@ fn simulcast_fabric_preparation_uses_all_exact_committed_encodings() {
             wire::desired_state::Value::Present(Box::new(video_spec(
                 "camera",
                 1234,
-                wire::RtpScalabilityMode::L1t1,
+                wire::RtpScalabilityMode::L1t3,
                 true,
             ))),
         ),
@@ -289,14 +286,14 @@ fn simulcast_fabric_preparation_uses_all_exact_committed_encodings() {
         .prepare_dd_fabric_ingress(published, fanout)
         .unwrap();
     let dd = pulsebeam_core::fabric::ExtensionKind::DependencyDescriptor;
-    assert_eq!(encodings.len(), 3);
-    for (ingress, primary) in encodings.iter().zip([1234_u32, 1236, 1238]) {
-        let encoding = ingress.source_encoding().unwrap();
-        assert_eq!(encoding.primary, primary.into());
-        assert_eq!(encoding.payload_type, 96_u8.into());
-        assert!(encoding.rid.is_none());
-        assert!(ingress.emission().unwrap().includes(dd));
-    }
+    let [ingress] = encodings.as_ref() else {
+        panic!("expected one encoding");
+    };
+    let encoding = ingress.source_encoding().unwrap();
+    assert_eq!(encoding.primary, 1234_u32.into());
+    assert_eq!(encoding.payload_type, 96_u8.into());
+    assert!(encoding.rid.is_none());
+    assert!(ingress.emission().unwrap().includes(dd));
 }
 
 #[test]
@@ -600,10 +597,7 @@ fn admitted_source_keeps_birth_identity_demand_and_cutoff_independent_of_desire(
             layer.encoding
         })
         .collect::<Vec<_>>();
-    assert_eq!(
-        encodings,
-        [77, 79, 81].map(|ssrc| track::SourceEncoding::Ssrc(ssrc.into()))
-    );
+    assert_eq!(encodings, [track::SourceEncoding::Ssrc(77.into())]);
     let mut handles = slotmap::SlotMap::<TrackHandle, PublicationKey>::with_key();
     let fanout = handles.insert(video_id);
     participant.apply(
@@ -638,7 +632,8 @@ fn admitted_source_keeps_birth_identity_demand_and_cutoff_independent_of_desire(
     assert_eq!(route.encoding, track::SourceEncoding::Ssrc(77.into()));
     let video_slot = participant.native_rtp.publications[&7].slot;
     let now = Instant::now();
-    for ssrc in [81, 77, 79] {
+    {
+        let ssrc = 77;
         // The RTC emits this notice before its first authenticated packet. Use
         // the committed binding, not bootstrap SDP or guessed source facts.
         let binding = participant.native_rtp.publications[&7]
@@ -691,7 +686,7 @@ fn admitted_source_keeps_birth_identity_demand_and_cutoff_independent_of_desire(
                 .contains(&(Mid::from("camera"), *encoding))
         );
     }
-    assert_eq!(participant.pending_keyframe_requests.len(), 3);
+    assert_eq!(participant.pending_keyframe_requests.len(), 1);
     assert_eq!(
         participant
             .native_rtp

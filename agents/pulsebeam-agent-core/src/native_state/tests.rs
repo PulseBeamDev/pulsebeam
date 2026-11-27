@@ -72,9 +72,14 @@ fn resource() -> Resource {
 
 fn binding(stream: u32) -> wire::TrackBinding {
     wire::TrackBinding {
-        transport: Some(wire::track_binding::Transport::Sctp(wire::SctpParameters {
-            stream_id: Some(stream),
-        })),
+        transport: Some(wire::track_binding::Transport::SctpDataV1(
+            wire::SctpDataV1Parameters {
+                stream_id: Some(stream),
+                version: u32::from(pulsebeam_proto::data_endpoint::DATA_V1),
+                channel_incarnation: u64::from(stream),
+                delivery: wire::DataV1Delivery::Reliable as i32,
+            },
+        )),
     }
 }
 
@@ -154,7 +159,7 @@ fn live(revision: u64, spec: wire::ResourceSpec) -> wire::ConfirmedState {
         rejection: None,
         value: Some(wire::confirmed_state::Value::Owned(Box::new(
             wire::LiveResource {
-                data_v1_source: None,
+                data_v1_source: enabled.then_some(1),
                 spec: Some(spec),
                 participant: Some(participant()),
                 track: Some(wire::Track {
@@ -533,7 +538,6 @@ fn ordered_session_and_latest_evaluation_gate_media_without_discarding_rejected_
     let mut lookup = spec(true, 1);
     lookup.declaration = Some(wire::resource_spec::Declaration::LogicalSubscription(
         wire::LogicalSubscriptionSpec {
-            data_version: None,
             source: Some(wire::LogicalSourceAddress {
                 room: "room".into(),
                 participant_id: "alice".into(),

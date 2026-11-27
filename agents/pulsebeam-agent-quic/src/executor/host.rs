@@ -595,7 +595,7 @@ impl Agent {
             publication_id: live.publication_id.to_owned(),
             ssrc: live.ssrc,
             payload_type: live.payload_type,
-            publishes_h264_dd: live.publishes_h264_dd,
+            publishes_h264_dd: live.mime_type == "video/h264" && live.emits_video_dd == Some(true),
         })
     }
 
@@ -674,11 +674,10 @@ impl Agent {
         }) {
             return Err(SendPacketError::NotReady);
         }
-        let publishes_h264_dd = live.publishes_h264_dd;
         let emits_video_dd = live.emits_video_dd;
         let profile =
             rtp_profile(live.mime_type).ok_or(SendPacketError::Invalid(WireError::PayloadType))?;
-        if publishes_h264_dd
+        if emits_video_dd == Some(true)
             && !input.payload.is_empty()
             && !input.extensions.iter().any(|extension| {
                 extension.kind == crate::fabric::ExtensionKind::DependencyDescriptor
@@ -707,7 +706,7 @@ impl Agent {
         {
             let offer = socket.peer_fabric().ok_or(SendPacketError::NotReady)?;
             let selected = FabricOffer::CURRENT
-                .bind_rtp_publisher(offer, profile, publishes_h264_dd, emits_video_dd)
+                .bind_rtp_publisher(offer, profile, emits_video_dd)
                 .map_err(SendPacketError::Invalid)?;
             self.media_senders.insert(
                 key.clone(),
@@ -871,7 +870,7 @@ impl Agent {
             .quic_rtp_publication(pulsebeam_agent_core::MediaKind::Video, track_id)
             .filter(|live| live.ready)
             .ok_or(H264SendError::NotReady)?;
-        if live.publishes_h264_dd {
+        if live.emits_video_dd == Some(true) {
             return Err(H264SendError::DescriptorRequired);
         }
         if !self

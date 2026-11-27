@@ -135,6 +135,7 @@ pub(crate) enum ReceiveTransport {
 pub(crate) struct FabricDataReceiver<P = wire::SctpDataV1Parameters> {
     pub(crate) parameters: P,
     pub(crate) endpoint: pulsebeam_proto::data_control::SubscriberBinding,
+    pub(crate) capture_clock: Option<wire::DataV1CaptureClock>,
 }
 
 pub(crate) struct ReceiverPolicy {
@@ -199,7 +200,7 @@ pub(crate) fn receiver(
     source: &Track,
     track: &wire::Track,
     capabilities: Option<&wire::RtpCapabilities>,
-    data_v1_endpoint: Option<pulsebeam_proto::data_control::SubscriberBinding>,
+    data_v1_offer: Option<&wire::DataV1ReceiverOffer>,
 ) -> Result<(ReceiveTransport, ReceiverPolicy), wire::FailureCode> {
     let Some(wire::resource_spec::Declaration::Subscription(subscription)) = &spec.declaration
     else {
@@ -219,7 +220,11 @@ pub(crate) fn receiver(
                 | wire::track_binding::Transport::QuicDataV1(_)),
             ),
         ) if subscription.kind == wire::TrackKind::Data as i32 => {
-            let endpoint = data_v1_endpoint
+            let offer = data_v1_offer
+                .filter(|offer| offer.capture_clock == data.capture_clock)
+                .ok_or(wire::FailureCode::Incompatible)?;
+            let endpoint = offer
+                .endpoint()
                 .filter(|endpoint| Some(endpoint.source) == source.fabric_data_source())
                 .ok_or(wire::FailureCode::Incompatible)?;
             if data.record_dd
@@ -234,6 +239,7 @@ pub(crate) fn receiver(
                     Ok(ReceiveTransport::FabricData(Box::new(FabricDataReceiver {
                         parameters: *parameters,
                         endpoint,
+                        capture_clock: offer.capture_clock.clone(),
                     })))
                 }
                 wire::track_binding::Transport::QuicDataV1(parameters)
@@ -242,6 +248,7 @@ pub(crate) fn receiver(
                     Ok(ReceiveTransport::QuicData(Box::new(FabricDataReceiver {
                         parameters: *parameters,
                         endpoint,
+                        capture_clock: offer.capture_clock.clone(),
                     })))
                 }
                 _ => Err(wire::FailureCode::InvalidConfiguration),

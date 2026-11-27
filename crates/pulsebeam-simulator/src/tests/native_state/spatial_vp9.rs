@@ -13,6 +13,10 @@ pub(in crate::tests) enum Check {
         track: &'static str,
         edge: (SocketAddr, SocketAddr),
     },
+    ColdStart {
+        publisher: &'static str,
+        track: &'static str,
+    },
     HeightChanges,
     Bandwidth {
         receiver_ip: IpAddr,
@@ -138,15 +142,17 @@ pub(in crate::tests) async fn receive(
     let declaration = match check {
         Check::WanRepair {
             publisher, track, ..
-        } => wire::resource_spec::Declaration::LogicalSubscription(wire::LogicalSubscriptionSpec {
-            source: Some(wire::LogicalSourceAddress {
-                room: "stage".into(),
-                participant_id: publisher.into(),
-                kind: wire::TrackKind::Video as i32,
-                track_id: track.into(),
-            }),
-            data_version: None,
-        }),
+        }
+        | Check::ColdStart { publisher, track } => {
+            wire::resource_spec::Declaration::LogicalSubscription(wire::LogicalSubscriptionSpec {
+                source: Some(wire::LogicalSourceAddress {
+                    room: "stage".into(),
+                    participant_id: publisher.into(),
+                    kind: wire::TrackKind::Video as i32,
+                    track_id: track.into(),
+                }),
+            })
+        }
         _ => wire::resource_spec::Declaration::Subscription(wire::SubscriptionSpec {
             publication_id: publication.into(),
             kind: wire::TrackKind::Video as i32,
@@ -167,7 +173,7 @@ pub(in crate::tests) async fn receive(
             )),
         }),
     };
-    let first_source = if matches!(check, Check::WanRepair { .. }) {
+    let first_source = if matches!(check, Check::WanRepair { .. } | Check::ColdStart { .. }) {
         viewer.desire(reference, reference, Some(spec.clone()));
         Some(
             tokio::time::timeout(
@@ -302,6 +308,16 @@ pub(in crate::tests) async fn receive(
             .context(
                 "WAN VP9 logical subscription did not recover within the lease and reopen budget",
             )?
+        }
+        Check::ColdStart { .. } => {
+            expect_height(
+                &sink,
+                "remote-only VP9 startup",
+                720,
+                Duration::from_secs(10),
+                false,
+            )
+            .await
         }
         Check::HeightChanges => {
             let wait = Duration::from_secs(3);

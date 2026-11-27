@@ -1190,7 +1190,6 @@ fn install_fabric_test_subscription(
         }),
         declaration: Some(wire::resource_spec::Declaration::LogicalSubscription(
             wire::LogicalSubscriptionSpec {
-                data_version: Some(u32::from(DATA_V1)),
                 source: Some(wire::LogicalSourceAddress {
                     room: meta.room.room.to_string(),
                     participant_id: meta.origin.to_string(),
@@ -3584,14 +3583,13 @@ fn native_video_reaches_a_protected_rtc_receiver_on_one_timeline() {
     let profiles = [Profile::H264, Profile::Vp8, Profile::Vp9, Profile::Av1];
     assert_eq!(capabilities.codecs.len(), profiles.len() + 1);
     for (candidate, profile) in capabilities.codecs.into_iter().skip(1).zip(profiles) {
-        let explicit = profile != Profile::H264;
         let ((mut peer, receiver, mid, _, receiver_pt, _), _) = endpoint_pair_at(
             MediaKind::Video,
             Direction::RecvOnly,
             true,
             None,
             false,
-            explicit.then_some(profile),
+            (profile != Profile::H264).then_some(profile),
             [
                 "127.0.0.1:6000".parse().unwrap(),
                 "127.0.0.1:5000".parse().unwrap(),
@@ -3606,13 +3604,13 @@ fn native_video_reaches_a_protected_rtc_receiver_on_one_timeline() {
                 format: candidate.format,
                 ..Default::default()
             }),
-            video_dd: explicit.then_some(wire::QuicVideoDd::Absent as i32),
+            video_dd: Some(wire::QuicVideoDd::Absent as i32),
             ..Default::default()
         };
         let binding = QuicRtpBinding::compile(&parameters, wire::TrackKind::Video).unwrap();
         let offer = FabricOffer::CURRENT;
         let tx = offer
-            .bind_rtp_publisher(offer, profile, false, explicit.then_some(false))
+            .bind_rtp_publisher(offer, profile, Some(false))
             .unwrap()
             .agreement;
         let emission =
@@ -3845,7 +3843,8 @@ fn prove_authenticated_rtp_timeline(profile: pulsebeam_core::fabric::Profile) {
     use pulsebeam_agent_quic::data_bindings::FabricOffer;
     use pulsebeam_core::fabric::{MAJOR, packet::MAX_PACKET_BYTES};
     let offer = FabricOffer::CURRENT;
-    let receiver_dd = matches!(profile, Profile::Vp8 | Profile::Vp9 | Profile::Av1)
+    let receiver_dd = profile
+        .is_video()
         .then_some(pulsebeam_proto::state::QuicVideoDd::Accept);
     let agreement = offer
         .bind_rtp_receiver(offer, profile, receiver_dd)

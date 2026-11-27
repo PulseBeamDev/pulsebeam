@@ -760,7 +760,6 @@ pub(crate) fn create_response(participant: &str, _etag: &str, uri: &str) -> Http
             "profile": "pulsebeam.media.v1",
             "rtp_capabilities": {},
             "data_delivery": ["LATEST", "LOSSY", "ORDERED"],
-            "data_version": pulsebeam_proto::data_endpoint::DATA_V1,
             "answer": "answer",
         }))
         .unwrap(),
@@ -949,7 +948,6 @@ fn activate_connection(
             generation,
             answer: "answer".to_string(),
             capabilities: BootstrapCapabilities {
-                data_v1: true,
                 rtp: Default::default(),
                 data_delivery: vec![
                     pulsebeam_proto::state::DataDelivery::Latest,

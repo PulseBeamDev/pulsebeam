@@ -319,7 +319,11 @@ fn inherited_exact_source_loses_reliable_continuity_on_confirmed_replacement() {
                     spec: Some((*spec).clone()),
                     source_revision,
                     execution: None,
-                    data_v1: None,
+                    data_v1: Some(state::DataV1ReceiverOffer {
+                        source: source_revision,
+                        branch: source_revision,
+                        capture_clock: None,
+                    }),
                     source: Some(state::Track {
                         publication_id: publication_id.into(),
                         participant_id: source.participant_id.clone(),
@@ -404,7 +408,11 @@ fn delivery_mismatch_fails_only_incompatible_receivers_and_revocation_keeps_the_
                     spec: Some(*spec),
                     source_revision: 1,
                     execution: None,
-                    data_v1: None,
+                    data_v1: Some(state::DataV1ReceiverOffer {
+                        source: 1,
+                        branch: 1,
+                        capture_clock: None,
+                    }),
                     source: Some(state::Track {
                         publication_id: "opaque-source".into(),
                         participant_id: "alice".into(),
@@ -530,7 +538,11 @@ fn resolved_source_description_does_not_claim_data_receiver_execution() {
                     spec: Some(*spec),
                     source_revision: 1,
                     execution: None,
-                    data_v1: None,
+                    data_v1: Some(state::DataV1ReceiverOffer {
+                        source: 1,
+                        branch: 1,
+                        capture_clock: None,
+                    }),
                     source: Some(state::Track {
                         publication_id: "opaque-data-track".into(),
                         participant_id: "alice".into(),

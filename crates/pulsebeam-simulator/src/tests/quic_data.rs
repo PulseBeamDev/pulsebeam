@@ -690,7 +690,6 @@ async fn prepare_subscription(
     let spec = wire::ResourceSpec {
         declaration: Some(wire::resource_spec::Declaration::LogicalSubscription(
             wire::LogicalSubscriptionSpec {
-                data_version: Some(1),
                 source: Some(wire::LogicalSourceAddress {
                     room: "stage".into(),
                     participant_id: source.0.into(),
@@ -3064,7 +3063,8 @@ async fn descriptor_h264_exchange(
     let mut depacketize = Depacketizer::new(binding, Codec::H264);
     let packetizer =
         H264::new(PacketBudget::new(1200, 24).context("DD RTP budget")?).context("H.264 budget")?;
-    let wire = FabricOffer::CURRENT.bind_publisher(FabricOffer::CURRENT, Profile::H264, true)?;
+    let wire =
+        FabricOffer::CURRENT.bind_rtp_publisher(FabricOffer::CURRENT, Profile::H264, Some(true))?;
     let template = FrameDependencyTemplate {
         dtis: [DecodeTargetIndication::Switch; 2].into_iter().collect(),
         ..Default::default()

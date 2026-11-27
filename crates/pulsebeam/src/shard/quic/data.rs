@@ -321,11 +321,7 @@ impl Installed {
             rid: None,
             payload_type: prepared.payload_type().into(),
         };
-        let (wire, emission) = self.publisher_wire(
-            ingress.profile(),
-            prepared.publishes_h264_dd(),
-            prepared.video_dd(),
-        )?;
+        let (wire, emission) = self.publisher_wire(ingress.profile(), prepared.video_dd())?;
         let frames = Receiver::new(wire.framing, binding.binding_id());
         let (source, incarnation) = core
             .install_quic_rtp_source(publisher, id, association, plan.enabled, encoding, emission)
@@ -369,8 +365,7 @@ impl Installed {
             );
             if let Track::Video(video) = &mut track {
                 video.format = format;
-                video.guarantees_video_dd = prepared.publishes_h264_dd()
-                    || prepared.video_dd() == Some(wire::QuicVideoDd::Emit);
+                video.guarantees_video_dd = prepared.video_dd() == Some(wire::QuicVideoDd::Emit);
                 video.av1_whole_source = prepared.video_dd() == Some(wire::QuicVideoDd::Absent)
                     && prepared.format().mime_type == "video/av1";
             }
@@ -474,7 +469,6 @@ impl Installed {
     fn publisher_wire(
         &self,
         profile: Profile,
-        publishes_h264_dd: bool,
         video_dd: Option<wire::QuicVideoDd>,
     ) -> Result<(FabricBinding, Emission), ExecutionFailure> {
         let peer = self.peer_fabric.ok_or(ExecutionFailureKind::Retired)?;
@@ -482,7 +476,6 @@ impl Installed {
             .bind_rtp_publisher(
                 FabricOffer::CURRENT,
                 profile,
-                publishes_h264_dd,
                 video_dd.map(|dd| dd == wire::QuicVideoDd::Emit),
             )
             .map_err(|_| ExecutionFailureKind::Unsupported)?;

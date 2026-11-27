@@ -3486,6 +3486,7 @@ impl ControllerActor {
                 (publisher.connection == connection).then_some((
                     shard,
                     publisher,
+                    None,
                     (room, publisher),
                 ))
             })
@@ -3493,16 +3494,39 @@ impl ControllerActor {
         self.stage_anchor_samples(candidates)
     }
 
+    fn stage_publisher_interests(
+        &mut self,
+        interests: impl IntoIterator<Item = (ShardId, crate::shard_update::PublisherInterest)>,
+    ) {
+        let generation = self.lifecycle.next_generation();
+        for (shard, interest) in interests {
+            if let Some(writer) = self
+                .updates
+                .get_mut(shard.index())
+                .filter(|writer| !writer.is_closed())
+            {
+                writer.stage_publisher_interest(generation, interest);
+                self.mark_update_touched(shard);
+            }
+        }
+        self.publish_staged();
+    }
+
     fn stage_anchor_samples<T>(
         &mut self,
-        candidates: Vec<(ShardId, crate::shard_update::PublisherAnchor, T)>,
+        candidates: Vec<(
+            ShardId,
+            crate::shard_update::PublisherAnchor,
+            Option<pulsebeam_runtime::time::Instant>,
+            T,
+        )>,
     ) -> Vec<(
         T,
         oneshot::Receiver<Option<crate::shard_update::PublisherPosition>>,
     )> {
         let generation = self.lifecycle.next_generation();
         let mut receipts = Vec::new();
-        for (shard, anchor, publisher) in candidates {
+        for (shard, anchor, interest_expires, publisher) in candidates {
             let Some(writer) = self
                 .updates
                 .get_mut(shard.index())
@@ -3510,6 +3534,15 @@ impl ControllerActor {
             else {
                 continue;
             };
+            if let Some(expires) = interest_expires.filter(|_| anchor.emission.supports_wan_rtp()) {
+                writer.stage_publisher_interest(
+                    generation,
+                    crate::shard_update::PublisherInterest {
+                        publisher: anchor,
+                        expires,
+                    },
+                );
+            }
             receipts.push((publisher, writer.stage_publisher_anchor(generation, anchor)));
             self.mark_update_touched(shard);
         }
@@ -5470,7 +5503,6 @@ mod replacement_tests {
                                 declaration: Some(
                                     wire::resource_spec::Declaration::LogicalSubscription(
                                         wire::LogicalSubscriptionSpec {
-                                            data_version: None,
                                             source: Some(wire::LogicalSourceAddress {
                                                 room: "handler-room".into(),
                                                 participant_id: "publisher".into(),

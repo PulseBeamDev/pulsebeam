@@ -7,8 +7,12 @@ package(default_visibility = ["//visibility:public"])
 filegroup(name = "workflow_inputs", srcs = glob(["*.md", "docs/**/*.md", "Justfile", "scripts/*.sh"], allow_empty = True))
 exports_files(["Cargo.toml", "scripts/codec-tools.nix"])
 exports_files(
-    ["fixtures/codec-inventory-v1.tsv", "scripts/codec_interop.py"],
+    ["scripts/codec_interop.py"],
     visibility = ["//agents/pulsebeam-agent-quic:__pkg__"],
+)
+exports_files(
+    ["fixtures/codec-inventory-v1.tsv"],
+    visibility = ["//agents/pulsebeam-agent-quic:__pkg__", "//crates/pulsebeam-simulator:__pkg__"],
 )
 
 filegroup(

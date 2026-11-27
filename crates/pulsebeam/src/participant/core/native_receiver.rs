@@ -852,7 +852,7 @@ impl Connection {
         if source.retired
             || !source.bound
             || source.handle.is_none()
-            || source.track.fabric_data_source() != Some(fabric.endpoint.source)
+            || !matches!(&source.track, Track::Data(track) if track.fabric_source == Some(fabric.endpoint.source) && track.capture_clock == fabric.capture_clock)
         {
             return None;
         }
@@ -863,10 +863,7 @@ impl Connection {
             source: receiver.source,
             endpoint: fabric.endpoint,
             prepared: data_fabric::PreparedSctp::from_negotiation(fabric.parameters, installation)?,
-            capture_clock: match &source.track {
-                Track::Data(track) => track.capture_clock.clone(),
-                _ => return None,
-            },
+            capture_clock: fabric.capture_clock.clone(),
         })
     }
 

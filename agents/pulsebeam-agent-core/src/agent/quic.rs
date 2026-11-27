@@ -17,7 +17,6 @@ use crate::{Effect, Generation, HttpResponse, OperationId, QuicAdmit, QuicEffect
 
 #[derive(Clone, Copy)]
 pub(super) enum PublicationProfile {
-    LegacyH264Dd,
     Video { mime: &'static str, emits_dd: bool },
 }
 
@@ -35,7 +34,6 @@ pub(super) enum Attempt {
 
 #[doc(hidden)]
 pub struct QuicRtpPublication<'a> {
-    pub publishes_h264_dd: bool,
     pub emits_video_dd: Option<bool>,
     pub mime_type: &'a str,
     pub generation: Generation,
@@ -303,7 +301,6 @@ impl Agent {
                 .and_then(|settings| settings.enabled)
                 == Some(true);
         Some(QuicRtpPublication {
-            publishes_h264_dd: parameters.publishes_h264_dd,
             emits_video_dd,
             mime_type: &codec.format.as_ref()?.mime_type,
             generation: session.generation,
@@ -324,7 +321,13 @@ impl Agent {
 
     #[doc(hidden)]
     pub fn enable_quic_h264_dd(&mut self, track_id: &str) -> Result<(), AgentError> {
-        self.configure_quic_publication(track_id, PublicationProfile::LegacyH264Dd)
+        self.configure_quic_publication(
+            track_id,
+            PublicationProfile::Video {
+                mime: "video/h264",
+                emits_dd: true,
+            },
+        )
     }
 
     #[doc(hidden)]
@@ -595,7 +598,6 @@ impl Agent {
             crate::BootstrapCapabilities {
                 rtp,
                 data_delivery: alloc::vec::Vec::new(),
-                data_v1: true,
             },
         );
         session.quic_owner = Some(owner.clone());

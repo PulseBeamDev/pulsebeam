@@ -93,6 +93,16 @@ pub(crate) struct ShardCore {
     updates: ShardUpdateApplication,
 }
 
+#[derive(Clone, Copy)]
+struct ActivePublisherInterest {
+    track: crate::keys::TrackHandle,
+    lease: crate::shard_update::PublisherInterest,
+    refresh_at: Instant,
+    refreshed_live_path: bool,
+}
+
+const MAX_PUBLISHER_INTERESTS: usize = 128;
+
 pub(crate) struct ShardExecution {
     pub(crate) shard_id: crate::id::ShardId,
     registry: ParticipantRegistry,
@@ -100,6 +110,7 @@ pub(crate) struct ShardExecution {
         std::collections::VecDeque<(crate::route::NodeTransportAddress, ConnectionConfig)>,
     pub(super) runtime: ShardRuntime,
     pending_publisher_lookups: Vec<PendingPublisherLookup>,
+    publisher_interests: Vec<ActivePublisherInterest>,
     plans: SecondaryMap<crate::keys::TrackHandle, crate::shard::router::InstalledTrackPlan>,
     timers: TimerWheel,
     dirty: DirtyTracker,
@@ -1040,7 +1051,17 @@ impl ShardExecution {
         packet: &pulsebeam_core::fabric::BorrowedPacket<'_>,
         now: Instant,
     ) {
-        if !self.fabric_publisher_authorized(publisher, source) {
+        if !self.fabric_publisher_authorized(publisher, source)
+            || self
+                .runtime
+                .local_fabric_publication(source, publisher)
+                .is_none_or(|publication| {
+                    self.runtime.track_handle(publication).is_none_or(|track| {
+                        !self.has_planned_subscribers(track)
+                            && !self.has_publisher_interest(track, now)
+                    })
+                })
+        {
             return;
         }
         let Ok(input) = ingress.prepare_packet(now.into_std(), packet) else {
@@ -1076,6 +1097,7 @@ impl ShardExecution {
             pending_replacements: std::collections::VecDeque::new(),
             pending_publisher_lookups: Vec::new(),
             runtime,
+            publisher_interests: Vec::new(),
             plans: SecondaryMap::new(),
             timers: TimerWheel::new(PARTICIPANT_CAPACITY_HINT),
             dirty: DirtyTracker::with_capacity(PARTICIPANT_CAPACITY_HINT),
@@ -1295,6 +1317,121 @@ impl ShardExecution {
                 .observe_publisher_data_expectation(source, observation, Instant::now())
         {
             self.record_relay_data_outcome(outcome);
+        }
+    }
+
+    fn has_planned_subscribers(&self, track: crate::keys::TrackHandle) -> bool {
+        self.plans
+            .get(track)
+            .is_some_and(|plan| !plan.local.is_empty() || !plan.remote.is_empty())
+    }
+
+    fn has_publisher_interest(&self, track: crate::keys::TrackHandle, now: Instant) -> bool {
+        self.publisher_interests
+            .iter()
+            .any(|entry| entry.track == track && now < entry.lease.expires)
+    }
+
+    pub(super) fn renew_publisher_interest(
+        &mut self,
+        lease: crate::shard_update::PublisherInterest,
+        now: Instant,
+    ) {
+        if now >= lease.expires {
+            return;
+        }
+        let Some((participant, _)) = self.authorized_rtp_publisher_source(lease.publisher) else {
+            return;
+        };
+        let Some(track) = self.runtime.track_handle(lease.publisher.publication) else {
+            return;
+        };
+        if let Some(current) = self
+            .publisher_interests
+            .iter_mut()
+            .find(|entry| entry.track == track)
+        {
+            if current.lease.publisher == lease.publisher {
+                current.lease.expires = current.lease.expires.max(lease.expires);
+                return;
+            }
+            *current = ActivePublisherInterest {
+                track,
+                lease,
+                refresh_at: now,
+                refreshed_live_path: false,
+            };
+        } else if self.publisher_interests.len() < MAX_PUBLISHER_INTERESTS {
+            self.publisher_interests.push(ActivePublisherInterest {
+                track,
+                lease,
+                refresh_at: now,
+                refreshed_live_path: false,
+            });
+        } else {
+            return;
+        }
+        if let Some(owner) = self.registry.resolve_mut(participant) {
+            owner.native_rtp_demand(lease.publisher.publication, true);
+            self.dirty.mark(participant, owner);
+        }
+    }
+
+    fn advance_publisher_interests(&mut self, now: Instant) {
+        let unix_now = self.fabric_unix_time();
+        let mut index = 0;
+        while let Some(entry) = self.publisher_interests.get(index) {
+            let ActivePublisherInterest {
+                track,
+                lease,
+                refresh_at,
+                refreshed_live_path,
+            } = *entry;
+            if now >= lease.expires {
+                self.publisher_interests.swap_remove(index);
+                if !self.has_planned_subscribers(track)
+                    && let Some((participant, _)) = self.rtp_publisher_source(lease.publisher)
+                    && let Some(owner) = self.registry.resolve_mut(participant)
+                {
+                    owner.native_rtp_demand(lease.publisher.publication, false);
+                    self.dirty.mark(participant, owner);
+                }
+                continue;
+            }
+            if now >= refresh_at {
+                let Some((publisher, source)) =
+                    self.authorized_rtp_publisher_source(lease.publisher)
+                else {
+                    self.publisher_interests.swap_remove(index);
+                    continue;
+                };
+                self.publisher_interests[index].refresh_at = now + crate::track::KEYFRAME_DEBOUNCE;
+                let live_path = self.runtime.has_live_publisher_path(source, now);
+                if live_path && refreshed_live_path {
+                    index += 1;
+                    continue;
+                }
+                let registry = &mut self.registry;
+                let dirty = &mut self.dirty;
+                let refreshed =
+                    self.runtime
+                        .request_interested_publisher_refresh(source, now, |ssrc| {
+                            Self::deliver_fabric_refresh(
+                                registry,
+                                dirty,
+                                (now, unix_now),
+                                source,
+                                publisher,
+                                ssrc,
+                            )
+                        });
+                self.quic_data_ready |= refreshed;
+                // Initial feedback establishes a real window, which may arrive
+                // before any child can see the keyframe. Request one more once
+                // a downstream WAN route can actually carry it.
+                self.publisher_interests[index].refreshed_live_path = live_path && refreshed;
+            }
+            index += 1;
         }
     }
 
@@ -1927,10 +2064,7 @@ impl ShardExecution {
             // queued before the controller observes that cutoff is stale.
             return 0;
         };
-        let previous = self
-            .plans
-            .get(track_handle)
-            .is_some_and(|plan| !plan.local.is_empty() || !plan.remote.is_empty());
+        let previous = self.has_planned_subscribers(track_handle);
         let cost = match &operation.plan {
             Some(plan) => {
                 debug_assert!(plan.is_valid());
@@ -1989,7 +2123,12 @@ impl ShardExecution {
             && let Some(publisher) = self.runtime.source_origin(track_handle)
             && let Some(meta) = self.registry.resolve_mut(publisher)
         {
-            meta.native_rtp_demand(operation.publication_id, active);
+            let now = Instant::now();
+            let remotely_demanded = self
+                .publisher_interests
+                .iter()
+                .any(|entry| entry.track == track_handle && now < entry.lease.expires);
+            meta.native_rtp_demand(operation.publication_id, active || remotely_demanded);
             self.dirty.mark(publisher, meta);
         }
         self.bind_installed_fabric_rtp_receivers(track_handle, operation.publication_id);
@@ -4120,6 +4259,11 @@ impl ShardExecution {
         self.timers
             .next_deadline()
             .into_iter()
+            .chain(
+                self.publisher_interests
+                    .iter()
+                    .map(|entry| entry.refresh_at.min(entry.lease.expires)),
+            )
             .chain(self.runtime.next_endpoint_deadline())
             .chain(
                 self.runtime
@@ -4511,6 +4655,9 @@ impl ShardExecution {
     }
 
     pub(crate) fn fire_timers(&mut self, now: Instant, send: impl Fn(ShardId, ShardFrame)) {
+        if !self.publisher_interests.is_empty() {
+            self.advance_publisher_interests(now);
+        }
         let registry = &mut self.registry;
         let dirty = &mut self.dirty;
         self.timers.drain_expired(now, |key| {

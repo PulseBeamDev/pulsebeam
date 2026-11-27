@@ -131,6 +131,10 @@ impl ShardUpdateApplication {
             for binding in delta.cutoff_bindings.drain(..) {
                 binding.fence();
             }
+            let now = pulsebeam_runtime::time::Instant::now();
+            for interest in delta.publisher_interests.drain(..) {
+                execution.renew_publisher_interest(interest, now);
+            }
             for sample in delta.source_anchors.drain(..) {
                 let _ = sample.result.send(execution.sample_publisher_anchor(
                     sample.publisher,

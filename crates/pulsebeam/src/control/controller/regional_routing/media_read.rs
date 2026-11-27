@@ -40,6 +40,8 @@ pub(super) struct Get {
     pub(super) project: ProjectId,
     pub(super) scope: SubscribeScope,
     pub(super) after: Option<NonZeroU64>,
+    pub(super) expires_ms: u64,
+    pub(super) demand_expires_ms: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -157,13 +159,26 @@ impl OwnerReads {
         }
     }
 
-    pub(super) fn stage(&mut self, actor: &mut ControllerActor, now: Instant) {
+    pub(super) fn stage(&mut self, actor: &mut ControllerActor, now: Instant, wall: SystemTime) {
         if self.queued.is_empty() {
             return;
         }
         self.cursors.retain(|_, cursor| now < cursor.expires);
         let mut samples = Vec::new();
         for (ticket, get) in self.queued.drain(..) {
+            let Some(wall_ms) = media_permit::unix_millis(wall) else {
+                continue;
+            };
+            let Some(expires) = get
+                .expires_ms
+                .checked_sub(wall_ms)
+                .map(Duration::from_millis)
+                .map(|ttl| ttl.min(ticket.expires().saturating_duration_since(now)))
+                .and_then(|ttl| now.checked_add(ttl))
+                .filter(|&expires| now < expires)
+            else {
+                continue;
+            };
             let after = if let Some(id) = get.after {
                 let cursor = self
                     .cursors
@@ -218,6 +233,10 @@ impl OwnerReads {
                 samples.push((
                     shard,
                     publisher,
+                    get.demand_expires_ms
+                        .and_then(|deadline| deadline.checked_sub(wall_ms))
+                        .and_then(|ttl| now.checked_add(Duration::from_millis(ttl)))
+                        .map(|deadline| deadline.min(expires)),
                     (ticket, get.id, next, room, publisher, get.scope),
                 ));
             } else {
@@ -373,6 +392,8 @@ mod tests {
             project,
             scope: scope.clone(),
             after: NonZeroU64::new(3),
+            expires_ms: 1234,
+            demand_expires_ms: Some(1200),
         };
         let wire = get.encode().unwrap();
         let decoded = Get::decode(&wire).unwrap();
@@ -380,6 +401,7 @@ mod tests {
         assert_eq!(decoded.project, project);
         assert_eq!(decoded.scope, scope);
         assert_eq!(decoded.after, get.after);
+        assert_eq!(decoded.expires_ms, get.expires_ms);
         assert!(Reply::decode(&wire).is_none());
         let unauthorized =
             serde_json::json!({"id":1, "project":project, "scope":grants, "after":null});

@@ -918,6 +918,10 @@ fn quic_reserves_nonreused_payload_ids_without_rtc_effects() {
         mime: "video/vp8",
         emits_dd: false,
     });
+    let h264_dd = Some(super::super::quic::PublicationProfile::Video {
+        mime: "video/h264",
+        emits_dd: true,
+    });
     let vp9_dd = Some(super::super::quic::PublicationProfile::Video {
         mime: "video/vp9",
         emits_dd: true,
@@ -940,6 +944,11 @@ fn quic_reserves_nonreused_payload_ids_without_rtc_effects() {
             format: state::CodecFormat::native_quic_baseline("video/vp9"),
             ..Default::default()
         });
+    session.capabilities.rtp.codecs.push(state::RtpCodecCapability {
+        format: state::CodecFormat::native_quic_baseline("video/h264"),
+        ..Default::default()
+    });
+    assert!(quic_rtp_binding(session, &video, None, h264_dd, None, &mut ids).is_none());
     assert!(quic_rtp_binding(session, &video, None, vp8, None, &mut ids).is_none());
     assert!(quic_rtp_binding(session, &video, None, vp9_dd, None, &mut ids).is_none());
     session.quic_directional_video_dd = true;
@@ -958,10 +967,18 @@ fn quic_reserves_nonreused_payload_ids_without_rtc_effects() {
         panic!("QUIC VP9 video binding");
     };
     assert_eq!(parameters.video_dd, Some(state::QuicVideoDd::Emit as i32));
-    assert!(!parameters.publishes_h264_dd);
     assert_eq!(
         parameters.codec.unwrap().format.unwrap().mime_type,
         "video/vp9"
+    );
+    let selected = quic_rtp_binding(session, &video, None, h264_dd, None, &mut ids).unwrap();
+    let Some(state::track_binding::Transport::QuicRtp(parameters)) = selected.transport else {
+        panic!("QUIC H.264 video binding");
+    };
+    assert_eq!(parameters.video_dd, Some(state::QuicVideoDd::Emit as i32));
+    assert_eq!(
+        parameters.codec.unwrap().format.unwrap().mime_type,
+        "video/h264"
     );
     assert!(effects.is_empty());
 }
@@ -1865,7 +1882,6 @@ fn logical_offer_selects_exact_identity_without_discovery_and_gates_pending_disa
             &selector,
             state::TrackKind::Video,
             Some(state::resource_settings::Receive::Video(Default::default())),
-            None,
         );
         spec.settings.as_mut().unwrap().enabled = Some(enabled);
         spec

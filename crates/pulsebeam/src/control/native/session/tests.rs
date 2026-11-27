@@ -672,7 +672,6 @@ fn quic_opus_preparation_checks_capabilities_and_receiver_source_format() {
         binding_id: 7,
         incarnation: 9,
         primary_ssrc: 11,
-        publishes_h264_dd: false,
         video_dd: None,
         codec: Some(wire::RtpCodecParameters {
             payload_type: Some(111),
@@ -789,8 +788,13 @@ fn publication(label: &str, enabled: bool) -> wire::ResourceSpec {
                     capture_clock: None,
                     delivery: wire::DataDelivery::Ordered as i32,
                     binding: Some(wire::TrackBinding {
-                        transport: Some(wire::track_binding::Transport::Sctp(
-                            wire::SctpParameters { stream_id: Some(1) },
+                        transport: Some(wire::track_binding::Transport::SctpDataV1(
+                            wire::SctpDataV1Parameters {
+                                stream_id: Some(1),
+                                version: u32::from(pulsebeam_proto::data_endpoint::DATA_V1),
+                                channel_incarnation: 1,
+                                delivery: wire::DataV1Delivery::Reliable as i32,
+                            },
                         )),
                     }),
                 })),
@@ -892,9 +896,14 @@ fn subscription(publication_id: &str) -> wire::ResourceSpec {
                 kind: wire::TrackKind::Data as i32,
                 source_room: "room".into(),
                 binding: Some(wire::TrackBinding {
-                    transport: Some(wire::track_binding::Transport::Sctp(wire::SctpParameters {
-                        stream_id: Some(1),
-                    })),
+                    transport: Some(wire::track_binding::Transport::SctpDataV1(
+                        wire::SctpDataV1Parameters {
+                            stream_id: Some(1),
+                            version: u32::from(pulsebeam_proto::data_endpoint::DATA_V1),
+                            channel_incarnation: 1,
+                            delivery: wire::DataV1Delivery::Reliable as i32,
+                        },
+                    )),
                 }),
             },
         )),
@@ -971,8 +980,10 @@ fn live(session: &NativeSession, work: &Preparation) -> wire::LiveResource {
             record_dd: false,
         }));
     }
+    let enabled = spec.settings.as_ref().unwrap().enabled == Some(true);
     wire::LiveResource {
-        data_v1_source: None,
+        data_v1_source: (enabled && matches!(track.kind, Some(wire::track::Kind::Data(_))))
+            .then_some(work.reference),
         spec: Some(spec.clone()),
         participant: Some(wire::Participant {
             participant_id: "owner".into(),
@@ -980,7 +991,7 @@ fn live(session: &NativeSession, work: &Preparation) -> wire::LiveResource {
             room_id: "room".into(),
         }),
         track: Some(track),
-        execution: if spec.settings.as_ref().unwrap().enabled == Some(true) {
+        execution: if enabled {
             wire::ExecutionStatus::Installed
         } else {
             wire::ExecutionStatus::Disabled
@@ -1437,7 +1448,6 @@ fn rejected_update_preserves_acceptance_and_publication_reservation() {
         }),
         declaration: Some(wire::resource_spec::Declaration::LogicalSubscription(
             wire::LogicalSubscriptionSpec {
-                data_version: None,
                 source: Some(wire::LogicalSourceAddress {
                     room: "room".into(),
                     participant_id: "Owner".into(),
@@ -1712,8 +1722,7 @@ fn terminal_lifetimes_release_rows_queues_and_byte_funding_without_history() {
         } else {
             work
         };
-        let mut value = live(&session, &work);
-        value.data_v1_source = Some(reference);
+        let value = live(&session, &work);
         assert!(session.complete(work, Ok(value), 100).unwrap());
         drain(&mut session);
         input(&mut session, vec![absent(reference, reference + 1)]).unwrap();
@@ -2063,7 +2072,7 @@ fn preparation_completion_cannot_replace_the_model_owned_target() {
 #[test]
 fn data_projection_uses_actual_metadata_without_a_payload_format_or_activity_claim() {
     use crate::entity::{ConnectionId, ParticipantId, RoomId, TrackKind};
-    use crate::track::{DataLane, Topic, Track, TrackMeta};
+    use crate::track::{DataLane, Track, TrackMeta};
     let mut session = session();
     let connection = ConnectionId::new();
     let origin = crate::entity::fixture_participant_id();
@@ -2077,9 +2086,10 @@ fn data_projection_uses_actual_metadata_without_a_payload_format_or_activity_cla
     .into_iter()
     .enumerate()
     {
+        let reference = index as u64 * 2 + 1;
         let label = format!("Literal_{lane:?}");
         let id = connection.fixture_publication(TrackKind::Data, &label);
-        let source = Track::data(
+        let source = Track::native_data_publication(
             TrackMeta {
                 room: crate::entity::ProjectRoomKey::fixture(room),
                 id,
@@ -2087,9 +2097,10 @@ fn data_projection_uses_actual_metadata_without_a_payload_format_or_activity_cla
                 connection_id: connection,
                 track_id: Some(crate::entity::TrackId::new(&label).unwrap()),
             },
-            Topic::for_test("application-topic"),
             lane,
+            std::num::NonZeroU64::new(reference),
             None,
+            false,
         );
         session
             .observe_candidate(super::super::ResolvedSource {
@@ -2118,7 +2129,6 @@ fn data_projection_uses_actual_metadata_without_a_payload_format_or_activity_cla
             }))
         );
         let descriptor = observed.clone();
-        let reference = index as u64 * 2 + 1;
         let mut spec = publication(&label, true);
         let Some(wire::resource_spec::Declaration::Publication(declaration)) =
             &mut spec.declaration
@@ -2129,6 +2139,18 @@ fn data_projection_uses_actual_metadata_without_a_payload_format_or_activity_cla
             panic!("data")
         };
         data.delivery = expected as i32;
+        let Some(wire::track_binding::Transport::SctpDataV1(parameters)) = data
+            .binding
+            .as_mut()
+            .and_then(|binding| binding.transport.as_mut())
+        else {
+            panic!("SCTP DATA binding")
+        };
+        parameters.delivery = match lane {
+            DataLane::Latest => wire::DataV1Delivery::Latest,
+            DataLane::Lossy => wire::DataV1Delivery::Unreliable,
+            DataLane::Ordered => wire::DataV1Delivery::Reliable,
+        } as i32;
         input(
             &mut session,
             vec![present(reference, reference, spec.clone())],
@@ -2136,7 +2158,7 @@ fn data_projection_uses_actual_metadata_without_a_payload_format_or_activity_cla
         .unwrap();
         let work = session.take_preparation().unwrap().unwrap();
         let fact = crate::participant::policy::PublicationExecution {
-            data_v1_source: None,
+            data_v1_source: source.fabric_data_source(),
             track: source,
             enabled: true,
             active: true,
@@ -2659,7 +2681,6 @@ fn denied_logical_subscription_never_resolves_or_prepares_even_in_another_room()
             }),
             declaration: Some(wire::resource_spec::Declaration::LogicalSubscription(
                 wire::LogicalSubscriptionSpec {
-                    data_version: None,
                     source: Some(wire::LogicalSourceAddress {
                         room: room.into(),
                         participant_id: "denied-publisher".into(),
@@ -2737,14 +2758,13 @@ fn logical_subscription_resolves_without_discover_and_tracks_replacement() {
         }),
         declaration: Some(wire::resource_spec::Declaration::LogicalSubscription(
             wire::LogicalSubscriptionSpec {
-                data_version: None,
                 source: Some(address.clone()),
             },
         )),
     };
-    let data_track = |connection: ConnectionId| {
+    let data_track = |connection: ConnectionId, incarnation| {
         let id = connection.fixture_publication(TrackKind::Data, label);
-        Track::data_publication(
+        Track::native_data_publication(
             TrackMeta {
                 room: crate::entity::ProjectRoomKey::fixture(room),
                 id,
@@ -2753,6 +2773,9 @@ fn logical_subscription_resolves_without_discover_and_tracks_replacement() {
                 track_id: Some(crate::entity::TrackId::new(&label).unwrap()),
             },
             DataLane::Ordered,
+            Some(incarnation),
+            None,
+            false,
         )
     };
 
@@ -2769,7 +2792,7 @@ fn logical_subscription_resolves_without_discover_and_tracks_replacement() {
     assert!(initial.source.is_none());
     let initial_revision = state.evaluated_revision;
 
-    let first = data_track(connection);
+    let first = data_track(connection, std::num::NonZeroU64::MIN);
     model
         .observe_participant(wire::Participant {
             participant_id: publisher_id.as_str().to_owned(),
@@ -2822,7 +2845,6 @@ fn logical_subscription_resolves_without_discover_and_tracks_replacement() {
         settings: None,
         declaration: Some(wire::resource_spec::Declaration::LogicalSubscription(
             wire::LogicalSubscriptionSpec {
-                data_version: None,
                 source: Some(address.clone()),
             },
         )),
@@ -2848,7 +2870,10 @@ fn logical_subscription_resolves_without_discover_and_tracks_replacement() {
 
     input(&mut model, vec![present(51, 54, lookup(true))]).unwrap();
     let replacement_connection = ConnectionId::new();
-    let replacement = data_track(replacement_connection);
+    let replacement = data_track(
+        replacement_connection,
+        std::num::NonZeroU64::MIN.saturating_add(1),
+    );
     model
         .refresh_source_lookups(32, 100, &DataBranchIds::default(), |_| {
             Some(super::super::ResolvedSource {
@@ -2898,21 +2923,23 @@ fn fabric_receiver_offers_are_versioned_and_rotate_with_the_authenticated_source
         connection_id: connection,
         track_id: Some(TrackId::new("cursor").unwrap()),
     };
-    let fabric = |source, record_dd| {
+    let fabric = |source, epoch: Option<u64>, record_dd| {
         Track::native_data_publication(
             meta.clone(),
             DataLane::Latest,
             NonZeroU64::new(source),
-            NonZeroU64::new(source).map(|_| wire::DataV1CaptureClock {
+            epoch.map(|epoch| wire::DataV1CaptureClock {
                 id: "source-clock".into(),
-                epoch: source,
+                epoch,
             }),
             record_dd,
         )
     };
-    let first = fabric(10, false);
-    let capable = fabric(10, true);
-    let legacy = fabric(0, false);
+    let first = fabric(10, Some(10), false);
+    let changed_clock = fabric(10, Some(20), false);
+    let missing_clock = fabric(10, None, false);
+    let capable = fabric(10, Some(10), true);
+    let legacy = fabric(0, None, false);
     let subscription = wire::ResourceSpec {
         settings: Some(wire::ResourceSettings {
             enabled: Some(true),
@@ -2920,7 +2947,6 @@ fn fabric_receiver_offers_are_versioned_and_rotate_with_the_authenticated_source
         }),
         declaration: Some(wire::resource_spec::Declaration::LogicalSubscription(
             wire::LogicalSubscriptionSpec {
-                data_version: Some(u32::from(pulsebeam_proto::data_endpoint::DATA_V1)),
                 source: Some(wire::LogicalSourceAddress {
                     room: room.to_string(),
                     participant_id: publisher.to_string(),
@@ -2948,13 +2974,10 @@ fn fabric_receiver_offers_are_versioned_and_rotate_with_the_authenticated_source
         };
         assert_eq!(state.source.is_some(), state.data_v1.is_some());
         if let Some(offer) = &state.data_v1 {
-            assert_eq!(
-                offer.capture_clock,
-                Some(wire::DataV1CaptureClock {
-                    id: "source-clock".into(),
-                    epoch: offer.source
-                })
-            );
+            let Track::Data(data) = track else {
+                panic!("DATA track");
+            };
+            assert_eq!(offer.capture_clock, data.capture_clock);
         }
         (
             state.source_revision,
@@ -2967,7 +2990,10 @@ fn fabric_receiver_offers_are_versioned_and_rotate_with_the_authenticated_source
     assert_eq!(offer(&mut model, &legacy), (0, None));
     assert_eq!(offer(&mut model, &first), (1, Some((10, 1))));
     assert_eq!(offer(&mut model, &first), (1, Some((10, 1))));
-    assert_eq!(offer(&mut model, &fabric(11, false)), (2, Some((11, 2))));
+    assert_eq!(
+        offer(&mut model, &fabric(11, Some(11), false)),
+        (2, Some((11, 2)))
+    );
     assert_eq!(offer(&mut model, &legacy), (3, None));
     assert_eq!(offer(&mut model, &first), (4, Some((10, 3))));
     let mut other_subscriber = session();
@@ -3019,11 +3045,15 @@ fn fabric_receiver_offers_are_versioned_and_rotate_with_the_authenticated_source
             .is_empty()
     );
     let work = model.take_preparation().unwrap().unwrap();
-    let stale = fabric(11, false);
-    assert!(
-        matches!(model.compile_execution(&work, None, |_| Some(super::super::ResolvedSource { track: &stale, publisher: &publisher })),
-        Err(error) if error.code() == wire::FailureCode::Incompatible)
-    );
+    let stale = fabric(11, Some(10), false);
+    for track in [&stale, &changed_clock, &missing_clock] {
+        assert!(matches!(
+            model.compile_execution(&work, None, |_| Some(super::super::ResolvedSource {
+                track, publisher: &publisher,
+            })),
+            Err(error) if error.code() == wire::FailureCode::Incompatible
+        ));
+    }
     assert!(matches!(
         model.compile_execution(&work, None, |_| Some(super::super::ResolvedSource {
             track: &capable, publisher: &publisher,
@@ -3052,6 +3082,7 @@ fn fabric_receiver_offers_are_versioned_and_rotate_with_the_authenticated_source
     assert_eq!(fabric.parameters, parameters);
     assert_eq!(fabric.endpoint.source.get(), 10);
     assert_eq!(fabric.endpoint.branch.get(), 3);
+    assert_eq!(fabric.capture_clock.unwrap().epoch, 10);
 
     let mut quic = NativeSession::with_binding_profile(validation::BindingProfile::Quic);
     quic.authorization(900, 1, ResourcePermissions::RoomBound)
@@ -3100,6 +3131,17 @@ fn fabric_receiver_offers_are_versioned_and_rotate_with_the_authenticated_source
     assert_eq!(fabric.parameters, parameters);
     assert_eq!(fabric.endpoint.source.get(), 10);
     assert_eq!(fabric.endpoint.branch.get(), 5);
+    assert_eq!(fabric.capture_clock.unwrap().epoch, 10);
+
+    assert_eq!(offer(&mut model, &changed_clock), (5, None));
+    let retirement = model.take_logical_retirement().unwrap().unwrap();
+    assert!(
+        matches!(retirement.into_action(), ExecutionAction::Retire(scope) if scope.binding == 2)
+    );
+    model
+        .observe_resource(crate::participant::policy::ResourceObservation::Released { binding: 2 })
+        .unwrap();
+    assert_eq!(offer(&mut model, &changed_clock), (6, Some((10, 6))));
 }
 
 #[test]
@@ -3137,7 +3179,6 @@ fn logical_subscription_keeps_one_reservation_across_scoped_receiver_replacement
         }),
         declaration: Some(wire::resource_spec::Declaration::LogicalSubscription(
             wire::LogicalSubscriptionSpec {
-                data_version: Some(u32::from(pulsebeam_proto::data_endpoint::DATA_V1)),
                 source: Some(wire::LogicalSourceAddress {
                     room: room.to_string(),
                     participant_id: publisher.to_string(),
@@ -3398,7 +3439,6 @@ fn unresolved_logical_subscription_revocation_and_close_finish_locally_without_e
         }),
         declaration: Some(wire::resource_spec::Declaration::LogicalSubscription(
             wire::LogicalSubscriptionSpec {
-                data_version: None,
                 source: Some(wire::LogicalSourceAddress {
                     room: "room".into(),
                     participant_id: "publisher".into(),
@@ -3455,7 +3495,6 @@ fn unresolved_logical_subscription_revocation_and_close_finish_locally_without_e
                 }),
                 declaration: Some(wire::resource_spec::Declaration::LogicalSubscription(
                     wire::LogicalSubscriptionSpec {
-                        data_version: None,
                         source: Some(wire::LogicalSourceAddress {
                             room: "room".into(),
                             participant_id: "publisher".into(),
@@ -3497,7 +3536,6 @@ fn logical_subscription_work_is_cursor_bounded_and_authorized_for_other_rooms() 
         }),
         declaration: Some(wire::resource_spec::Declaration::LogicalSubscription(
             wire::LogicalSubscriptionSpec {
-                data_version: None,
                 source: Some(address()),
             },
         )),

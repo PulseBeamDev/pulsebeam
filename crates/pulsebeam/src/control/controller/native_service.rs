@@ -30,6 +30,37 @@ impl SourceLookupKey {
             track_id: TrackId::new(&address.track_id).ok()?,
         })
     }
+
+    fn interest_keys(self) -> impl Iterator<Item = InterestKey> {
+        std::iter::once(InterestKey::Exact(self)).chain(
+            [Component::Any, Component::Literal(self.room.room)]
+                .into_iter()
+                .flat_map(move |room| {
+                    [Component::Any, Component::Literal(self.participant)]
+                        .into_iter()
+                        .flat_map(move |participant| {
+                            [Component::Any, Component::Literal(self.kind)]
+                                .into_iter()
+                                .flat_map(move |kind| {
+                                    [Component::Any, Component::Literal(self.track_id)]
+                                        .into_iter()
+                                        .map(move |track| {
+                                            InterestKey::Selector(
+                                                self.room.project,
+                                                SubscriptionSelector {
+                                                    project: Component::Any,
+                                                    room,
+                                                    participant,
+                                                    kind,
+                                                    track,
+                                                },
+                                            )
+                                        })
+                                })
+                        })
+                }),
+        )
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -58,12 +89,14 @@ impl InterestKey {
 
 pub(super) type MediaInterestId = (ConnectionId, u64);
 
-/// The owner and revision remain local. Only the project and attenuated
-/// Subscribe scope can be forwarded as an authenticated server assertion.
+/// The owner and revision remain local. The peer receives the attenuated
+/// Subscribe scope and a deadline, not the viewer's token.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct MediaInterest {
     pub(super) owner: MediaInterestId,
     pub(super) authorization: u64,
+    pub(super) expires_unix: u64,
+    pub(super) wants_media: bool,
     pub(super) project: ProjectId,
     pub(super) selector: SubscriptionSelector,
     pub(super) scope: pulsebeam_core::auth::grants::SubscribeScope,
@@ -153,25 +186,8 @@ impl SourceLookupIndex {
     }
 
     fn source_changed(&mut self, source: SourceLookupKey) {
-        self.queue_wake(InterestKey::Exact(source));
-        let project = source.room.project;
-        for room in [Component::Any, Component::Literal(source.room.room)] {
-            for participant in [Component::Any, Component::Literal(source.participant)] {
-                for kind in [Component::Any, Component::Literal(source.kind)] {
-                    for track in [Component::Any, Component::Literal(source.track_id)] {
-                        self.queue_wake(InterestKey::Selector(
-                            project,
-                            SubscriptionSelector {
-                                project: Component::Any,
-                                room,
-                                participant,
-                                kind,
-                                track,
-                            },
-                        ));
-                    }
-                }
-            }
+        for key in source.interest_keys() {
+            self.queue_wake(key);
         }
     }
 
@@ -231,6 +247,13 @@ impl ControllerActor {
         Some(MediaInterest {
             owner,
             authorization: lease.revision(),
+            expires_unix: lease.expiry().unix_seconds(),
+            wants_media: self
+                .native_connections
+                .get(&owner.0)?
+                .handler
+                .model
+                .wants_media(owner.1),
             project,
             selector,
             scope: lease
@@ -248,6 +271,12 @@ impl ControllerActor {
             .is_some_and(|(project, selector, lease)| {
                 (project, selector, lease.revision())
                     == (sent.project, sent.selector, sent.authorization)
+                    && self
+                        .native_connections
+                        .get(&sent.owner.0)
+                        .is_some_and(|native| {
+                            native.handler.model.wants_media(sent.owner.1) == sent.wants_media
+                        })
             })
     }
 
@@ -272,6 +301,53 @@ impl ControllerActor {
                         track,
                     )
             })
+    }
+
+    pub(super) fn direct_media_interest_expiry(
+        &self,
+        track: &crate::track::Track,
+        wall_now: SystemTime,
+        limit_ms: u64,
+    ) -> Option<u64> {
+        let meta = track.meta();
+        let source = SourceLookupKey {
+            room: meta.room,
+            participant: meta.origin,
+            kind: track.id().kind(),
+            track_id: meta.track_id?,
+        };
+        let mut latest = None;
+        for key in source.interest_keys() {
+            let Some(owners) = self.source_lookup_index.by_source.get(&key) else {
+                continue;
+            };
+            for &owner in owners.iter().take(LOOKUP_WAKE_BUDGET) {
+                let Some((project, selector, lease)) = self.media_interest_lease(owner, wall_now)
+                else {
+                    continue;
+                };
+                if self
+                    .native_connections
+                    .get(&owner.0)
+                    .is_some_and(|native| native.handler.model.wants_media(owner.1))
+                    && lease.permissions().allows_selector_match(
+                        project,
+                        selector,
+                        source.room,
+                        source.participant,
+                        source.kind,
+                        source.track_id,
+                    )
+                {
+                    let expiry = lease.expiry().unix_seconds().saturating_mul(1_000);
+                    if expiry >= limit_ms {
+                        return Some(limit_ms);
+                    }
+                    latest = latest.max(Some(expiry));
+                }
+            }
+        }
+        latest
     }
 
     pub(super) fn media_interest_page(

@@ -104,8 +104,7 @@ fn quic_ingress_uses_the_negotiated_profile_not_the_session_payload_type() {
         Profile::Vp9,
         Profile::Av1,
     ]) {
-        let video_dd = matches!(profile, Profile::Vp8 | Profile::Vp9 | Profile::Av1)
-            .then_some(wire::QuicVideoDd::Absent as i32);
+        let video_dd = profile.is_video().then_some(wire::QuicVideoDd::Absent as i32);
         let parameters = wire::QuicRtpParameters {
             binding_id: 7,
             incarnation: 9,

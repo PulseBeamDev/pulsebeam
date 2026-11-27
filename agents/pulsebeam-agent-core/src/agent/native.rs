@@ -610,7 +610,6 @@ fn logical_subscription(
     selector: &crate::TrackSelector,
     kind: state::TrackKind,
     receive: Option<state::resource_settings::Receive>,
-    data_version: Option<u32>,
 ) -> state::ResourceSpec {
     state::ResourceSpec {
         settings: Some(state::ResourceSettings {
@@ -619,7 +618,6 @@ fn logical_subscription(
         }),
         declaration: Some(state::resource_spec::Declaration::LogicalSubscription(
             state::LogicalSubscriptionSpec {
-                data_version,
                 source: Some(state::LogicalSourceAddress {
                     room: selector.room.clone(),
                     participant_id: selector.participant_id.clone(),
@@ -1067,7 +1065,7 @@ fn quic_rtp_binding(
                 })?
             }
             Some(PublicationProfile::Video { .. }) => return None,
-            None | Some(PublicationProfile::LegacyH264Dd) => supported().find(|format| {
+            None => supported().find(|format| {
                 matches!(
                     (video, format.known_codec()),
                     (false, Some(state::codec_format::Codec::Opus(_)))
@@ -1097,8 +1095,10 @@ fn build_quic_rtp_binding(
     use super::quic::PublicationProfile;
     use state::track_binding::Transport;
     let video_dd = match format.mime_type.as_str() {
-        "audio/opus" | "video/h264" => None,
-        "video/vp8" | "video/vp9" | "video/av1" if session.quic_directional_video_dd => {
+        "audio/opus" => None,
+        "video/h264" | "video/vp8" | "video/vp9" | "video/av1"
+            if session.quic_directional_video_dd =>
+        {
             state::VideoMode::for_format(&format, "L1T1").ok()?;
             let direction = if receiving {
                 state::QuicVideoDd::Accept
@@ -1114,7 +1114,6 @@ fn build_quic_rtp_binding(
         }
         _ => return None,
     };
-    let publishes_h264_dd = video && matches!(profile, Some(PublicationProfile::LegacyH264Dd));
     let id = u16::try_from(session.next_stream).ok()?;
     session.next_stream = session.next_stream.checked_add(1)?;
     Some(state::TrackBinding {
@@ -1122,7 +1121,6 @@ fn build_quic_rtp_binding(
             binding_id: u32::from(id),
             incarnation: ids.channel().get(),
             primary_ssrc: u32::from(id),
-            publishes_h264_dd,
             video_dd,
             codec: Some(state::RtpCodecParameters {
                 payload_type: Some(if video { 102 } else { 111 }),
@@ -1199,7 +1197,7 @@ pub(super) fn reconcile(
             },
         ));
         if let Some(selector) = &video.selector {
-            let spec = logical_subscription(selector, state::TrackKind::Video, receive, None);
+            let spec = logical_subscription(selector, state::TrackKind::Video, receive);
             let resource = Resource::LogicalReception(slot.clone());
             reconcile_logical_media(session, &mut media, &slot, &resource, &spec, ids)?;
             wanted.insert(resource, spec);
@@ -1375,39 +1373,32 @@ pub(super) fn reconcile(
         };
         let slot = MediaSlot::RemoteAudio(index);
         let resource = Resource::LogicalReception(slot.clone());
-        let spec = logical_subscription(selector, state::TrackKind::Audio, audio_options(), None);
+        let spec = logical_subscription(selector, state::TrackKind::Audio, audio_options());
         reconcile_logical_media(session, &mut media, &slot, &resource, &spec, ids)?;
         wanted.insert(resource, spec);
     }
     let mut data = BTreeMap::new();
-    let mut subscribers: BTreeMap<_, (BTreeSet<_>, bool)> = desired
-        .topics
-        .subscribers
-        .iter()
-        .filter(|_| session.capabilities.data_v1)
-        .fold(BTreeMap::new(), |mut by_source, subscriber| {
-            by_source
-                .entry(crate::TrackSelector {
-                    room: subscriber.room.clone(),
-                    participant_id: subscriber.participant_id.clone(),
-                    track_id: subscriber.topic.clone(),
-                })
-                .or_insert_with(|| (BTreeSet::new(), false))
-                .0
-                .insert(subscriber.mode);
-            by_source
-        });
-    if session.capabilities.data_v1 {
-        for selector in resources.inherited_data_demand() {
-            subscribers.entry(selector.clone()).or_default().1 = true;
-        }
+    let mut subscribers: BTreeMap<_, (BTreeSet<_>, bool)> =
+        desired
+            .topics
+            .subscribers
+            .iter()
+            .fold(BTreeMap::new(), |mut by_source, subscriber| {
+                by_source
+                    .entry(crate::TrackSelector {
+                        room: subscriber.room.clone(),
+                        participant_id: subscriber.participant_id.clone(),
+                        track_id: subscriber.topic.clone(),
+                    })
+                    .or_insert_with(|| (BTreeSet::new(), false))
+                    .0
+                    .insert(subscriber.mode);
+                by_source
+            });
+    for selector in resources.inherited_data_demand() {
+        subscribers.entry(selector.clone()).or_default().1 = true;
     }
-    for publisher in desired
-        .topics
-        .publishers
-        .iter()
-        .filter(|_| joined && session.capabilities.data_v1)
-    {
+    for publisher in desired.topics.publishers.iter().filter(|_| joined) {
         data.insert(
             Resource::Publication {
                 kind: state::TrackKind::Data,
@@ -1420,12 +1411,7 @@ pub(super) fn reconcile(
         let resource = Resource::LogicalData(selector.clone());
         wanted.insert(
             resource.clone(),
-            logical_subscription(
-                &selector,
-                state::TrackKind::Data,
-                None,
-                Some(u32::from(pulsebeam_proto::data_endpoint::DATA_V1)),
-            ),
+            logical_subscription(&selector, state::TrackKind::Data, None),
         );
         let Some((offer, logical)) = session.state.logical_offer(&resource) else {
             continue;

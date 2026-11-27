@@ -92,6 +92,8 @@ fn media_permit_pins_origin_incarnation_scope_window_descriptor_and_expiry() {
     let interest = |project, participant| MediaInterest {
         owner: (ConnectionId::new(), 1),
         authorization: 1,
+        expires_unix: u64::MAX,
+        wants_media: true,
         project,
         selector: SubscriptionSelector {
             project: Component::Literal(project),

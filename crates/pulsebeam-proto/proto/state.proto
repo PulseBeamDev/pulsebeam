@@ -455,9 +455,8 @@ message ResourceSpec {
 message LogicalSubscriptionSpec {
   LogicalSourceAddress source = 1;
 
-  // Only DATA subscriptions may request an explicit Fabric payload version.
-  // Absence is a legacy subscription and cannot receive a Fabric offer.
-  optional uint32 data_version = 2;
+  reserved 2;
+  // DATA source addresses always use DATA_V1 receiver offers.
 }
 
 // An absent component matches any value. Present components are typed literals,
@@ -700,10 +699,12 @@ message VideoReceiveOptions {
 // packet indices, replay state and RTCP attribution. Terminal replacements use
 // fresh RTP identities or reset-gated SCTP channels, never source relabeling.
 message TrackBinding {
+  reserved 2;
+  reserved "sctp";
+
   // Exactly one negotiated transport. QUIC arms are never sent to RTC peers.
   oneof transport {
     RtpParameters rtp = 1;
-    SctpParameters sctp = 2;
     SctpDataV1Parameters sctp_data_v1 = 3;
     QuicDataV1Parameters quic_data_v1 = 4;
     QuicRtpParameters quic_rtp = 5;
@@ -720,12 +721,13 @@ message QuicDataV1Parameters {
 }
 
 message QuicRtpParameters {
+  reserved 5;
+
   uint32 binding_id = 1;
   fixed64 incarnation = 2;
   RtpCodecParameters codec = 3;
   fixed32 primary_ssrc = 4;
-  bool publishes_h264_dd = 5; // H.264 publication only; requires Dependency Descriptor.
-  // Only when both peers advertise the directional video DD contract.
+  // Required for video, with directional DD capability on both peers. Absent for audio.
   optional QuicVideoDd video_dd = 6;
 }
 
@@ -737,10 +739,12 @@ enum QuicVideoDd {
   QUIC_VIDEO_DD_REQUIRE = 4;
 }
 
-// Explicit DATA_V1 payload negotiation, never an opt-in flag on a legacy
-// SCTP binding. A peer that does not understand this oneof member cannot
-// interpret it as a TopicFrame channel.
+// One client-allocated negotiated payload channel, independent of DTLS role.
+// Reuse requires completed protocol reset at both endpoints and fencing of old
+// messages/channel callbacks. Close notification or confirmed absence alone is
+// not a reset barrier. Actual association capacity must be known first.
 message SctpDataV1Parameters {
+  // Required: 1..65534 and below the actual usable association ceiling.
   optional uint32 stream_id = 1;
   uint32 version = 2;
   fixed64 channel_incarnation = 3; // Nonzero; echoed with the complete binding.
@@ -752,16 +756,6 @@ enum DataV1Delivery {
   DATA_V1_DELIVERY_UNRELIABLE = 1;
   DATA_V1_DELIVERY_LATEST = 2;
   DATA_V1_DELIVERY_RELIABLE = 3;
-}
-
-// One client-allocated negotiated payload channel, independent of DTLS role.
-// Reuse requires completed protocol reset at both endpoints and fencing of old
-// messages/channel callbacks. Close notification or confirmed absence alone is
-// not a reset barrier. Actual association capacity must be known first.
-message SctpParameters {
-  // Presence REQUIRED; 1..65534 and below the actual usable association ceiling.
-  // Channel reliability/ordering MUST agree with the immutable DataDelivery.
-  optional uint32 stream_id = 1;
 }
 
 // Complete RTP facts for one local sender/receiver. These are not discovery IDs or

@@ -28,6 +28,10 @@ impl Ticket {
     pub(super) fn live(self, now: Instant) -> bool {
         now < self.expires
     }
+
+    pub(super) fn expires(self) -> Instant {
+        self.expires
+    }
 }
 
 #[derive(Clone, Copy)]

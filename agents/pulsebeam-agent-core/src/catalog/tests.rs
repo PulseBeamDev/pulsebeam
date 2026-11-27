@@ -393,9 +393,14 @@ fn raw_catalog_commands_share_resource_budgets_and_reconnect_reissues_pinned_sco
                                 capture_clock: None,
                                 delivery: wire::DataDelivery::Latest as i32,
                                 binding: Some(wire::TrackBinding {
-                                    transport: Some(wire::track_binding::Transport::Sctp(
-                                        wire::SctpParameters {
+                                    transport: Some(wire::track_binding::Transport::SctpDataV1(
+                                        wire::SctpDataV1Parameters {
                                             stream_id: Some(index + 1),
+                                            version: u32::from(
+                                                pulsebeam_proto::data_endpoint::DATA_V1,
+                                            ),
+                                            channel_incarnation: u64::from(index + 1),
+                                            delivery: wire::DataV1Delivery::Latest as i32,
                                         },
                                     )),
                                 }),

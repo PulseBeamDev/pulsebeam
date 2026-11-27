@@ -22,7 +22,6 @@ fn logical_receiver_reports_follow_the_owned_offer_not_the_publication() {
         }),
         declaration: Some(wire::resource_spec::Declaration::LogicalSubscription(
             wire::LogicalSubscriptionSpec {
-                data_version: None,
                 source: Some(wire::LogicalSourceAddress {
                     room: selector.room.clone(),
                     participant_id: selector.participant_id.clone(),
@@ -40,7 +39,11 @@ fn logical_receiver_reports_follow_the_owned_offer_not_the_publication() {
                 rejection: None,
                 value: Some(wire::confirmed_state::Value::LogicalSubscription(Box::new(
                     wire::LogicalSubscriptionState {
-                        data_v1: None,
+                        data_v1: source.map(|_| wire::DataV1ReceiverOffer {
+                            source: source_revision,
+                            branch: source_revision,
+                            capture_clock: None,
+                        }),
                         spec: Some(spec.clone()),
                         source_revision,
                         source: source.map(|id| wire::Track {
@@ -61,9 +64,14 @@ fn logical_receiver_reports_follow_the_owned_offer_not_the_publication() {
         )
     };
     let binding = wire::TrackBinding {
-        transport: Some(wire::track_binding::Transport::Sctp(wire::SctpParameters {
-            stream_id: Some(9),
-        })),
+        transport: Some(wire::track_binding::Transport::SctpDataV1(
+            wire::SctpDataV1Parameters {
+                stream_id: Some(9),
+                version: u32::from(pulsebeam_proto::data_endpoint::DATA_V1),
+                channel_incarnation: 9,
+                delivery: wire::DataV1Delivery::Reliable as i32,
+            },
+        )),
     };
 
     client.stage(resource.clone(), Some(spec.clone())).unwrap();

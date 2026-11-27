@@ -434,10 +434,7 @@ impl Installed {
                             PayloadBinding::Data(binding),
                             SubscriberPayload::Data {
                                 endpoint: fabric.endpoint,
-                                capture_clock: match &plan.source {
-                                    Track::Data(data) => data.capture_clock.clone(),
-                                    _ => None,
-                                },
+                                capture_clock: fabric.capture_clock,
                                 wire: Box::new(wire),
                             },
                             emission,

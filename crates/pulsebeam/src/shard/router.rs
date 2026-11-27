@@ -2453,6 +2453,41 @@ impl ShardRuntime {
         refresh.request(now, |ssrc| request(*publisher, ssrc))
     }
 
+    pub(super) fn has_live_publisher_path(
+        &self,
+        source: FabricSourceHandle,
+        now: pulsebeam_runtime::time::Instant,
+    ) -> bool {
+        let Some(FabricIngress::Publisher {
+            publisher_sends, ..
+        }) = self.fabric_sources.get(source).map(|bound| &bound.ingress)
+        else {
+            return false;
+        };
+        publisher_sends.iter().any(|hop| {
+            hop.lifetime.is_live() && hop.route.tx.is_live() && now < hop.route.tx.expires()
+        })
+    }
+
+    pub(super) fn request_interested_publisher_refresh(
+        &mut self,
+        source: FabricSourceHandle,
+        now: pulsebeam_runtime::time::Instant,
+        request: impl FnOnce(u32) -> bool,
+    ) -> bool {
+        let Some(FabricIngress::Publisher {
+            refresh: Some(refresh),
+            ..
+        }) = self
+            .fabric_sources
+            .get_mut(source)
+            .map(|bound| &mut bound.ingress)
+        else {
+            return false;
+        };
+        refresh.request(now, request)
+    }
+
     pub(super) fn request_peer_media_refresh(
         &mut self,
         source: FabricSourceHandle,

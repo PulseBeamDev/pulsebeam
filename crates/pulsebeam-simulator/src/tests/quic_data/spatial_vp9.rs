@@ -81,7 +81,7 @@ pub(in crate::tests) async fn connect_publisher(
         ..Default::default()
     }))?;
     publisher.command(AgentCommand::Join("stage".into()))?;
-    let source = timeout(Duration::from_secs(2), async {
+    let source = timeout(Duration::from_secs(5), async {
         loop {
             if let Some(source) = publisher.rtp_publication(MediaKind::Video, TRACK) {
                 return anyhow::Ok(source);
@@ -103,11 +103,39 @@ pub(in crate::tests) async fn replay(
     start: Instant,
     repeat: bool,
 ) -> Result<()> {
+    replay_capture(publisher, source, start, repeat, false).await
+}
+
+pub(in crate::tests) async fn replay_on_feedback(
+    publisher: &mut Agent,
+    source: &Publication,
+) -> Result<()> {
+    replay_capture(publisher, source, Instant::now(), true, true).await
+}
+
+async fn replay_capture(
+    publisher: &mut Agent,
+    source: &Publication,
+    start: Instant,
+    repeat: bool,
+    feedback_only: bool,
+) -> Result<()> {
     const PICTURES: u16 = 36;
     const LAYERS: u16 = 3;
     let mut next = None;
     let mut next_packet_at = start;
     for cycle in 0_u16.. {
+        let cycle_start = if feedback_only {
+            while !publisher.take_h264_keyframe_request(TRACK) {
+                publisher
+                    .turn()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("VP9 publisher feedback: {e:?}"))?;
+            }
+            Instant::now()
+        } else {
+            start + Duration::from_millis(1200) * u32::from(cycle)
+        };
         let mut captured_next = None;
         let mut capture =
             Cursor::new(WIRE, INDEX).map_err(|_| anyhow::anyhow!("VP9 capture index"))?;
@@ -117,8 +145,7 @@ pub(in crate::tests) async fn replay(
             }
             // Capture timestamps group whole packet bursts. Pace packets within
             // each burst so the relay proof does not start with a QUIC queue test.
-            let at = (start + Duration::from_millis(1200) * u32::from(cycle) + record.send_after)
-                .max(next_packet_at);
+            let at = (cycle_start + record.send_after).max(next_packet_at);
             while Instant::now() < at {
                 pulsebeam_runtime::select! {
                     () = sleep_until(at) => break,

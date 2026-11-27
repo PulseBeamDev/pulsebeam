@@ -186,11 +186,6 @@ impl AsyncHttpClient for FamilyHttp {
             }
             let (parts, body) = response.into_parts();
             let mut body: Value = serde_json::from_slice(&body)?;
-            if body.get("data_version").and_then(Value::as_u64)
-                != Some(u64::from(pulsebeam_proto::data_endpoint::DATA_V1))
-            {
-                return Err("native conformance requires DATA_V1 negotiation".into());
-            }
             let deliveries = body
                 .get("data_delivery")
                 .and_then(Value::as_array)

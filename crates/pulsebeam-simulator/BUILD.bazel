@@ -259,7 +259,20 @@ py_binary(
     data = [":membership_sim_binary", ":candidate"],
 )
 
-test_suite(name = "fast", tests = [":media_fast", ":membership_fast"])
+QUALIFICATION_INPUTS = [
+    "qualification.tsv",
+    "//crates/pulsebeam-testdata:fixtures/codec-inventory-v1.tsv",
+]
+
+py_test(
+    name = "media_qualification",
+    srcs = ["scripts/media_qualification.py"],
+    args = ["$(rootpath %s)" % path for path in QUALIFICATION_INPUTS],
+    data = QUALIFICATION_INPUTS,
+    size = "small",
+)
+
+test_suite(name = "fast", tests = [":media_fast", ":media_qualification", ":membership_fast"])
 rustfmt_test(name = "format", targets = [":test_binary", ":membership_binary"])
 rust_clippy_test(name = "media_clippy", targets = [":test_binary"])
 rust_clippy_test(name = "membership_clippy", targets = [":membership_binary"])

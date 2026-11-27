@@ -234,15 +234,11 @@ fn answer_source_lookup(
                             &address.participant_id
                         }
                     });
-                    let offer = data_v1.clone().or_else(|| {
-                        (lookup.data_version == Some(DATA_V1)).then_some(
-                            state::DataV1ReceiverOffer {
-                                source: record.owned,
-                                branch: record.owned,
-                                capture_clock: None,
-                            },
-                        )
-                    });
+                    let offer = Some(data_v1.clone().unwrap_or(state::DataV1ReceiverOffer {
+                        source: record.owned,
+                        branch: record.owned,
+                        capture_clock: None,
+                    }));
                     Some(lookup_record(
                         record.owned,
                         revision,
@@ -283,16 +279,7 @@ pub(crate) fn grant(revision: u64) -> state::ServerStateRecord {
 pub(crate) const OFFER: &str =
     "v=0\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=mid:data\r\n";
 
-const DATA_V1: u32 = pulsebeam_proto::data_endpoint::DATA_V1 as u32;
-
 pub(crate) fn joining(topics: crate::TopicRegistrations) -> (Agent, Generation, ChannelId) {
-    joining_with_data_version(topics, Some(DATA_V1))
-}
-
-fn joining_with_data_version(
-    topics: crate::TopicRegistrations,
-    data_version: Option<u32>,
-) -> (Agent, Generation, ChannelId) {
     let mut agent = Agent::new(AgentConfig {
         endpoint: "https://sfu.test/".into(),
         token: "private-token".into(),
@@ -333,18 +320,7 @@ fn joining_with_data_version(
         }))
         .unwrap();
     let (operation, _) = native_request(&mut agent, generation);
-    let mut response = crate::tests::create_response("p1", "unused", PARTICIPANT_URI);
-    let mut json: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
-    let fields = json.as_object_mut().unwrap();
-    match data_version {
-        Some(version) => {
-            fields.insert("data_version".into(), version.into());
-        }
-        None => {
-            fields.remove("data_version");
-        }
-    }
-    response.body = serde_json::to_vec(&json).unwrap();
+    let response = crate::tests::create_response("p1", "unused", PARTICIPANT_URI);
     agent
         .handle(HostEvent::Http(HttpEvent::Response {
             operation,
@@ -400,21 +376,20 @@ pub(crate) fn connected(topics: crate::TopicRegistrations) -> (Agent, Generation
             .subscribers
             .iter()
             .any(|subscriber| subscriber.mode == TopicMode::Ordered);
-    let (mut agent, generation, control) = connected_with_data_profile(topics, Some(DATA_V1), None);
+    let (mut agent, generation, control) = connected_with_data_offer(topics, None);
     if reliable {
         agent.enable_reliable_data_fixture();
     }
     (agent, generation, control)
 }
 
-fn connected_with_data_profile(
+fn connected_with_data_offer(
     topics: crate::TopicRegistrations,
-    data_version: Option<u32>,
     data_v1: Option<state::DataV1ReceiverOffer>,
 ) -> (Agent, Generation, ChannelId) {
     let has_subscribers = !topics.subscribers.is_empty();
     let fixture_topics = topics.clone();
-    let (mut agent, generation, channel) = joining_with_data_version(topics, data_version);
+    let (mut agent, generation, channel) = joining(topics);
     complete_initial_state(&mut agent, generation, channel);
     if has_subscribers {
         let _ = answer_source_lookup(
@@ -429,28 +404,6 @@ fn connected_with_data_profile(
         assert!(agent.next_effect_after_turn().is_none());
     }
     (agent, generation, channel)
-}
-
-#[test]
-fn native_without_data_v1_does_not_allocate_a_legacy_payload_channel() {
-    let topics = crate::TopicRegistrations {
-        publishers: vec![crate::TopicPublisher {
-            topic: "updates".into(),
-            mode: TopicMode::Latest,
-        }],
-        ..Default::default()
-    };
-    let (mut agent, generation, _) = connected_with_data_profile(topics, None, None);
-    assert!(agent.next_effect_after_turn().is_none());
-    assert!(
-        agent
-            .snapshot()
-            .topics
-            .publishers
-            .iter()
-            .all(|publisher| publisher.channel.is_none() && publisher.publication_id.is_none())
-    );
-    assert_eq!(agent.snapshot().generation, Some(generation));
 }
 
 pub(crate) const SOURCE: &str = "opaque/server/data/source";
@@ -520,7 +473,6 @@ fn reliable_receiver_uses_active_native_signaling_for_expectations_and_receipts(
             self, BranchUnit, Expectation, SourceUnit, SubscriberControl, SubscriberObservation,
             subscriber_control, subscriber_observation,
         },
-        data_endpoint::DATA_V1,
         data_record::{Header, Record},
     };
     let selector = TrackSelector {
@@ -543,8 +495,7 @@ fn reliable_receiver_uses_active_native_signaling_for_expectations_and_receipts(
         capture_clock: None,
     };
     let endpoint = offer.endpoint().unwrap();
-    let (mut agent, generation, control) =
-        connected_with_data_profile(topics, Some(u32::from(DATA_V1)), Some(offer));
+    let (mut agent, generation, control) = connected_with_data_offer(topics, Some(offer));
     agent.enable_reliable_data_fixture();
     let ResourceResult::Owned { owner } = agent
         .resource(ResourceCommand::ReceiveData {
@@ -742,11 +693,7 @@ fn explicit_fabric_offer_delivers_only_on_the_exact_installed_data_v1_channel() 
             epoch: stamp.clock.epoch,
         }),
     };
-    let (mut agent, generation, control) = connected_with_data_profile(
-        topics,
-        Some(u32::from(pulsebeam_proto::data_endpoint::DATA_V1)),
-        Some(offer.clone()),
-    );
+    let (mut agent, generation, control) = connected_with_data_offer(topics, Some(offer.clone()));
     let ResourceResult::Owned { owner } = agent
         .resource(ResourceCommand::ReceiveData {
             spec: TrackSpec::Data {
@@ -888,7 +835,7 @@ fn explicit_fabric_offer_delivers_only_on_the_exact_installed_data_v1_channel() 
 
 #[test]
 fn negotiated_publisher_admits_only_on_the_installed_lease_and_emits_records() {
-    use pulsebeam_proto::{data_endpoint::DATA_V1, data_record::Record};
+    use pulsebeam_proto::data_record::Record;
     let publisher = TopicPublisher {
         topic: "cursor".into(),
         mode: TopicMode::Latest,
@@ -901,8 +848,7 @@ fn negotiated_publisher_admits_only_on_the_installed_lease_and_emits_records() {
         publishers: vec![publisher],
         ..Default::default()
     };
-    let (mut agent, generation, control) =
-        connected_with_data_profile(topics, Some(u32::from(DATA_V1)), None);
+    let (mut agent, generation, control) = connected_with_data_offer(topics, None);
     let prepared = prepare_data(&mut agent, generation, control);
     assert!(matches!(
         agent.send_data(spec.clone(), vec![1]),
@@ -964,12 +910,9 @@ fn negotiated_publisher_admits_only_on_the_installed_lease_and_emits_records() {
 fn reliable_publisher_uses_active_signaling_for_admission_repair_and_delivery() {
     use crate::ffi::{ReliableDelivery, ReliablePublishEvent};
     use core::num::NonZeroU64;
-    use pulsebeam_proto::{
-        data_control::{
-            self, BranchUnit, ControlOutcome, DeliveryOutcome, Expectation, OriginalDemand,
-            PublisherBinding, PublisherObservation, SourceUnit, publisher_observation::Record,
-        },
-        data_endpoint::DATA_V1,
+    use pulsebeam_proto::data_control::{
+        self, BranchUnit, ControlOutcome, DeliveryOutcome, Expectation, OriginalDemand,
+        PublisherBinding, PublisherObservation, SourceUnit, publisher_observation::Record,
     };
     let publisher = TopicPublisher {
         topic: "cursor".into(),
@@ -979,12 +922,11 @@ fn reliable_publisher_uses_active_signaling_for_admission_repair_and_delivery() 
         track_id: publisher.topic.clone(),
         delivery: publisher.mode,
     };
-    let (mut agent, generation, signaling) = connected_with_data_profile(
+    let (mut agent, generation, signaling) = connected_with_data_offer(
         crate::TopicRegistrations {
             publishers: vec![publisher],
             ..Default::default()
         },
-        Some(u32::from(DATA_V1)),
         None,
     );
     agent.enable_reliable_data_fixture();
@@ -1203,7 +1145,6 @@ fn fabric_installed(
         }),
         declaration: Some(state::resource_spec::Declaration::LogicalSubscription(
             state::LogicalSubscriptionSpec {
-                data_version: Some(u32::from(pulsebeam_proto::data_endpoint::DATA_V1)),
                 source: Some(state::LogicalSourceAddress {
                     room: selector.room,
                     participant_id: selector.participant_id,
@@ -1339,7 +1280,6 @@ pub(crate) fn prepare_data_pending(
                 )
             };
             let stream_id = match binding.transport {
-                Some(state::track_binding::Transport::Sctp(sctp)) => sctp.stream_id,
                 Some(state::track_binding::Transport::SctpDataV1(sctp)) => sctp.stream_id,
                 _ => panic!("SCTP binding"),
             };

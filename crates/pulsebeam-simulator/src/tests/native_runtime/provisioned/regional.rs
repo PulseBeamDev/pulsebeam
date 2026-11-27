@@ -33,6 +33,53 @@ type Port = (
 );
 
 impl Fixture {
+    pub(super) fn cold_path(
+        seed: u64,
+        root: &std::path::Path,
+        tls: pulsebeam_agent_quic::transport::ServerConfig,
+    ) -> anyhow::Result<(turmoil::Sim<'static>, [IpAddr; 3], Self)> {
+        use SimRegionalRole::{Gateway, Router};
+        let mut fixture = Self {
+            roles: vec![Router, Gateway, Gateway, Router],
+            costs: vec![std::array::from_fn(|_| SimLinkCost::new(NonZeroU16::MIN)); 3],
+            streams: Vec::new(),
+            hierarchy: Some(Hierarchy {
+                regions: &[
+                    ("parent", None, &[0, 1]),
+                    ("child", Some("parent"), &[2, 3]),
+                ],
+                borders: &[(2, 1)],
+                owner: 0,
+            }),
+        };
+        let subnet = reserve_subnet();
+        let [publisher, border_a, border_b, viewer, client] =
+            [1, 2, 3, 4, 5].map(|host| subnet_ip(subnet, host));
+        let latency = Duration::from_millis(5);
+        let mut sim = turmoil::Builder::new()
+            .min_message_latency(latency)
+            .max_message_latency(latency)
+            .simulation_duration(Duration::from_secs(24))
+            .rng_seed(seed)
+            .build();
+        install_nodes(
+            &mut sim,
+            root,
+            &[publisher, border_a, border_b, viewer],
+            &[(0, 1), (1, 2), (2, 3)],
+            seed,
+            None,
+            RoutingFixture::Regional(&mut fixture, Some(tls)),
+        )?;
+        Ok((sim, [publisher, viewer, client], fixture))
+    }
+
+    pub(super) fn connect(&mut self) {
+        for control in &mut self.streams {
+            control.connect();
+        }
+    }
+
     pub(super) fn region_tree(
         &self,
         identity: impl Fn(usize) -> (NodeId, NonZeroU64, ApiPublicKey),
@@ -171,12 +218,10 @@ fn regional_weighted_routes_aggregate_child_demand() -> anyhow::Result<()> {
         &EDGES,
         seed,
         None,
-        RoutingFixture::Regional(&mut fixture),
+        RoutingFixture::Regional(&mut fixture, None),
     )?;
     sim.client(client, async move {
-        for control in &mut fixture.streams {
-            control.connect();
-        }
+        fixture.connect();
         prove_weighted(client, ips, fixture.costs, &mut fixture.streams)
             .await
             .map_err(Into::into)
@@ -229,12 +274,10 @@ fn sibling_regions_share_a_wan_branch_and_reroute_without_replacing_the_source()
         &SIBLING_EDGES,
         seed,
         None,
-        RoutingFixture::Regional(&mut fixture),
+        RoutingFixture::Regional(&mut fixture, None),
     )?;
     sim.client(client, async move {
-        for control in &mut fixture.streams {
-            control.connect();
-        }
+        fixture.connect();
         prove_siblings(client, ips, &mut fixture.streams)
             .await
             .map_err(|error| anyhow::anyhow!("{error:#}").into())

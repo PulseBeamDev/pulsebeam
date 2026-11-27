@@ -38,7 +38,7 @@ pub(crate) fn publication(
         publication_declaration(spec).ok_or(wire::FailureCode::Unsupported)?;
     let track_id = TrackId::new(label).map_err(|_| wire::FailureCode::InvalidConfiguration)?;
     let binding = publication_binding(parameters, kind, capabilities)?;
-    // Neither simulcast nor temporal H.264 may infer dependencies from RTP markers.
+    // A layered H.264 encoding must signal its dependencies explicitly.
     let dependency_descriptor = parameters.header_extensions.iter().any(|extension| {
         extension.uri
             == wire::RtpHeaderExtensionType::RtpHeaderExtensionDependencyDescriptor.as_str()
@@ -47,15 +47,8 @@ pub(crate) fn publication(
     let profile =
         fabric_profile(&binding.codec.parameters).ok_or(wire::FailureCode::Unsupported)?;
     if profile == Profile::Vp9
-        || (profile.is_video()
-            && binding.encodings.len() != 1
-            && (profile != Profile::H264 || !dependency_descriptor))
-        || kind == wire::TrackKind::Audio
-            && (binding.encodings.len() != 1
-                || binding
-                    .encodings
-                    .iter()
-                    .any(|encoding| encoding.rid.is_some()))
+        || binding.encodings.len() != 1
+        || kind == wire::TrackKind::Audio && binding.encodings[0].rid.is_some()
         || parameters.encodings.iter().any(|encoding| {
             encoding.scalability_mode.as_deref().is_some_and(|mode| {
                 mode != wire::RtpScalabilityMode::L1t1.as_str()
@@ -198,7 +191,7 @@ mod tests {
     use wire::RtpHeaderExtensionType as Extension;
 
     #[test]
-    fn h264_requires_dd_only_when_multiple_encodings_need_selection() {
+    fn h264_rejects_multiple_encodings_even_with_dd() {
         let capabilities = super::super::capabilities();
         let publish = |encodings: usize, dd: bool| {
             let mut extensions = vec![
@@ -256,10 +249,9 @@ mod tests {
             publication(&spec, &capabilities).map(|(_, _, binding)| binding)
         };
         assert_eq!(publish(1, false).unwrap().description().encodings.len(), 1);
-        assert_eq!(
-            publish(2, false).unwrap_err(),
-            wire::FailureCode::Unsupported
-        );
-        assert_eq!(publish(2, true).unwrap().description().encodings.len(), 2);
+        assert_eq!(publish(1, true).unwrap().description().encodings.len(), 1);
+        for dd in [false, true] {
+            assert_eq!(publish(2, dd).unwrap_err(), wire::FailureCode::Unsupported);
+        }
     }
 }

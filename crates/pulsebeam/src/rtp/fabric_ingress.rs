@@ -508,7 +508,7 @@ struct OwnedCopy {
 #[derive(Clone, Copy)]
 pub(crate) struct QuicRtpIngress {
     profile: Profile,
-    publishes_h264_dd: bool,
+    emits_video_dd: bool,
 }
 
 impl QuicRtpIngress {
@@ -520,7 +520,7 @@ impl QuicRtpIngress {
         let profile = rtp_profile(&binding.format().mime_type).ok_or(DropReason::Binding)?;
         Ok(Self {
             profile,
-            publishes_h264_dd: binding.publishes_h264_dd(),
+            emits_video_dd: binding.video_dd() == Some(pulsebeam_proto::state::QuicVideoDd::Emit),
         })
     }
 
@@ -535,7 +535,7 @@ impl QuicRtpIngress {
         if header.profile != self.profile {
             return Err(DropReason::Binding);
         }
-        if self.publishes_h264_dd
+        if self.emits_video_dd
             && !packet.payload().is_empty()
             && !packet
                 .extensions()

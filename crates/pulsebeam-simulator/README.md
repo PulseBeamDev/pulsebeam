@@ -60,6 +60,66 @@ production integration evidence remain distinct. A real active-camera freeze
 still fails; redesigning the oracle does not qualify unresolved recovery or
 publication failures.
 
+## Cluster media qualification
+
+[`qualification.tsv`](qualification.tsv) maps each inventoried endpoint direction,
+codec, source structure and capability to its path disposition. Run
+`./bazel test //crates/pulsebeam-simulator:media_qualification` to validate the
+matrix against the codec fixture catalog. To inspect the expanded cells, run:
+
+```sh
+python3 crates/pulsebeam-simulator/scripts/media_qualification.py \
+  crates/pulsebeam-simulator/qualification.tsv \
+  crates/pulsebeam-testdata/fixtures/codec-inventory-v1.tsv --show
+```
+
+`observed` means fresh decoded video in the named witness; `warm` limits that
+observation to an already flowing source. `encoded` covers complete media or
+packet interoperation without a full decoder claim. `partial` covers specific
+regression cases, not every listed permutation. `gap` is an obligation without
+that proof, `blocked` names an obligation the current forwarding path cannot
+carry, and `candidate` identifies a structure to assess, not a public promise.
+`rejected` identifies negative admission, `legacy` a superseded raw-wire path,
+and a dash is not applicable. The codec fixture catalog is separate evidence:
+replay and recorded observations do not qualify a deployed endpoint or route.
+
+Native RTC is the owned SDK surface. The `rtc-wire` tests instead prepare
+explicit per-MID codec/RTX and RTP extension bindings; they do not establish
+public SDK support for those shapes. The browser and Linux QUIC have distinct
+endpoint adapters even when the same witness exercises interoperation. A codec
+in a capability offer is not an applied RTP slot or an admitted publication.
+Use the catalog's effective source format and transport's installed binding,
+then check fresh output from that incarnation. A missing compatible slot or
+unsupported publication returns an explicit non-admission, not a different
+codec. Independent RTP encodings are not part of the public contract.
+
+Exercise same-shard and cross-shard routes separately, then provision two
+edges joined by a direct peer link. Measure direct LAN and shaped WAN as
+separate link classes even when the forwarding implementation is shared.
+Use a provisioned region tree for discovery and a diamond with two distinct
+relay failure domains for protection. Inter-node RTP requires an authenticated
+Fabric association and an acknowledged route accepting the full source emission
+set; unlayered VP8 and DD-free VP9 are not currently eligible on that RTP path.
+DATA uses separate record delivery and repair semantics, and Opus tests do not
+imply video target selection.
+
+Keep the complete protected WAN UDP payload at or below 1,232 bytes (IPv6
+minimum MTU, excluding IP and UDP headers), with SRTP or DTLS overhead charged
+inside that limit. Native QUIC uses a separate 1,200-byte UDP payload cap.
+For initial deterministic witnesses, retain the existing direct peer cases at
+1 ms and 5 ms link delay, then vary delay, jitter, loss, reordering and capacity
+on the directed inter-node hop independently of the endpoint legs. Use the
+existing 250 ms camera age and 500 ms gap oracles for ordinary playback; for
+protected base continuity use a per-picture deadline from source cadence and
+fixed playout, not those camera liveness tolerances. The numbers are fixture
+bounds, not a qualified network or traffic SLA.
+
+Protection assumes healthy source and receiver, overlapping live base traffic
+on two independent routes, surviving capacity including overhead, and enough
+playout slack for the qualified impairment. Never infer protection from
+control reachability or eventual rebinding. Loss of both routes, a source stop,
+or overload beyond the measured envelope must report degraded or unavailable.
+
 ## Observation boundaries
 
 System fidelity claims use documented SDK/API behavior and end-user media/data

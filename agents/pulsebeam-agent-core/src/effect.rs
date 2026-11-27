@@ -99,7 +99,6 @@ impl core::fmt::Debug for QuicAdmit {
 pub struct BootstrapCapabilities {
     pub rtp: pulsebeam_proto::state::RtpCapabilities,
     pub data_delivery: Vec<pulsebeam_proto::state::DataDelivery>,
-    pub data_v1: bool,
 }
 
 impl BootstrapCapabilities {

@@ -433,49 +433,39 @@ fn reserved_channel_uses_control_contract_without_label_grammar() {
 
 #[test]
 fn declaration_without_a_usable_binding_is_not_invented_execution() {
-    for invalid_spec in [false, true] {
-        let mut participant = participant();
-        let mut sink = MockParticipantSink::new();
-        let mut spec = declaration();
-        let Some(resource_spec::Declaration::Publication(publication)) = spec.declaration.as_mut()
-        else {
-            panic!("publication");
-        };
-        let Some(wire::publication_spec::Kind::Data(data)) = publication.kind.as_mut() else {
-            panic!("data");
-        };
-        data.binding = (!invalid_spec).then_some(wire::TrackBinding {
-            transport: Some(wire::track_binding::Transport::Sctp(wire::SctpParameters {
-                stream_id: Some(1),
-            })),
-        });
-        participant.handle_native_signaling(
-            &frame(1, wire::desired_state::Value::Present(Box::new(spec))),
-            &mut sink,
-        );
-        assert_eq!(participant.native_execution.sequence, 0);
-        assert!(participant.native_execution.pending.is_empty());
-        assert!(participant.disconnect_reason.is_none());
-        assert!(participant.native_data.publications.is_empty());
-        assert!(participant.native_data.channels.is_empty());
-        assert!(participant.native_data.deadlines.is_empty());
-        assert!(sink.publish_track_calls.is_empty());
-        let values = confirmations(&mut participant);
-        assert_eq!(values.len(), 1);
-        assert_eq!(values[0].evaluated_revision, 1);
-        assert_eq!(
-            values[0].rejection.as_ref().unwrap().code,
-            if invalid_spec {
-                wire::FailureCode::InvalidConfiguration
-            } else {
-                wire::FailureCode::Unsupported
-            } as i32
-        );
-        assert!(matches!(
-            values[0].value,
-            Some(wire::confirmed_state::Value::Absent(_))
-        ));
-    }
+    let mut participant = participant();
+    let mut sink = MockParticipantSink::new();
+    let mut spec = declaration();
+    let Some(resource_spec::Declaration::Publication(publication)) = spec.declaration.as_mut()
+    else {
+        panic!("publication");
+    };
+    let Some(wire::publication_spec::Kind::Data(data)) = publication.kind.as_mut() else {
+        panic!("data");
+    };
+    data.binding = None;
+    participant.handle_native_signaling(
+        &frame(1, wire::desired_state::Value::Present(Box::new(spec))),
+        &mut sink,
+    );
+    assert_eq!(participant.native_execution.sequence, 0);
+    assert!(participant.native_execution.pending.is_empty());
+    assert!(participant.disconnect_reason.is_none());
+    assert!(participant.native_data.publications.is_empty());
+    assert!(participant.native_data.channels.is_empty());
+    assert!(participant.native_data.deadlines.is_empty());
+    assert!(sink.publish_track_calls.is_empty());
+    let values = confirmations(&mut participant);
+    assert_eq!(values.len(), 1);
+    assert_eq!(values[0].evaluated_revision, 1);
+    assert_eq!(
+        values[0].rejection.as_ref().unwrap().code,
+        wire::FailureCode::InvalidConfiguration as i32
+    );
+    assert!(matches!(
+        values[0].value,
+        Some(wire::confirmed_state::Value::Absent(_))
+    ));
 }
 
 #[test]

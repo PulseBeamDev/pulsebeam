@@ -70,7 +70,7 @@ pub(crate) fn quic_capabilities(directional_video_dd: bool) -> wire::RtpCapabili
             "video/av1",
         ][..]
     } else {
-        &["audio/opus", "video/h264"][..]
+        &["audio/opus"][..]
     };
     wire::RtpCapabilities {
         codecs: media
@@ -425,17 +425,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn quic_raw_video_capabilities_preserve_the_legacy_intersection() {
-        let legacy = quic_capabilities(false);
+    fn quic_raw_video_requires_directional_dd_capability() {
+        let audio_only = quic_capabilities(false);
         let current = quic_capabilities(true);
-        assert_eq!(validation::validate_capabilities(&legacy), Ok(()));
+        assert_eq!(validation::validate_capabilities(&audio_only), Ok(()));
         assert_eq!(validation::validate_capabilities(&current), Ok(()));
-        assert_eq!(legacy.codecs, current.codecs[..2]);
-        assert_eq!(legacy.codecs.len(), 2);
-        for (candidate, mime) in
-            current.codecs[2..]
-                .iter()
-                .zip(["video/vp8", "video/vp9", "video/av1"])
+        assert_eq!(audio_only.codecs, current.codecs[..1]);
+        for (candidate, mime) in current.codecs[1..]
+            .iter()
+            .zip(["video/h264", "video/vp8", "video/vp9", "video/av1"])
         {
             assert!(candidate.scalability_modes.is_empty());
             let format = candidate.format.as_ref().unwrap();
