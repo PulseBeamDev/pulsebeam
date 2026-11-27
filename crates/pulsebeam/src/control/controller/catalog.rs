@@ -274,7 +274,7 @@ pub(super) struct CatalogRuntime {
 fn expected_responders(controller: &ControllerActor) -> Vec<responders::Peer> {
     if let Some(routing) = &controller.regional_routing {
         return routing
-            .catalog_members()
+            .catalog_coverage_members()
             .map(|member| (member.node, member.generation))
             .collect();
     }

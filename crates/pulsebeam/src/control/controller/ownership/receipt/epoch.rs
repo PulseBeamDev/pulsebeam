@@ -64,7 +64,7 @@ struct View {
 }
 
 pub(in crate::control) struct Validated {
-    peer: NodeId,
+    issuer: Issuer,
     view: View,
     retired: Vec<Key>,
 }
@@ -135,6 +135,32 @@ impl Trust {
                 view: None,
             },
         );
+        Ok(())
+    }
+
+    /// Advance an enrolled slot only after authenticated, durable boot admission.
+    /// Old issuance is not transferable; learned terminal facts are.
+    pub(in crate::control) fn advance_peer(&mut self, issuer: Issuer) -> Result<(), Error> {
+        let peer = self.peers.get_mut(&issuer.node).ok_or(Error::Invalid)?;
+        if issuer.trust_domain != peer.issuer.trust_domain
+            || issuer.incarnation <= peer.issuer.incarnation
+        {
+            return Err(Error::Invalid);
+        }
+        if let Some(view) = peer.view.take() {
+            self.blocked |= view.blocked;
+            for (key, fact) in view.records {
+                if !fact.retired {
+                    continue;
+                }
+                if self.records.len() >= CAPACITY && !self.records.contains_key(&key) {
+                    self.blocked = true;
+                    break;
+                }
+                self.records.entry(key).or_default().retired = true;
+            }
+        }
+        peer.issuer = issuer;
         Ok(())
     }
 
@@ -210,7 +236,7 @@ impl Trust {
             .filter_map(|(key, fact)| (fact.retired && !self.retired(*key)).then_some(*key))
             .collect();
         Ok(Validated {
-            peer: origin.0,
+            issuer: remote.issuer,
             view: View {
                 revision,
                 deadline,
@@ -225,10 +251,19 @@ impl Trust {
         &mut self,
         checkpoint: Validated,
     ) -> Result<Vec<Key>, Error> {
-        self.peers
-            .get_mut(&checkpoint.peer)
-            .ok_or(Error::Invalid)?
-            .view = Some(checkpoint.view);
+        let peer = self
+            .peers
+            .get_mut(&checkpoint.issuer.node)
+            .ok_or(Error::Invalid)?;
+        if peer.issuer != checkpoint.issuer
+            || peer
+                .view
+                .as_ref()
+                .is_some_and(|view| view.revision >= checkpoint.view.revision)
+        {
+            return Err(Error::Invalid);
+        }
+        peer.view = Some(checkpoint.view);
         Ok(checkpoint.retired)
     }
 

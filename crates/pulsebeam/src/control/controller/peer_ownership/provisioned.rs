@@ -19,7 +19,9 @@ use super::super::publisher_handoffs::Frame as HandoffFrame;
 use super::{
     ControllerActor, Session, fabric_data, media_repair,
     ownership::{
-        receipt::{Authority, Issuer, epoch::Trust, standby::wire::Frame as StandbyFrame},
+        receipt::{
+            Authority, Issuer, PeerTrust, epoch::Trust, standby::wire::Frame as StandbyFrame,
+        },
         wire,
     },
     relay::{self, interest, wan_source::WanSourceWindow, wan_transit},
@@ -28,7 +30,8 @@ use super::{
 
 use crate::{
     cluster::{
-        ProvisionedPeer,
+        EnrolledPeer, ProvisionedPeer,
+        admission::{AdmittedBoot, MediaCredentials},
         declarations::{Declaration, Exchange, Finalized, Kind, Role},
         mesh,
     },
@@ -72,13 +75,37 @@ enum Transport {
     CatalogFixture,
     Wan(WanHost),
     Regional {
-        port: mesh::Port,
+        port: ControlPort,
         media: WanHost,
     },
 }
 
+struct ControlPort {
+    sessions: ControlSessions,
+    roles: (Role, Role),
+    cost: mesh::LinkCost,
+}
+
+enum ControlSessions {
+    Exact(mpsc::Receiver<PeerControl>),
+    Enrolled {
+        lane: Option<PeerControl>,
+        credentials: MediaCredentials,
+    },
+}
+
+impl ControlPort {
+    fn take_lane(&mut self) -> Option<PeerControl> {
+        match &mut self.sessions {
+            ControlSessions::Exact(sessions) => sessions.try_recv().ok(),
+            ControlSessions::Enrolled { lane, .. } => lane.take(),
+        }
+        .filter(PeerControl::is_ready)
+    }
+}
+
 struct WanHost {
-    peer: NetworkPeer,
+    peer: Option<NetworkPeer>,
     generation: NonZeroU64,
     host: crate::link::wan_host::Provisioner,
 }
@@ -103,7 +130,7 @@ impl Transport {
             Self::Wan(media) => {
                 let id = links.reserve_wan_peer()?;
                 let (commands, lane) = media.host.open(
-                    media.peer.clone(),
+                    media.peer.clone().ok_or(LinkError::Security)?,
                     id,
                     media.generation,
                     links.clock_origin(),
@@ -115,14 +142,13 @@ impl Transport {
                 Ok((id, lane))
             }
             Self::Regional { port, media } => {
-                let lane = port.sessions.try_recv().map_err(|_| LinkError::Closed)?;
-                if lane.is_closed() {
-                    return Err(LinkError::Closed);
-                }
+                let lane = port.take_lane().ok_or(LinkError::Closed)?;
                 let id = links.reserve_wan_peer()?;
-                let commands = media
-                    .host
-                    .open_media(media.peer.clone(), id, media.generation)?;
+                let commands = media.host.open_media(
+                    media.peer.clone().ok_or(LinkError::Security)?,
+                    id,
+                    media.generation,
+                )?;
                 links
                     .attach_wan_host(commands, Carriage::Ownership)
                     .map_err(|_| LinkError::Capacity)?;
@@ -697,6 +723,10 @@ impl Peer {
         }
     }
 
+    pub(in crate::control::controller) fn regional_member(&self) -> mesh::Member {
+        self.mesh_member()
+    }
+
     pub(in crate::control::controller) fn routed_control(
         &self,
         member: mesh::Member,
@@ -765,8 +795,7 @@ impl Peer {
             if assoc.lane.is_closed()
                 && let Transport::Regional { port, .. } = &mut self.transport
                 && let Some(stream) = self.last_stream.checked_add(1).and_then(NonZeroU64::new)
-                && let Ok(lane) = port.sessions.try_recv()
-                && lane.is_ready()
+                && let Some(lane) = port.take_lane()
             {
                 self.last_stream = stream.get();
                 assoc.reconnect_regional(lane, port.roles, member, stream, now);
@@ -1989,27 +2018,69 @@ impl ControllerActor {
         wan_host: crate::link::wan_host::Provisioner,
         regional: Option<mesh::Port>,
     ) -> anyhow::Result<()> {
+        let media = WanHost {
+            peer: Some(spec.transport.clone()),
+            generation: spec.local.1,
+            host: wan_host,
+        };
+        let transport = match regional {
+            Some(port) => Transport::Regional {
+                media,
+                port: ControlPort {
+                    sessions: ControlSessions::Exact(port.sessions),
+                    roles: port.roles,
+                    cost: port.cost,
+                },
+            },
+            None => Transport::Wan(media),
+        };
+        self.register_provisioned_peer(spec, transport)
+    }
+
+    pub(crate) fn add_enrolled_ownership_peer(
+        &mut self,
+        spec: EnrolledPeer,
+        wan_host: crate::link::wan_host::Provisioner,
+        credentials: MediaCredentials,
+        roles: (Role, Role),
+        cost: mesh::LinkCost,
+    ) -> anyhow::Result<()> {
+        let generation = spec.local.1;
+        self.register_provisioned_peer(
+            spec,
+            Transport::Regional {
+                port: ControlPort {
+                    sessions: ControlSessions::Enrolled {
+                        lane: None,
+                        credentials,
+                    },
+                    roles,
+                    cost,
+                },
+                media: WanHost {
+                    peer: None,
+                    generation,
+                    host: wan_host,
+                },
+            },
+        )
+    }
+
+    fn register_provisioned_peer<T>(
+        &mut self,
+        spec: ProvisionedPeer<T>,
+        transport: Transport,
+    ) -> anyhow::Result<()> {
         let issuer = |(node, incarnation)| Issuer {
             trust_domain: spec.authority_epoch,
             node,
             incarnation,
         };
-        let media = WanHost {
-            peer: spec.transport,
-            generation: spec.local.1,
-            host: wan_host,
-        };
-        let transport = match regional {
-            Some(port) => {
-                anyhow::ensure!(
-                    port.roles.0.adjacent(port.roles.1),
-                    "invalid regional adjacency roles"
-                );
-                Transport::Regional { port, media }
-            }
-            None => Transport::Wan(media),
-        };
         let mesh_identity = if let Transport::Regional { port, .. } = &transport {
+            anyhow::ensure!(
+                port.roles.0.adjacent(port.roles.1),
+                "invalid regional adjacency roles"
+            );
             let role = port.roles.0;
             let local = mesh::Member {
                 node: spec.local.0,
@@ -2056,6 +2127,56 @@ impl ControllerActor {
             spec.relay_from,
             Instant::now(),
         ));
+        Ok(())
+    }
+
+    pub(in crate::control) fn admit_ownership_boot(
+        &mut self,
+        admission: AdmittedBoot,
+        now: Instant,
+    ) -> anyhow::Result<()> {
+        let boot = admission.into_session();
+        let peer = self
+            .provisioned_peers
+            .iter_mut()
+            .find(|peer| peer.remote.0 == boot.peer.node)
+            .ok_or_else(|| anyhow::anyhow!("admitted boot has no ownership slot"))?;
+        let Transport::Regional { port, media } = &mut peer.transport else {
+            anyhow::bail!("admitted ownership boot requires regional control");
+        };
+        let ControlSessions::Enrolled { lane, credentials } = &mut port.sessions else {
+            anyhow::bail!("admitted ownership boot requires an enrolled slot");
+        };
+        let generation = boot.peer.generation;
+        if generation < peer.remote.1 {
+            return Ok(());
+        }
+        let mut superseded = None;
+        if generation > peer.remote.1 {
+            let Some(Authority::Provisioned(trust)) = &mut self.receipt_trust else {
+                anyhow::bail!("enrolled ownership boot requires provisioned receipt authority");
+            };
+            trust
+                .advance_peer(Issuer {
+                    node: boot.peer.node,
+                    incarnation: generation,
+                    trust_domain: trust.issuer().trust_domain,
+                })
+                .map_err(|error| anyhow::anyhow!("advancing receipt authority: {error:?}"))?;
+            peer.remote.1 = generation;
+            peer.last_revision = 0;
+            peer.last_stream = 0;
+            superseded = peer.association.take();
+        }
+        media.peer = Some(credentials.pin(boot.media_leaf));
+        *lane = boot.control.is_ready().then_some(boot.control);
+        peer.next_step = now;
+        if let Some(old) = superseded {
+            if let Some(session) = old.session {
+                let _ = self.close_ownership_peer(session);
+            }
+            self.close_link_peer(old.network);
+        }
         Ok(())
     }
 

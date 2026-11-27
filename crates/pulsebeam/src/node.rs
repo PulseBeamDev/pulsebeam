@@ -108,6 +108,8 @@ pub struct NodeBuilder {
     operator_socket: bool,
     operator_listener: Option<std::os::unix::net::UnixListener>,
     provisioned_peers: Vec<ProvisionedPeer>,
+    #[cfg(not(feature = "sim"))]
+    enrolled_boot: Option<(crate::cluster::admission::LocalBoot, Vec<crate::cluster::EnrolledPeer>)>,
     publisher_handoff_store: Option<crate::cluster::handoff::Store>,
     link_listen: Option<SocketAddr>,
     link_control: Option<pulsebeam_runtime::sync::oneshot::Sender<crate::link::Control>>,
@@ -176,6 +178,8 @@ impl NodeBuilder {
             operator_socket: false,
             operator_listener: None,
             provisioned_peers: Vec::new(),
+            #[cfg(not(feature = "sim"))]
+            enrolled_boot: None,
             publisher_handoff_store: None,
             link_listen: None,
             link_control: None,
@@ -542,8 +546,9 @@ impl NodeBuilder {
             Topology::SingleNode => OwnershipMode::Standalone,
             Topology::MultiNode => OwnershipMode::Unavailable,
         };
+        let has_configured_links = !options.ownership_peers.is_empty() || !options.enrolled_peers.is_empty();
         anyhow::ensure!(
-            options.ownership_peers.is_empty() || self.link_listen.is_none(),
+            !has_configured_links || self.link_listen.is_none(),
             "an explicit Link listener cannot be combined with provisioned Fabric WAN peers"
         );
         self.provisioned_peers = options.ownership_peers.clone();
@@ -551,13 +556,22 @@ impl NodeBuilder {
         self.protected_base_stream_bps = options.protected_base_stream_bps;
         if self.operator_socket {
             anyhow::ensure!(
-                !self.provisioned_peers.is_empty() && self.key_registry.is_some(),
+                has_configured_links && self.key_registry.is_some(),
                 "operator socket requires provisioned peers and a participant key registry"
             );
         }
-        let handoff_directory =
-            (!self.provisioned_peers.is_empty()).then(|| options.data_dir.clone());
+        let handoff_directory = has_configured_links.then(|| options.data_dir.clone());
+        #[cfg(not(feature = "sim"))]
+        let enrolled = options.enrolled_peers.clone();
         let membership = crate::cluster::Service::start(options).await?;
+        #[cfg(not(feature = "sim"))]
+        let mut membership = membership;
+        #[cfg(not(feature = "sim"))]
+        if let Some(boot) = membership.boot.take() {
+            self.region_tree.as_mut().context("boot admission requires a region tree")?
+                .begin_boot_admission(boot.member)?;
+            self.enrolled_boot = Some((boot, enrolled));
+        }
         if let Some(directory) = handoff_directory {
             let operator_socket = self.operator_socket;
             let (store, listener) = pulsebeam_runtime::task::spawn_blocking(move || {
@@ -752,6 +766,8 @@ impl NodeBuilder {
 
         let mut tcp_service = None;
         let mut link_results = Vec::new();
+        #[cfg(not(feature = "sim"))]
+        let mut boot_results = Vec::new();
         let result: Result<()> = async {
         let mut tcp_rxs = Vec::with_capacity(shard_count);
         let mut tcp_txs = Vec::new();
@@ -845,6 +861,12 @@ impl NodeBuilder {
         let wall_anchor = WallAnchor::from(pulsebeam_runtime::net::ReceiveTime::now());
         let initial_global_clock = global_clock.snapshot();
         let mut clock_senders = Vec::with_capacity(shard_count);
+        #[cfg(not(feature = "sim"))]
+        let discovery_clock = self.enrolled_boot.as_ref().map(|_| {
+            let (tx, rx) = pulsebeam_queue::bounded(std::num::NonZeroUsize::MIN);
+            clock_senders.push(tx);
+            rx
+        });
 
         let mut shard_contexts = Vec::with_capacity(shard_count);
 
@@ -990,9 +1012,63 @@ impl NodeBuilder {
         }
         let member = |(node, generation)| crate::cluster::mesh::Member { node, generation };
         if let Some(tree) = &self.region_tree {
-            let local = self.provisioned_peers.first().context("region tree requires local identity")?;
-            controller.set_region_tree(member(local.local), tree.clone(), clock_origin, self.protected_base_stream_bps);
-            controller.set_regional_media_key(&local.receipt_key)?;
+            let identity = self.provisioned_peers.first().map(|local| (member(local.local), &local.receipt_key));
+            #[cfg(not(feature = "sim"))]
+            let identity = identity.or_else(|| self.enrolled_boot.as_ref().and_then(|(boot, peers)| {
+                Some((boot.member, &peers.first()?.receipt_key))
+            }));
+            let (local, key) = identity.context("region tree requires local identity")?;
+            controller.set_region_tree(local, tree.clone(), clock_origin, self.protected_base_stream_bps);
+            controller.set_regional_media_key(key)?;
+        }
+        #[cfg(not(feature = "sim"))]
+        if let Some((boot, enrolled)) = self.enrolled_boot {
+            use crate::cluster::{admission::{DiscoveryBroker, MediaCredentials}, mesh::LinkCost, regional::Adjacency};
+            let tree = self.region_tree.as_ref().context("boot admission requires a region tree")?;
+            let (candidates, candidate_rx) = pulsebeam_runtime::sync::mpsc::channel(enrolled.len());
+            let (admitted, admission_rx) = pulsebeam_runtime::sync::mpsc::channel(enrolled.len());
+            controller.set_regional_boot_admissions(admission_rx)?;
+            let (discovery, port) = DiscoveryBroker::channel(32);
+            let first = enrolled.first().context("no enrolled control lanes")?;
+            controller.set_regional_discovery(
+                first.authority_epoch, first.receipt_key.clone(), enrolled.iter().map(|peer| peer.remote.0).collect(),
+                initial_global_clock, discovery_clock.context("missing regional discovery clock")?, port,
+            )?;
+            for mut peer in enrolled {
+                let scope = tree.enrolled_adjacency(boot.member.node, peer.remote.0).context("missing enrolled adjacency")?;
+                let config = peer.regional_control.take().context("enrolled adjacency requires regional TLS")?;
+                let cost = LinkCost::Fixed(config.link_cost);
+                let adjacency = Adjacency::open_boot(config, boot.member, peer.remote.0, peer.authority_epoch, boot.media.fingerprint(), tree)
+                    .await.context("initializing enrolled regional control adjacency")?;
+                let (host, provisioner) = crate::link::wan_host::Service::bind(peer.listen, clock_origin, peer.protected_egress_bps)
+                    .await.context("binding enrolled Fabric WAN UDP")?;
+                hosts.push(SocketHost::Wan(host));
+                let credentials = MediaCredentials::new(peer.transport, boot.media.clone(), boot.member.node, peer.remote.0);
+                if scope.is_border() {
+                    controller.add_enrolled_border(peer.remote.0, credentials, provisioner)?;
+                } else {
+                    peer.local.1 = boot.member.generation;
+                    controller.add_enrolled_ownership_peer(peer, provisioner, credentials, scope.roles, cost)?;
+                }
+                let (report, result) = pulsebeam_runtime::sync::oneshot::channel();
+                boot_results.push(result);
+                let sender = candidates.clone();
+                let cancel = shutdown.clone();
+                control_tasks.spawn(async move {
+                    let result = adjacency.run_boot(clock_origin, sender, cancel.child_token()).await;
+                    if result.is_err() { cancel.cancel(); }
+                    let _ = report.send(result);
+                });
+            }
+            drop(candidates);
+            let (report, result) = pulsebeam_runtime::sync::oneshot::channel();
+            boot_results.push(result);
+            let cancel = shutdown.clone();
+            control_tasks.spawn(async move {
+                let result = boot.admit_sessions(candidate_rx, admitted, Some(discovery), cancel.child_token()).await;
+                if result.is_err() { cancel.cancel(); }
+                let _ = report.send(result);
+            });
         }
         #[cfg(feature = "sim")]
         let mut sim_regional_ports = self.sim_regional_ports;
@@ -1184,6 +1260,11 @@ impl NodeBuilder {
                 .await
                 .context("Link host task stopped without reporting")?
                 .context("Link UDP host failed")?;
+        }
+        #[cfg(not(feature = "sim"))]
+        for result in boot_results {
+            result.await.context("regional boot service stopped without reporting")?
+                .context("regional boot service failed")?;
         }
         if let Some(error) = control_error {
             return Err(error.into());

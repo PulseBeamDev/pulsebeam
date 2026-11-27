@@ -669,6 +669,7 @@ fn native_agents_prove_media_topics_reconnect_and_close() {
             )
             .with_cluster(pulsebeam::cluster::Options {
                 ownership_peers: Vec::new(),
+                enrolled_peers: Vec::new(),
                 region_tree: None,
                 protected_base_stream_bps: None,
                 cluster_id: "native-reconnect".into(),

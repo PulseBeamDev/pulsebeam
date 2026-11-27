@@ -32,19 +32,21 @@ use super::{
 const MAX_FLIGHTS: usize = 8;
 const MAX_ATTACHMENTS: usize = 32;
 const DELAY: Duration = Duration::from_millis(250);
+// Reserve time to try another border before the current permit expires.
+const FIRST_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(1);
 
 struct Query {
     interests: Vec<MediaInterest>,
     target: usize,
     after: Option<NonZeroU64>,
-    retry: u8,
+    retry: Option<u8>,
     empty: bool,
 }
 
 impl Query {
     fn advance(&mut self, next: Option<NonZeroU64>) {
         self.after = next;
-        self.retry = 0;
+        self.retry = None;
         if next.is_none() {
             self.target = self.target.saturating_add(1);
         }
@@ -56,9 +58,9 @@ impl Query {
         self.advance(next.filter(|_| valid));
     }
 
-    fn failed(&mut self) {
-        if self.retry == 0 {
-            self.retry = 1;
+    fn failed(&mut self, attempt: u8) {
+        if self.retry.is_none() {
+            self.retry = Some(attempt.wrapping_add(1));
         } else {
             self.observe_page(false, None);
         }
@@ -218,6 +220,14 @@ pub(super) struct Client {
 }
 
 impl Client {
+    pub(super) fn withdraw_member(&mut self, member: Member) {
+        self.flights.retain(|_, flight| flight.target != member);
+        self.demand.retain(|(owner, _), _| *owner != member);
+        self.attempts.remove(&member);
+        self.changed
+            .extend(std::mem::take(&mut self.empty).into_keys());
+    }
+
     pub(super) fn take_coverage_changes(&mut self) -> BTreeSet<MediaInterestId> {
         std::mem::take(&mut self.changed)
     }
@@ -371,11 +381,11 @@ impl Client {
                     interests: std::mem::take(&mut flight.query.interests),
                     ..flight.query
                 };
-                if query.retry != 0 {
+                if query.retry.is_some() {
                     self.attempts
                         .insert(flight.target, flight.attempt.wrapping_add(1));
                 }
-                query.failed();
+                query.failed(flight.attempt);
                 self.ready.push_back(query);
                 return false;
             }
@@ -414,9 +424,6 @@ impl Client {
                 break;
             };
             self.serial = id.get();
-            let Some(expires) = now.checked_add(ROUTED_READ_TTL) else {
-                break;
-            };
             let Some(expires_ms) = wall
                 .checked_add(ROUTED_READ_TTL)
                 .and_then(media_permit::unix_millis)
@@ -442,11 +449,14 @@ impl Client {
                     .map(|interest| interest.expires_unix.saturating_mul(1_000).min(expires_ms))
                     .max(),
             };
-            let attempt = self.attempt_for(target).wrapping_add(query.retry);
-            if get.encode().is_some_and(|payload| {
-                forwarding
-                    .request(router, target, attempt, &payload, now)
-                    .is_some()
+            let attempt = query.retry.unwrap_or_else(|| self.attempt_for(target));
+            let timeout = if query.retry.is_some() {
+                ROUTED_READ_TTL
+            } else {
+                FIRST_ATTEMPT_TIMEOUT
+            };
+            if let Some(expires) = get.encode().and_then(|payload| {
+                forwarding.request(router, target, attempt, &payload, now, timeout)
             }) {
                 self.flights.insert(
                     id,
@@ -458,7 +468,7 @@ impl Client {
                     },
                 );
             } else {
-                query.failed();
+                query.failed(attempt);
                 self.ready.push_back(query);
             }
         }
@@ -480,7 +490,7 @@ fn enqueue(ready: &mut VecDeque<Query>, interest: MediaInterest) {
             interests: vec![interest],
             target: 0,
             after: None,
-            retry: 0,
+            retry: None,
             empty: true,
         });
     }
@@ -496,7 +506,7 @@ mod tests {
             interests: Vec::new(),
             target: 0,
             after: None,
-            retry: 0,
+            retry: None,
             empty: true,
         };
         let after = NonZeroU64::new(1);
@@ -504,7 +514,8 @@ mod tests {
         complete.observe_page(true, after);
         assert_eq!(complete.target, 0);
         complete.observe_page(true, None);
-        complete.failed();
+        complete.failed(4);
+        assert_eq!(complete.retry, Some(5));
         assert_eq!(complete.target, 1);
         complete.observe_page(true, None);
         assert_eq!(complete.target, 2);
@@ -522,8 +533,9 @@ mod tests {
         assert!(!unresolved.empty);
 
         let mut unreachable = query();
-        unreachable.failed();
-        unreachable.failed();
+        unreachable.failed(4);
+        unreachable.failed(5);
+        assert_eq!(unreachable.retry, None);
         unreachable.observe_page(true, None);
         assert!(!unreachable.empty);
     }

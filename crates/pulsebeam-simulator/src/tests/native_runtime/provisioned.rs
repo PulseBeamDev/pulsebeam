@@ -1241,6 +1241,7 @@ fn install_nodes(
             })
             .collect();
         let options = Options {
+            enrolled_peers: Vec::new(),
             cluster_id: "provisioned-witness".into(),
             topology: Topology::MultiNode,
             listen: gossip,

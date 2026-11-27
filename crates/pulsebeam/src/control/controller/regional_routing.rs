@@ -2,18 +2,23 @@
 //! sessions are independent of publisher issuers and ownership observations.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     num::NonZeroU64,
     time::SystemTime,
 };
 
-use pulsebeam_core::auth::ApiSigningKey;
+use pulsebeam_core::{auth::ApiSigningKey, identity::NodeId};
 use pulsebeam_link::{LinkTime, NetworkId, NetworkPeer, PeerControl};
-use pulsebeam_runtime::time::Instant;
+use pulsebeam_runtime::{sync::mpsc, time::Instant};
 
-use crate::cluster::{
-    RegionTree,
-    mesh::{Exchange, Member, Port},
+use crate::{
+    clock::reference::Snapshot,
+    cluster::{
+        RegionTree,
+        admission::{AdmittedBoot, BootSession, DiscoveryPort, MediaCredentials},
+        boot_announcement,
+        mesh::{Exchange, Member, Port},
+    },
 };
 
 use super::{
@@ -28,6 +33,7 @@ use super::{
     peer_ownership::provisioned::Peer,
 };
 
+mod discovery;
 mod forwarding;
 mod frames;
 mod media_branch;
@@ -38,10 +44,14 @@ mod media_protection;
 mod media_read;
 
 use forwarding::{Arrival, Forwarding, Link, Links, Router};
-pub(super) use frames::recognizes;
+pub(super) fn recognizes(frame: &[u8]) -> bool {
+    frames::recognizes(frame) || discovery::recognizes(frame)
+}
 
 const INBOX_CAPACITY: usize = 64;
+const DISCOVERY_INBOX_CAPACITY: usize = 16;
 const BORDER_QUANTUM: usize = 4;
+const ADMISSION_QUANTUM: usize = 16;
 
 // A routed read is anchored to the target member and the owner's row revision,
 // not to a declaration or stream belonging to a replaceable next hop.
@@ -51,8 +61,15 @@ pub(super) const ROUTED: DeclarationId = DeclarationId {
     changed_at: NonZeroU64::MIN,
 };
 
+struct EnrolledBorder {
+    transport: MediaCredentials,
+    host: crate::link::wan_host::Provisioner,
+    current: Option<Member>,
+}
+
+#[derive(Default)]
 struct Border {
-    port: Port,
+    port: Option<Port>,
     lane: Option<PeerControl>,
     revision: u64,
     media: Option<NetworkId>,
@@ -64,9 +81,16 @@ impl Border {
             return;
         }
         self.lane = None;
-        if let Some(next) = self.revision.checked_add(1)
-            && let Ok(lane) = self.port.sessions.try_recv()
-            && lane.is_ready()
+        if let Some(port) = &mut self.port
+            && let Ok(lane) = port.sessions.try_recv()
+        {
+            self.install_lane(lane);
+        }
+    }
+
+    fn install_lane(&mut self, lane: PeerControl) {
+        if lane.is_ready()
+            && let Some(next) = self.revision.checked_add(1)
         {
             self.revision = next;
             self.lane = Some(lane);
@@ -88,6 +112,15 @@ struct Connected<'a> {
 }
 
 impl Connected<'_> {
+    fn discovery_links(&self) -> Vec<Link> {
+        self.borders
+            .keys()
+            .copied()
+            .chain(self.peers.iter().map(Peer::regional_member))
+            .filter_map(|member| self.link(member))
+            .collect()
+    }
+
     fn media_edge(&self, link: Link) -> Option<media_branch::Edge> {
         let network = self
             .borders
@@ -152,6 +185,10 @@ pub(super) struct Routing {
     tree: RegionTree,
     epoch: Instant,
     borders: BTreeMap<Member, Border>,
+    enrolled_borders: BTreeMap<NodeId, EnrolledBorder>,
+    admitted_boots: Option<mpsc::Receiver<AdmittedBoot>>,
+    discovery: Option<discovery::Discovery>,
+    discovery_inbox: VecDeque<(Link, Box<[u8]>)>,
     inbox: VecDeque<(Link, Box<[u8]>)>,
     forwarding: Forwarding,
     reads: BTreeMap<Member, Reads>,
@@ -335,6 +372,12 @@ impl Routing {
         }
     }
 
+    pub(super) fn catalog_coverage_members(&self) -> impl Iterator<Item = Member> + '_ {
+        self.tree
+            .catalog_coverage_members()
+            .filter(|member| *member != self.local)
+    }
+
     pub(super) fn catalog_members(&self) -> impl Iterator<Item = Member> + '_ {
         self.reads.keys().copied()
     }
@@ -344,9 +387,59 @@ impl Routing {
     }
 
     pub(super) fn enqueue(&mut self, member: Member, stream: NonZeroU64, bytes: Box<[u8]>) {
-        if self.inbox.len() < INBOX_CAPACITY {
-            self.inbox.push_back((Link { member, stream }, bytes));
+        let input = (Link { member, stream }, bytes);
+        if discovery::recognizes(&input.1) {
+            if self.discovery.is_some() && self.discovery_inbox.len() < DISCOVERY_INBOX_CAPACITY {
+                self.discovery_inbox.push_back(input);
+            }
+        } else if self.inbox.len() < INBOX_CAPACITY {
+            self.inbox.push_back(input);
         }
+    }
+
+    fn withdraw_boot(&mut self, member: Member) {
+        self.tree.withdraw_boot(member);
+        self.reads.remove(&member);
+        self.media_targets.retain(|candidate| *candidate != member);
+        self.inbox.retain(|(link, _)| link.member != member);
+        self.media_client.withdraw_member(member);
+        self.media_branches.withdraw_member(member);
+    }
+
+    fn admit_boot(&mut self, member: Member) -> bool {
+        let previous = self.tree.current_member(member.node);
+        if !self.tree.admit_boot(member) {
+            return false;
+        }
+        if let Some(old) = previous
+            && old != member
+        {
+            self.withdraw_boot(old);
+        }
+        // Unrelated reads and branches keep their original leases. A restarted
+        // target no longer has the old boot's catalog row and window namespace.
+        self.reads
+            .retain(|old, _| old.node != member.node || *old == member);
+        if self
+            .tree
+            .catalog_members()
+            .any(|candidate| candidate == member)
+        {
+            self.reads.entry(member).or_default();
+        }
+        self.media_targets
+            .retain(|old| old.node != member.node || *old == member);
+        if self.reads.contains_key(&member)
+            && self.tree.media_key(member).is_some()
+            && (self.protected_base_stream_bps.is_some()
+                || self.tree.region(member) != self.tree.region(self.local))
+            && !self.media_targets.contains(&member)
+        {
+            self.media_targets.push(member);
+        }
+        self.inbox
+            .retain(|(link, _)| link.member.node != member.node || link.member == member);
+        true
     }
 
     fn drive(&mut self, actor: &mut ControllerActor, now: Instant) {
@@ -364,7 +457,14 @@ impl Routing {
                         break;
                     }
                     let Some(bytes) = lane.try_recv() else { break };
-                    if recognizes(&bytes) {
+                    if discovery::recognizes(&bytes) {
+                        if self.discovery.is_some()
+                            && self.discovery_inbox.len() < DISCOVERY_INBOX_CAPACITY
+                        {
+                            self.discovery_inbox
+                                .push_back((Link { member, stream }, bytes));
+                        }
+                    } else if frames::recognizes(&bytes) {
                         self.inbox.push_back((Link { member, stream }, bytes));
                     } else if let Some((network, demand)) =
                         border.media.zip(Demand::decode_refresh(&bytes))
@@ -426,6 +526,24 @@ impl Routing {
                 }
             }
         }
+        if let Some(discovery) = &mut self.discovery {
+            let links = Connected {
+                epoch: self.epoch,
+                now,
+                mesh: actor.regional_mesh.as_ref(),
+                peers: &actor.provisioned_peers,
+                borders: &self.borders,
+            };
+            let changes = discovery.drive(&self.tree, &links, &mut self.discovery_inbox, now);
+            for change in changes {
+                match change {
+                    discovery::Change::Admit(member) => {
+                        self.admit_boot(member);
+                    }
+                    discovery::Change::Withdraw(member) => self.withdraw_boot(member),
+                }
+            }
+        }
         let router = Router {
             local: self.local,
             tree: &self.tree,
@@ -470,9 +588,27 @@ impl Routing {
                     }
                 }
                 Some(Arrival::Branch(request)) => {
-                    if let Some(edge) = router.links.media_edge(from) {
-                        self.media_branches
-                            .receive(&self.tree, self.local, edge, request, now, wall_now);
+                    if let Some(edge) = router.links.media_edge(from)
+                        && let Some(lease) = self
+                            .media_branches
+                            .receive(&self.tree, self.local, edge, request, now, wall_now)
+                        && lease.protection.is_none()
+                    {
+                        let label = lease.ack.window.ssrc();
+                        if self
+                            .media_receives
+                            .transit_label_retired(edge.network, label)
+                            && let Some(frame) = frames::Frame::BranchRetired(label).encode()
+                        {
+                            router.links.send(from, frame, lease.expires);
+                        }
+                    }
+                }
+                Some(Arrival::BranchRetired(label)) => {
+                    if let Some(edge) = router.links.media_edge(from)
+                        && let Some(links) = actor.links.as_mut()
+                    {
+                        self.media_receives.retire_remote_label(links, edge, label);
                     }
                 }
                 _ => {}
@@ -502,7 +638,14 @@ impl Routing {
                 get.encode(id).is_some_and(|payload| {
                     let [attempt, ..] = id.get().to_le_bytes();
                     self.forwarding
-                        .request(&router, owner, attempt, &payload, now)
+                        .request(
+                            &router,
+                            owner,
+                            attempt,
+                            &payload,
+                            now,
+                            forwarding::ROUTED_READ_TTL,
+                        )
                         .is_some()
                 })
             });
@@ -520,16 +663,17 @@ impl Routing {
             .protected()
             .filter_map(|lease| media_protection::TransitPlan::new(&router, lease))
             .collect();
-        let receiver_plans =
-            self.protected_base_stream_bps
-                .map_or_else(BTreeMap::new, |wire_bps| {
-                    media_protection::receiver_plans(
-                        &router,
-                        self.media_client.demands(),
-                        wire_bps,
-                        now,
-                    )
-                });
+        let receiver_plans = self.protected_base_stream_bps.map_or_else(
+            media_protection::ReceiverPlans::default,
+            |wire_bps| {
+                media_protection::receiver_plans(
+                    &router,
+                    self.media_client.demands(),
+                    wire_bps,
+                    now,
+                )
+            },
+        );
         let plans = media_ingress::plan(
             &router,
             self.media_client.demands(),
@@ -614,6 +758,10 @@ impl ControllerActor {
             epoch,
             reads,
             borders: BTreeMap::new(),
+            enrolled_borders: BTreeMap::new(),
+            admitted_boots: None,
+            discovery: None,
+            discovery_inbox: VecDeque::new(),
             inbox: VecDeque::new(),
             forwarding: Forwarding::default(),
             media_key: None,
@@ -657,10 +805,8 @@ impl ControllerActor {
         match routing.borders.entry(member) {
             std::collections::btree_map::Entry::Vacant(entry) => {
                 entry.insert(Border {
-                    port,
-                    lane: None,
-                    revision: 0,
-                    media: None,
+                    port: Some(port),
+                    ..Border::default()
                 });
                 Ok(())
             }
@@ -701,6 +847,157 @@ impl ControllerActor {
         links.identify_peer(network, remote.node);
         border.media = Some(network);
         Ok(())
+    }
+
+    pub(crate) fn set_regional_discovery(
+        &mut self,
+        epoch: [u8; 16],
+        key: ApiSigningKey,
+        direct: BTreeSet<NodeId>,
+        clock: Snapshot,
+        clocks: pulsebeam_queue::Receiver<Snapshot>,
+        port: DiscoveryPort,
+    ) -> anyhow::Result<()> {
+        let routing = self
+            .regional_routing
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("boot discovery requires a region tree"))?;
+        anyhow::ensure!(
+            routing.tree.discovery_key(routing.local) == Some(key.public_key()),
+            "regional boot verifier does not match local signing key"
+        );
+        anyhow::ensure!(
+            routing.discovery.is_none(),
+            "regional boot discovery is already wired"
+        );
+        let scope = boot_announcement::Scope {
+            epoch,
+            roster: *routing.tree.fingerprint(),
+        };
+        routing.discovery = Some(discovery::Discovery::new(
+            routing.local,
+            scope,
+            key,
+            direct,
+            clock,
+            clocks,
+            port,
+        ));
+        Ok(())
+    }
+
+    pub(crate) fn set_regional_boot_admissions(
+        &mut self,
+        admitted: mpsc::Receiver<AdmittedBoot>,
+    ) -> anyhow::Result<()> {
+        let routing = self
+            .regional_routing
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("boot admission requires a region tree"))?;
+        anyhow::ensure!(
+            routing.admitted_boots.is_none(),
+            "regional boot admission is already wired"
+        );
+        routing.admitted_boots = Some(admitted);
+        Ok(())
+    }
+
+    pub(crate) fn add_enrolled_border(
+        &mut self,
+        peer: NodeId,
+        transport: MediaCredentials,
+        host: crate::link::wan_host::Provisioner,
+    ) -> anyhow::Result<()> {
+        let routing = self
+            .regional_routing
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("border enrollment requires a region tree"))?;
+        anyhow::ensure!(
+            routing
+                .tree
+                .enrolled_adjacency(routing.local.node, peer)
+                .is_some_and(|scope| scope.is_border()),
+            "invalid enrolled border slot"
+        );
+        match routing.enrolled_borders.entry(peer) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(EnrolledBorder {
+                    transport,
+                    host,
+                    current: None,
+                });
+                Ok(())
+            }
+            std::collections::btree_map::Entry::Occupied(_) => {
+                anyhow::bail!("duplicate enrolled border slot")
+            }
+        }
+    }
+
+    fn admit_border_boot(&mut self, boot: BootSession) -> anyhow::Result<()> {
+        let routing = self
+            .regional_routing
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("border admission requires a region tree"))?;
+        let slot = routing
+            .enrolled_borders
+            .get_mut(&boot.peer.node)
+            .ok_or_else(|| anyhow::anyhow!("admitted boot has no border slot"))?;
+        let old_network = match slot.current.replace(boot.peer) {
+            Some(old) if old != boot.peer => {
+                routing.borders.remove(&old).and_then(|border| border.media)
+            }
+            _ => None,
+        };
+        let transport = slot.transport.pin(boot.media_leaf);
+        let host = slot.host.clone();
+        let needs_media = routing
+            .borders
+            .entry(boot.peer)
+            .or_default()
+            .media
+            .is_none();
+        if let Some(network) = old_network {
+            self.close_link_peer(network);
+        }
+        if needs_media {
+            self.attach_regional_border_media(boot.peer, transport, host)?;
+        }
+        if let Some(border) = self
+            .regional_routing
+            .as_mut()
+            .and_then(|routing| routing.borders.get_mut(&boot.peer))
+        {
+            border.install_lane(boot.control);
+        }
+        Ok(())
+    }
+
+    pub(super) fn drive_regional_boots(&mut self, now: Instant) {
+        for _ in 0..ADMISSION_QUANTUM {
+            let Some(routing) = &mut self.regional_routing else {
+                break;
+            };
+            let Some(boot) = routing
+                .admitted_boots
+                .as_mut()
+                .and_then(|rx| rx.try_recv().ok())
+            else {
+                break;
+            };
+            let peer = boot.peer();
+            if !routing.admit_boot(peer) {
+                continue;
+            }
+            let installed = if routing.enrolled_borders.contains_key(&peer.node) {
+                self.admit_border_boot(boot.into_session())
+            } else {
+                self.admit_ownership_boot(boot, now)
+            };
+            if let Err(error) = installed {
+                tracing::warn!(%error, "could not install admitted regional boot");
+            }
+        }
     }
 
     pub(super) fn regional_selector_empty_confirmed(

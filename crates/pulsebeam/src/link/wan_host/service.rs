@@ -24,6 +24,7 @@ pub(crate) struct Service {
     protected_egress_bps: Option<NonZeroU64>,
 }
 
+#[derive(Clone)]
 pub(crate) struct Provisioner(pulsebeam_queue::Sender<Open>);
 
 struct Open {

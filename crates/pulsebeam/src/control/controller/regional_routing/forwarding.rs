@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, num::NonZeroU64, time::Duration};
+use std::{
+    collections::BTreeMap,
+    num::{NonZeroU32, NonZeroU64},
+    time::Duration,
+};
 
 use pulsebeam_runtime::time::Instant;
 
@@ -11,7 +15,7 @@ const MAX_FLIGHTS: usize = 64;
 // A routed flight includes both directions and the owner's shard sampling.
 pub(super) const ROUTED_READ_TTL: Duration = Duration::from_secs(3);
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct Link {
     pub(super) member: Member,
     pub(super) stream: NonZeroU64,
@@ -50,6 +54,7 @@ pub(super) enum Arrival<'a> {
     Request(Ticket, &'a [u8]),
     Reply(Member, &'a [u8]),
     Branch(Request<'a>),
+    BranchRetired(NonZeroU32),
 }
 
 /// Forwarding state is per request, not per room, with one bounded lease per
@@ -186,9 +191,10 @@ impl Forwarding {
         attempt: u8,
         payload: &[u8],
         now: Instant,
-    ) -> Option<()> {
+        timeout: Duration,
+    ) -> Option<Instant> {
         let id = self.reserve(now)?;
-        let expires = now.checked_add(ROUTED_READ_TTL)?;
+        let expires = now.checked_add(timeout)?;
         let next = router.request(
             id,
             Request {
@@ -209,7 +215,7 @@ impl Forwarding {
                 expires,
             },
         );
-        Some(())
+        Some(expires)
     }
 
     pub(super) fn receive<'a>(
@@ -227,6 +233,7 @@ impl Forwarding {
                 router.validate_ingress(from.member, &mut request)?;
                 Some(Arrival::Branch(request))
             }
+            Frame::BranchRetired(label) => Some(Arrival::BranchRetired(label)),
             Frame::Request(id, mut request) => {
                 router.validate_ingress(from.member, &mut request)?;
                 let ticket = Ticket {

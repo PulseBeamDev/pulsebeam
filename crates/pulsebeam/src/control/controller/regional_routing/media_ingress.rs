@@ -296,6 +296,28 @@ pub(super) struct Receives {
 }
 
 impl Receives {
+    pub(super) fn transit_label_retired(&self, peer: NetworkId, label: NonZeroU32) -> bool {
+        self.transit
+            .get(&peer)
+            .is_some_and(|sends| sends.retired(label))
+    }
+
+    pub(super) fn retire_remote_label(
+        &self,
+        links: &mut MediaLinks,
+        upstream: Edge,
+        label: NonZeroU32,
+    ) {
+        if let Some(window) = self.installed.values().find_map(|installed| {
+            (installed.upstream == upstream)
+                .then_some(installed.window)
+                .flatten()
+                .filter(|window| window.ssrc() == label)
+        }) {
+            links.retire_routed_wan_receive(upstream.network, window);
+        }
+    }
+
     pub(super) fn canonical_ingress(&self, demand: &Demand) -> Option<NetworkId> {
         let installed = self.installed.get(&Key::new(
             demand.endpoint,
@@ -402,8 +424,7 @@ impl Receives {
             };
             let mut old = self.installed.remove(&key);
             if old.as_ref().is_some_and(|old| {
-                (!pin_ingress && old.canonical != upstream.network)
-                    || old.source.publisher != source.publisher
+                old.source.publisher != source.publisher
                     || old.source.origin != source.origin
                     || &old.descriptor != offer.descriptor
             }) && let Some(old) = old.take()
@@ -558,7 +579,13 @@ impl Receives {
                 true,
             );
         }
-        self.transit.retain(|_, sends| !sends.is_empty());
+        // Labels stay consumed for the life of the association, even when no branch is active.
+        self.transit.retain(|peer, _| {
+            actor
+                .links
+                .as_ref()
+                .is_some_and(|links| links.is_wan_peer(*peer))
+        });
         for (peer, branches) in outputs {
             let mut sends = wan_transit::Sends::default();
             sends.reconcile(actor, peer, branches, now, true);

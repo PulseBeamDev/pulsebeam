@@ -68,7 +68,7 @@ pkg_files(name = "server_payload", srcs = ["//crates/pulsebeam:server"], prefix 
 pkg_tar(name = "rootfs", srcs = [":server_payload"], owner = "65532.65532", portable_mtime = True)
 oci_image(name = "image", base = "@distroless_linux_amd64//:distroless_linux_amd64", tars = [":rootfs"],
           entrypoint = ["/app/pulsebeam"], workdir = "/app", user = "65532:65532",
-          exposed_ports = ["3478/udp", "7070/tcp"])
+          exposed_ports = ["3478/udp", "3478/tcp", "7070/tcp"])
 oci_load(name = "load", image = ":image", repo_tags = ["pulsebeam:local"])
 
 py_test(

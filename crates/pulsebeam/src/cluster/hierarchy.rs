@@ -45,6 +45,8 @@ struct ConfiguredMember {
     catalog: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     media_key: Option<ApiPublicKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    boot_key: Option<ApiPublicKey>,
 }
 
 impl ConfiguredMember {
@@ -72,6 +74,13 @@ pub struct RegionTree {
     members: BTreeMap<NodeId, (String, ConfiguredMember)>,
     borders: BTreeMap<String, BTreeSet<Border>>,
     fingerprint: [u8; 32],
+    admitted: Option<AdmittedBoots>,
+}
+
+#[derive(Clone, Debug)]
+struct AdmittedBoots {
+    local: Member,
+    remote: BTreeMap<NodeId, NonZeroU64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -106,7 +115,7 @@ impl TryFrom<Manifest> for RegionTree {
         );
         let mut parents = BTreeMap::new();
         let mut members = BTreeMap::new();
-        let mut media_keys = BTreeSet::new();
+        let mut member_keys = BTreeMap::new();
         for region in config.regions {
             ensure!(valid_region_name(&region.name), "invalid region name");
             ensure!(
@@ -115,12 +124,12 @@ impl TryFrom<Manifest> for RegionTree {
                 "invalid region membership size"
             );
             for member in region.members {
-                ensure!(
-                    member
-                        .media_key
-                        .is_none_or(|key| media_keys.insert(*key.as_bytes())),
-                    "reuse of a media origin key across configured member slots"
-                );
+                for key in [member.media_key, member.boot_key].into_iter().flatten() {
+                    ensure!(
+                        *member_keys.entry(*key.as_bytes()).or_insert(member.node) == member.node,
+                        "reuse of an origin key across configured member slots"
+                    );
+                }
                 ensure!(
                     members
                         .insert(member.node, (region.name.clone(), member))
@@ -189,6 +198,7 @@ impl TryFrom<Manifest> for RegionTree {
             members,
             borders,
             fingerprint,
+            admitted: None,
         })
     }
 }
@@ -198,14 +208,122 @@ impl RegionTree {
         &self.fingerprint
     }
 
+    /// Version 2 advertises stable policy. Configured generations become enrollment
+    /// floors, not authorization for a running boot.
+    pub(crate) fn begin_boot_admission(&mut self, local: Member) -> Result<()> {
+        ensure!(
+            self.admitted.is_none(),
+            "regional boot admission is already enabled"
+        );
+        let (_, enrolled) = self
+            .members
+            .get(&local.node)
+            .context("local node is not enrolled")?;
+        ensure!(
+            local.generation >= enrolled.generation,
+            "local generation is below enrollment"
+        );
+        let stable_members: BTreeMap<_, _> = self
+            .members
+            .iter()
+            .map(|(&node, (region, member))| {
+                (
+                    node,
+                    (
+                        region,
+                        member.role,
+                        member.catalog,
+                        member.media_key,
+                        member.boot_key,
+                    ),
+                )
+            })
+            .collect();
+        let encoded = serde_json::to_vec(&(
+            "pulsebeam-region-roster-v2",
+            &self.parents,
+            stable_members,
+            &self.borders,
+        ))?;
+        self.fingerprint = Sha3_256::digest(encoded).into();
+        self.admitted = Some(AdmittedBoots {
+            local,
+            remote: BTreeMap::new(),
+        });
+        Ok(())
+    }
+
+    /// Called only after boot authentication and durable floor admission.
+    pub(crate) fn admit_boot(&mut self, member: Member) -> bool {
+        let Some((_, enrolled)) = self.members.get(&member.node) else {
+            return false;
+        };
+        let Some(admitted) = &mut self.admitted else {
+            return false;
+        };
+        if member.node == admitted.local.node
+            || member.generation < enrolled.generation
+            || admitted
+                .remote
+                .get(&member.node)
+                .is_some_and(|old| *old > member.generation)
+        {
+            return false;
+        }
+        admitted.remote.insert(member.node, member.generation);
+        true
+    }
+
+    pub(crate) fn current_member(&self, node: NodeId) -> Option<Member> {
+        self.current(self.members.get(&node)?.1)
+    }
+
+    pub(crate) fn withdraw_boot(&mut self, member: Member) {
+        if let Some(admitted) = &mut self.admitted
+            && admitted.remote.get(&member.node) == Some(&member.generation)
+        {
+            admitted.remote.remove(&member.node);
+        }
+    }
+
+    fn current(&self, member: ConfiguredMember) -> Option<Member> {
+        match &self.admitted {
+            None => Some(member.identity()),
+            Some(admitted) if member.node == admitted.local.node => Some(admitted.local),
+            Some(admitted) => Some(Member {
+                node: member.node,
+                generation: *admitted.remote.get(&member.node)?,
+            }),
+        }
+    }
+
     pub(crate) fn region(&self, identity: Member) -> Option<&str> {
         let (region, member) = self.members.get(&identity.node)?;
-        (member.generation == identity.generation).then_some(region.as_str())
+        (self.current(*member)? == identity).then_some(region.as_str())
+    }
+
+    pub(super) fn has_discovery_keys(&self) -> bool {
+        self.members
+            .values()
+            .all(|(_, member)| member.boot_key.is_some())
+    }
+
+    pub(super) fn discovery_slots(&self) -> impl Iterator<Item = Member> + '_ {
+        self.members
+            .values()
+            .filter_map(|(_, member)| member.boot_key.map(|_| member.identity()))
+    }
+
+    pub(crate) fn discovery_key(&self, origin: Member) -> Option<ApiPublicKey> {
+        let (_, slot) = self.members.get(&origin.node)?;
+        (origin.generation >= slot.generation)
+            .then_some(slot.boot_key)
+            .flatten()
     }
 
     pub(crate) fn media_key(&self, origin: Member) -> Option<ApiPublicKey> {
         let (_, member) = self.members.get(&origin.node)?;
-        (member.identity() == origin)
+        (self.current(*member)? == origin)
             .then_some(member.media_key)
             .flatten()
     }
@@ -214,21 +332,34 @@ impl RegionTree {
         self.members
             .values()
             .filter(|(_, member)| member.catalog)
-            .map(|(_, member)| member.identity())
+            .filter_map(|(_, member)| self.current(*member))
+    }
+
+    pub(crate) fn catalog_coverage_members(&self) -> impl Iterator<Item = Member> + '_ {
+        self.members
+            .values()
+            .filter(|(_, member)| member.catalog)
+            .map(|(_, member)| {
+                // The enrollment generation marks missing coverage, never a routable boot.
+                self.current(*member).unwrap_or_else(|| member.identity())
+            })
     }
 
     pub(crate) fn adjacency(&self, local: Member, peer: Member) -> Option<Adjacency<'_>> {
-        let (local_region, local_member) = self.members.get(&local.node)?;
-        let (peer_region, peer_member) = self.members.get(&peer.node)?;
-        if local_member.identity() != local || peer_member.identity() != peer {
-            return None;
-        }
+        self.region(local)?;
+        self.region(peer)?;
+        self.enrolled_adjacency(local.node, peer.node)
+    }
+
+    pub(crate) fn enrolled_adjacency(&self, local: NodeId, peer: NodeId) -> Option<Adjacency<'_>> {
+        let (local_region, local_member) = self.members.get(&local)?;
+        let (peer_region, peer_member) = self.members.get(&peer)?;
         let (local_region, peer_region) = (local_region.as_str(), peer_region.as_str());
         let roles = (local_member.role, peer_member.role);
         let allowed = if local_region == peer_region {
             local != peer && roles.0.adjacent(roles.1)
         } else {
-            self.border_pairs(local_region, peer_region)
+            self.border_ids(local_region, peer_region)
                 .any(|pair| pair == (local, peer))
         };
         allowed.then_some(Adjacency {
@@ -259,6 +390,19 @@ impl RegionTree {
         from: &str,
         to: &str,
     ) -> impl Iterator<Item = (Member, Member)> + 'a {
+        self.border_ids(from, to).filter_map(|(from, to)| {
+            Some((
+                self.current(self.members.get(&from)?.1)?,
+                self.current(self.members.get(&to)?.1)?,
+            ))
+        })
+    }
+
+    fn border_ids<'a>(
+        &'a self,
+        from: &str,
+        to: &str,
+    ) -> impl Iterator<Item = (NodeId, NodeId)> + 'a {
         let up = self.parents.get(from).and_then(Option::as_deref) == Some(to);
         let down = self.parents.get(to).and_then(Option::as_deref) == Some(from);
         let pairs = if up {
@@ -268,10 +412,12 @@ impl RegionTree {
         } else {
             None
         };
-        pairs.into_iter().flatten().filter_map(move |pair| {
-            let child = self.members.get(&pair.child)?.1.identity();
-            let parent = self.members.get(&pair.parent)?.1.identity();
-            Some(if up { (child, parent) } else { (parent, child) })
+        pairs.into_iter().flatten().map(move |pair| {
+            if up {
+                (pair.child, pair.parent)
+            } else {
+                (pair.parent, pair.child)
+            }
         })
     }
 }

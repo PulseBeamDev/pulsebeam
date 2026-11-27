@@ -7,6 +7,7 @@ fn configured(role: Role) -> ConfiguredMember {
         role,
         catalog: false,
         media_key: None,
+        boot_key: None,
     }
 }
 
@@ -107,9 +108,12 @@ fn malformed_hierarchies_are_rejected_before_opening_links() {
     let mut missing_border = fixture();
     missing_border.borders.pop();
     let mut reused_key = fixture();
+    let mut cross_use = fixture();
     let key = pulsebeam_core::auth::ApiSigningKey::from_seed([7; 32]).public_key();
     reused_key.regions[1].members[0].media_key = Some(key);
     reused_key.regions[2].members[0].media_key = Some(key);
+    cross_use.regions[1].members[0].media_key = Some(key);
+    cross_use.regions[2].members[0].boot_key = Some(key);
     for config in [
         cyclic,
         second_root,
@@ -119,9 +123,84 @@ fn malformed_hierarchies_are_rejected_before_opening_links() {
         nongateway_border,
         missing_border,
         reused_key,
+        cross_use,
     ] {
         assert!(RegionTree::try_from(config).is_err());
     }
+}
+
+#[test]
+fn enrolled_roster_has_stable_policy_but_authorizes_only_admitted_boots() {
+    let mut config = fixture();
+    let local = config.regions[0].members[0].identity();
+    let peer = &mut config.regions[1].members[0];
+    peer.catalog = true;
+    let pin = pulsebeam_core::auth::ApiSigningKey::from_seed([6; 32]).public_key();
+    peer.media_key = Some(pin);
+    peer.boot_key = Some(pin);
+    let enrolled = peer.identity();
+    let rebooted = Member {
+        generation: NonZeroU64::new(7).unwrap(),
+        ..enrolled
+    };
+    let other_gateway = config.regions[1].members[1].identity();
+
+    let mut tree = RegionTree::try_from(config.clone()).unwrap();
+    let legacy_fingerprint = *tree.fingerprint();
+    let mut expected_coverage = tree.catalog_members().collect::<Vec<_>>();
+    tree.begin_boot_admission(local).unwrap();
+    let stable_fingerprint = *tree.fingerprint();
+    assert_ne!(legacy_fingerprint, stable_fingerprint);
+    assert!(tree.enrolled_adjacency(local.node, enrolled.node).is_some());
+    assert!(
+        tree.enrolled_adjacency(local.node, other_gateway.node)
+            .is_none()
+    );
+    assert!(tree.adjacency(local, enrolled).is_none());
+    assert!(tree.media_key(enrolled).is_none());
+    assert_eq!(tree.discovery_key(enrolled), Some(pin));
+    assert_eq!(tree.discovery_key(rebooted), Some(pin));
+    assert_eq!(tree.catalog_members().count(), 0);
+    assert_eq!(
+        tree.catalog_coverage_members().collect::<Vec<_>>(),
+        expected_coverage
+    );
+    assert!(tree.admit_boot(enrolled));
+    assert_eq!(tree.media_key(enrolled), Some(pin));
+    assert!(tree.admit_boot(rebooted));
+    assert!(!tree.admit_boot(enrolled));
+    assert!(!tree.admit_boot(Member {
+        generation: NonZeroU64::MAX,
+        ..local
+    }));
+    assert_eq!(tree.media_key(enrolled), None);
+    assert_eq!(tree.media_key(rebooted), Some(pin));
+    assert!(tree.adjacency(local, enrolled).is_none());
+    assert!(tree.adjacency(local, rebooted).is_some());
+    assert_eq!(tree.catalog_members().collect::<Vec<_>>(), [rebooted]);
+    *expected_coverage
+        .iter_mut()
+        .find(|member| **member == enrolled)
+        .unwrap() = rebooted;
+    assert_eq!(
+        tree.catalog_coverage_members().collect::<Vec<_>>(),
+        expected_coverage
+    );
+    assert_eq!(
+        tree.border_pairs("hub", "west").collect::<Vec<_>>(),
+        [(local, rebooted)]
+    );
+    assert_eq!(*tree.fingerprint(), stable_fingerprint);
+
+    config.regions[1].members[0].generation = rebooted.generation;
+    let mut from_new_floor = RegionTree::try_from(config.clone()).unwrap();
+    from_new_floor.begin_boot_admission(local).unwrap();
+    assert_eq!(*from_new_floor.fingerprint(), stable_fingerprint);
+    assert!(!from_new_floor.admit_boot(enrolled));
+    config.regions[1].members[0].catalog = false;
+    let mut changed_policy = RegionTree::try_from(config).unwrap();
+    changed_policy.begin_boot_admission(local).unwrap();
+    assert_ne!(*changed_policy.fingerprint(), stable_fingerprint);
 }
 
 #[test]

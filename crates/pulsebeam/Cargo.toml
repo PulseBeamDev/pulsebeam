@@ -76,6 +76,7 @@ uuid = { version = "1.23.2", features = ["v4", "v5", "v7"] }
 zerocopy = { version = "0.8.56", features = ["derive"] }
 parking_lot = "0.12.5"
 prost = "0.14.4"
+rustls = { version = "0.23.46", default-features = false, features = ["std", "aws_lc_rs"] }
 tokio-stream = "0.1.18"
 tonic = { version = "0.14.9", default-features = false, features = ["codegen", "router", "transport", "tls-aws-lc"] }
 tonic-prost = "0.14.9"

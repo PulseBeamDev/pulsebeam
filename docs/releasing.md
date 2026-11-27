@@ -54,7 +54,8 @@ This checks artifacts, not merely a successful link in the provisioning runtime.
 
 The release contract exercises archive/layout/hash checks, real installation,
 replacement of an existing installation and checksum-failure atomicity against
-local non-production fixtures. Its temporary HOME/CARGO_HOME and loopback services
+local non-production fixtures. It starts the installed binary with a public key
+registry and checks that signaling and internal health and metrics are separate. Its temporary HOME/CARGO_HOME and loopback services
 are isolated. Installer fixture routing uses `PULSEBEAM_DOWNLOAD_URL`; do not
 point acceptance at a live release.
 
@@ -69,11 +70,15 @@ The second command requires an explicitly available Docker-compatible daemon;
 image construction itself does not. `rules_oci` combines the Bazel-built release
 binary with the immutable `cc-debian13:nonroot` base. The image is linux/amd64,
 uses UID/GID 65532, `/app` working directory and `/app/pulsebeam` entrypoint, and
-exposes `3478/udp` and `7070/tcp`. Arguments remain application arguments:
+declares `3478/udp`, `3478/tcp` and `7070/tcp`. These are image metadata, not
+published host ports. For an authenticated setup, see [Deploy PulseBeam](/deployment).
+Arguments remain application arguments:
 
 ```sh
 docker run --rm pulsebeam:local --help
-docker run --rm --net=host pulsebeam:local --dev
+docker run --rm --net=host \
+  --mount type=bind,src=/usr/share/zoneinfo/leap-seconds.list,dst=/app/leap-seconds.list,readonly \
+  pulsebeam:local --dev --utc-policy /app/leap-seconds.list
 ```
 
 Docker/Podman runtime use and privileged networking are optional host operations,

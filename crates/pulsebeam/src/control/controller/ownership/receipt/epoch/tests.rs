@@ -226,6 +226,60 @@ fn pinned_peers_have_independent_revisions_and_cannot_install_each_others_checkp
 }
 
 #[test]
+fn admitted_peer_boot_requires_new_checkpoint_and_keeps_learned_retirements() {
+    let (mut verifier, mut old) = pair();
+    let now = Instant::now();
+    let deadline = now + LEASE;
+    let endpoint = endpoint();
+    let retired = ClaimRank::root(ConnectionId::new());
+    old.retire(endpoint, retired);
+    verifier
+        .apply(rev(7), old.checkpoint(), now, deadline)
+        .unwrap();
+    let delayed = verifier
+        .validate_checkpoint(
+            (old.issuer().node, old.issuer().incarnation),
+            rev(8),
+            old.checkpoint(),
+            now,
+            deadline,
+        )
+        .unwrap();
+    assert!(verifier.admission_ready(now));
+    assert!(verifier.is_retired(endpoint, retired));
+    let current = Issuer {
+        incarnation: rev(6),
+        ..old.issuer()
+    };
+    verifier.advance_peer(current).unwrap();
+    assert!(!verifier.admission_ready(now));
+    assert!(verifier.eligible_key(old.issuer()).is_none());
+    assert!(verifier.is_retired(endpoint, retired));
+    assert!(matches!(
+        verifier.install_checkpoint(delayed),
+        Err(Error::Invalid)
+    ));
+    assert!(verifier.advance_peer(old.issuer()).is_err());
+
+    let replacement = Trust::new(
+        current,
+        old.key.clone(),
+        verifier.issuer(),
+        verifier.key.public_key(),
+    )
+    .unwrap();
+    verifier
+        .apply(rev(1), replacement.checkpoint(), now, deadline)
+        .unwrap();
+    assert!(verifier.admission_ready(now));
+    assert!(verifier.is_retired(endpoint, retired));
+    assert_eq!(
+        issue_accepted(&mut verifier, endpoint, retired, 1000).err(),
+        Some(Error::Retired)
+    );
+}
+
+#[test]
 fn saturation_reserves_existing_fences_and_blocks_if_a_new_terminal_fact_cannot_fit() {
     let (mut a, mut b) = pair();
     let now = Instant::now();

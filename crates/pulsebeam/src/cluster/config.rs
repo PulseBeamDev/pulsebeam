@@ -21,11 +21,11 @@ pub(crate) const MAX_PROVISIONED_PEERS: usize = 16;
 /// Identities pinned for one ownership Link. Never reuse a DTLS
 /// private key across committed incarnations or between nodes.
 #[derive(Clone)]
-pub struct ProvisionedPeer {
+pub struct ProvisionedPeer<T = NetworkPeer> {
     pub listen: SocketAddr,
     pub local: (NodeId, NonZeroU64),
     pub remote: (NodeId, NonZeroU64),
-    pub transport: NetworkPeer,
+    pub transport: T,
     /// Explicit programmatic selection of the WAN carrier, with no fallback.
     pub regional_control: Option<RegionalControlConfig>,
     /// Explicitly allow WAN sources from this pinned upstream on this outgoing edge.
@@ -37,13 +37,15 @@ pub struct ProvisionedPeer {
     pub peer_receipt_key: ApiPublicKey,
 }
 
-impl std::fmt::Debug for ProvisionedPeer {
+/// Provisioned policy without a DTLS pin. The peer pin is supplied by an admitted boot.
+pub type EnrolledPeer = ProvisionedPeer<SocketAddr>;
+
+impl<T> std::fmt::Debug for ProvisionedPeer<T> {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         out.debug_struct("ProvisionedPeer")
             .field("listen", &self.listen)
             .field("local", &self.local)
             .field("remote", &self.remote)
-            .field("endpoint", &self.transport.endpoint)
             .finish_non_exhaustive()
     }
 }
@@ -167,8 +169,12 @@ impl ServerConfig {
             );
             seeds.insert(resolved);
         }
-        let ownership_peers = if cluster.adjacency.is_empty() {
-            Vec::new()
+        let (ownership_peers, enrolled_peers) = if cluster.adjacency.is_empty() {
+            ensure!(
+                !cluster.boot_admission,
+                "boot admission requires regional adjacencies"
+            );
+            (Vec::new(), Vec::new())
         } else {
             ensure!(
                 cluster.topology == Topology::MultiNode,
@@ -178,12 +184,26 @@ impl ServerConfig {
                 cluster.adjacency.len() <= MAX_PROVISIONED_PEERS,
                 "too many provisioned adjacencies"
             );
-            pulsebeam_runtime::task::spawn_blocking(move || {
-                cluster
-                    .adjacency
-                    .into_iter()
-                    .map(PeerConfig::resolve)
-                    .collect::<Result<Vec<_>>>()
+            let peers = cluster.adjacency;
+            let enrolled = cluster.boot_admission;
+            pulsebeam_runtime::task::spawn_blocking(move || -> Result<_> {
+                if enrolled {
+                    Ok((
+                        vec![],
+                        peers
+                            .into_iter()
+                            .map(PeerConfig::resolve_enrolled)
+                            .collect::<Result<_>>()?,
+                    ))
+                } else {
+                    Ok((
+                        peers
+                            .into_iter()
+                            .map(PeerConfig::resolve)
+                            .collect::<Result<_>>()?,
+                        vec![],
+                    ))
+                }
             })
             .await
             .context("regional adjacency credential worker failed")??
@@ -196,6 +216,7 @@ impl ServerConfig {
             seeds: seeds.into_iter().collect(),
             data_dir,
             ownership_peers,
+            enrolled_peers,
             region_tree: cluster.region_tree,
             protected_base_stream_bps: cluster.protected_base_stream_bps,
         };
@@ -217,6 +238,8 @@ pub struct ClusterConfig {
     gossip: GossipConfig,
     #[serde(default)]
     adjacency: Vec<PeerConfig>,
+    #[serde(default)]
+    boot_admission: bool,
     region_tree: Option<RegionTree>,
     protected_base_stream_bps: Option<NonZeroU64>,
 }
@@ -227,12 +250,12 @@ struct PeerConfig {
     listen: SocketAddr,
     local_node: NodeId,
     local_generation: NonZeroU64,
-    certificate_der: PathBuf,
-    key_pkcs8_der: PathBuf,
+    certificate_der: Option<PathBuf>,
+    key_pkcs8_der: Option<PathBuf>,
     peer_node: NodeId,
     peer_generation: NonZeroU64,
     peer_endpoint: SocketAddr,
-    peer_sha256: String,
+    peer_sha256: Option<String>,
     authority_epoch: String,
     receipt_key_file: PathBuf,
     peer_receipt_key: ApiPublicKey,
@@ -242,9 +265,52 @@ struct PeerConfig {
 
 impl PeerConfig {
     fn resolve(self) -> Result<ProvisionedPeer> {
-        let expected_peer = parse_hex(&self.peer_sha256)
+        let expected_peer = self
+            .peer_sha256
+            .as_deref()
+            .and_then(parse_hex)
             .map(PeerFingerprint::from_bytes)
             .context("cluster.adjacency.peer_sha256 must be 64 hexadecimal digits")?;
+        let certificate = read_identity_file(
+            self.certificate_der
+                .as_deref()
+                .context("missing Link certificate path")?,
+        )
+        .context("reading Link certificate")?;
+        let key = read_identity_file(
+            self.key_pkcs8_der
+                .as_deref()
+                .context("missing Link private key path")?,
+        )
+        .context("reading Link private key")?;
+        let credential = SecretCredential::from_der(certificate, key)
+            .map_err(|_| anyhow::anyhow!("invalid Link certificate or PKCS#8 key"))?;
+        let transport = NetworkPeer {
+            endpoint: self.peer_endpoint,
+            credential,
+            expected_peer,
+            role: if self.local_node < self.peer_node {
+                PeerRole::Initiator
+            } else {
+                PeerRole::Responder
+            },
+            class: NetworkClass::Wan,
+        };
+        self.with_transport(transport)
+    }
+
+    fn resolve_enrolled(self) -> Result<EnrolledPeer> {
+        ensure!(
+            self.certificate_der.is_none()
+                && self.key_pkcs8_der.is_none()
+                && self.peer_sha256.is_none(),
+            "boot admission derives DTLS credentials and pins; remove the fixed Link certificate, key and peer pin"
+        );
+        let endpoint = self.peer_endpoint;
+        self.with_transport(endpoint)
+    }
+
+    fn with_transport<T>(self, transport: T) -> Result<ProvisionedPeer<T>> {
         let authority_epoch = parse_hex(&self.authority_epoch)
             .context("cluster.adjacency.authority_epoch must be 32 hexadecimal digits")?;
         let signing_key =
@@ -253,12 +319,7 @@ impl PeerConfig {
             .ok()
             .and_then(|key| key.trim().parse().ok())
             .context("receipt signing key must be base64url PKCS#8")?;
-        let certificate =
-            read_identity_file(&self.certificate_der).context("reading Link certificate")?;
-        let key = read_identity_file(&self.key_pkcs8_der).context("reading Link private key")?;
-        let credential = SecretCredential::from_der(certificate, key)
-            .map_err(|_| anyhow::anyhow!("invalid Link certificate or PKCS#8 key"))?;
-        let peer = ProvisionedPeer {
+        Ok(ProvisionedPeer {
             listen: self.listen,
             local: (self.local_node, self.local_generation),
             remote: (self.peer_node, self.peer_generation),
@@ -268,19 +329,8 @@ impl PeerConfig {
             regional_control: Some(self.regional_control),
             relay_from: None,
             protected_egress_bps: self.protected_egress_bps,
-            transport: NetworkPeer {
-                endpoint: self.peer_endpoint,
-                credential,
-                expected_peer,
-                role: if self.local_node < self.peer_node {
-                    PeerRole::Initiator
-                } else {
-                    PeerRole::Responder
-                },
-                class: NetworkClass::Wan,
-            },
-        };
-        Ok(peer)
+            transport,
+        })
     }
 }
 
@@ -356,6 +406,7 @@ pub struct Options {
     pub seeds: Vec<SocketAddr>,
     pub data_dir: PathBuf,
     pub ownership_peers: Vec<ProvisionedPeer>,
+    pub enrolled_peers: Vec<EnrolledPeer>,
     pub region_tree: Option<RegionTree>,
     /// Opt in to staging two warm base legs for eligible regional receives.
     /// The configured worst-case wire rate is reserved on each directed hop.
@@ -378,18 +429,59 @@ impl Options {
                 "cluster.topology = 'single_node' requires identical loopback listen and advertise endpoints"
             );
         }
+        if !self.enrolled_peers.is_empty() {
+            ensure!(
+                self.ownership_peers.is_empty(),
+                "cannot mix fixed and enrolled regional adjacencies"
+            );
+            let tree = self
+                .region_tree
+                .as_ref()
+                .context("enrolled adjacencies require a region tree")?;
+            ensure!(
+                tree.has_discovery_keys(),
+                "enrolled regional discovery requires a boot_key for every roster member"
+            );
+            ensure!(
+                self.enrolled_peers.iter().all(|peer| {
+                    tree.discovery_key(peer_member(peer.local))
+                        == Some(peer.receipt_key.public_key())
+                        && tree.discovery_key(peer_member(peer.remote))
+                            == Some(peer.peer_receipt_key)
+                }),
+                "regional boot keys must match the enrolled node receipt keys"
+            );
+            ensure!(
+                self.enrolled_peers
+                    .iter()
+                    .all(|peer| peer.regional_control.is_some()),
+                "enrolled adjacencies require pinned regional control"
+            );
+            return self.validate_peers(&self.enrolled_peers, |endpoint| *endpoint);
+        }
+        for peer in &self.ownership_peers {
+            ensure!(
+                peer.transport.expected_peer != peer.transport.credential.fingerprint(),
+                "peer and local DTLS pins must differ"
+            );
+        }
+        self.validate_peers(&self.ownership_peers, |transport| transport.endpoint)
+    }
+
+    fn validate_peers<T>(
+        &self,
+        peers: &[ProvisionedPeer<T>],
+        endpoint: impl Fn(&T) -> SocketAddr,
+    ) -> Result<()> {
         ensure!(
-            self.ownership_peers.len() <= MAX_PROVISIONED_PEERS,
+            peers.len() <= MAX_PROVISIONED_PEERS,
             "too many provisioned ownership peers"
         );
         let mut listeners = BTreeSet::new();
         let mut endpoints = BTreeSet::new();
         let mut nodes = BTreeSet::new();
-        let first = self.ownership_peers.first();
-        let regional = self
-            .ownership_peers
-            .iter()
-            .any(|peer| peer.regional_control.is_some());
+        let first = peers.first();
+        let regional = peers.iter().any(|peer| peer.regional_control.is_some());
         if let Some(tree) = &self.region_tree {
             let first =
                 first.context("region tree requires configured node identity and adjacencies")?;
@@ -413,7 +505,8 @@ impl Options {
                 RegionalControlConfig::ipv6(seed, false)?;
             }
         }
-        for peer in &self.ownership_peers {
+        for peer in peers {
+            let peer_endpoint = endpoint(&peer.transport);
             if let Some(tree) = &self.region_tree {
                 ensure!(
                     peer.relay_from.is_none()
@@ -446,7 +539,7 @@ impl Options {
                     "all regional adjacencies must share a local region and role"
                 );
                 RegionalControlConfig::ipv6(peer.listen, false)?;
-                RegionalControlConfig::ipv6(peer.transport.endpoint, false)?;
+                RegionalControlConfig::ipv6(peer_endpoint, false)?;
                 RegionalControlConfig::ipv6(control.listen, true)?;
                 RegionalControlConfig::ipv6(control.endpoint, false)?;
                 ensure!(
@@ -462,7 +555,7 @@ impl Options {
             if let Some(upstream) = peer.relay_from {
                 ensure!(
                     upstream != peer.remote.0
-                        && self.ownership_peers.iter().any(|candidate| {
+                        && peers.iter().any(|candidate| {
                             candidate.remote.0 == upstream && candidate.relay_from.is_none()
                         }),
                     "WAN transit requires a distinct pinned upstream without an export policy"
@@ -476,10 +569,10 @@ impl Options {
                     "ownership peers must share the local identity and authority epoch"
                 );
             }
-            if self.ownership_peers.len() > 1 {
+            if peers.len() > 1 {
                 ensure!(
                     listeners.insert(peer.listen)
-                        && endpoints.insert(peer.transport.endpoint)
+                        && endpoints.insert(peer_endpoint)
                         && nodes.insert(peer.remote.0),
                     "multiple ownership peers require distinct WAN listeners, endpoints and nodes"
                 );
@@ -499,7 +592,7 @@ impl Options {
                     && !matches!(peer.listen.ip(), IpAddr::V4(ip) if ip.is_broadcast()),
                 "Fabric WAN must listen on a fixed unicast address"
             );
-            let remote = unique_endpoint(std::iter::once(peer.transport.endpoint))
+            let remote = unique_endpoint(std::iter::once(peer_endpoint))
                 .context("invalid ownership peer endpoint")?;
             ensure!(
                 remote.is_ipv4() == peer.listen.is_ipv4(),
@@ -508,10 +601,6 @@ impl Options {
             ensure!(
                 remote != peer.listen,
                 "ownership peer endpoint must differ from the local listener"
-            );
-            ensure!(
-                peer.transport.expected_peer != peer.transport.credential.fingerprint(),
-                "peer and local DTLS pins must differ"
             );
             ensure!(
                 peer.authority_epoch != [0; 16],

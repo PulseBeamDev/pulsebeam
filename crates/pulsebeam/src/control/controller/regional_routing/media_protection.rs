@@ -430,7 +430,6 @@ impl<'a> ReceiverPlan<'a> {
         {
             return None;
         }
-        let mesh = router.links.mesh?;
         let hop = |path: &[Member]| {
             let upstream = router
                 .links
@@ -443,11 +442,12 @@ impl<'a> ReceiverPlan<'a> {
             )?;
             Some(Hop { upstream, path })
         };
-        let primary = hop(mesh.path(origin)?);
+        let primary_path = router.links.mesh.and_then(|mesh| mesh.path(origin));
+        let primary = primary_path.and_then(hop);
         // A media adjacency can outlive its control stream. Don't let an
         // unusable computed primary invalidate the exact, still-live standby.
-        let standby = mesh
-            .protection_paths(origin, now)
+        let standby = primary_path
+            .and_then(|_| router.links.mesh?.protection_paths(origin, now))
             .and_then(|(_, path)| hop(&path))
             .filter(|standby| {
                 primary
@@ -457,7 +457,7 @@ impl<'a> ReceiverPlan<'a> {
         let mut hops = ArrayVec::new();
         hops.extend(primary);
         hops.extend(standby);
-        (!hops.is_empty()).then_some(Self {
+        Some(Self {
             demand,
             permit,
             hops,
@@ -465,12 +465,18 @@ impl<'a> ReceiverPlan<'a> {
     }
 }
 
+#[derive(Default)]
+pub(super) struct ReceiverPlans<'a> {
+    unavailable: usize,
+    routes: BTreeMap<relay::Key, ReceiverPlan<'a>>,
+}
+
 pub(super) fn receiver_plans<'a>(
     router: &Router<'_, Connected<'_>>,
     demands: impl Iterator<Item = &'a Demand>,
     wire_bps: NonZeroU64,
     now: Instant,
-) -> BTreeMap<relay::Key, ReceiverPlan<'a>> {
+) -> ReceiverPlans<'a> {
     let mut sources = BTreeMap::new();
     for demand in demands {
         sources
@@ -478,16 +484,29 @@ pub(super) fn receiver_plans<'a>(
             .and_modify(|demand| *demand = None)
             .or_insert(Some(demand));
     }
-    sources
+    let mut unavailable = 0;
+    let routes = sources
         .into_iter()
-        .filter_map(|(key, demand)| Some((key, ReceiverPlan::new(router, demand?, wire_bps, now)?)))
+        .filter_map(|(key, demand)| {
+            let plan = ReceiverPlan::new(router, demand?, wire_bps, now)?;
+            if plan.hops.is_empty() {
+                unavailable += 1;
+                return None;
+            }
+            Some((key, plan))
+        })
         .take(relay::LIMIT)
-        .collect()
+        .collect();
+    ReceiverPlans {
+        unavailable,
+        routes,
+    }
 }
 
 #[derive(Default)]
 pub(super) struct Receivers {
     routes: BTreeMap<relay::Key, ReceiveLegs>,
+    observed: Option<[usize; 3]>,
 }
 
 struct ReceiveLegs {
@@ -693,12 +712,13 @@ impl Receivers {
         actor: &mut ControllerActor,
         primary: &media_ingress::Receives,
         local: Member,
-        plans: BTreeMap<relay::Key, ReceiverPlan<'_>>,
+        plans: ReceiverPlans<'_>,
         now: Instant,
     ) -> Vec<Update> {
         let mut updates = Vec::new();
         let mut next = BTreeMap::new();
-        for (key, mut plan) in plans {
+        let mut observed = [plans.unavailable + plans.routes.len(), 0, 0];
+        for (key, mut plan) in plans.routes {
             let permit = plan.permit;
             let drained = primary.drained_relay(plan.demand);
             if let Some(relay) = drained {
@@ -750,11 +770,30 @@ impl Receivers {
                 }
             }
             if !legs.is_empty() {
+                let fresh = actor.links.as_ref().map_or(0, |links| {
+                    legs.iter()
+                        .filter(|leg| leg.fresh_media(links, now))
+                        .count()
+                });
+                if fresh > 0 {
+                    observed[0] -= 1;
+                    observed[fresh] += 1;
+                }
                 next.insert(key, ReceiveLegs { canonical, legs });
             }
         }
         for (_, old) in std::mem::replace(&mut self.routes, next) {
             old.retire(actor, now, &mut updates);
+        }
+        if self.observed != Some(observed) {
+            self.observed = Some(observed);
+            for (state, count) in ["unavailable", "degraded", "protected"]
+                .into_iter()
+                .zip(observed)
+            {
+                metrics::gauge!("regional_media_protection_sources", "state" => state)
+                    .set(count as f64);
+            }
         }
         updates
     }

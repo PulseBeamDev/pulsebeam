@@ -218,9 +218,9 @@ impl Leases {
         request: Request<'_>,
         now: Instant,
         wall: SystemTime,
-    ) {
+    ) -> Option<&Lease> {
         if request.payload.len() > MAX_BYTES {
-            return;
+            return None;
         }
         if let Some(body) = request.payload.strip_prefix(&[WITHDRAW]) {
             if let Some(ack) = serde_json::from_slice::<WireWanLiveRouteAck>(body)
@@ -244,11 +244,9 @@ impl Leases {
                     }
                 }
             }
-            return;
+            return None;
         }
-        let Some(mut lease) = Lease::verify(tree, local, from, request, now, wall) else {
-            return;
-        };
+        let mut lease = Lease::verify(tree, local, from, request, now, wall)?;
         let key = (
             from.link.member,
             request.target,
@@ -262,9 +260,9 @@ impl Leases {
                 && current.downstream.network == from.network
                 && current.ack.window.ssrc() == lease.ack.window.ssrc()
         }) {
-            return;
+            return None;
         }
-        if let Some(current) = self.inner.get_mut(&key) {
+        if let Some(current) = self.inner.get(&key) {
             if lease.issued_ms < current.issued_ms
                 || current.protection != lease.protection
                 || (lease.protection.is_some()
@@ -272,7 +270,7 @@ impl Leases {
                         || current.downstream.link != from.link
                         || current.downstream.network != from.network))
             {
-                return;
+                return None;
             }
             if lease.issued_ms == current.issued_ms
                 && lease.wall_expiry_ms == current.wall_expiry_ms
@@ -280,10 +278,19 @@ impl Leases {
                 lease.permit_deadline = lease.permit_deadline.min(current.permit_deadline);
                 lease.expires = lease.expires.min(lease.permit_deadline);
             }
-            *current = lease;
-        } else if self.inner.len() < relay::LIMIT {
-            self.inner.insert(key, lease);
+        } else if self.inner.len() >= relay::LIMIT {
+            return None;
         }
+        self.inner.insert(key, lease);
+        self.inner.get(&key)
+    }
+
+    pub(super) fn withdraw_member(&mut self, member: Member) {
+        self.inner.retain(|_, lease| {
+            lease.source.origin != Some(member)
+                && lease.downstream.link.member != member
+                && !lease.visited.contains(&member)
+        });
     }
 
     pub(super) fn expire(&mut self, now: Instant, wall: SystemTime) {

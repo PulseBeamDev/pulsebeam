@@ -3807,6 +3807,7 @@ dependencies = [
  "rcgen",
  "reqwest",
  "rust-embed",
+ "rustls",
  "serde",
  "serde_json",
  "sha3",

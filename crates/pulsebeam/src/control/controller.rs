@@ -1105,6 +1105,7 @@ impl ControllerActor {
             .expire(&mut self.core.registry, started, API_COMMAND_BUDGET);
         self.expire_authorizations(started, SystemTime::now());
         self.expire_peer_sources(started);
+        self.drive_regional_boots(started);
         self.drive_provisioned_peers(started);
         self.advance_materializations();
         if let Some(links) = &mut self.links {

@@ -20,13 +20,24 @@ struct State {
     generation: u64,
 }
 
+enum ExpectedIdentity {
+    Exact(NodeId, NonZeroU64),
+    Enrolled(NodeId),
+}
+
 pub(super) struct Identity {
     pub node_id: NodeId,
     pub generation: u64,
-    _lock: File,
+    lock: File,
 }
 
 impl Identity {
+    pub(super) fn retain_lock(&self) -> Result<File> {
+        self.lock
+            .try_clone()
+            .context("retaining membership identity lock")
+    }
+
     pub fn allocate(directory: &Path) -> Result<Self> {
         Self::allocate_with_sync(directory, None, File::sync_all)
     }
@@ -35,14 +46,37 @@ impl Identity {
         directory: &Path,
         expected: (NodeId, NonZeroU64),
     ) -> Result<Self> {
-        Self::allocate_with_sync(directory, Some(expected), File::sync_all)
+        Self::allocate_with_sync(
+            directory,
+            Some(ExpectedIdentity::Exact(expected.0, expected.1)),
+            File::sync_all,
+        )
     }
 
-    fn allocate_with_sync(
-        directory: &Path,
-        expected: Option<(NodeId, NonZeroU64)>,
-        sync: impl Fn(&File) -> std::io::Result<()>,
-    ) -> Result<Self> {
+    pub(super) fn allocate_enrolled(directory: &Path, node: NodeId) -> Result<Self> {
+        Self::allocate_with_sync(
+            directory,
+            Some(ExpectedIdentity::Enrolled(node)),
+            File::sync_all,
+        )
+    }
+
+    pub(super) fn lock_enrolled(directory: &Path, node: NodeId) -> Result<Self> {
+        let lock = Self::lock(directory)?;
+        let state = Self::read_state(directory)?
+            .context("regional enrollment requires an existing membership identity")?;
+        ensure!(
+            state.node_id == node,
+            "regional enrollment does not match the stored membership identity"
+        );
+        Ok(Self {
+            node_id: state.node_id,
+            generation: state.generation,
+            lock,
+        })
+    }
+
+    fn lock(directory: &Path) -> Result<File> {
         create_directory(directory)?;
         let lock = OpenOptions::new()
             .read(true)
@@ -54,7 +88,11 @@ impl Identity {
             .context("opening stable membership lock")?;
         lock.try_lock()
             .context("membership data directory is already in use or cannot be locked")?;
-        let mut state = match File::open(directory.join(STATE)) {
+        Ok(lock)
+    }
+
+    fn read_state(directory: &Path) -> Result<Option<State>> {
+        match File::open(directory.join(STATE)) {
             Ok(file) => {
                 let mut bytes = Vec::new();
                 file.take(4097)
@@ -76,30 +114,53 @@ impl Identity {
                     state.generation > 0,
                     "membership identity generation must be positive"
                 );
-                state
+                Ok(Some(state))
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => State {
-                version: 1,
-                node_id: NodeId::new(),
-                generation: 0,
-            },
-            Err(error) => return Err(error).context("opening membership identity state"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error).context("opening membership identity state"),
+        }
+    }
+
+    fn allocate_with_sync(
+        directory: &Path,
+        expected: Option<ExpectedIdentity>,
+        sync: impl Fn(&File) -> std::io::Result<()>,
+    ) -> Result<Self> {
+        let lock = Self::lock(directory)?;
+        let mut state = match Self::read_state(directory)? {
+            Some(state) => state,
+            None => {
+                ensure!(
+                    expected.is_none(),
+                    "provisioned ownership requires existing membership identity"
+                );
+                State {
+                    version: 1,
+                    node_id: NodeId::new(),
+                    generation: 0,
+                }
+            }
         };
         state.generation = state
             .generation
             .checked_add(1)
             .context("membership generation exhausted")?;
-        ensure!(
-            expected
-                .is_none_or(|(node, generation)| node == state.node_id
-                    && generation.get() == state.generation),
-            "provisioned ownership identity does not match the node's next membership incarnation"
-        );
+        match expected {
+            Some(ExpectedIdentity::Exact(node, generation)) => ensure!(
+                node == state.node_id && generation.get() == state.generation,
+                "provisioned ownership identity does not match the node's next membership incarnation"
+            ),
+            Some(ExpectedIdentity::Enrolled(node)) => ensure!(
+                node == state.node_id,
+                "regional enrollment does not match the stored membership identity"
+            ),
+            None => {}
+        }
         replace_json(directory, STATE, NEXT, &state, sync)?;
         Ok(Self {
             node_id: state.node_id,
             generation: state.generation,
-            _lock: lock,
+            lock,
         })
     }
 }
@@ -188,6 +249,21 @@ mod tests {
         let empty = tempfile::tempdir().unwrap();
         assert!(Identity::allocate_provisioned(empty.path(), (id, NonZeroU64::MIN)).is_err());
         assert!(!empty.path().join(STATE).exists());
+    }
+
+    #[test]
+    fn enrolled_identity_accepts_later_boots_but_cannot_replace_missing_or_other_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let enrolled = Identity::allocate(dir.path()).unwrap().node_id;
+        assert!(Identity::allocate_enrolled(dir.path(), NodeId::new()).is_err());
+        for expected in [2, 3, 4] {
+            let boot = Identity::allocate_enrolled(dir.path(), enrolled).unwrap();
+            assert_eq!((boot.node_id, boot.generation), (enrolled, expected));
+            assert!(Identity::allocate_enrolled(dir.path(), enrolled).is_err());
+        }
+        fs::remove_file(dir.path().join(STATE)).unwrap();
+        assert!(Identity::allocate_enrolled(dir.path(), enrolled).is_err());
+        assert!(!dir.path().join(STATE).exists());
     }
 
     #[test]

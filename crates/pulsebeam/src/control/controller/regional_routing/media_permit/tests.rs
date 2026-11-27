@@ -342,7 +342,7 @@ fn check_branch(
         .encode()
         .unwrap();
         if let Some(Arrival::Branch(request)) = fwd.receive(&router, from, &frame, now) {
-            leases.receive(tree, local, edge, request, now, wall);
+            let _ = leases.receive(tree, local, edge, request, now, wall);
         }
         (leases.iter().count(), leases.protected().count())
     };

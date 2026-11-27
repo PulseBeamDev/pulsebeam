@@ -14,6 +14,7 @@ use pulsebeam_runtime::{
 };
 use std::{
     net::{IpAddr, Ipv6Addr, SocketAddr},
+    num::NonZeroU16,
     path::{Path, PathBuf},
 };
 use tracing_subscriber::util::SubscriberInitExt;
@@ -78,9 +79,21 @@ struct Args {
     /// Persistent node identity directory, required when [cluster] is configured.
     #[arg(long)]
     data_dir: Option<PathBuf>,
+    /// Enroll the regional peer generation floors offline, then exit.
+    #[arg(long, requires_all = ["config", "data_dir"], conflicts_with = "dev")]
+    enroll_regional_boots: bool,
     /// Enable the private publisher ownership socket under --data-dir/operator.
     #[arg(long, requires = "data_dir")]
     operator_socket: bool,
+    /// RTC listen and advertised port (default 443, or 3478 with --dev).
+    #[arg(long)]
+    rtc_port: Option<NonZeroU16>,
+    /// Cleartext signaling bind address. Use loopback behind a same-host TLS proxy.
+    #[arg(long, default_value = "[::]:7070")]
+    http_listen: SocketAddr,
+    /// Bind unauthenticated health, metrics and profiling to this private address.
+    #[arg(long, default_value = "127.0.0.1:6060")]
+    internal_listen: SocketAddr,
     /// Write newline-delimited JSON instead of compact console logs.
     #[arg(long)]
     json_logs: bool,
@@ -156,6 +169,25 @@ fn main() {
         .with(fmt_layer)
         .init();
 
+    if args.enroll_regional_boots {
+        let result = pulsebeam_runtime::rt::block_on(async {
+            pulsebeam::cluster::ServerConfig::read(args.config.as_deref())?
+                .resolve(args.data_dir.take())
+                .await?
+                .context("missing [cluster] enrollment configuration")?
+                .enroll_regional_boots()
+                .await
+        })
+        .unwrap_or_else(|error| {
+            pulsebeam_runtime::fatal!("cannot build the enrollment runtime: {error}")
+        });
+        if let Err(error) = result {
+            pulsebeam_runtime::fatal!("regional enrollment failed: {error:#}");
+        }
+        tracing::info!("regional generation floors enrolled");
+        return;
+    }
+
     let registry =
         configured_key_registry(&args, Path::new("key-registry.json")).unwrap_or_else(|error| {
             pulsebeam_runtime::fatal!("invalid authentication configuration: {error:#}")
@@ -223,7 +255,9 @@ async fn run(
     key_registry: KeyRegistry,
     cluster: Option<pulsebeam::cluster::Options>,
 ) -> Result<()> {
-    let rtc_port = if args.dev { 3478 } else { 443 };
+    let rtc_port = args
+        .rtc_port
+        .map_or(if args.dev { 3478 } else { 443 }, NonZeroU16::get);
     let native_quic = args.native_quic.load()?;
     let external_ips = pulsebeam_runtime::system::select_host_addresses(args.iface.as_deref());
     let external_addrs: Vec<SocketAddr> = external_ips
@@ -231,10 +265,7 @@ async fn run(
         .copied()
         .map(|ip| SocketAddr::new(ip, rtc_port))
         .collect();
-    let unspecified_v6 = |port| SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port);
-    let local_addr = unspecified_v6(rtc_port);
-    let http_api_addr = unspecified_v6(7070);
-    let metrics_addr = unspecified_v6(6060);
+    let local_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), rtc_port);
 
     tracing::info!(
         ?external_addrs,
@@ -249,9 +280,9 @@ async fn run(
         .external_addrs(external_addrs)
         .rng(rng)
         .runtime_profile(execution.profile, execution.shards_per_worker)
-        .with_http_api(http_api_addr)
+        .with_http_api(args.http_listen)
         .with_key_registry(key_registry)
-        .with_internal_metrics(metrics_addr);
+        .with_internal_metrics(args.internal_listen);
 
     let node_builder = match cluster {
         Some(options) => node_builder.with_cluster(options),
@@ -408,6 +439,35 @@ mod tests {
         assert!(
             Args::try_parse_from(["pulsebeam", "--project-registry", "registry.json"]).is_err()
         );
+    }
+
+    #[test]
+    fn production_can_use_unprivileged_media_and_loopback_signaling() {
+        let args = Args::try_parse_from([
+            "pulsebeam",
+            "--rtc-port",
+            "3478",
+            "--http-listen",
+            "127.0.0.1:7070",
+        ])
+        .unwrap();
+        assert!(!args.dev);
+        assert_eq!(args.rtc_port.map(NonZeroU16::get), Some(3478));
+        assert_eq!(args.http_listen, "127.0.0.1:7070".parse().unwrap());
+        assert!(Args::try_parse_from(["pulsebeam", "--rtc-port", "0"]).is_err());
+    }
+
+    #[test]
+    fn internal_endpoints_default_to_loopback_and_allow_a_private_bind() {
+        let default = Args::try_parse_from(["pulsebeam"]).unwrap();
+        assert_eq!(default.internal_listen, "127.0.0.1:6060".parse().unwrap());
+        let configured =
+            Args::try_parse_from(["pulsebeam", "--internal-listen", "[fd00::2]:6060"]).unwrap();
+        assert_eq!(
+            configured.internal_listen,
+            "[fd00::2]:6060".parse().unwrap()
+        );
+        assert!(Args::try_parse_from(["pulsebeam", "--internal-listen", "invalid"]).is_err());
     }
 
     #[test]

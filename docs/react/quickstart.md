@@ -29,10 +29,13 @@ owned publications, subscriptions and room watches.
 ## 1. Run the PulseBeam media server
 
 With Docker (or Podman), set `PULSEBEAM_SERVER_IMAGE` to your matching server
-image before running:
+image. Use a current IANA `leap-seconds.list` from the host time zone data
+package. Adjust the mount source if your package installs it elsewhere.
 
 ```sh
-docker run --rm --network host "$PULSEBEAM_SERVER_IMAGE" --dev
+docker run --rm --network host \
+  --mount type=bind,src=/usr/share/zoneinfo/leap-seconds.list,dst=/app/leap-seconds.list,readonly \
+  "$PULSEBEAM_SERVER_IMAGE" --dev --utc-policy /app/leap-seconds.list
 ```
 
 The PulseBeam endpoint is `http://localhost:7070`.

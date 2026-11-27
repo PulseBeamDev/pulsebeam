@@ -1,7 +1,10 @@
 //! Optional trusted-network gossip. This service owns persistence and lifecycle,
 //! independently of shard execution and room authority.
+pub(crate) mod admission;
+pub(crate) mod boot_announcement;
 mod config;
 pub(crate) mod declarations;
+mod generation_floor;
 pub(crate) mod handoff;
 mod hierarchy;
 mod identity;
@@ -14,7 +17,9 @@ pub(crate) const REGIONAL_FRAME_BYTES: usize =
     pulsebeam_proto::catalog::MAX_CATALOG_ENTRY_BYTES + 1024;
 
 pub(crate) use config::MAX_PROVISIONED_PEERS;
-pub use config::{Options, ProvisionedPeer, RegionalControlConfig, ServerConfig, Topology};
+pub use config::{
+    EnrolledPeer, Options, ProvisionedPeer, RegionalControlConfig, ServerConfig, Topology,
+};
 pub(crate) use hierarchy::MAX_CATALOG_MEMBERS;
 pub use hierarchy::RegionTree;
 #[cfg(feature = "sim")]
@@ -74,6 +79,46 @@ pub struct Service {
     task: Option<JoinHandle<Result<()>>>,
     observations: Handle,
     incarnation: Incarnation,
+    pub(crate) boot: Option<admission::LocalBoot>,
+}
+
+impl Options {
+    fn discovered_slots(
+        &self,
+        local: pulsebeam_membership::NodeId,
+    ) -> Vec<(pulsebeam_membership::NodeId, std::num::NonZeroU64)> {
+        self.region_tree
+            .iter()
+            .flat_map(RegionTree::discovery_slots)
+            .filter(|member| {
+                member.node != local
+                    && !self
+                        .enrolled_peers
+                        .iter()
+                        .any(|peer| peer.remote.0 == member.node)
+            })
+            .map(|member| (member.node, member.generation))
+            .collect()
+    }
+
+    /// Create initial admission floors while offline. Never replaces existing floors.
+    pub async fn enroll_regional_boots(self) -> Result<()> {
+        self.validate_topology()?;
+        let peer = self
+            .enrolled_peers
+            .first()
+            .context("enrollment requires cluster.boot_admission = true")?;
+        let (local, epoch) = (peer.local.0, peer.authority_epoch);
+        let discovered = self.discovered_slots(local);
+        pulsebeam_runtime::task::spawn_blocking(move || {
+            let identity = identity::Identity::lock_enrolled(&self.data_dir, local)?;
+            let slots = self.enrolled_peers.iter().map(|peer| peer.remote);
+            generation_floor::Store::enroll(&self.data_dir, &identity, epoch, slots, discovered)?;
+            Ok(())
+        })
+        .await
+        .context("regional enrollment worker failed")?
+    }
 }
 
 impl Service {
@@ -87,9 +132,43 @@ impl Service {
         );
         let data_dir = options.data_dir.clone();
         let expected = options.ownership_peers.first().map(|peer| peer.local);
-        let identity = pulsebeam_runtime::task::spawn_blocking(move || match expected {
-            Some(expected) => identity::Identity::allocate_provisioned(&data_dir, expected),
-            None => identity::Identity::allocate(&data_dir),
+        let enrollment = options.enrolled_peers.first().map(|first| {
+            (
+                first.local,
+                first.authority_epoch,
+                options
+                    .enrolled_peers
+                    .iter()
+                    .map(|peer| peer.remote)
+                    .collect::<Vec<_>>(),
+                options.discovered_slots(first.local.0),
+            )
+        });
+        let (identity, boot) = pulsebeam_runtime::task::spawn_blocking(move || -> Result<_> {
+            if let Some((local, epoch, slots, discovered)) = enrollment {
+                let identity = identity::Identity::allocate_enrolled(&data_dir, local.0)?;
+                let generation = std::num::NonZeroU64::new(identity.generation)
+                    .context("empty committed boot generation")?;
+                anyhow::ensure!(
+                    generation >= local.1,
+                    "committed identity is below regional enrollment"
+                );
+                let store = generation_floor::Store::open(&data_dir, &identity, epoch)?;
+                store.check_slots(slots, discovered)?;
+                let boot = admission::LocalBoot::new(
+                    mesh::Member {
+                        node: local.0,
+                        generation,
+                    },
+                    store,
+                )?;
+                return Ok((identity, Some(boot)));
+            }
+            let identity = match expected {
+                Some(expected) => identity::Identity::allocate_provisioned(&data_dir, expected),
+                None => identity::Identity::allocate(&data_dir),
+            }?;
+            Ok((identity, None))
         })
         .await
         .context("membership identity worker failed")??;
@@ -105,7 +184,9 @@ impl Service {
             options.listen,
         )
         .await?;
-        Self::start_bound(options, identity, socket).await
+        let mut service = Self::start_bound(options, identity, socket).await?;
+        service.boot = boot;
+        Ok(service)
     }
 
     async fn start_bound(
@@ -139,6 +220,7 @@ impl Service {
             task: Some(task),
             observations,
             incarnation,
+            boot: None,
         })
     }
 
@@ -249,6 +331,88 @@ mod tests {
     }
 
     #[pulsebeam_runtime::test(crate = "pulsebeam_runtime::__harness")]
+    async fn enrolled_startup_rotates_media_leaf_without_reprovisioning() {
+        use declarations::Role;
+        use pulsebeam_core::auth::ApiSigningKey;
+        use pulsebeam_membership::NodeId;
+        use std::num::{NonZeroU16, NonZeroU64};
+
+        let dir = tempfile::tempdir().unwrap();
+        let identity = identity::Identity::allocate(dir.path()).unwrap();
+        let local = identity.node_id;
+        drop(identity);
+        let remote = NodeId::new();
+        let local_key = ApiSigningKey::from_seed([17; 32]);
+        let remote_key = ApiSigningKey::from_seed([18; 32]).public_key();
+        let ports = UdpSocket::open("[::1]:0".parse().unwrap()).await.unwrap();
+        let listen = ports.local_addr().unwrap();
+        drop(ports);
+        let min = NonZeroU64::MIN;
+        let options = Options {
+            cluster_id: "enrolled-startup".into(),
+            topology: Topology::MultiNode,
+            listen,
+            advertise: listen,
+            seeds: vec![],
+            data_dir: dir.path().to_owned(),
+            ownership_peers: vec![],
+            enrolled_peers: vec![EnrolledPeer {
+                listen: "[::1]:9010".parse().unwrap(),
+                local: (local, min),
+                remote: (remote, min),
+                transport: "[::1]:9011".parse().unwrap(),
+                regional_control: Some(RegionalControlConfig {
+                    region: "test".into(),
+                    role: Role::Edge,
+                    peer_role: Role::Router,
+                    link_cost: NonZeroU16::MIN,
+                    listen: "[::1]:9020".parse().unwrap(),
+                    endpoint: "[::1]:9021".parse().unwrap(),
+                    peer_name: "neighbor.test".into(),
+                    certificate_pem: "/unused".into(),
+                    private_key_pem: "/unused".into(),
+                    peer_ca_pem: "/unused".into(),
+                    peer_certificate_der: "/unused".into(),
+                }),
+                relay_from: None,
+                protected_egress_bps: None,
+                authority_epoch: [7; 16],
+                receipt_key: local_key.clone(),
+                peer_receipt_key: remote_key,
+            }],
+            region_tree: Some(
+                serde_json::from_value(serde_json::json!({
+                    "regions": [{"name":"test", "members":[
+                        {"node":local, "generation":1, "role":"edge", "boot_key": local_key.public_key()},
+                        {"node":remote, "generation":1, "role":"router", "boot_key": remote_key}
+                    ]}],
+                    "borders": []
+                }))
+                .unwrap(),
+            ),
+            protected_base_stream_bps: None,
+        };
+        let rejected = Service::start(options.clone()).await.err().unwrap();
+        assert!(format!("{rejected:#}").contains("opening enrolled regional generation floors"));
+        options.clone().enroll_regional_boots().await.unwrap();
+        assert!(options.clone().enroll_regional_boots().await.is_err());
+
+        let first = Service::start(options.clone()).await.unwrap();
+        let first_boot = first.boot.as_ref().unwrap();
+        let prior = first_boot.member;
+        let old_leaf = first_boot.media.fingerprint();
+        assert_eq!(prior.node, local);
+        assert!(options.clone().enroll_regional_boots().await.is_err());
+        first.finish().await.unwrap();
+        let restarted = Service::start(options).await.unwrap();
+        let current = restarted.boot.as_ref().unwrap();
+        assert_eq!(current.member.node, local);
+        assert_eq!(current.member.generation.get(), prior.generation.get() + 1);
+        assert_ne!(current.media.fingerprint(), old_leaf);
+        restarted.finish().await.unwrap();
+    }
+
+    #[pulsebeam_runtime::test(crate = "pulsebeam_runtime::__harness")]
     async fn real_udp_commit_precedes_packets_and_shutdown_releases_socket_and_lock() {
         let dir = tempfile::tempdir().unwrap();
         let mut peer = UdpSocket::open("127.0.0.1:0".parse().unwrap())
@@ -271,6 +435,7 @@ mod tests {
                 seeds: vec![seed],
                 data_dir: dir.path().to_owned(),
                 ownership_peers: Vec::new(),
+                enrolled_peers: Vec::new(),
                 region_tree: None,
                 protected_base_stream_bps: None,
             };

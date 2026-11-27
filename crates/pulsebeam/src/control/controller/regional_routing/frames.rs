@@ -1,4 +1,4 @@
-use std::num::NonZeroU64;
+use std::num::{NonZeroU32, NonZeroU64};
 
 use pulsebeam_core::identity::NodeId;
 
@@ -76,6 +76,7 @@ pub(super) enum Frame<'a> {
     Request(NonZeroU64, Request<'a>),
     Reply(NonZeroU64, &'a [u8]),
     Branch(Request<'a>),
+    BranchRetired(NonZeroU32),
 }
 
 pub(in crate::control::controller) fn recognizes(frame: &[u8]) -> bool {
@@ -89,8 +90,14 @@ impl Frame<'_> {
         }
         let bytes = bytes.strip_prefix(TAG)?;
         let (&kind, rest) = bytes.split_first()?;
-        if kind == 2 {
-            return Some(Frame::Branch(take_request(rest)?));
+        match kind {
+            2 => return Some(Frame::Branch(take_request(rest)?)),
+            3 => {
+                return Some(Frame::BranchRetired(NonZeroU32::new(u32::from_be_bytes(
+                    rest.try_into().ok()?,
+                ))?));
+            }
+            _ => {}
         }
         let (id, rest) = rest.split_at_checked(8)?;
         let id = NonZeroU64::new(u64::from_be_bytes(id.try_into().ok()?))?;
@@ -117,6 +124,11 @@ impl Frame<'_> {
             Self::Branch(request) => {
                 bytes.push(2);
                 put_request(&mut bytes, request)?
+            }
+            Self::BranchRetired(label) => {
+                bytes.push(3);
+                bytes.extend_from_slice(&label.get().to_be_bytes());
+                return Some(bytes.into_boxed_slice());
             }
         };
         if bytes.len().saturating_add(payload.len()) > MAX_BYTES || payload.is_empty() {
